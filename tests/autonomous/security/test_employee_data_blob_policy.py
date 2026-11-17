@@ -144,9 +144,9 @@ def test_exact_label_policy_rejects_extra_cross_resource_and_secret_keys(
         tenant_key="tenant_1",
         owner_principal_id="principal_1",
         document_id="data_0123456789abcdef",
-        kind="reasoning",
+        kind="memory_summary",
     )
-    assert document["purpose"] == "reasoning"
+    assert document["purpose"] == "memory_summary"
 
     store = BlobStore(
         tmp_path / "blobs",
@@ -167,7 +167,7 @@ def test_exact_label_policy_rejects_extra_cross_resource_and_secret_keys(
     ("purpose", "resource_id"),
     [
         ("execution_history", "data_0123456789abcdef"),
-        ("reasoning", "hist_" + "a" * 64),
+        ("memory_summary", "hist_" + "a" * 64),
     ],
 )
 def test_label_validation_binds_purpose_to_resource_shape(

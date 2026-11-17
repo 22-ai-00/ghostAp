@@ -11,7 +11,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -21,7 +20,6 @@ import lark_oapi as lark
 from src.utils.path import canonicalize_user_home_path
 
 from ...trust.registry import ManagedGroupRegistry
-from ..acceptance.main_bot_audit import MainBotSendAuditLog
 from ..acceptance.main_bot_warning_outbox import (
     MainBotWarningConflictError,
     MainBotWarningOutbox,
@@ -52,7 +50,10 @@ from ..gateway.env_scope import (
 )
 from ..gateway.models import EmployeeDispatchReportingDeferredError
 from ..ingress.attachments import AttachmentStagingService
-from ..ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
+from ..ingress.models import (
+    EmployeeIngressMetadata,
+    EmployeeIngressPayload,  # noqa: F401
+)
 from ..ingress.projection import IngressProjectionState
 from ..ingress.router import (
     DurableEmployeeIngressRouter,
@@ -77,12 +78,6 @@ from ..outbox.service import EmployeeOutboxService
 from ..supervisor.employee_channels import (
     ChannelProcessState,
     EmployeeChannelSupervisor,
-)
-from ..team.coordinator import SessionCoordinatorDecisionProvider
-from ..team.service import (
-    EmployeeTeamService,
-    TeamAttemptResult,
-    TeamTarget,
 )
 from ..workforce.credential_vault import CredentialVault
 from ..workforce.identity import default_employee_storage_base
@@ -117,7 +112,6 @@ _EMPLOYEE_HANDOFF_FINALIZATION_RESERVE_SECONDS = 0.25
 _EMPLOYEE_HANDOFF_FINALIZATION_CLOSE_SECONDS = 5.0
 _EMPLOYEE_HANDOFF_FINALIZATION_MAX_PENDING = 64
 _EMPLOYEE_HANDOFF_FINALIZATION_WORKERS = 4
-_EMPLOYEE_TEAM_CLOSE_SECONDS = 5.0
 _EMPLOYEE_OUTBOX_CLOSE_DRAIN_SECONDS = 5.0
 _EMPLOYEE_OUTBOX_CLOSE_MAX_BATCHES = 10_000
 _EMPLOYEE_OUTBOX_DELIVERY_BATCH = 16
@@ -209,267 +203,6 @@ class _ChannelSupervisor(Protocol):
     def close(self) -> None: ...
 
 
-class _RuntimeTeamBackend:
-    """Adapt TeamRun work to the canonical employee ingress/gateway pipeline."""
-
-    def __init__(
-        self,
-        runtime: "EmployeeDepartmentRuntime",
-        notify: Callable[[str, str, str], object],
-    ) -> None:
-        self._runtime = runtime
-        self._notify = notify
-
-    def list_active(self, tenant_key: str, chat_id: str) -> tuple[TeamTarget, ...]:
-        runtime = self._runtime
-        service = runtime._require_service()
-        ready_agent_ids = runtime._team_execution_ready_agent_ids(
-            tenant_key,
-            chat_id,
-        )
-        projection = service.synchronize_projection()
-        targets: list[TeamTarget] = []
-        for state in service.list_states():
-            employee = projection.employees.get(state.agent_id)
-            status = runtime._channels.status(state.agent_id) if runtime._channels else None
-            if (
-                state.phase is HirePhase.ACTIVE
-                and employee is not None
-                and employee.tenant_key == tenant_key
-                and chat_id in employee.member_groups
-                and getattr(status, "state", None) is ChannelProcessState.READY
-                and getattr(status, "generation", None) == state.channel_generation
-                and employee.agent_id in ready_agent_ids
-            ):
-                targets.append(
-                    TeamTarget(
-                        employee.agent_id,
-                        employee.name,
-                        employee.role,
-                        tuple(employee.capabilities),
-                        "ready",
-                        0,
-                    )
-                )
-        return tuple(sorted(targets, key=lambda item: item.agent_id))
-
-    def submit(
-        self,
-        *,
-        run_id: str,
-        step_id: str,
-        target: TeamTarget,
-        tenant_key: str,
-        chat_id: str,
-        message_id: str,
-        requester_principal_id: str,
-        instruction: str,
-        deadline_at: str,
-    ) -> str:
-        runtime = self._runtime
-        service = runtime._require_service()
-        ingress = runtime._ingress
-        channels = runtime._channels
-        if ingress is None or channels is None:
-            raise RuntimeError("team employee ingress is unavailable")
-        state = next(
-            (
-                candidate
-                for candidate in service.list_states()
-                if candidate.agent_id == target.agent_id
-                and candidate.tenant_key == tenant_key
-                and candidate.phase is HirePhase.ACTIVE
-            ),
-            None,
-        )
-        status = channels.status(target.agent_id)
-        ready_metadata = getattr(status, "ready_metadata", None)
-        connection_id = ready_metadata.get("connection_id") if isinstance(ready_metadata, Mapping) else ""
-        if (
-            state is None
-            or getattr(status, "state", None) is not ChannelProcessState.READY
-            or getattr(status, "generation", None) != state.channel_generation
-            or not isinstance(connection_id, str)
-            or not connection_id
-        ):
-            raise RuntimeError("team employee channel authority is unavailable")
-        stable = hashlib.sha256(f"{run_id}\0{step_id}\0{target.agent_id}".encode()).hexdigest()
-        payload = EmployeeIngressPayload(
-            schema_version=1,
-            envelope_id=f"ing_{stable}",
-            normalized_parts=(
-                {
-                    "type": "team_assignment",
-                    "message_type": "text",
-                    "chat_type": "group",
-                    "content": instruction,
-                    "team_instruction": instruction,
-                    "sender_id": requester_principal_id,
-                    "sender_id_type": "open_id",
-                    "sender_type": "user",
-                    "sender_tenant_key": tenant_key,
-                    "feishu_thread_id": "",
-                    "team_run_id": run_id,
-                    "team_step_id": step_id,
-                    "team_deadline_at": deadline_at,
-                },
-            ),
-            attachment_descriptors=(),
-        )
-        metadata = EmployeeIngressMetadata(
-            schema_version=1,
-            envelope_id=payload.envelope_id,
-            tenant_key=tenant_key,
-            agent_id=state.agent_id,
-            bot_principal_id=state.bot_principal_id,
-            app_id=state.app_id,
-            channel_generation=state.channel_generation,
-            connection_id=connection_id,
-            event_id=f"evt_{stable}",
-            message_id=message_id,
-            event_type="ghostap.team.assignment.v1",
-            action_identity=f"team:{run_id}:{step_id}",
-            chat_id=chat_id,
-            thread_root_message_id=message_id,
-            sender_principal_id=requester_principal_id,
-            received_at=datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            semantic_digest=payload.payload_sha256,
-            payload_sha256=payload.payload_sha256,
-            payload_size_bytes=payload.canonical_size_bytes,
-            attachment_count=0,
-            attachment_total_bytes=0,
-        )
-        # Inbox acceptance is the first durable ownership fact.  Group context
-        # is then projected by the canonical admission path before Router queue
-        # ownership; a crash or transient ledger failure is recovered by the
-        # periodic Inbox scan without creating a phantom ledger-only task.
-        ack = ingress.accept(metadata, payload, request_id=f"req_{stable}")
-        acceptance_id = ack.acceptance.acceptance_id
-        try:
-            runtime._admit_employee_ingress_once(acceptance_id)
-        except Exception as exc:
-            # Acceptance is already Journal-anchored.  A failed fast-path must
-            # leave it for the periodic recovery scan rather than make Team
-            # retry an execution whose durable ownership is now uncertain.
-            logger.warning(
-                "team employee ingress fast admission deferred: %s",
-                type(exc).__name__,
-            )
-        finally:
-            runtime._notify_employee_handoff_progress()
-        return acceptance_id
-
-    def result(self, acceptance_id: str) -> TeamAttemptResult | None:
-        runtime = self._runtime
-        dispatch = runtime._dispatch
-        if dispatch is None:
-            return TeamAttemptResult(
-                "action_required",
-                error_code="team_gateway_unavailable",
-                retry_allowed=False,
-            )
-        try:
-            snapshot = dispatch.team_attempt_result(acceptance_id)
-        except Exception:
-            return TeamAttemptResult(
-                "action_required",
-                error_code="team_gateway_unavailable",
-                retry_allowed=False,
-            )
-        return (
-            None
-            if snapshot is None
-            else TeamAttemptResult(
-                snapshot.status,
-                output=snapshot.output,
-                history_record_id=snapshot.history_record_id,
-                error_code=snapshot.error_code,
-                retry_allowed=True,
-            )
-        )
-
-    def cancel(
-        self,
-        acceptance_id: str,
-        *,
-        run_id: str,
-        step_id: str,
-    ) -> TeamAttemptResult:
-        dispatch = self._runtime._dispatch
-        if dispatch is None:
-            return TeamAttemptResult(
-                "action_required",
-                error_code="team_gateway_unavailable",
-                retry_allowed=False,
-            )
-        try:
-            outcome = dispatch.request_team_cancel(
-                acceptance_id=acceptance_id,
-                team_run_id=run_id,
-                team_step_id=step_id,
-            )
-        except Exception:
-            return TeamAttemptResult(
-                "action_required",
-                error_code="team_gateway_unavailable",
-                retry_allowed=False,
-            )
-        if outcome.status in {"cancel_requested", "already_terminal"}:
-            # A retry is safe only after the canceled attempt has a durable
-            # Gateway terminal frame. Give the live interruption a bounded
-            # window to finish; absence of a terminal remains non-retryable.
-            terminal_deadline = time.monotonic() + 5.0
-            while True:
-                try:
-                    terminal = dispatch.team_attempt_result(acceptance_id)
-                except Exception:
-                    return TeamAttemptResult(
-                        "action_required",
-                        error_code="team_gateway_unavailable",
-                        retry_allowed=False,
-                    )
-                if terminal is not None:
-                    return TeamAttemptResult(
-                        terminal.status,
-                        output=terminal.output,
-                        history_record_id=terminal.history_record_id,
-                        error_code=terminal.error_code,
-                        retry_allowed=True,
-                    )
-                if time.monotonic() >= terminal_deadline:
-                    break
-                time.sleep(0.01)
-            return TeamAttemptResult(
-                "canceled",
-                error_code="team_step_timeout",
-                retry_allowed=False,
-            )
-        return TeamAttemptResult(
-            "action_required",
-            error_code="team_cancel_failed",
-            retry_allowed=False,
-        )
-
-    def notify(
-        self,
-        message_id: str,
-        chat_id: str,
-        result: str,
-        *,
-        idempotency_key: str = "",
-        tenant_key: str = "",
-        requester_principal_id: str = "",
-    ) -> None:
-        self._notify(
-            message_id,
-            chat_id,
-            result,
-            idempotency_key=idempotency_key,
-            tenant_key=tenant_key,
-            requester_principal_id=requester_principal_id,
-        )
-
-
 class _SlashReconciler(Protocol):
     async def reconcile(self) -> VerifiedSlashState: ...
 
@@ -487,16 +220,29 @@ EmployeeEnvironmentProvider = Callable[
 
 
 class _TeamMembershipHealth:
-    """Treat an unavailable or ambiguous activated Team as degraded."""
+    """Treat an unavailable or unverified team chat as degraded."""
 
-    def __init__(self, manager: object) -> None:
+    def __init__(
+        self,
+        manager: object | None,
+        registry: object | None = None,
+    ) -> None:
         self._manager = manager
+        self._registry = registry
 
     def is_degraded(self, _agent_id: str, team_id: str) -> bool:
-        try:
-            self._manager.resolve_employee_engine(chat_id=team_id)
-        except Exception:
-            return True
+        if self._manager is not None:
+            try:
+                self._manager.resolve_employee_engine(chat_id=team_id)
+            except Exception:
+                return True
+            return False
+        active_record = getattr(self._registry, "active_record", None)
+        if callable(active_record):
+            try:
+                return active_record(team_id) is None
+            except Exception:
+                return True
         return False
 
 
@@ -597,7 +343,6 @@ class EmployeeDepartmentRuntime(
         self._membership: EmployeeMembershipService | None = None
         self._fire: EmployeeFireService | None = None
         self._external_mutation_gate = EmployeeExternalMutationGate()
-        self._team: EmployeeTeamService | None = None
         self._dispatch_thread: threading.Thread | None = None
         self._dispatch_stop = threading.Event()
         self._dispatch_wakeup = threading.Event()
@@ -685,7 +430,7 @@ class EmployeeDepartmentRuntime(
         )
         self._employee_handoff_revision = 0
         self._notification_status: Callable[[DurableHireState, str], object] | None = None
-        self._owned_main_bot_send_audit: MainBotSendAuditLog | None = None
+        self._owned_main_bot_send_audit: Any = None
         self._main_bot_warning_outbox: MainBotWarningOutbox | None = None
         self._main_bot_warning_transport: MainBotWarningTransport | None = None
         self._monitor_task: asyncio.Task[None] | None = None
@@ -765,26 +510,8 @@ class EmployeeDepartmentRuntime(
         )
         runtime._team_runtime = team_runtime
         runtime._environment_provider = employee_environment_provider
-        owned_main_bot_send_audit: MainBotSendAuditLog | None = None
-        if main_bot_send_audit is None:
-            try:
-                owned_main_bot_send_audit = MainBotSendAuditLog.open(
-                    settings.autonomous_main_bot_audit_dir,
-                    anchor_path=settings.autonomous_main_bot_audit_anchor_path,
-                    hmac_key=material.journal_hmac_key,
-                )
-                main_bot_send_audit = owned_main_bot_send_audit.count_target_attempts
-            except Exception as exc:
-                logger.error(
-                    "local main Bot send audit unavailable: %s",
-                    type(exc).__name__,
-                )
-                try:
-                    writer.close()
-                finally:
-                    vault.close()
-                return cls(blockers=("main_bot_send_audit",))
-        runtime._owned_main_bot_send_audit = owned_main_bot_send_audit
+        runtime._owned_main_bot_send_audit = None
+        del main_bot_send_audit, team_notification
         runtime._notification_status = notification_status
         try:
             runtime._start_loop()
@@ -831,35 +558,6 @@ class EmployeeDepartmentRuntime(
                 membership_health=membership_health or runtime._membership,
             )
             runtime._compose_fire(settings)
-            if team_notification is not None and runtime._writer is not None:
-                if team_runtime is None:
-                    raise RuntimeError("team coordinator project resolver is unavailable")
-
-                def resolve_coordinator_cwd(run: object) -> str:
-                    binding = team_runtime.resolve_employee_engine(chat_id=run.chat_id)
-                    return binding.canonical_root
-
-                decision_provider = SessionCoordinatorDecisionProvider(
-                    tool=getattr(settings, "autonomous_team_coordinator_tool", "coco"),
-                    model=getattr(settings, "autonomous_team_coordinator_model", ""),
-                    profile=getattr(settings, "autonomous_team_coordinator_profile", ""),
-                    effort=getattr(settings, "autonomous_team_coordinator_effort", ""),
-                    cwd_resolver=resolve_coordinator_cwd,
-                )
-                runtime._team = EmployeeTeamService(
-                    writer=runtime._writer,
-                    backend=_RuntimeTeamBackend(runtime, team_notification),
-                    attempt_timeout_seconds=float(settings.autonomous_team_step_timeout_seconds),
-                    blob_store=(runtime._ingress.blob_store if runtime._ingress is not None else None),
-                    active_key_id=(runtime._data_keyring.active_key_id if runtime._data_keyring is not None else ""),
-                    blob_retainer=(runtime._ingress.retain_shared_blob if runtime._ingress is not None else None),
-                    blob_releaser=(runtime._ingress.release_shared_blob if runtime._ingress is not None else None),
-                    coordinator_tool=getattr(settings, "autonomous_team_coordinator_tool", "coco"),
-                    coordinator_model=getattr(settings, "autonomous_team_coordinator_model", ""),
-                    coordinator_profile=getattr(settings, "autonomous_team_coordinator_profile", ""),
-                    coordinator_effort=getattr(settings, "autonomous_team_coordinator_effort", ""),
-                    coordinator_decision_provider=decision_provider,
-                )
             if recover_immediately:
                 runtime.recover()
             return runtime
@@ -890,10 +588,6 @@ class EmployeeDepartmentRuntime(
         return self._fire
 
     @property
-    def team_service(self) -> EmployeeTeamService | None:
-        return self._team
-
-    @property
     def data_composition(self) -> EmployeeDataComposition | None:
         return self._data
 
@@ -902,7 +596,7 @@ class EmployeeDepartmentRuntime(
         return self._dispatch
 
     @property
-    def main_bot_outbound_audit(self) -> MainBotSendAuditLog | None:
+    def main_bot_outbound_audit(self) -> Any:
         return self._owned_main_bot_send_audit
 
     def bind_main_bot_warning_transport(
@@ -969,40 +663,8 @@ class EmployeeDepartmentRuntime(
     def hire_readiness(self) -> RuntimeReadiness:
         if self._service is None:
             return RuntimeReadiness(False, self._blockers or ("not_composed",))
-        activation_audit = self._owned_main_bot_send_audit
-        if activation_audit is None or activation_audit.activation_fence_ready is not True:
-            return RuntimeReadiness(False, ("main_bot_activation_fence",))
         service_readiness: HireReadiness = self._service.readiness()
         return RuntimeReadiness(service_readiness.ready, service_readiness.blockers)
-
-    def _team_execution_ready_agent_ids(
-        self,
-        tenant_key: str,
-        chat_id: str,
-    ) -> frozenset[str]:
-        """Probe one team snapshot once, then isolate per-employee failures."""
-
-        if not isinstance(chat_id, str) or not chat_id.strip():
-            return frozenset()
-        readiness, projection, active = self._prepare_execution_probe()
-        if not readiness.ready:
-            return frozenset()
-        ready: set[str] = set()
-        for state in active:
-            if state.tenant_key != tenant_key:
-                continue
-            employee = projection.employees.get(state.agent_id)
-            if employee is None or chat_id not in employee.member_groups:
-                continue
-            employee_readiness = self._probe_employee_execution(
-                projection,
-                state,
-                chat_id=chat_id,
-                probe_remote=False,
-            )
-            if employee_readiness.ready:
-                ready.add(state.agent_id)
-        return frozenset(ready)
 
     def _prepare_execution_probe(
         self,
@@ -1172,16 +834,6 @@ class EmployeeDepartmentRuntime(
         self._core_recovered = False
         self._membership_audit_ready = not self._runtime_enabled or self._membership is None
         self._service.recover()
-        repair = self._service.recover_replay_safe_action_required() if self._runtime_enabled else None
-        base_summary = EmployeeRecoverySummary(
-            eligible=0 if repair is None else repair.eligible,
-            recovered=0,
-            skipped=0 if repair is None else repair.skipped,
-            failed=0 if repair is None else repair.failed,
-        )
-        repaired_intents = set(() if repair is None else repair.repaired_intent_ids)
-        if repair is not None and repair.failed:
-            raise RuntimeError(f"durable ACTION_REQUIRED repair failed: {repair.failed}/{repair.eligible} intents")
         if self._membership is not None:
             self._membership.rebuild_projection()
             if self._runtime_enabled:
@@ -1262,7 +914,6 @@ class EmployeeDepartmentRuntime(
                 assert self._dispatch is not None
                 assert self._outbox is not None
                 self._ingress.rebuild_projection()
-                self._reconcile_retired_activation_ingress()
                 self._router.rebuild_projection()
                 if not outbox_projection_recovered:
                     self._outbox.rebuild_projection()
@@ -1277,21 +928,6 @@ class EmployeeDepartmentRuntime(
                     type(exc).__name__,
                 )
                 self._execution_blockers = ("employee_recovery",)
-                execution_recovered = False
-        if execution_recovered and self._team is not None:
-            try:
-                recovered_team_runs = self._team.recover()
-                if recovered_team_runs:
-                    logger.warning(
-                        "employee team recovered %d interrupted run(s)",
-                        recovered_team_runs,
-                    )
-            except Exception as exc:
-                logger.error(
-                    "employee team recovery failed closed: %s",
-                    type(exc).__name__,
-                )
-                self._execution_blockers = ("team_recovery",)
                 execution_recovered = False
         if self._fire is not None and self._runtime_enabled:
             try:
@@ -1314,13 +950,10 @@ class EmployeeDepartmentRuntime(
         self._core_recovered = not self._execution_blockers and not self._context_blockers
         if not self._runtime_enabled:
             self._service.mark_runtime_recovered()
-            return base_summary
+            return EmployeeRecoverySummary()
         pending_intents: list[str] = []
         recovery_states = tuple(self._service.list_states())
         for state in recovery_states:
-            if state.intent_id in repaired_intents:
-                pending_intents.append(state.intent_id)
-                continue
             if (
                 state.phase
                 in {
@@ -1351,21 +984,19 @@ class EmployeeDepartmentRuntime(
             recovery_future = self._submit_coroutine(
                 self._recover_runtime(
                     list(dict.fromkeys(pending_intents)),
-                    repaired_intents=repaired_intents,
-                    base_summary=base_summary,
                 ),
                 label="recovery",
             )
             return recovery_future.result()
         else:
-            if not base_summary.failed and self._membership_audit_ready:
+            if self._membership_audit_ready:
                 self._service.mark_runtime_recovered()
             if self._loop is not None:
                 self._loop.call_soon_threadsafe(self._start_monitor_in_loop)
             self._start_reporting_worker()
             if execution_recovered:
                 self._start_dispatch_worker()
-            return base_summary
+            return EmployeeRecoverySummary()
 
     def close(self, *, timeout_seconds: float | None = None) -> None:
         """Join one close attempt without mistaking in-progress for success.
@@ -1467,14 +1098,6 @@ class EmployeeDepartmentRuntime(
             cleanup("hire_admission", self._service.stop_admission)
         if self._context_service is not None:
             cleanup("context_admission", self._context_service.stop_admission)
-        team_safe = True
-        if self._team is not None:
-            team_safe = cleanup(
-                "team_service",
-                lambda: self._team.close(
-                    timeout_seconds=_EMPLOYEE_TEAM_CLOSE_SECONDS,
-                ),
-            )
         self._dispatch_stop.set()
         self._dispatch_wakeup.set()
         dispatch_safe = True
@@ -1551,8 +1174,7 @@ class EmployeeDepartmentRuntime(
                 ),
             )
         resources_safe = (
-            team_safe
-            and dispatch_safe
+            dispatch_safe
             and admission_safe
             and reporting_safe
             and activities_safe
@@ -1591,11 +1213,6 @@ class EmployeeDepartmentRuntime(
                 resources_safe = cleanup("writer", self._writer.close)
         if resources_safe and self._vault is not None:
             resources_safe = cleanup("vault", self._vault.close)
-        if resources_safe and self._owned_main_bot_send_audit is not None:
-            resources_safe = cleanup(
-                "main_bot_send_audit",
-                self._owned_main_bot_send_audit.close,
-            )
         if not resources_safe:
             errors.append("dependent_resources_held")
         if resources_safe and self._loop is not None:
@@ -1764,8 +1381,38 @@ class EmployeeDepartmentRuntime(
         if data.state.data_authority.mode != "canonical":
             raise LegacyEmployeeDataUnsupportedError("legacy employee data requires an offline migration")
         data.rebuild_all()
-        if data.knowledge_service is not None:
-            data.knowledge_service.recover()
+
+    def _resolve_team_owner(self, chat_id: str) -> str:
+        if self._team_runtime is not None:
+            try:
+                getter = getattr(self._team_runtime, "get_activated_engine", None)
+                engine = getter(chat_id) if callable(getter) else None
+                channel = getattr(engine, "channel", None)
+                return str(getattr(channel, "owner_id", "") or "")
+            except Exception:
+                return ""
+        active_record = getattr(self._managed_group_registry, "active_record", None)
+        if callable(active_record):
+            try:
+                record = active_record(chat_id)
+                return str(getattr(record, "owner_id", "") or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _is_team_active(self, chat_id: str) -> bool:
+        if self._team_runtime is not None:
+            try:
+                return bool(self._team_runtime.get_activated_engine(chat_id))
+            except Exception:
+                return False
+        active_record = getattr(self._managed_group_registry, "active_record", None)
+        if callable(active_record):
+            try:
+                return active_record(chat_id) is not None
+            except Exception:
+                return False
+        return False
 
     def _compose_membership(
         self,
@@ -1781,7 +1428,6 @@ class EmployeeDepartmentRuntime(
             or self._service is None
             or self._vault is None
             or not callable(manager_client_factory)
-            or self._team_runtime is None
         ):
             self._membership = None
             return
@@ -1794,15 +1440,6 @@ class EmployeeDepartmentRuntime(
             app_secret = self._vault.resolve(credential_ref, agent_id, app_id)
             return lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
 
-        def team_owner(chat_id: str) -> str:
-            try:
-                getter = getattr(self._team_runtime, "get_activated_engine", None)
-                engine = getter(chat_id) if callable(getter) else None
-                channel = getattr(engine, "channel", None)
-                return str(getattr(channel, "owner_id", "") or "")
-            except Exception:
-                return ""
-
         try:
             remote = LarkMembershipAPI(
                 manager_client_factory(),
@@ -1813,8 +1450,8 @@ class EmployeeDepartmentRuntime(
                 hire_service=self._service,
                 remote=remote,
                 admin_principal_ids=frozenset(getattr(settings, "admin_user_ids", ()) or ()),
-                team_owner_resolver=team_owner,
-                team_active_resolver=lambda chat_id: bool(self._team_runtime.get_activated_engine(chat_id)),
+                team_owner_resolver=self._resolve_team_owner,
+                team_active_resolver=self._is_team_active,
                 external_mutation_gate=self._external_mutation_gate,
             )
         except Exception as exc:
@@ -1910,9 +1547,6 @@ class EmployeeDepartmentRuntime(
         ):
             self._execution_blockers = ("employee_gateway",)
             return
-        if self._team_runtime is None or not callable(getattr(self._team_runtime, "employee_activation_guard", None)):
-            self._execution_blockers = ("team_runtime",)
-            return
         if not callable(self._environment_provider):
             self._execution_blockers = ("employee_environment",)
             return
@@ -1930,7 +1564,10 @@ class EmployeeDepartmentRuntime(
                     storage_base_path=legacy_base,
                 )
 
-            health = membership_health or _TeamMembershipHealth(self._team_runtime)
+            health = membership_health or _TeamMembershipHealth(
+                self._team_runtime,
+                self._managed_group_registry,
+            )
             constraints_digest = hashlib.sha256(b"ghostap.employee-execution-constraints.v1").hexdigest()
             self._router = DurableEmployeeIngressRouter(
                 writer=self._writer,
@@ -1994,18 +1631,7 @@ class EmployeeDepartmentRuntime(
                 ),
                 attempt_lifecycle=outbox_lifecycle,
                 admin_principal_ids=frozenset(getattr(settings, "admin_user_ids", ()) or ()),
-                team_owner_resolver=lambda chat_id: str(
-                    getattr(
-                        getattr(
-                            self._team_runtime.get_activated_engine(chat_id),
-                            "channel",
-                            None,
-                        ),
-                        "owner_id",
-                        "",
-                    )
-                    or ""
-                ),
+                team_owner_resolver=self._resolve_team_owner,
                 timeout_seconds=getattr(
                     settings,
                     "autonomous_team_step_timeout_seconds",

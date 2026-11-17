@@ -88,14 +88,6 @@ class HireReadiness:
     blockers: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class ActionRequiredRecoveryResult:
-    eligible: int
-    repaired_intent_ids: tuple[str, ...]
-    skipped: int
-    failed: int
-
-
 class AppRegistrarPort(Protocol):
     async def register(
         self,
@@ -510,300 +502,6 @@ class ProductionEmployeeHireService:
                 ) from None
         return admitted
 
-    @staticmethod
-    def _single_event_frame_matches(
-        frame: TransactionFrame,
-        *,
-        event_type: str,
-        aggregate_id: str,
-        payload: Mapping[str, object],
-    ) -> bool:
-        return (
-            len(frame.events) == 1
-            and frame.events[0].event_type == event_type
-            and frame.events[0].aggregate_id == aggregate_id
-            and frame.events[0].payload == payload
-        )
-
-    @classmethod
-    def _has_exact_replay_safe_recovery_exhausted_history(
-        cls,
-        state: DurableHireState,
-        frames: tuple[TransactionFrame, ...],
-        *,
-        recovery_writer_epoch: int,
-    ) -> bool:
-        """Accept only convergent Slash failures after a prior clean activation."""
-
-        generation = state.channel_generation
-        channel_effect_id = f"channel-start:{generation}"
-        baseline_slash_id = cls._latest_slash_effect_id(state, generation)
-        channel_metadata = dict(state.metadata_for(channel_effect_id))
-        baseline_slash_metadata = (
-            dict(state.metadata_for(baseline_slash_id))
-            if baseline_slash_id is not None
-            else {}
-        )
-        action_required = tuple(
-            effect_id
-            for effect_id, effect_state in state.effects
-            if effect_state is HireEffectState.ACTION_REQUIRED
-            and re.fullmatch(
-                rf"slash-reconcile:{generation + 1}:[1-9][0-9]*",
-                effect_id,
-            )
-            is not None
-        )
-        if len(action_required) != 1:
-            return False
-        failed_effect_id = action_required[0]
-        if re.fullmatch(
-            rf"slash-reconcile:{generation + 1}:[1-9][0-9]*",
-            failed_effect_id,
-        ) is None:
-            return False
-        if (
-            state.phase is not HirePhase.ACTION_REQUIRED
-            or generation <= 0
-            or not state.app_id
-            or not state.credential_ref
-            or state.activation_source != "channel_ready"
-            or state.verification_consumed is not True
-            or not math.isfinite(state.activation_verified_at)
-            or state.activation_verified_at <= 0
-            or not state.slash_spec_hash
-            or state.slash_observed_hash != state.slash_spec_hash
-            or state.slash_verified_at <= 0
-            or state.channel_identity_app_id != state.app_id
-            or not state.channel_connection_id
-            or state.channel_verified_at < state.slash_verified_at
-            or state.effect_state(channel_effect_id) is not HireEffectState.COMMITTED
-            or channel_metadata.get("app_id") != state.app_id
-            or channel_metadata.get("identity_app_id") != state.app_id
-            or channel_metadata.get("generation") != str(generation)
-            or channel_metadata.get("connection_id") != state.channel_connection_id
-            or baseline_slash_id is None
-            or state.effect_state(baseline_slash_id) is not HireEffectState.COMMITTED
-            or baseline_slash_metadata.get("slash_spec_hash")
-            != state.slash_spec_hash
-            or baseline_slash_metadata.get("slash_observed_hash")
-            != state.slash_spec_hash
-            or dict(state.effect_types).get(failed_effect_id)
-            != "slash_reconciliation"
-            or dict(state.metadata_for(failed_effect_id))
-            not in (
-                {"error_code": "recovery_exhausted"},
-                {"error_code": "terminal_anchor_failed"},
-            )
-            or any(
-                effect_state
-                not in {HireEffectState.COMMITTED, HireEffectState.ACTION_REQUIRED}
-                for _effect_id, effect_state in state.effects
-            )
-        ):
-            return False
-
-        related = tuple(
-            frame
-            for frame in frames
-            if any(
-                event.aggregate_id in {state.intent_id, state.agent_id}
-                for event in frame.events
-            )
-        )
-        if len(related) < 7 or state.last_sequence != related[-1].sequence:
-            return False
-        effect_payload = {
-            "effect_id": failed_effect_id,
-            "effect_type": "slash_reconciliation",
-        }
-        terminal_payload = {
-            **effect_payload,
-            "metadata": dict(state.metadata_for(failed_effect_id)),
-        }
-
-        def matches_failure_prefix(tail: tuple[TransactionFrame, ...]) -> bool:
-            return len(tail) >= 6 and (
-                cls._single_event_frame_matches(
-                    tail[0],
-                    event_type="hire.channel.crashed",
-                    aggregate_id=state.intent_id,
-                    payload={"generation": generation},
-                )
-                and cls._single_event_frame_matches(
-                    tail[1],
-                    event_type="employee.state_changed",
-                    aggregate_id=state.agent_id,
-                    payload={"state": HirePhase.VALIDATING.value},
-                )
-                and cls._single_event_frame_matches(
-                    tail[2],
-                    event_type="hire.effect.prepared",
-                    aggregate_id=state.intent_id,
-                    payload=effect_payload,
-                )
-                and cls._single_event_frame_matches(
-                    tail[3],
-                    event_type="hire.effect.executing",
-                    aggregate_id=state.intent_id,
-                    payload=effect_payload,
-                )
-                and cls._single_event_frame_matches(
-                    tail[4],
-                    event_type="hire.effect.action_required",
-                    aggregate_id=state.intent_id,
-                    payload=terminal_payload,
-                )
-                and tail[0].writer_epoch == tail[1].writer_epoch
-                and len({frame.writer_epoch for frame in tail[2:5]}) == 1
-            )
-
-        standard_tail = related[-6:]
-        standard_failure = matches_failure_prefix(standard_tail) and (
-            cls._single_event_frame_matches(
-                standard_tail[5],
-                event_type="employee.state_changed",
-                aggregate_id=state.agent_id,
-                payload={"state": HirePhase.ACTION_REQUIRED.value},
-            )
-            and len({frame.writer_epoch for frame in standard_tail[2:]}) == 1
-            and standard_tail[5].writer_epoch != recovery_writer_epoch
-        )
-        revalidated_tail = related[-7:]
-        revalidated_failure = matches_failure_prefix(revalidated_tail) and (
-            cls._single_event_frame_matches(
-                revalidated_tail[5],
-                event_type="hire.channel.crashed",
-                aggregate_id=state.intent_id,
-                payload={"generation": generation},
-            )
-            and cls._single_event_frame_matches(
-                revalidated_tail[6],
-                event_type="employee.state_changed",
-                aggregate_id=state.agent_id,
-                payload={"state": HirePhase.ACTION_REQUIRED.value},
-            )
-            and revalidated_tail[5].writer_epoch
-            == revalidated_tail[6].writer_epoch
-            and revalidated_tail[4].writer_epoch
-            != revalidated_tail[5].writer_epoch
-            and revalidated_tail[6].writer_epoch != recovery_writer_epoch
-        )
-        if not standard_failure and not revalidated_failure:
-            return False
-        failure_tail_length = 6 if standard_failure else 7
-
-        expected_activation_payload = {
-            "tenant_key": state.tenant_key,
-            "app_id": state.app_id,
-            "agent_id": state.agent_id,
-            "generation": generation,
-            "slash_spec_hash": state.slash_spec_hash,
-            "channel_connection_id": state.channel_connection_id,
-            "requester_principal_id": state.requester_principal_id,
-            "requester_union_id": state.requester_union_id,
-            "source": "channel_ready",
-            "activated_at": state.activation_verified_at,
-        }
-        return any(
-            len(frame.events) == 2
-            and frame.events[0].event_type == "hire.activation.automatic"
-            and frame.events[0].aggregate_id == state.intent_id
-            and frame.events[0].payload == expected_activation_payload
-            and frame.events[1].event_type == "employee.state_changed"
-            and frame.events[1].aggregate_id == state.agent_id
-            and frame.events[1].payload == {"state": HirePhase.ACTIVE.value}
-            for frame in related[:-failure_tail_length]
-        )
-
-    def recover_replay_safe_action_required(self) -> ActionRequiredRecoveryResult:
-        """Atomically reopen only exact, replay-safe Slash exhaustion histories."""
-
-        repaired: list[str] = []
-        with self.employee_dispatch_guard(), self._writer.transaction_guard():
-            self._synchronize_projection_to_journal_locked()
-            frames = tuple(self._writer.replay())
-            candidates = tuple(
-                state
-                for state in self._hire_projection.states.values()
-                if state.phase is HirePhase.ACTION_REQUIRED
-            )
-            eligible = tuple(
-                state
-                for state in candidates
-                if (
-                    (employee := self._projection_state.employees.get(state.agent_id))
-                    is not None
-                    and employee.worker_type is WorkerType.VISIBLE
-                    and employee.state is EmployeeState.ACTION_REQUIRED
-                    and self._has_exact_replay_safe_recovery_exhausted_history(
-                        state,
-                        frames,
-                        recovery_writer_epoch=self._writer.writer_epoch,
-                    )
-                )
-            )
-            skipped = len(candidates) - len(eligible)
-            events = tuple(
-                event
-                for state in eligible
-                for event in (
-                    JournalEvent(
-                        event_type="hire.channel.phase_only_recovery",
-                        aggregate_id=state.intent_id,
-                        payload={"generation": state.channel_generation},
-                    ),
-                    JournalEvent(
-                        event_type="employee.state_changed",
-                        aggregate_id=state.agent_id,
-                        payload={"state": HirePhase.VALIDATING.value},
-                    ),
-                )
-            )
-            if events:
-                try:
-                    validate_workforce_events(
-                        self._projection_state,
-                        tuple(events[1::2]),
-                    )
-                    last = self._writer.get_last_frame()
-                    sequence = 0 if last is None else last.sequence
-                    logical_hash = "" if last is None else last.frame_hash
-                    result = self._writer.commit(
-                        events,
-                        self._writer.get_aggregate_versions(
-                            tuple(event.aggregate_id for event in events)
-                        ),
-                        expected_head_sequence=sequence,
-                        expected_head_hash=logical_hash,
-                    )
-                    if result.state is CommitState.ANCHORED:
-                        apply_frame(self._projection_state, result.frame)
-                        self._hire_projection = HireProjection.rebuild(
-                            self._writer.replay()
-                        )
-                        reopened = tuple(
-                            self._require_hire(state.intent_id)
-                            for state in eligible
-                        )
-                        if all(
-                            state.phase is HirePhase.VALIDATING
-                            for state in reopened
-                        ):
-                            repaired.extend(
-                                state.intent_id for state in eligible
-                            )
-                except Exception:
-                    pass
-        batch_failed = len(repaired) != len(eligible)
-        return ActionRequiredRecoveryResult(
-            eligible=len(eligible),
-            repaired_intent_ids=() if batch_failed else tuple(repaired),
-            skipped=skipped,
-            failed=len(eligible) if batch_failed else 0,
-        )
-
-
     def commit_effect_transition(
         self,
         intent_id: str,
@@ -907,7 +605,6 @@ class ProductionEmployeeHireService:
         *,
         generation: int,
         force_refresh: bool,
-        allow_action_required_refresh: bool = False,
     ) -> str:
         """Select a durable, resumable Slash attempt for one Channel generation."""
         if isinstance(generation, bool) or generation <= 0:
@@ -918,13 +615,7 @@ class ProductionEmployeeHireService:
             if not attempts:
                 return f"slash-reconcile:{generation}:1"
             attempt, effect_id = attempts[-1]
-            refreshable = state.effect_state(effect_id) is HireEffectState.COMMITTED or (
-                allow_action_required_refresh
-                and state.effect_state(effect_id) is HireEffectState.ACTION_REQUIRED
-                and dict(state.effect_types).get(effect_id) == "slash_reconciliation"
-                and dict(state.metadata_for(effect_id)).get("error_code")
-                in {"recovery_exhausted", "terminal_anchor_failed"}
-            )
+            refreshable = state.effect_state(effect_id) is HireEffectState.COMMITTED
             if force_refresh and refreshable:
                 return f"slash-reconcile:{generation}:{attempt + 1}"
             return effect_id
@@ -1620,34 +1311,6 @@ class ProductionEmployeeHireService:
 
     def _reconcile_recovered_hires(self) -> None:
         for state in tuple(self._hire_projection.states.values()):
-            effect_types = dict(state.effect_types)
-            retired_replies = [
-                (effect_id, effect_type)
-                for effect_id, effect_state in state.effects
-                if effect_state
-                in {HireEffectState.PREPARED, HireEffectState.EXECUTING}
-                and (effect_type := effect_types.get(effect_id, ""))
-                in {
-                    "employee_activation_required_reply",
-                    "employee_status_reply",
-                }
-            ]
-            for effect_id, effect_type in retired_replies:
-                metadata = dict(state.metadata_for(effect_id))
-                metadata.setdefault("error_code", "manual_activation_retired")
-                state = self.commit_effect_transition(
-                    state.intent_id,
-                    effect_id=effect_id,
-                    effect_type=effect_type,
-                    next_state=HireEffectState.ACTION_REQUIRED,
-                    metadata=metadata,
-                )
-            if (
-                state.phase is HirePhase.READY_PENDING_VERIFICATION
-                and state.activation_ingress_event_id
-            ):
-                self._commit_phase_transition(state, HirePhase.ACTIVE)
-                continue
             if state.phase in {
                 HirePhase.ACTION_REQUIRED,
                 HirePhase.CONFIGURING,
@@ -2076,7 +1739,6 @@ class ProductionEmployeeHireService:
 
 __all__ = [
     "HireAdmissionError",
-    "ActionRequiredRecoveryResult",
     "HireReadiness",
     "ProductionEmployeeHireService",
 ]

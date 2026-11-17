@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from ..autonomous.membership.service import EmployeeMembershipService
     from ..autonomous.provisioning.fire_service import EmployeeFireService
     from ..autonomous.provisioning.hire_port import EmployeeHireService
-    from ..autonomous.team import EmployeeTeamService
     from ..chat_lock import ChatLockManager
     from ..config.env_file_store import AtomicEnvFileStore
     from ..deep_engine import DeepEngineManager, ProgressReporter
@@ -97,7 +96,6 @@ class HandlerContext:
     employee_hire_readiness: Optional[Callable[[], Any]] = None
     employee_membership_service: Optional["EmployeeMembershipService"] = None
     employee_data_composition: Optional["EmployeeDataComposition"] = None
-    employee_team_service: Optional["EmployeeTeamService"] = None
     employee_runtime_facade: Any = None
     main_bot_outbound_audit: Optional[Callable[[str, str, str], None]] = None
     main_bot_outbound_audit_failure: Optional[Callable[[Exception], None]] = None

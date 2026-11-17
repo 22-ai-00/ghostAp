@@ -46,9 +46,6 @@ from ..ingress.targeted_task import (
 from ..membership import (
     MembershipBindingError,
 )
-from .hire_state import (
-    HireEffectState,
-)
 
 if TYPE_CHECKING:
     from .composition import (
@@ -1929,56 +1926,6 @@ class EmployeeRuntimeIngressMixin:
             chat_type=str(part.get("chat_type") or "group"),
         )
 
-    def _reconcile_retired_activation_ingress(self) -> None:
-        """Fail closed old prompt effects and prevent their ingress replay."""
-        service = self._require_service()
-        ingress = self._ingress
-        if ingress is None:
-            return
-        retired_types = {
-            "employee_activation_required_reply",
-            "employee_status_reply",
-        }
-        retired_event_ids: set[str] = set()
-        for snapshot in service.list_states():
-            state = snapshot
-            effect_types = dict(state.effect_types)
-            for effect_id, effect_state in snapshot.effects:
-                effect_type = effect_types.get(effect_id, "")
-                if effect_type not in retired_types:
-                    continue
-                metadata = dict(state.metadata_for(effect_id))
-                event_id = metadata.get("ingress_event_id", "")
-                if event_id:
-                    retired_event_ids.add(event_id)
-                if effect_state not in {
-                    HireEffectState.PREPARED,
-                    HireEffectState.EXECUTING,
-                }:
-                    continue
-                metadata.setdefault(
-                    "error_code",
-                    "manual_activation_retired_unknown_outcome",
-                )
-                state = service.commit_effect_transition(
-                    state.intent_id,
-                    effect_id=effect_id,
-                    effect_type=effect_type,
-                    next_state=HireEffectState.ACTION_REQUIRED,
-                    metadata=metadata,
-                )
-        for acceptance_id, record in tuple(ingress.state.by_acceptance_id.items()):
-            if record.disposition is not None or record.metadata.event_id not in retired_event_ids:
-                continue
-            try:
-                ingress.record_disposition(
-                    acceptance_id,
-                    state="ignored",
-                    reason_code="activation_retired",
-                )
-            except IngressConflictError:
-                pass
-
     def _handle_control_ingress(
         self,
         acceptance_id: str,
@@ -2598,7 +2545,6 @@ class EmployeeRuntimeIngressMixin:
         sender_id = part.get("sender_id")
         sender_union_id = part.get("sender_union_id", "")
         service = self._service
-        is_team_assignment = getattr(record.metadata, "event_type", "") == "ghostap.team.assignment.v1"
         if (
             not isinstance(sender_id, str)
             or not sender_id
@@ -2616,25 +2562,13 @@ class EmployeeRuntimeIngressMixin:
         if len(states) != 1:
             return False
         owner_principal_id = states[0].requester_principal_id
-        team_run_id = part.get("team_run_id") if is_team_assignment else None
-        team_step_id = part.get("team_step_id") if is_team_assignment else None
-        if is_team_assignment:
-            canonical_sender_id = (
-                sender_id
-                if part.get("type") == "team_assignment"
-                and sender_id == owner_principal_id
-                and all(isinstance(value, str) and value for value in (team_run_id, team_step_id))
-                and record.metadata.action_identity == f"team:{team_run_id}:{team_step_id}"
-                else None
-            )
-        else:
-            canonical_sender_id = self._resolve_employee_requester_principal(
-                tenant_key=record.metadata.tenant_key,
-                agent_id=record.metadata.agent_id,
-                owner_principal_id=owner_principal_id,
-                sender_principal_id=sender_id,
-                sender_union_id=sender_union_id,
-            )
+        canonical_sender_id = self._resolve_employee_requester_principal(
+            tenant_key=record.metadata.tenant_key,
+            agent_id=record.metadata.agent_id,
+            owner_principal_id=owner_principal_id,
+            sender_principal_id=sender_id,
+            sender_union_id=sender_union_id,
+        )
         if canonical_sender_id is None:
             return False
         ledger.publish(
@@ -2642,7 +2576,7 @@ class EmployeeRuntimeIngressMixin:
             chat_id=chat_id,
             thread_id=str(part.get("feishu_thread_id", "")),
             message_id=message_id,
-            transport_principal_id=("main_bot" if is_team_assignment else record.metadata.bot_principal_id),
+            transport_principal_id=record.metadata.bot_principal_id,
             transport_event_id=record.metadata.event_id,
             payload=GroupEventPayload(
                 sender_id=record.metadata.sender_principal_id,
@@ -2652,6 +2586,6 @@ class EmployeeRuntimeIngressMixin:
                 text=text,
                 timestamp=_composition_module().time.time(),
             ),
-            causal_event_id=(f"{team_run_id}:{team_step_id}" if is_team_assignment else ""),
+            causal_event_id="",
         )
         return True

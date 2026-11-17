@@ -146,7 +146,7 @@ class DispatchBinding:
     dispatch_committed_at: str
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError("unsupported dispatch binding schema")
         if not isinstance(
             self.authorization_scope,
@@ -227,10 +227,8 @@ class DispatchBinding:
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
         prompt_digest = _optional_digest(self.prompt_digest, "prompt_digest")
-        if self.schema_version == 2 and not prompt_digest:
+        if not prompt_digest:
             raise ValueError("prompt_digest is required for dispatch binding v2")
-        if self.schema_version == 1 and prompt_digest:
-            raise ValueError("legacy dispatch binding cannot carry prompt_digest")
         object.__setattr__(self, "prompt_digest", prompt_digest)
         effective_input_kind = _optional_text(
             self.effective_input_kind,
@@ -265,8 +263,6 @@ class DispatchBinding:
                 or self.requester_principal_id != self.owner_principal_id
             ):
                 raise ValueError("unsupported effective input kind")
-        if self.schema_version == 1 and effective_input_kind:
-            raise ValueError("legacy dispatch binding cannot carry effective input")
         object.__setattr__(
             self,
             "constraints_digest",
@@ -294,8 +290,6 @@ class DispatchBinding:
             raise ValueError("dispatch_committed_at must be canonical UTC")
 
     def to_dict(self) -> dict[str, object]:
-        if self.schema_version != 2:
-            raise ValueError("legacy dispatch binding is replay-only")
         result = {name: getattr(self, name) for name in self.__dataclass_fields__}
         result["authorization_scope"] = self.authorization_scope.value
         result["permissions"] = list(self.permissions)
@@ -307,9 +301,6 @@ class DispatchBinding:
         if not isinstance(value, dict):
             raise ValueError("dispatch binding must be an object")
         normalized = dict(value)
-        # Older journal frames carried an execution-policy label. It no longer
-        # has runtime meaning, but replay must remain compatible after removal.
-        normalized.pop("security_profile", None)
         expected = set(cls.__dataclass_fields__)
         if set(normalized) != expected:
             raise ValueError("dispatch binding must use exact schema")

@@ -172,9 +172,6 @@ def test_reporting_worker_starts_after_actor_recovery_fails() -> None:
         def recover(self) -> None:
             return None
 
-        def recover_replay_safe_action_required(self) -> None:
-            return None
-
         def list_states(self) -> tuple[()]:
             return ()
 

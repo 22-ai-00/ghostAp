@@ -141,7 +141,6 @@ async def test_retirement_fence_blocks_slash_and_channel_before_external_calls(
                 state,
                 generation=2,
                 force_refresh=True,
-                allow_action_required_refresh=False,
             )
         with pytest.raises(RuntimeError, match="retiring"):
             await runtime._start_channel(state)  # noqa: SLF001
@@ -174,7 +173,6 @@ async def test_retirement_waits_for_inflight_slash_terminal_anchor(
             state,
             generation=2,
             force_refresh=True,
-            allow_action_required_refresh=False,
         )
     )
     await asyncio.wait_for(slash.started.wait(), timeout=1.0)
@@ -227,7 +225,6 @@ async def test_slash_credential_failure_is_recorded_as_replay_safe(
             state,
             generation=2,
             force_refresh=True,
-            allow_action_required_refresh=False,
         )
 
     current = service.get_state("hire_recover")
@@ -262,7 +259,6 @@ async def test_closing_runtime_does_not_start_slash_credential_resolution(
             state,
             generation=2,
             force_refresh=True,
-            allow_action_required_refresh=False,
         )
 
     current = service.get_state("hire_recover")
@@ -329,7 +325,6 @@ async def test_child_cancelled_slash_is_disposed_before_releasing_lease(
             state,
             generation=2,
             force_refresh=True,
-            allow_action_required_refresh=False,
         )
 
     current = service.get_state("hire_recover")
@@ -395,7 +390,6 @@ async def test_cancelled_slash_with_child_failure_preserves_cancellation(
             state,
             generation=2,
             force_refresh=True,
-            allow_action_required_refresh=False,
         )
     )
     await asyncio.wait_for(slash.started.wait(), timeout=1.0)

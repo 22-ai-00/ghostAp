@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 
@@ -77,91 +76,6 @@ def _assert_zero_dispatch(delegate: _DispatchSpies) -> None:
     assert delegate.calls == []
     assert delegate.task_commits == []
     assert delegate.acp_calls == []
-
-
-class _InTraversalMutationSource(_FakeSource):
-    """Mutate the source after page one and before page two is returned."""
-
-    def __init__(self, kind: str) -> None:
-        super().__init__(traversals=[])
-        self._kind = kind
-        self._traversal = -1
-        self.events: list[tuple[int, str]] = []
-        self._root = _msg("om_root", "root", create=1_000, position=0)
-        self._before = _msg("om_before", "before", create=2_000, position=1)
-        self._current = _msg("om_current", "current", create=4_000, position=3)
-
-    def list_thread_messages(
-        self,
-        *,
-        page_token: str = "",
-        page_size: int = 50,
-    ) -> MessagePage:
-        del page_size
-        self.thread_calls += 1
-        if not page_token:
-            self._traversal += 1
-            self.events.append((self._traversal, "page1"))
-            return MessagePage((self._root, self._before), True, "next")
-
-        assert page_token == "next"
-        inject_mutation = self._traversal % 2 == 0
-        messages = []
-        if inject_mutation:
-            self.events.append((self._traversal, self._kind))
-            if self._kind == "insert":
-                messages.append(
-                    _msg("om_inserted", "inserted", create=3_000, position=2)
-                )
-            elif self._kind == "edit":
-                messages.append(
-                    replace(
-                        self._before,
-                        text="edited",
-                        update_time_ms=2_500,
-                        edited=True,
-                    )
-                )
-            else:
-                messages.append(
-                    replace(
-                        self._before,
-                        text="",
-                        update_time_ms=2_500,
-                        deleted=True,
-                    )
-                )
-        else:
-            self.events.append((self._traversal, "baseline"))
-        messages.append(self._current)
-        return MessagePage(tuple(messages), False)
-
-
-@pytest.mark.parametrize("mutation", ["insert", "edit", "delete"])
-def test_paging_mutation_fails_revision_and_never_dispatches(
-    mutation: str,
-) -> None:
-    source = _InTraversalMutationSource(mutation)
-    source_factory = _SourceFactory(source)
-    built, delegate, port = _port(source_factory=source_factory)
-
-    with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
-
-    assert raised.value.reason is ContextUnavailableReason.REVISION
-    _assert_zero_dispatch(delegate)
-    assert built.source_factory.close_calls == 1
-    assert source.thread_calls == 8
-    assert source.events == [
-        (0, "page1"),
-        (0, mutation),
-        (1, "page1"),
-        (1, "baseline"),
-        (2, "page1"),
-        (2, mutation),
-        (3, "page1"),
-        (3, "baseline"),
-    ]
 
 
 class _SlowSource(_FakeSource):

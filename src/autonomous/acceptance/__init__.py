@@ -1,6 +1,5 @@
 """Runtime audit contracts for autonomous employees."""
 
-from .main_bot_audit import MainBotSendAuditLog
 from .main_bot_warning_outbox import (
     MainBotWarningDrainResult,
     MainBotWarningOutbox,
@@ -12,7 +11,6 @@ from .main_bot_warning_outbox import (
 )
 
 __all__ = [
-    "MainBotSendAuditLog",
     "MainBotWarningDrainResult",
     "MainBotWarningOutbox",
     "MainBotWarningRecord",

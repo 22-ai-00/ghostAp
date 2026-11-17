@@ -359,11 +359,11 @@ def test_owner_p2p_owner_drift_is_rejected_inside_dispatch_guard(
     from src.autonomous.gateway.coordinator import EmployeeDispatchError
 
     harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
-    original_guard = harness.team_runtime.employee_activation_guard
+    original_binding = harness.coordinator._resolve_execution_binding  # noqa: SLF001
 
     @contextmanager
-    def drifting_guard(*, chat_id):
-        with original_guard(chat_id=chat_id) as binding:
+    def drifting_binding(*, chat_id, workspace_path):
+        with original_binding(chat_id=chat_id, workspace_path=workspace_path) as binding:
             harness.workforce.employees["agt_alpha"] = replace(
                 harness.workforce.employees["agt_alpha"],
                 owner_principal_id="ou_rotated_owner",
@@ -371,9 +371,9 @@ def test_owner_p2p_owner_drift_is_rejected_inside_dispatch_guard(
             yield binding
 
     monkeypatch.setattr(
-        harness.team_runtime,
-        "employee_activation_guard",
-        drifting_guard,
+        harness.coordinator,
+        "_resolve_execution_binding",
+        drifting_binding,
     )
 
     with pytest.raises(EmployeeDispatchError, match="authority changed"):
@@ -427,8 +427,6 @@ def test_completed_gateway_publishes_scoped_memory_summary(tmp_path, monkeypatch
     assert {command.kind for command in commands} == {
         DataKind.L1_MEMORY,
         DataKind.MEMORY_SUMMARY,
-        DataKind.SKILL_PROFILE,
-        DataKind.REASONING,
     }
     for command in commands:
         assert command.agent_id == prepared.binding.agent_id
@@ -440,17 +438,6 @@ def test_completed_gateway_publishes_scoped_memory_summary(tmp_path, monkeypatch
     assert summary.chat_id == prepared.binding.chat_id
     assert summary.thread_root_id == prepared.binding.thread_root_id
     assert summary.content == b"durable result"
-    reasoning = next(
-        command for command in commands if command.kind is DataKind.REASONING
-    )
-    assert reasoning.source_id == prepared.binding.task_id
-    assert json.loads(reasoning.content) == {
-        "attempt_id": prepared.binding.attempt_id,
-        "request_digest": hashlib.sha256(prepared.prompt.encode()).hexdigest(),
-        "result_digest": hashlib.sha256(b"durable result").hexdigest(),
-        "status": "completed",
-        "task_id": prepared.binding.task_id,
-    }
     harness.close()
 
 
@@ -474,11 +461,7 @@ def test_owner_p2p_completion_never_publishes_group_memory_summary(
     harness.coordinator.execute_prepared(prepared)
 
     commands = [call.args[0] for call in sink.publish_document.call_args_list]
-    assert {command.kind for command in commands} == {
-        DataKind.L1_MEMORY,
-        DataKind.SKILL_PROFILE,
-        DataKind.REASONING,
-    }
+    assert {command.kind for command in commands} == {DataKind.L1_MEMORY}
     assert all(command.chat_id == "" for command in commands)
     harness.close()
 
@@ -661,50 +644,6 @@ def _replay_gateway_binding_frame(tmp_path, binding_payload):
         reopened.close()
 
 
-def _legacy_slock_binding_payload():
-    payload = _binding().to_dict()
-    payload["schema_version"] = 1
-    for field_name in (
-        "authorization_scope",
-        "source_requester_principal_id",
-        "effective_input_kind",
-        "effective_input_digest",
-        "target_bot_open_id_digest",
-        "prompt_digest",
-    ):
-        payload.pop(field_name)
-    payload["slock_chat_id"] = payload.pop("team_chat_id")
-    payload["slock_engine_identity"] = payload.pop("team_identity")
-    payload["slock_root_identity"] = payload.pop("team_root_identity")
-    return payload
-
-
-def test_gateway_replay_normalizes_exact_pre_scope_slock_binding(tmp_path) -> None:
-    from src.autonomous.gateway.models import DispatchBinding
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _legacy_slock_binding_payload()
-    payload["security_profile"] = "employee_v1"
-    with pytest.raises(ValueError, match="exact schema"):
-        DispatchBinding.from_dict(payload)
-
-    state = GatewayProjectionState()
-    for frame in _replay_gateway_binding_frame(tmp_path, payload):
-        reduce_gateway_frame(state, frame)
-
-    binding = state.attempts[_binding().attempt_id].binding
-    assert binding.team_chat_id == "oc_team"
-    assert binding.team_identity == "8" * 64
-    assert binding.team_root_identity == "9" * 64
-    assert binding.schema_version == 1
-    assert binding.prompt_digest == ""
-    with pytest.raises(ValueError, match="legacy"):
-        binding.to_dict()
-
-
 def test_gateway_full_rebuild_avoids_per_frame_defensive_clones(
     tmp_path,
     monkeypatch,
@@ -718,7 +657,7 @@ def test_gateway_full_rebuild_avoids_per_frame_defensive_clones(
 
     frames = _replay_gateway_binding_frame(
         tmp_path,
-        _legacy_slock_binding_payload(),
+        _binding().to_dict(),
     )
     clone_calls = 0
     original_clone = GatewayProjectionState.clone
@@ -744,174 +683,6 @@ def test_gateway_full_rebuild_avoids_per_frame_defensive_clones(
     assert rebuilt == live
 
 
-def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
-    tmp_path,
-) -> None:
-    from src.autonomous.gateway.models import DispatchBinding
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _binding().to_dict()
-    payload["schema_version"] = 1
-    for field_name in (
-        "authorization_scope",
-        "source_requester_principal_id",
-        "effective_input_kind",
-        "effective_input_digest",
-        "target_bot_open_id_digest",
-        "prompt_digest",
-    ):
-        payload.pop(field_name)
-    with pytest.raises(ValueError, match="exact schema"):
-        DispatchBinding.from_dict(payload)
-
-    state = GatewayProjectionState()
-    for frame in _replay_gateway_binding_frame(tmp_path, payload):
-        reduce_gateway_frame(state, frame)
-
-    binding = state.attempts[_binding().attempt_id].binding
-    assert binding.authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
-    assert binding.source_requester_principal_id == binding.requester_principal_id
-
-
-def test_gateway_replay_normalizes_exact_pre_effective_scoped_team_binding(
-    tmp_path,
-) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _binding().to_dict()
-    payload["schema_version"] = 1
-    for field_name in (
-        "effective_input_kind",
-        "effective_input_digest",
-        "target_bot_open_id_digest",
-        "prompt_digest",
-    ):
-        payload.pop(field_name)
-    payload["security_profile"] = "employee_v1"
-
-    state = GatewayProjectionState()
-    for frame in _replay_gateway_binding_frame(tmp_path, payload):
-        reduce_gateway_frame(state, frame)
-
-    binding = state.attempts[_binding().attempt_id].binding
-    assert binding.schema_version == 1
-    assert binding.authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
-    assert binding.source_requester_principal_id == "ou_requester"
-    assert binding.prompt_digest == ""
-
-
-@pytest.mark.parametrize("invalid_shape", ["mixed", "missing", "extra"])
-def test_gateway_replay_rejects_non_exact_legacy_binding(
-    tmp_path,
-    invalid_shape,
-) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionError,
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _legacy_slock_binding_payload()
-    if invalid_shape == "mixed":
-        payload["team_chat_id"] = payload.pop("slock_chat_id")
-    elif invalid_shape == "missing":
-        payload.pop("slock_root_identity")
-    else:
-        payload["unexpected"] = "value"
-
-    state = GatewayProjectionState()
-    frames = _replay_gateway_binding_frame(tmp_path, payload)
-    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
-        for frame in frames:
-            reduce_gateway_frame(state, frame)
-
-
-def test_gateway_replay_rejects_impossible_current_slock_hybrid(tmp_path) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionError,
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _binding().to_dict()
-    payload["slock_chat_id"] = payload.pop("team_chat_id")
-    payload["slock_engine_identity"] = payload.pop("team_identity")
-    payload["slock_root_identity"] = payload.pop("team_root_identity")
-
-    state = GatewayProjectionState()
-    frames = _replay_gateway_binding_frame(tmp_path, payload)
-    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
-        for frame in frames:
-            reduce_gateway_frame(state, frame)
-
-
-def test_gateway_replay_rejects_impossible_scoped_slock_hybrid(tmp_path) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionError,
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _binding().to_dict()
-    for field_name in (
-        "effective_input_kind",
-        "effective_input_digest",
-        "target_bot_open_id_digest",
-        "prompt_digest",
-    ):
-        payload.pop(field_name)
-    payload["schema_version"] = 1
-    payload["slock_chat_id"] = payload.pop("team_chat_id")
-    payload["slock_engine_identity"] = payload.pop("team_identity")
-    payload["slock_root_identity"] = payload.pop("team_root_identity")
-
-    state = GatewayProjectionState()
-    frames = _replay_gateway_binding_frame(tmp_path, payload)
-    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
-        for frame in frames:
-            reduce_gateway_frame(state, frame)
-
-
-def test_gateway_replay_rejects_legacy_shape_claiming_schema_v2(tmp_path) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionError,
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _legacy_slock_binding_payload()
-    payload["schema_version"] = 2
-
-    state = GatewayProjectionState()
-    frames = _replay_gateway_binding_frame(tmp_path, payload)
-    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
-        for frame in frames:
-            reduce_gateway_frame(state, frame)
-
-
-def test_gateway_replay_rejects_current_shape_claiming_schema_v1(tmp_path) -> None:
-    from src.autonomous.gateway.projection import (
-        GatewayProjectionError,
-        GatewayProjectionState,
-        reduce_gateway_frame,
-    )
-
-    payload = _binding().to_dict()
-    payload["schema_version"] = 1
-
-    state = GatewayProjectionState()
-    frames = _replay_gateway_binding_frame(tmp_path, payload)
-    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
-        for frame in frames:
-            reduce_gateway_frame(state, frame)
-
-
 def _runtime_model(binding) -> str:
     from src.acp.employee_selection import compose_employee_model_selection
 
@@ -921,25 +692,6 @@ def _runtime_model(binding) -> str:
         binding.profile,
         binding.effort,
     )
-
-
-def _commit_team_effect(writer, aggregate_id: str, state: str) -> None:
-    from src.autonomous.journal.frame import JournalEvent
-
-    run_id, step_id = aggregate_id.rsplit(":", 1)
-    event = JournalEvent(
-        event_type=f"team.v2.effect.{state}",
-        aggregate_id=f"{run_id}:assignment:{step_id}",
-        payload={"effect_type": "employee_dispatch"},
-    )
-    with writer.transaction_guard():
-        last = writer.get_last_frame()
-        writer.commit(
-            (event,),
-            writer.get_aggregate_versions((event.aggregate_id,)),
-            expected_head_sequence=0 if last is None else last.sequence,
-            expected_head_hash="" if last is None else last.frame_hash,
-        )
 
 
 def _real_coordinator_harness(
@@ -995,7 +747,6 @@ def _real_coordinator_harness(
     from src.autonomous.journal.writer import JournalWriter
     from src.autonomous.supervisor.channel_models import ChannelProcessState
     from src.autonomous.supervisor.employee_channels import ChannelProcessStatus
-    from src.autonomous.team.runtime import TeamRuntime
     from src.autonomous.workforce.projection import workforce_projection_guard
     from src.autonomous.workforce.registry import ProjectedAgentRegistry
     from src.trust.models import ManagedGroupOrigin
@@ -1433,11 +1184,6 @@ def _real_coordinator_harness(
             return None
 
     engine = _FakeEngine()
-    runtime = TeamRuntime(
-        project_root_resolver=lambda _chat_id: str(root),
-        owner_resolver=lambda _chat_id: "ou_owner",
-        session_host=engine,
-    )
     hire = _Hire()
     channels = _Channels()
     context = _Context()
@@ -1449,7 +1195,7 @@ def _real_coordinator_harness(
         data_service=data,
         data_sink=MagicMock(),
         channel_supervisor=channels,
-        team_runtime=runtime,
+        session_host=engine,
         context_service=context,
         environment_provider=lambda authority: EmployeeProcessEnvironmentMaterial(
             tenant_key=authority.tenant_key,
@@ -1475,7 +1221,8 @@ def _real_coordinator_harness(
         return DurableEmployeeIngressRouter(**router_kwargs)
 
     def close():
-        runtime.close()
+        coordinator.close()
+        engine.close()
         data.close()
         ingress.close()
         writer.close()
@@ -1492,7 +1239,6 @@ def _real_coordinator_harness(
         workforce=workforce,
         channels=channels,
         context=context,
-        team_runtime=runtime,
         acceptance_ids=tuple(acceptance_ids),
         restart=restart,
         restart_router=restart_router,
@@ -1545,15 +1291,6 @@ def test_binding_profile_schema_fails_closed_but_legacy_identity_defaults() -> N
     )
     assert identity.model_profile == "standard"
     assert identity.reasoning_effort == "default"
-
-
-def test_binding_replay_ignores_removed_legacy_security_profile() -> None:
-    from src.autonomous.gateway.models import DispatchBinding
-
-    payload = _binding().to_dict()
-    payload["security_profile"] = "employee_v1"
-
-    assert DispatchBinding.from_dict(payload) == _binding()
 
 
 def test_actor_gateway_rejects_prompt_that_differs_from_anchored_binding() -> None:
@@ -2263,88 +2000,6 @@ def test_targeted_group_render_budget_failure_terminally_rejects_candidate_once(
         harness.close()
 
 
-def test_inactive_team_assignment_is_rejected_before_context_assembly(tmp_path) -> None:
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at="2026-07-14T00:02:00Z",
-    )
-
-    class _ContextMustNotRun:
-        def assemble(self, _request):
-            raise AssertionError("inactive team assignment reached Context")
-
-    harness.coordinator._context = _ContextMustNotRun()  # noqa: SLF001
-
-    assert harness.coordinator.prepare_next() is None
-    record = next(iter(harness.router.state.by_acceptance_id.values()))
-    assert record.state == "terminal"
-    assert record.reason_code == "team_step_inactive"
-    assert not harness.coordinator.state.attempts
-    harness.close()
-
-
-def test_team_ordering_failure_uses_canonical_partial_and_records_warning(
-    tmp_path,
-) -> None:
-    from dataclasses import replace as dataclass_replace
-
-    from src.autonomous.context import (
-        ContextQuality,
-        ContextUnavailableError,
-        ContextUnavailableReason,
-        ContextWarning,
-    )
-
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at="2026-07-14T00:02:00Z",
-    )
-    aggregate = "teamrun_inactive:analysis"
-    _commit_team_effect(harness.writer, aggregate, "prepared")
-    _commit_team_effect(harness.writer, aggregate, "executing")
-    complete_context = harness.coordinator._context  # noqa: SLF001
-
-    class _OrderingThenLedger:
-        def assemble(self, _request):
-            raise ContextUnavailableError(ContextUnavailableReason.ORDERING)
-
-        def assemble_canonical_partial(
-            self,
-            request,
-            *,
-            warning_reason,
-            causal_event_id,
-        ):
-            assert warning_reason is ContextUnavailableReason.ORDERING
-            assert causal_event_id == "teamrun_inactive:analysis"
-            return dataclass_replace(
-                complete_context.assemble(request),
-                quality=ContextQuality.CANONICAL_PARTIAL,
-                warnings=(ContextWarning("order_unavailable", "lark"),),
-            )
-
-    harness.coordinator._context = _OrderingThenLedger()  # noqa: SLF001
-    prepared = harness.coordinator.prepare_next()
-
-    assert prepared is not None
-    warning_events = [
-        event
-        for frame in harness.writer.replay()
-        for event in frame.events
-        if event.event_type == "context.warning.recorded"
-    ]
-    assert len(warning_events) == 1
-    assert warning_events[0].payload["quality"] == "canonical_partial"
-    assert warning_events[0].payload["code"] == "order_unavailable"
-    assert all(
-        record.reason_code != "context_unavailable"
-        for record in harness.router.state.by_acceptance_id.values()
-    )
-    harness.close()
-
-
 def test_direct_ordering_failure_uses_canonical_partial_and_continues(
     tmp_path,
 ) -> None:
@@ -2393,228 +2048,6 @@ def test_direct_ordering_failure_uses_canonical_partial_and_continues(
         record.reason_code != "context_unavailable"
         for record in harness.router.state.by_acceptance_id.values()
     )
-    harness.close()
-
-
-def test_team_absolute_deadline_propagates_remaining_permit_duration(tmp_path) -> None:
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at="2026-07-14T00:01:05Z",
-    )
-    aggregate = "teamrun_inactive:analysis"
-    _commit_team_effect(harness.writer, aggregate, "prepared")
-    _commit_team_effect(harness.writer, aggregate, "executing")
-
-    prepared = harness.coordinator.prepare_next()
-
-    assert prepared is not None
-    assert prepared.permit.timeout_seconds == pytest.approx(5.0)
-    harness.close()
-
-
-@pytest.mark.parametrize(
-    "deadline, overrides",
-    [
-        ("", {}),
-        ("2026-07-14T00:02:00Z", {"team_run_id": ""}),
-        ("2026-07-14T00:02:00Z", {"unexpected": "extra"}),
-    ],
-)
-def test_invalid_team_assignment_schema_fails_closed_before_context(
-    tmp_path,
-    deadline,
-    overrides,
-) -> None:
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at=deadline,
-        team_content_overrides=overrides,
-    )
-    aggregate = "teamrun_inactive:analysis"
-    _commit_team_effect(harness.writer, aggregate, "prepared")
-    _commit_team_effect(harness.writer, aggregate, "executing")
-    calls: list[str] = []
-
-    class _ContextMustNotRun:
-        def assemble(self, _request):
-            calls.append("context")
-            raise AssertionError("invalid Team assignment reached Context")
-
-    harness.coordinator._context = _ContextMustNotRun()  # noqa: SLF001
-
-    assert harness.coordinator.prepare_next() is None
-    record = harness.router.state.by_acceptance_id[harness.acceptance_ids[0]]
-    assert record.state == "terminal"
-    assert record.reason_code == "team_assignment_invalid"
-    assert calls == []
-    assert not harness.coordinator.state.attempts
-    harness.close()
-
-
-def test_empty_team_instruction_is_terminalized_at_router_authority_boundary(
-    tmp_path,
-) -> None:
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at="2026-07-14T00:02:00Z",
-        team_content_overrides={"team_instruction": ""},
-        expected_route_rejection="sender_invalid",
-    )
-
-    assert harness.coordinator.prepare_next() is None
-    record = harness.router.state.by_acceptance_id[harness.acceptance_ids[0]]
-    assert record.state == "terminal"
-    assert record.reason_code == "sender_invalid"
-    assert not harness.coordinator.state.attempts
-    harness.close()
-
-
-def test_expired_team_assignment_never_reaches_acp(tmp_path, monkeypatch) -> None:
-    harness = _real_coordinator_harness(
-        tmp_path,
-        team_assignment=True,
-        team_deadline_at="2026-07-14T00:00:59.999999Z",
-    )
-    aggregate = "teamrun_inactive:analysis"
-    _commit_team_effect(harness.writer, aggregate, "prepared")
-    _commit_team_effect(harness.writer, aggregate, "executing")
-    calls: list[str] = []
-    monkeypatch.setattr(
-        harness.engine,
-        "_run_acp_session",
-        lambda *_args, **_kwargs: calls.append("acp") or "unexpected",
-    )
-
-    assert harness.coordinator.prepare_next() is None
-    record = harness.router.state.by_acceptance_id[harness.acceptance_ids[0]]
-    assert record.reason_code == "team_step_expired"
-    assert calls == []
-    assert not harness.coordinator.state.attempts
-    harness.close()
-
-
-@pytest.mark.parametrize(
-    ("status_name", "safe_error", "expected_error"),
-    [
-        ("COMPLETED", "", ""),
-        ("FAILED", "employee_session_failed", "employee_session_failed"),
-        ("CANCELED", "cancel_requested", "cancel_requested"),
-        ("TIMEOUT", "employee_session_timeout", "employee_session_timeout"),
-        ("ACTION_REQUIRED", "approval_required", "approval_required"),
-    ],
-)
-def test_team_attempt_result_preserves_all_gateway_terminals_at_one_projection_head(
-    tmp_path, status_name, safe_error, expected_error
-) -> None:
-    from src.autonomous.gateway.models import (
-        GatewayExecutionResult,
-        GatewayExecutionStatus,
-    )
-
-    harness = _real_coordinator_harness(tmp_path)
-    prepared = harness.coordinator.prepare_next()
-    assert prepared is not None
-    status = getattr(GatewayExecutionStatus, status_name)
-    harness.coordinator.finalize_attempt(
-        prepared.binding.attempt_id,
-        GatewayExecutionResult(
-            status,
-            output="done" if status is GatewayExecutionStatus.COMPLETED else "",
-            safe_error_code=safe_error,
-        ),
-        request_text=prepared.prompt,
-    )
-
-    result = harness.coordinator.team_attempt_result(
-        prepared.binding.acceptance_id
-    )
-
-    assert result is not None
-    assert result.status == status.value
-    assert result.error_code == expected_error
-    assert result.output == ("done" if status is GatewayExecutionStatus.COMPLETED else "")
-    harness.close()
-
-
-def test_team_attempt_result_retries_head_change_without_success_downgrade(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    from src.autonomous.gateway.models import (
-        GatewayExecutionResult,
-        GatewayExecutionStatus,
-    )
-
-    harness = _real_coordinator_harness(tmp_path)
-    prepared = harness.coordinator.prepare_next()
-    assert prepared is not None
-    harness.coordinator.finalize_attempt(
-        prepared.binding.attempt_id,
-        GatewayExecutionResult(GatewayExecutionStatus.COMPLETED, output="done"),
-        request_text=prepared.prompt,
-    )
-    original = harness.data.get_history_payload
-    calls = 0
-
-    def move_once(record_id):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            _commit_team_effect(
-                harness.writer,
-                "teamrun_real_head_interleave:probe",
-                "prepared",
-            )
-        return original(record_id)
-
-    monkeypatch.setattr(
-        harness.data,
-        "get_history_payload",
-        move_once,
-    )
-
-    result = harness.coordinator.team_attempt_result(
-        prepared.binding.acceptance_id
-    )
-
-    assert calls == 2
-    assert result is not None and result.status == "completed"
-    assert result.output == "done"
-    harness.close()
-
-
-def test_team_attempt_result_fails_closed_on_authenticated_history_read_failure(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    from src.autonomous.gateway.models import (
-        GatewayExecutionResult,
-        GatewayExecutionStatus,
-    )
-
-    harness = _real_coordinator_harness(tmp_path)
-    prepared = harness.coordinator.prepare_next()
-    assert prepared is not None
-    finalized = harness.coordinator.finalize_attempt(
-        prepared.binding.attempt_id,
-        GatewayExecutionResult(GatewayExecutionStatus.COMPLETED, output="secret"),
-        request_text=prepared.prompt,
-    )
-    monkeypatch.setattr(
-        harness.data._blob_store,  # noqa: SLF001
-        "read",
-        lambda _ref: (_ for _ in ()).throw(ValueError("authentication failed")),
-    )
-
-    result = harness.coordinator.team_attempt_result(prepared.binding.acceptance_id)
-
-    assert result is not None
-    assert result.status == "action_required"
-    assert result.history_record_id == finalized.history_record_id
-    assert result.error_code == "team_history_unavailable"
     harness.close()
 
 

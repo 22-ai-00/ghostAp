@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 from pathlib import Path
 
@@ -53,23 +52,6 @@ class TestEmployeeDocumentMaterializer:
         assert path.absolute.exists()
         assert path.absolute.read_bytes() == content
         assert path.relative == "memory/MEMORY.md"
-
-    def test_materialize_skill_profile(self, tmp_path: Path) -> None:
-        mat = EmployeeDocumentMaterializer(tmp_path / "agents")
-        content = json.dumps({"skills": ["coding", "analysis"]}).encode()
-        content_hash = hashlib.sha256(content).hexdigest()
-        path = mat.materialize("agt_alpha", DataKind.SKILL_PROFILE, "skill_profile", content, content_hash)
-        assert path.relative == "skill_profile.json"
-        assert json.loads(path.absolute.read_bytes()) == {"skills": ["coding", "analysis"]}
-
-    def test_materialize_reasoning(self, tmp_path: Path) -> None:
-        mat = EmployeeDocumentMaterializer(tmp_path / "agents")
-        content = json.dumps({"reasoning": "step by step"}).encode()
-        content_hash = hashlib.sha256(content).hexdigest()
-        source_id = "task_123"
-        path = mat.materialize("agt_alpha", DataKind.REASONING, source_id, content, content_hash)
-        assert "reasoning/" in path.relative
-        assert path.absolute.exists()
 
     def test_materialize_memory_summary(self, tmp_path: Path) -> None:
         mat = EmployeeDocumentMaterializer(tmp_path / "agents")
@@ -149,16 +131,6 @@ class TestEmployeeMemoryFacade:
             state=state,
         )
         assert facade.read_l1("agt_missing", "tenant_1") is None
-
-    def test_reads_skill_profile_canonical(self, tmp_path: Path) -> None:
-        mat = EmployeeDocumentMaterializer(tmp_path / "agents")
-        skill_data = {"skills": ["python", "debugging"]}
-        content = json.dumps(skill_data).encode()
-        content_hash = hashlib.sha256(content).hexdigest()
-        mat.materialize("agt_alpha", DataKind.SKILL_PROFILE, "skill_profile", content, content_hash)
-        state = DataProjectionState()
-        facade = EmployeeMemoryFacade(materializer=mat, state=state)
-        assert facade.read_skill_profile("agt_alpha") == skill_data
 
     def test_is_canonical_detects_documents(self, tmp_path: Path) -> None:
         mat = EmployeeDocumentMaterializer(tmp_path / "agents")

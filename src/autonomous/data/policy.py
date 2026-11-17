@@ -17,11 +17,6 @@ _PURPOSES = frozenset(
         "execution_history",
         "l1_memory",
         "memory_summary",
-        "skill_profile",
-        "reasoning",
-        "knowledge_page",
-        "knowledge_index",
-        "knowledge_review",
     }
 )
 _SECRET_NAME = re.compile(r"(?i)(secret|token|password|credential|api[_-]?key)")

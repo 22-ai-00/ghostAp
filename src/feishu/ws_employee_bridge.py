@@ -615,51 +615,6 @@ class WSEmployeeBridgeMixin:
         finally:
             _ws_client_module().set_current_tenant_key(previous_tenant_key)
 
-    def _reply_employee_team_message(
-        self,
-        message_id: str,
-        chat_id: str,
-        text: str,
-        *,
-        tenant_key: str,
-        requester_principal_id: str,
-        idempotency_key: str | None = None,
-    ) -> object | None:
-        """Restore durable Team Run requester scope before a recovered reply."""
-
-        if not all(
-            isinstance(value, str) and bool(value)
-            for value in (
-                message_id,
-                chat_id,
-                tenant_key,
-                requester_principal_id,
-            )
-        ):
-            logger.warning("employee team notification recipient scope is unavailable")
-            raise RuntimeError("employee team notification recipient scope is unavailable")
-        if not self._restore_durable_message_origin(
-            message_id=message_id,
-            chat_id=chat_id,
-            sender_id=requester_principal_id,
-            tenant_key=tenant_key,
-        ):
-            logger.warning("employee team notification recipient scope is unavailable")
-            raise RuntimeError("employee team notification recipient scope is unavailable")
-        previous_tenant_key = _ws_client_module().get_current_tenant_key()
-        _ws_client_module().set_current_tenant_key(tenant_key)
-        try:
-            reply_id = self._handler_ctx.handlers["coco"].reply_text(
-                message_id,
-                text,
-                idempotency_key=idempotency_key,
-            )
-            if not reply_id:
-                raise RuntimeError("employee team notification delivery failed")
-            return reply_id
-        finally:
-            _ws_client_module().set_current_tenant_key(previous_tenant_key)
-
     def _restore_employee_hire_origin(self, state: object) -> bool:
         """Link an employee hire notification message back to its origin request."""
         message_id = getattr(state, "message_id", "")
@@ -984,20 +939,4 @@ class WSEmployeeBridgeMixin:
             reply_handler_ready = False
         if not reply_handler_ready:
             return False, "main_bot_reply_handler"
-
-        if not _ws_client_module()._visible_employee_runtime_requires_outbound_audit(
-            getattr(self, "settings", None)
-        ):
-            return True, ""
-
-        audit = getattr(handler_ctx, "main_bot_outbound_audit", None)
-        audit_failure = getattr(
-            handler_ctx,
-            "main_bot_outbound_audit_failure",
-            None,
-        )
-        if audit is _ws_client_module()._unavailable_main_bot_outbound_audit or not callable(audit):
-            return False, "main_bot_outbound_audit"
-        if not callable(audit_failure):
-            return False, "main_bot_outbound_audit_failure"
         return True, ""

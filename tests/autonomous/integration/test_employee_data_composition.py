@@ -342,32 +342,6 @@ class TestFullComposition:
         with pytest.raises(ValueError, match="idempotency conflict"):
             composition.publish_document(command(b"different", "attempt_2"))
 
-    def test_reasoning_preserves_task_source_and_versions(
-        self,
-        composition: EmployeeDataComposition,
-    ) -> None:
-        def command(content: bytes, key: str) -> PublishEmployeeDocumentCommand:
-            return PublishEmployeeDocumentCommand(
-                agent_id="agt_alpha",
-                tenant_key="tenant_1",
-                owner_principal_id="principal_owner",
-                kind=DataKind.REASONING,
-                source_id="task_alpha",
-                content=content,
-                content_type="application/json",
-                idempotency_key=key,
-            )
-
-        composition.publish_document(command(b'{"attempt":1}', "attempt_1"))
-        composition.publish_document(command(b'{"attempt":2}', "attempt_2"))
-
-        records = sorted(
-            composition.state.employee_documents.values(),
-            key=lambda item: item.version,
-        )
-        assert [record.source_id for record in records] == ["task_alpha", "task_alpha"]
-        assert [record.version for record in records] == [1, 2]
-
     def test_gc_serializes_with_inflight_publish_before_quarantine(
         self,
         composition: EmployeeDataComposition,

@@ -204,7 +204,6 @@ _DISPATCH_REJECTION_REASONS = frozenset(
         "team_assignment_invalid",
     }
 )
-_LEGACY_REPLAY_TERMINAL_REASONS = frozenset({"control_consumed"})
 
 
 class RouterProjectionError(RuntimeError):
@@ -387,32 +386,10 @@ class RouterAuthoritySnapshot:
         return result
 
     @classmethod
-    def from_dict(
-        cls,
-        value: object,
-        *,
-        allow_legacy_replay: bool = False,
-    ) -> RouterAuthoritySnapshot:
+    def from_dict(cls, value: object) -> RouterAuthoritySnapshot:
         if not isinstance(value, dict):
             raise ValueError("Router authority snapshot must use exact schema")
         normalized = dict(value)
-        previous_fields = cls._FIELDS - {
-            "effective_input_kind",
-            "effective_input_digest",
-            "target_bot_open_id_digest",
-        }
-        oldest_fields = previous_fields - {"authorization_scope"}
-        if allow_legacy_replay and frozenset(normalized) in {
-            frozenset(previous_fields),
-            frozenset(oldest_fields),
-        }:
-            normalized.setdefault(
-                "authorization_scope",
-                EmployeeAuthorizationScope.MANAGED_GROUP.value,
-            )
-            normalized["effective_input_kind"] = ""
-            normalized["effective_input_digest"] = ""
-            normalized["target_bot_open_id_digest"] = ""
         if set(normalized) != cls._FIELDS:
             raise ValueError("Router authority snapshot must use exact schema")
         try:
@@ -645,16 +622,12 @@ class RouterLifecycleRecord:
 @dataclass(slots=True)
 class RouterProjectionState:
     by_acceptance_id: dict[str, RouterLifecycleRecord] = field(default_factory=dict)
-    ignored_legacy_acceptances: dict[str, RouterLifecycleRecord] = field(
-        default_factory=dict
-    )
     cursor_sequence: int = 0
     cursor_hash: str = ""
 
     def clone(self) -> RouterProjectionState:
         return RouterProjectionState(
             by_acceptance_id=dict(self.by_acceptance_id),
-            ignored_legacy_acceptances=dict(self.ignored_legacy_acceptances),
             cursor_sequence=self.cursor_sequence,
             cursor_hash=self.cursor_hash,
         )
@@ -683,14 +656,9 @@ def _accepted_record(
         "blob_ref",
         "transport_message_proof",
     }
-    legacy_fields = current_fields - {"transport_message_proof"}
     if (
-        frozenset(payload)
-        not in {
-            frozenset(current_fields),
-            frozenset(legacy_fields),
-        }
-        or type(payload.get("transport_message_proof", False)) is not bool
+        set(payload) != current_fields
+        or type(payload.get("transport_message_proof")) is not bool
     ):
         raise RouterProjectionError("invalid employee ingress acceptance")
     try:
@@ -731,7 +699,6 @@ def _reduce_router_event(
     event: JournalEvent,
     *,
     sequence: int,
-    allow_legacy_replay: bool = False,
 ) -> None:
     payload = event.payload
     acceptance_id = payload.get("acceptance_id") if isinstance(payload, dict) else None
@@ -744,18 +711,10 @@ def _reduce_router_event(
             "authority",
             "source_requester_principal_id",
         }
-        legacy_payload = {"acceptance_id", "authority"}
-        is_legacy_replay = allow_legacy_replay and set(payload) == legacy_payload
-        if (
-            set(payload) != current_payload
-            and not is_legacy_replay
-        ) or record.state != "accepted":
+        if set(payload) != current_payload or record.state != "accepted":
             raise RouterProjectionError("invalid Router authorized transition")
         try:
-            authority = RouterAuthoritySnapshot.from_dict(
-                payload["authority"],
-                allow_legacy_replay=allow_legacy_replay,
-            )
+            authority = RouterAuthoritySnapshot.from_dict(payload["authority"])
         except (TypeError, ValueError) as exc:
             raise RouterProjectionError("invalid Router authority snapshot") from exc
         accepted_coordinates = (
@@ -777,13 +736,8 @@ def _reduce_router_event(
         team_matches = record.team_id == authority.team_id or (
             record.team_id == _remote_index(authority.team_id, "oc_")
         )
-        source_requester_principal_id = (
-            record.requester_principal_id
-            if is_legacy_replay
-            else payload["source_requester_principal_id"]
-        )
         requester_matches = (
-            source_requester_principal_id == record.requester_principal_id
+            payload["source_requester_principal_id"] == record.requester_principal_id
         )
         if (
             authority_coordinates != accepted_coordinates
@@ -809,47 +763,38 @@ def _reduce_router_event(
             "queue_position",
             "response_obligation",
         }
-        legacy_fields = current_fields - {"response_obligation"}
-        is_legacy_replay = allow_legacy_replay and set(payload) == legacy_fields
-        if (
-            set(payload) != current_fields
-            and not is_legacy_replay
-        ) or record.state != "staging":
+        if set(payload) != current_fields or record.state != "staging":
             raise RouterProjectionError("invalid Router queued transition")
         try:
-            authority = RouterAuthoritySnapshot.from_dict(
-                payload["authority"],
-                allow_legacy_replay=allow_legacy_replay,
-            )
+            authority = RouterAuthoritySnapshot.from_dict(payload["authority"])
         except (TypeError, ValueError) as exc:
             raise RouterProjectionError("invalid queued Router authority") from exc
         position = payload["queue_position"]
         if authority != record.authority or isinstance(position, bool) or not isinstance(position, int) or position < 1:
             raise RouterProjectionError("invalid Router queue disposition")
         response_obligation = None
-        if not is_legacy_replay:
-            raw_obligation = payload["response_obligation"]
-            if record.event_type == "im.message.receive_v1":
-                try:
-                    response_obligation = RouterResponseObligation.from_dict(
-                        raw_obligation
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise RouterProjectionError(
-                        "invalid Router response obligation"
-                    ) from exc
-                if not _response_obligation_matches_record(
-                    record,
-                    authority,
-                    response_obligation,
-                ):
-                    raise RouterProjectionError(
-                        "Router response obligation does not match acceptance"
-                    )
-            elif raw_obligation is not None:
-                raise RouterProjectionError(
-                    "non-message Router work cannot carry a response obligation"
+        raw_obligation = payload["response_obligation"]
+        if record.event_type == "im.message.receive_v1":
+            try:
+                response_obligation = RouterResponseObligation.from_dict(
+                    raw_obligation
                 )
+            except (TypeError, ValueError) as exc:
+                raise RouterProjectionError(
+                    "invalid Router response obligation"
+                ) from exc
+            if not _response_obligation_matches_record(
+                record,
+                authority,
+                response_obligation,
+            ):
+                raise RouterProjectionError(
+                    "Router response obligation does not match acceptance"
+                )
+        elif raw_obligation is not None:
+            raise RouterProjectionError(
+                "non-message Router work cannot carry a response obligation"
+            )
         updated = replace(
             record,
             state="queued",
@@ -923,10 +868,7 @@ def _reduce_router_event(
         }:
             raise RouterProjectionError("invalid Router terminal transition")
         reason = payload["reason_code"]
-        if reason not in _TERMINAL_REASONS and not (
-            allow_legacy_replay
-            and reason in _LEGACY_REPLAY_TERMINAL_REASONS
-        ):
+        if reason not in _TERMINAL_REASONS:
             raise RouterProjectionError("invalid Router terminal reason")
         if (
             reason in _PREQUEUE_ONLY_TERMINAL_REASONS
@@ -948,58 +890,20 @@ def _reduce_router_event(
 def _apply_router_frame_events(
     state: RouterProjectionState,
     frame: TransactionFrame,
-    *,
-    allow_legacy_replay: bool = False,
 ) -> None:
-    """Project one frame while tombstoning unproven legacy public history."""
+    """Project one Router transaction frame."""
 
     for event in frame.events:
         if event.event_type == "employee.ingress.accepted":
             record = _accepted_record(event, frame.sequence)
-            if (
-                record.acceptance_id in state.by_acceptance_id
-                or record.acceptance_id in state.ignored_legacy_acceptances
-            ):
+            if record.acceptance_id in state.by_acceptance_id:
                 raise RouterProjectionError("duplicate Router acceptance")
-            if (
-                record.event_type == "im.message.receive_v1"
-                and event.payload.get("transport_message_proof", False) is not True
-            ):
-                state.ignored_legacy_acceptances[record.acceptance_id] = record
-            else:
-                state.by_acceptance_id[record.acceptance_id] = record
+            state.by_acceptance_id[record.acceptance_id] = record
         elif event.event_type in _ROUTER_EVENTS:
-            acceptance_id = (
-                event.payload.get("acceptance_id")
-                if isinstance(event.payload, dict)
-                else None
-            )
-            ignored_record = state.ignored_legacy_acceptances.get(
-                acceptance_id or ""
-            )
-            if ignored_record is not None:
-                if event.aggregate_id != ignored_record.aggregate_id:
-                    raise RouterProjectionError(
-                        "Router transition references unknown acceptance"
-                    )
-                ignored_state = RouterProjectionState(
-                    by_acceptance_id={ignored_record.acceptance_id: ignored_record}
-                )
-                _reduce_router_event(
-                    ignored_state,
-                    event,
-                    sequence=frame.sequence,
-                    allow_legacy_replay=allow_legacy_replay,
-                )
-                state.ignored_legacy_acceptances[ignored_record.acceptance_id] = (
-                    ignored_state.by_acceptance_id[ignored_record.acceptance_id]
-                )
-                continue
             _reduce_router_event(
                 state,
                 event,
                 sequence=frame.sequence,
-                allow_legacy_replay=allow_legacy_replay,
             )
         elif event.event_type.startswith(_ROUTER_PREFIX):
             raise RouterProjectionError("unknown Router event")
@@ -1196,11 +1100,7 @@ class DurableEmployeeIngressRouter:
                 raise RouterWriteDisabledError(
                     "Router projection cannot verify Journal anchor"
                 )
-            _apply_router_frame_events(
-                next_state,
-                frame,
-                allow_legacy_replay=True,
-            )
+            _apply_router_frame_events(next_state, frame)
             next_state.cursor_sequence = frame.sequence
             next_state.cursor_hash = frame.frame_hash
             expected_sequence += 1
@@ -1350,11 +1250,7 @@ class DurableEmployeeIngressRouter:
                 self._ensure_handoff_deadline(hard_deadline)
                 if frame.sequence > anchor.sequence:
                     break
-                _apply_router_frame_events(
-                    fresh,
-                    frame,
-                    allow_legacy_replay=True,
-                )
+                _apply_router_frame_events(fresh, frame)
                 fresh.cursor_sequence = frame.sequence
                 fresh.cursor_hash = frame.frame_hash
                 anchored_hash = frame.frame_hash

@@ -1309,26 +1309,7 @@ class EmployeeRuntimeRecoveryMixin:
     async def _recover_runtime(
         self,
         pending_intents: list[str],
-        *,
-        repaired_intents: set[str],
-        base_summary: EmployeeRecoverySummary,
     ) -> EmployeeRecoverySummary:
-        def summarize_durable_outcomes() -> EmployeeRecoverySummary:
-            recovered = 0
-            for intent_id in repaired_intents:
-                try:
-                    state = self._require_service().get_state(intent_id)
-                except Exception:
-                    continue
-                if state is not None and state.phase is _composition_module().HirePhase.ACTIVE:
-                    recovered += 1
-            return _composition_module().EmployeeRecoverySummary(
-                eligible=base_summary.eligible,
-                recovered=recovered,
-                skipped=base_summary.skipped,
-                failed=base_summary.eligible - recovered,
-            )
-
         failed_intents: list[str] = []
         if pending_intents:
             results = await asyncio.gather(
@@ -1336,7 +1317,6 @@ class EmployeeRuntimeRecoveryMixin:
                     self._configure_intent(
                         intent_id,
                         force_slash_refresh=True,
-                        allow_action_required_refresh=intent_id in repaired_intents,
                     )
                     for intent_id in pending_intents
                 ),
@@ -1354,10 +1334,7 @@ class EmployeeRuntimeRecoveryMixin:
         if failed_intents:
             retry_results = await asyncio.gather(
                 *(
-                    self._retry_recovery_intent(
-                        intent_id,
-                        allow_action_required_refresh=intent_id in repaired_intents,
-                    )
+                    self._retry_recovery_intent(intent_id)
                     for intent_id in failed_intents
                 ),
                 return_exceptions=True,
@@ -1369,7 +1346,7 @@ class EmployeeRuntimeRecoveryMixin:
                     failures,
                 )
                 self._execution_blockers = ("hire_recovery",)
-                return summarize_durable_outcomes()
+                return _composition_module().EmployeeRecoverySummary()
             if failures:
                 logger.error(
                     "employee recovery isolated %d exhausted intent(s) as action_required",
@@ -1377,18 +1354,16 @@ class EmployeeRuntimeRecoveryMixin:
                 )
         self._start_monitor_in_loop()
         await self._retry_terminal_notifications()
-        if not base_summary.failed and self._membership_audit_ready:
+        if self._membership_audit_ready:
             self._require_service().mark_runtime_recovered()
         self._start_reporting_worker()
         if not self._execution_blockers:
             self._start_dispatch_worker()
-        return summarize_durable_outcomes()
+        return _composition_module().EmployeeRecoverySummary()
 
     async def _retry_recovery_intent(
         self,
         intent_id: str,
-        *,
-        allow_action_required_refresh: bool = False,
     ) -> bool:
         for delay in _composition_module()._RECOVERY_RETRY_DELAYS:
             if self._closing:
@@ -1398,7 +1373,6 @@ class EmployeeRuntimeRecoveryMixin:
                 await self._configure_intent(
                     intent_id,
                     force_slash_refresh=True,
-                    allow_action_required_refresh=allow_action_required_refresh,
                 )
                 return True
             except Exception as exc:
@@ -1545,7 +1519,6 @@ class EmployeeRuntimeRecoveryMixin:
         intent_id: str,
         *,
         force_slash_refresh: bool = False,
-        allow_action_required_refresh: bool = False,
     ) -> None:
         service = self._require_service()
         state = service.get_state(intent_id)
@@ -1565,7 +1538,6 @@ class EmployeeRuntimeRecoveryMixin:
                 state.intent_id,
                 generation=generation,
                 force_refresh=force_slash_refresh,
-                allow_action_required_refresh=allow_action_required_refresh,
             )
             current_effect_ids = {
                 selected_slash_effect_id,
@@ -1609,7 +1581,6 @@ class EmployeeRuntimeRecoveryMixin:
                 state,
                 generation=generation,
                 force_refresh=force_slash_refresh,
-                allow_action_required_refresh=allow_action_required_refresh,
             )
             state = service.get_state(intent_id) or state
             try:
@@ -1673,14 +1644,12 @@ class EmployeeRuntimeRecoveryMixin:
         *,
         generation: int,
         force_refresh: bool,
-        allow_action_required_refresh: bool,
     ) -> VerifiedSlashState:
         service = self._require_service()
         effect_id = service.select_slash_reconcile_effect(
             state.intent_id,
             generation=generation,
             force_refresh=force_refresh,
-            allow_action_required_refresh=allow_action_required_refresh,
         )
         current = service.get_state(state.intent_id) or state
         try:

@@ -337,54 +337,6 @@ def _ignore_ws_event(_data: object) -> None:
     """Acknowledge subscribed events that require no product action."""
 
 
-def _unavailable_main_bot_outbound_audit(
-    _tenant_key: str,
-    _operation: str,
-    _target: str,
-) -> None:
-    raise RuntimeError("main Bot outbound audit is unavailable")
-
-
-def _main_bot_outbound_wiring(
-    runtime: object | None,
-    *,
-    required: bool,
-) -> tuple[
-    Callable[[str, str, str], None] | None,
-    Callable[[Exception], None] | None,
-]:
-    """Bind all main-Bot mutations to the same audit used by activation."""
-
-    try:
-        audit = getattr(runtime, "main_bot_outbound_audit", None)
-    except Exception as exc:
-        logger.error(
-            "main Bot outbound audit lookup failed: %s",
-            type(exc).__name__,
-        )
-        audit = None
-    if audit is not None:
-        record_attempt = getattr(audit, "record_attempt", None)
-        mark_incomplete = getattr(audit, "mark_incomplete", None)
-        if callable(record_attempt) and callable(mark_incomplete):
-            return record_attempt, mark_incomplete
-    if required:
-        return _unavailable_main_bot_outbound_audit, None
-    return None, None
-
-
-def _visible_employee_runtime_requires_outbound_audit(settings: object) -> bool:
-    """Fail closed when an injected settings object has an invalid limit shape."""
-
-    limit = getattr(settings, "autonomous_visible_employee_limit", 0)
-    if type(limit) is not int:
-        logger.error(
-            "Invalid autonomous_visible_employee_limit type: %s",
-            type(limit).__name__,
-        )
-        return True
-    return limit > 0
-
 _READONLY_CARD_ACTIONS = {
     "deep_expand", "deep_collapse", "deep_mode_full", "deep_mode_compact", "deep_expand_ac", "deep_collapse_ac",
     "spec_expand", "spec_collapse", "spec_mode_full", "spec_mode_compact", "spec_expand_ac", "spec_collapse_ac",
@@ -688,8 +640,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         self._progress_reporter = ProgressReporter()
         self._spec_engine_manager = SpecEngineManager()
         self._spec_reporter = SpecReporter()
-        from ..autonomous.team.runtime import TeamRuntime
-        self._team_runtime = TeamRuntime()
+        self._team_runtime = None
 
         from ..workflow_engine.manager import WorkflowEngineManager
         self._workflow_engine_manager = WorkflowEngineManager()
@@ -724,7 +675,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 self.settings,
                 managed_group_registry=self._managed_group_registry,
                 managed_group_owner_id=self._managed_group_owner_id,
-                team_runtime=self._team_runtime,
                 employee_environment_provider=lambda authority: local_employee_environment(
                     authority,
                     traex_auth_home=getattr(
@@ -739,21 +689,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                     f"请在 {expire_in} 秒内完成独立飞书智能体注册：{url}",
                 ),
                 notification_status=self._reply_employee_hire_status,
-                team_notification=(
-                    lambda message_id,
-                    chat_id,
-                    result,
-                    idempotency_key="",
-                    tenant_key="",
-                    requester_principal_id="": self._reply_employee_team_message(
-                        message_id,
-                        chat_id,
-                        result,
-                        tenant_key=tenant_key,
-                        requester_principal_id=requester_principal_id,
-                        idempotency_key=idempotency_key or None,
-                    )
-                ),
                 recover_immediately=False,
             )
         except Exception as exc:
@@ -761,15 +696,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 "Employee Department composition failed closed: %s",
                 type(exc).__name__,
             )
-
-        main_bot_outbound_audit, main_bot_outbound_audit_failure = (
-            _main_bot_outbound_wiring(
-                self._employee_department_runtime,
-                required=_visible_employee_runtime_requires_outbound_audit(
-                    self.settings,
-                ),
-            )
-        )
 
         # ------------------------------------------------------------------
         # Handler infrastructure
@@ -836,14 +762,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 if self._employee_department_runtime is not None
                 else None
             ),
-            employee_team_service=(
-                self._employee_department_runtime.team_service
-                if self._employee_department_runtime is not None
-                else None
-            ),
             employee_runtime_facade=self._employee_department_runtime,
-            main_bot_outbound_audit=main_bot_outbound_audit,
-            main_bot_outbound_audit_failure=main_bot_outbound_audit_failure,
             tenant_key_resolver=get_current_tenant_key,
             channel_client_factory=self._get_channel_client,
             ingress_access_policy_provider=(

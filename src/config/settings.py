@@ -580,12 +580,6 @@ class Settings(BaseSettings):
     autonomous_manager_acl: str = ""
     autonomous_anchor_path: str = "~/.ghostap/autonomy/journal.anchor"
     autonomous_visible_employee_limit: int = Field(default=8, ge=0)
-    autonomous_main_bot_audit_dir: str = (
-        "~/.ghostap/autonomy/main-bot-send-audit"
-    )
-    autonomous_main_bot_audit_anchor_path: str = (
-        "~/.ghostap/autonomy/main-bot-send-audit.anchor"
-    )
 
     @field_validator(
         "autonomous_thread_context_max_messages",
@@ -673,16 +667,6 @@ class Settings(BaseSettings):
     def _validate_autonomous_anchor_path(cls, value: str) -> str:
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
             raise ValueError("autonomous_anchor_path must be a non-empty path")
-        return value
-
-    @field_validator(
-        "autonomous_main_bot_audit_dir",
-        "autonomous_main_bot_audit_anchor_path",
-    )
-    @classmethod
-    def _validate_main_bot_audit_paths(cls, value: str) -> str:
-        if not isinstance(value, str) or "\x00" in value:
-            raise ValueError("main Bot audit paths must be text without NUL")
         return value
 
     @field_validator("autonomous_history_timezone")

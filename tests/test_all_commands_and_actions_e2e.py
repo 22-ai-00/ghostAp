@@ -70,7 +70,6 @@ def _build_real_ws_graph(tmp_path: Path, monkeypatch):
             fire_service=None,
             membership_service=None,
             data_composition=None,
-            team_service=None,
             main_bot_outbound_audit=audit,
             readiness=lambda: SimpleNamespace(ready=True),
             bind_main_bot_warning_transport=MagicMock(),

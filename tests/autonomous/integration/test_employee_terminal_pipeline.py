@@ -199,7 +199,7 @@ def test_recovery_rebuilds_missing_terminal_snapshot_without_rerunning_acp(
     try:
         assert harness.coordinator.reconcile_terminal_snapshots() == 1
         assert recovered == [(prepared.binding.attempt_id, "durable result")]
-        assert harness.coordinator._data_sink.publish_document.call_count == 8
+        assert harness.coordinator._data_sink.publish_document.call_count == 4
     finally:
         harness.close()
 

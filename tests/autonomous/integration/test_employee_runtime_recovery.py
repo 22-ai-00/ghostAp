@@ -10,19 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.autonomous.domain import EmployeeState, WorkerType
 from src.autonomous.journal.anchor import FileAnchor
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.journal.writer import JournalWriter
-from src.autonomous.provisioning import composition, hire_service
+from src.autonomous.provisioning import composition
 from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 from src.autonomous.provisioning.hire_service import ProductionEmployeeHireService
 from src.autonomous.provisioning.hire_state import (
-    DurableHireState,
     HireEffectState,
     HirePhase,
-    HireProjection,
 )
 from src.autonomous.supervisor.employee_channels import (
     ChannelProcessState,
@@ -585,478 +582,6 @@ def test_reconfigure_disposes_superseded_effect_before_automatic_activation(
         service.close()
 
 
-def _seed_action_required(
-    tmp_path: Path,
-    *,
-    effect_type: str = "slash_reconciliation",
-    effect_id: str = "slash-reconcile:2:1",
-    terminal: bool = True,
-    error_code: str = "recovery_exhausted",
-    duplicate_revalidation: bool = False,
-) -> ProductionEmployeeHireService:
-    _seed_active_employee(tmp_path)
-    epoch_two = _service(_writer(tmp_path, 2))
-    epoch_two.commit_effect_transition(
-        "hire_recover",
-        effect_id=effect_id,
-        effect_type=effect_type,
-        next_state=HireEffectState.PREPARED,
-    )
-    epoch_two.commit_effect_transition(
-        "hire_recover",
-        effect_id=effect_id,
-        effect_type=effect_type,
-        next_state=HireEffectState.EXECUTING,
-    )
-    if terminal:
-        if duplicate_revalidation:
-            epoch_two.commit_effect_transition(
-                "hire_recover",
-                effect_id=effect_id,
-                effect_type=effect_type,
-                next_state=HireEffectState.ACTION_REQUIRED,
-                metadata={"error_code": error_code},
-            )
-            epoch_two.close()
-            recovery_epoch = _service(_writer(tmp_path, 3))
-            recovery_epoch.begin_channel_revalidation(
-                "hire_recover",
-                observed_generation=1,
-            )
-            recovery_epoch.mark_recovery_action_required(
-                "hire_recover",
-                error_code="recovery_exhausted",
-            )
-            recovery_epoch.close()
-            return _service(_writer(tmp_path, 4))
-        else:
-            epoch_two.mark_recovery_action_required(
-                "hire_recover",
-                error_code=error_code,
-            )
-    else:
-        commit_workforce_events(
-            epoch_two._writer,  # noqa: SLF001
-            epoch_two.projection_state,
-            (
-                JournalEvent(
-                    event_type="employee.state_changed",
-                    aggregate_id="agt_recover",
-                    payload={"state": "action_required"},
-                ),
-            ),
-        )
-    epoch_two.close()
-    return _service(_writer(tmp_path, 3))
-
-
-def test_recovery_exhausted_slash_is_atomically_reopened_and_uses_fresh_attempt(
-    tmp_path: Path,
-) -> None:
-    service = _seed_action_required(tmp_path)
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(
-        eligible=1,
-        repaired_intent_ids=("hire_recover",),
-        skipped=0,
-        failed=0,
-    )
-    state = service.get_state("hire_recover")
-    assert state is not None
-    assert state.phase is HirePhase.VALIDATING
-    assert state.channel_generation == 1
-    assert state.effect_state("slash-reconcile:2:1") is HireEffectState.ACTION_REQUIRED
-    assert service.select_slash_reconcile_effect(
-        state.intent_id,
-        generation=2,
-        force_refresh=True,
-        allow_action_required_refresh=True,
-    ) == "slash-reconcile:2:2"
-    marker_frames = [
-        frame
-        for frame in service._writer.replay()  # noqa: SLF001
-        if any(
-            event.event_type == "hire.channel.phase_only_recovery"
-            for event in frame.events
-        )
-    ]
-    assert len(marker_frames) == 1
-    assert [event.event_type for event in marker_frames[0].events] == [
-        "hire.channel.phase_only_recovery",
-        "employee.state_changed",
-    ]
-    assert marker_frames[0].events[0].payload == {"generation": 1}
-    assert marker_frames[0].events[1].payload == {"state": "validating"}
-
-
-def test_terminal_anchor_failed_slash_is_reopened_as_convergent_reconciliation(
-    tmp_path: Path,
-) -> None:
-    service = _seed_action_required(
-        tmp_path,
-        error_code="terminal_anchor_failed",
-    )
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(
-        eligible=1,
-        repaired_intent_ids=("hire_recover",),
-        skipped=0,
-        failed=0,
-    )
-    state = service.get_state("hire_recover")
-    assert state is not None
-    assert state.phase is HirePhase.VALIDATING
-    assert service.select_slash_reconcile_effect(
-        state.intent_id,
-        generation=2,
-        force_refresh=True,
-        allow_action_required_refresh=True,
-    ) == "slash-reconcile:2:2"
-
-
-def test_terminal_anchor_failed_slash_with_recovery_revalidation_is_reopened(
-    tmp_path: Path,
-) -> None:
-    service = _seed_action_required(
-        tmp_path,
-        error_code="terminal_anchor_failed",
-        duplicate_revalidation=True,
-    )
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(
-        eligible=1,
-        repaired_intent_ids=("hire_recover",),
-        skipped=0,
-        failed=0,
-    )
-    state = service.get_state("hire_recover")
-    assert state is not None
-    assert state.phase is HirePhase.VALIDATING
-
-
-def test_same_epoch_crash_and_exhaustion_requires_restart_then_recovers(
-    tmp_path: Path,
-) -> None:
-    _seed_active_employee(tmp_path, begin_revalidation=False)
-    writer_two = _writer(tmp_path, 2)
-    assert writer_two.writer_epoch == 2
-    same_epoch = _service(writer_two)
-    same_epoch.begin_channel_revalidation("hire_recover", observed_generation=1)
-    for next_state in (HireEffectState.PREPARED, HireEffectState.EXECUTING):
-        same_epoch.commit_effect_transition(
-            "hire_recover",
-            effect_id="slash-reconcile:2:1",
-            effect_type="slash_reconciliation",
-            next_state=next_state,
-        )
-    same_epoch.mark_recovery_action_required(
-        "hire_recover",
-        error_code="recovery_exhausted",
-    )
-
-    assert same_epoch.recover_replay_safe_action_required() == (
-        hire_service.ActionRequiredRecoveryResult(0, (), 1, 0)
-    )
-    same_epoch.close()
-
-    writer_three = _writer(tmp_path, 3)
-    assert writer_three.writer_epoch == 3
-    restarted = _service(writer_three)
-
-    assert restarted.recover_replay_safe_action_required() == (
-        hire_service.ActionRequiredRecoveryResult(1, ("hire_recover",), 0, 0)
-    )
-
-
-def test_repaired_intent_reaches_active_with_fresh_effects_and_one_worker(
-    tmp_path: Path,
-    run_asyncio_threads_inline: None,
-) -> None:
-    service = _seed_action_required(tmp_path)
-    repaired = service.recover_replay_safe_action_required()
-    starts: list[int] = []
-
-    class Slash:
-        async def reconcile(self):
-            return SimpleNamespace(
-                spec_hash="slash_hash",
-                observed_hash="slash_hash",
-                observed=(),
-            )
-
-    class Channels:
-        def start(
-            self,
-            _agent_id,
-            _app_id,
-            _credential_ref,
-            generation,
-            _on_event,
-        ):
-            starts.append(generation)
-            return SimpleNamespace(
-                state=ChannelProcessState.READY,
-                identity={"app_id": "cli_employee"},
-                ready_metadata={"connection_id": "conn_generation_2"},
-                error_code="",
-            )
-
-    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
-    runtime._service = service  # noqa: SLF001
-    runtime._vault = SimpleNamespace(resolve=lambda *_args: "secret")  # noqa: SLF001
-    runtime._slash_factory = lambda *_args: Slash()  # noqa: SLF001
-    runtime._channels = Channels()  # type: ignore[assignment]  # noqa: SLF001
-
-    asyncio.run(
-        runtime._configure_intent(  # noqa: SLF001
-            repaired.repaired_intent_ids[0],
-            force_slash_refresh=True,
-            allow_action_required_refresh=True,
-        )
-    )
-
-    state = service.get_state("hire_recover")
-    assert state is not None
-    assert state.phase is HirePhase.ACTIVE
-    assert starts == [2]
-    assert state.effect_state("slash-reconcile:2:1") is HireEffectState.ACTION_REQUIRED
-    assert state.effect_state("slash-reconcile:2:2") is HireEffectState.COMMITTED
-    assert state.effect_state("channel-start:2") is HireEffectState.COMMITTED
-    assert not any(
-        event.event_type == "hire.verification.challenge_issued"
-        for frame in service._writer.replay()  # noqa: SLF001
-        for event in frame.events
-    )
-
-
-def test_projection_consumes_phase_only_automatic_activation_proof_once(
-    tmp_path: Path,
-    run_asyncio_threads_inline: None,
-) -> None:
-    from src.autonomous.provisioning.hire_state import HireProjectionError
-
-    service = _seed_action_required(tmp_path)
-    try:
-        repaired = service.recover_replay_safe_action_required()
-
-        class Slash:
-            async def reconcile(self):
-                return SimpleNamespace(
-                    spec_hash="slash_hash",
-                    observed_hash="slash_hash",
-                    observed=(),
-                )
-
-        class Channels:
-            def start(
-                self,
-                _agent_id,
-                _app_id,
-                _credential_ref,
-                generation,
-                _on_event,
-            ):
-                return SimpleNamespace(
-                    state=ChannelProcessState.READY,
-                    identity={"app_id": "cli_employee"},
-                    ready_metadata={"connection_id": f"conn_generation_{generation}"},
-                    error_code="",
-                )
-
-        runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
-        runtime._service = service  # noqa: SLF001
-        runtime._vault = SimpleNamespace(resolve=lambda *_args: "secret")  # noqa: SLF001
-        runtime._slash_factory = lambda *_args: Slash()  # noqa: SLF001
-        runtime._channels = Channels()  # type: ignore[assignment]  # noqa: SLF001
-        asyncio.run(
-            runtime._configure_intent(  # noqa: SLF001
-                repaired.repaired_intent_ids[0],
-                force_slash_refresh=True,
-                allow_action_required_refresh=True,
-            )
-        )
-
-        state = service.get_state("hire_recover")
-        assert state is not None
-        assert state.phase is HirePhase.ACTIVE
-        assert state.automatic_reactivation_generation == 0
-        state = service._commit_phase_transition(  # noqa: SLF001
-            state,
-            HirePhase.VALIDATING,
-        )
-        state = service._commit_phase_transition(  # noqa: SLF001
-            state,
-            HirePhase.READY_PENDING_VERIFICATION,
-        )
-
-        class Frame:
-            def __init__(self, sequence, events):
-                self.sequence = sequence
-                self.events = tuple(events)
-
-        frames = list(service._writer.replay())  # noqa: SLF001
-        duplicate = JournalEvent(
-            "hire.activation.automatic",
-            state.intent_id,
-            {
-                "tenant_key": state.tenant_key,
-                "app_id": state.app_id,
-                "agent_id": state.agent_id,
-                "generation": state.channel_generation,
-                "slash_spec_hash": state.slash_spec_hash,
-                "channel_connection_id": state.channel_connection_id,
-                "requester_principal_id": state.requester_principal_id,
-                "requester_union_id": state.requester_union_id,
-                "source": "channel_ready",
-                "activated_at": state.channel_verified_at + 1.0,
-            },
-        )
-        with pytest.raises(HireProjectionError, match="invalid automatic activation"):
-            HireProjection.rebuild(  # type: ignore[arg-type]
-                (*frames, Frame(frames[-1].sequence + 1, (duplicate,)))
-            )
-    finally:
-        service.close()
-
-
-def test_later_generation_exhaustion_ignores_disposed_prior_generation(
-    tmp_path: Path,
-    run_asyncio_threads_inline: None,
-) -> None:
-    service = _seed_action_required(tmp_path)
-    repaired = service.recover_replay_safe_action_required()
-
-    class Slash:
-        async def reconcile(self):
-            return SimpleNamespace(
-                spec_hash="slash_hash",
-                observed_hash="slash_hash",
-                observed=(),
-            )
-
-    class Channels:
-        def start(
-            self,
-            _agent_id,
-            _app_id,
-            _credential_ref,
-            generation,
-            _on_event,
-        ):
-            return SimpleNamespace(
-                state=ChannelProcessState.READY,
-                identity={"app_id": "cli_employee"},
-                ready_metadata={"connection_id": f"conn_generation_{generation}"},
-                error_code="",
-            )
-
-    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
-    runtime._service = service  # noqa: SLF001
-    runtime._vault = SimpleNamespace(resolve=lambda *_args: "secret")  # noqa: SLF001
-    runtime._slash_factory = lambda *_args: Slash()  # noqa: SLF001
-    runtime._channels = Channels()  # type: ignore[assignment]  # noqa: SLF001
-    asyncio.run(
-        runtime._configure_intent(  # noqa: SLF001
-            repaired.repaired_intent_ids[0],
-            force_slash_refresh=True,
-            allow_action_required_refresh=True,
-        )
-    )
-    service.begin_channel_revalidation("hire_recover", observed_generation=2)
-    service.close()
-
-    epoch_four = _service(_writer(tmp_path, 4))
-    for next_state in (HireEffectState.PREPARED, HireEffectState.EXECUTING):
-        epoch_four.commit_effect_transition(
-            "hire_recover",
-            effect_id="slash-reconcile:3:1",
-            effect_type="slash_reconciliation",
-            next_state=next_state,
-        )
-    epoch_four.mark_recovery_action_required(
-        "hire_recover",
-        error_code="recovery_exhausted",
-    )
-    epoch_four.close()
-
-    reopened = _service(_writer(tmp_path, 5))
-    result = reopened.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(1, ("hire_recover",), 0, 0)
-    state = reopened.get_state("hire_recover")
-    assert state is not None
-    assert state.phase is HirePhase.VALIDATING
-    assert state.effect_state("slash-reconcile:2:1") is HireEffectState.ACTION_REQUIRED
-    assert state.effect_state("slash-reconcile:3:1") is HireEffectState.ACTION_REQUIRED
-    assert reopened.select_slash_reconcile_effect(
-        state.intent_id,
-        generation=3,
-        force_refresh=True,
-        allow_action_required_refresh=True,
-    ) == "slash-reconcile:3:2"
-
-
-@pytest.mark.parametrize(
-    ("effect_type", "effect_id", "terminal"),
-    [
-        ("app_registration", "register-app-retry", True),
-        ("credential_vault_put", "store-credential-retry", True),
-        ("employee_channel_start", "channel-start:2", True),
-        ("slash_reconciliation", "slash-reconcile:2:1", False),
-    ],
-)
-def test_unsafe_action_required_evidence_is_skipped(
-    tmp_path: Path,
-    effect_type: str,
-    effect_id: str,
-    terminal: bool,
-) -> None:
-    service = _seed_action_required(
-        tmp_path,
-        effect_type=effect_type,
-        effect_id=effect_id,
-        terminal=terminal,
-    )
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(
-        eligible=0,
-        repaired_intent_ids=(),
-        skipped=1,
-        failed=0,
-    )
-    assert service.get_state("hire_recover").phase is HirePhase.ACTION_REQUIRED  # type: ignore[union-attr]
-
-
-def test_recovery_anchor_failure_never_publishes_repaired_intent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = _seed_action_required(tmp_path)
-    monkeypatch.setattr(
-        service._writer.anchor,  # noqa: SLF001
-        "compare_and_swap",
-        lambda *_args: False,
-    )
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(
-        eligible=1,
-        repaired_intent_ids=(),
-        skipped=0,
-        failed=1,
-    )
-    assert service.get_state("hire_recover").phase is HirePhase.ACTION_REQUIRED  # type: ignore[union-attr]
-
-
 def test_runtime_recover_is_single_flight_and_waits_for_actual_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1068,7 +593,7 @@ def test_runtime_recover_is_single_flight_and_waits_for_actual_completion(
         credential_ref="vault://employee",
         channel_generation=1,
     )
-    calls = {"repair": 0, "configure": 0, "opened": 0}
+    calls = {"configure": 0, "opened": 0}
     started = threading.Event()
     release = threading.Event()
 
@@ -1078,9 +603,8 @@ def test_runtime_recover_is_single_flight_and_waits_for_actual_completion(
         def recover(self):
             return SimpleNamespace(states={state.intent_id: state})
 
-        def recover_replay_safe_action_required(self):
-            calls["repair"] += 1
-            return hire_service.ActionRequiredRecoveryResult(1, (state.intent_id,), 2, 0)
+        def begin_channel_revalidation(self, _intent_id, *, observed_generation):
+            return None
 
         def list_states(self):
             return (state,)
@@ -1101,7 +625,6 @@ def test_runtime_recover_is_single_flight_and_waits_for_actual_completion(
     async def configure(intent_id, **kwargs):
         assert intent_id == state.intent_id
         assert kwargs["force_slash_refresh"] is True
-        assert kwargs["allow_action_required_refresh"] is True
         calls["configure"] += 1
         started.set()
         await __import__("asyncio").to_thread(release.wait)
@@ -1116,73 +639,13 @@ def test_runtime_recover_is_single_flight_and_waits_for_actual_completion(
             assert not first.done()
             assert not second.done()
             release.set()
-            expected = composition.EmployeeRecoverySummary(1, 1, 2, 0)
+            expected = composition.EmployeeRecoverySummary()
             assert first.result(timeout=2.0) == expected
             assert second.result(timeout=2.0) == expected
 
-        assert calls == {"repair": 1, "configure": 1, "opened": 1}
-        assert runtime.recover() == composition.EmployeeRecoverySummary(1, 1, 2, 0)
-        assert calls == {"repair": 1, "configure": 1, "opened": 1}
-    finally:
-        runtime._closing = True  # noqa: SLF001
-        assert runtime._loop is not None  # noqa: SLF001
-        runtime._loop.call_soon_threadsafe(runtime._loop.stop)  # noqa: SLF001
-        assert runtime._loop_thread is not None  # noqa: SLF001
-        runtime._loop_thread.join(timeout=2.0)  # noqa: SLF001
-
-
-def test_runtime_batch_repair_failure_prevents_all_external_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = SimpleNamespace(
-        intent_id="hire_repaired_before_batch_failure",
-        agent_id="agt_repaired_before_batch_failure",
-        tenant_key="tenant-a",
-        phase=HirePhase.VALIDATING,
-        credential_ref="vault://employee",
-        channel_generation=1,
-    )
-    calls = {"configure": 0, "opened": 0}
-
-    class Service:
-        projection_state = SimpleNamespace(employees={})
-
-        def recover(self):
-            return SimpleNamespace(states={state.intent_id: state})
-
-        def recover_replay_safe_action_required(self):
-            return hire_service.ActionRequiredRecoveryResult(
-                eligible=2,
-                repaired_intent_ids=(state.intent_id,),
-                skipped=0,
-                failed=1,
-            )
-
-        def list_states(self):
-            return (state,)
-
-        def get_state(self, _intent_id):
-            return state
-
-        def mark_runtime_recovered(self):
-            calls["opened"] += 1
-
-    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
-    runtime._service = Service()  # type: ignore[assignment]  # noqa: SLF001
-    runtime._execution_blockers = ("test-isolation",)  # noqa: SLF001
-    monkeypatch.setattr(runtime, "_refresh_context_bindings", lambda _projection: True)
-    monkeypatch.setattr(runtime, "_start_monitor_in_loop", lambda: None)
-    runtime._start_loop()  # noqa: SLF001
-
-    async def configure(*_args, **_kwargs):
-        calls["configure"] += 1
-        state.phase = HirePhase.ACTIVE
-
-    monkeypatch.setattr(runtime, "_configure_intent", configure)
-    try:
-        with pytest.raises(RuntimeError, match="ACTION_REQUIRED repair failed"):
-            runtime.recover()
-        assert calls == {"configure": 0, "opened": 0}
+        assert calls == {"configure": 1, "opened": 1}
+        assert runtime.recover() == composition.EmployeeRecoverySummary()
+        assert calls == {"configure": 1, "opened": 1}
     finally:
         runtime._closing = True  # noqa: SLF001
         assert runtime._loop is not None  # noqa: SLF001
@@ -1240,9 +703,6 @@ def _runtime_with_startup_membership_audit(
         def recover(self):
             events.append("hire_replay")
 
-        def recover_replay_safe_action_required(self):
-            return hire_service.ActionRequiredRecoveryResult(0, (), 0, 0)
-
         def list_states(self):
             return ()
 
@@ -1283,7 +743,6 @@ def _runtime_with_startup_membership_audit(
         rebuild_projection=noop,
     )
     monkeypatch.setattr(runtime, "_repair_employee_dispatch_reporting", noop)
-    monkeypatch.setattr(runtime, "_reconcile_retired_activation_ingress", noop)
     monkeypatch.setattr(runtime, "_reconcile_terminal_ingress", noop)
     monkeypatch.setattr(runtime, "_refresh_context_bindings", lambda _projection: True)
     monkeypatch.setattr(runtime, "_start_monitor_in_loop", noop)
@@ -1376,72 +835,6 @@ def test_background_recovery_entry_retries_once_then_completes() -> None:
     assert client._employee_runtime_recovery_error is None
 
 
-def test_background_recovery_retries_failed_repair_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from src.feishu.ws_client import FeishuWSClient
-
-    calls = {"recover": 0, "repair": 0, "opened": 0}
-    published: list[bool] = []
-
-    class Service:
-        projection_state = ProjectionState()
-
-        def recover(self):
-            calls["recover"] += 1
-
-        def recover_replay_safe_action_required(self):
-            calls["repair"] += 1
-            if calls["repair"] == 1:
-                return hire_service.ActionRequiredRecoveryResult(1, (), 0, 1)
-            return hire_service.ActionRequiredRecoveryResult(0, (), 0, 0)
-
-        def list_states(self):
-            return ()
-
-        def mark_runtime_recovered(self):
-            calls["opened"] += 1
-
-    def noop() -> None:
-        return None
-
-    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
-    runtime._service = Service()  # type: ignore[assignment]  # noqa: SLF001
-    runtime._ingress = SimpleNamespace(  # noqa: SLF001
-        rebuild_projection=noop,
-        gc_terminal_payloads=noop,
-    )
-    runtime._router = SimpleNamespace(  # noqa: SLF001
-        rebuild_projection=noop,
-        recover_terminal_attachments=noop,
-    )
-    runtime._dispatch = SimpleNamespace(  # noqa: SLF001
-        employee_runtime=None,
-        recover_incomplete_attempts=noop,
-        reconcile_terminal_snapshots=noop,
-    )
-    runtime._outbox = SimpleNamespace(rebuild_projection=noop)  # noqa: SLF001
-    monkeypatch.setattr(runtime, "_reconcile_retired_activation_ingress", noop)
-    monkeypatch.setattr(runtime, "_reconcile_terminal_ingress", noop)
-    monkeypatch.setattr(runtime, "_refresh_context_bindings", lambda _projection: True)
-    monkeypatch.setattr(runtime, "_start_dispatch_worker", noop)
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._employee_department_runtime = runtime
-    client._handler_ctx = SimpleNamespace(handlers={"coco": object()})
-    client._employee_runtime_recovery_error = None
-    client._try_publish_restart_readiness = lambda: published.append(True)
-
-    client._run_employee_runtime_recovery()
-
-    assert calls == {"recover": 2, "repair": 2, "opened": 1}
-    assert runtime._recovery_attempts == 2  # noqa: SLF001
-    assert runtime._execution_blockers == ()  # noqa: SLF001
-    assert runtime._core_recovered is True  # noqa: SLF001
-    assert client._employee_runtime_recovery_error is None
-    assert published == [True]
-
-
 def test_background_recovery_entry_stops_after_second_failure() -> None:
     from src.feishu.ws_client import FeishuWSClient
 
@@ -1474,158 +867,6 @@ def test_background_recovery_entry_stops_after_second_failure() -> None:
     assert isinstance(client._employee_runtime_recovery_error, RuntimeError)
 
 
-def test_reducer_accepts_one_atomic_frame_for_multiple_recovery_pairs() -> None:
-    class Frame:
-        def __init__(self, sequence, events, *, epoch=1):
-            self.sequence = sequence
-            self.events = tuple(events)
-            self.writer_epoch = epoch
-
-    frames = []
-    sequence = 0
-    for suffix in ("one", "two"):
-        agent_id = f"agt_{suffix}"
-        intent_id = f"hire_{suffix}"
-        bot_id = f"bot_{suffix}"
-        created = JournalEvent(
-            event_type="employee.created",
-            aggregate_id=agent_id,
-            payload={
-                "agent_id": agent_id,
-                "tenant_key": "tenant-a",
-                "owner_principal_id": "ou_admin",
-                "name": suffix,
-                "tool": "codex",
-                "model": "gpt-5.6-sol",
-                "effort": "high",
-                "profile": "standard",
-                "worker_type": "visible",
-                "state": "provisioning_app",
-                "hire_schema_version": 1,
-                "hire_intent_id": intent_id,
-                "hire_message_id": f"om_{suffix}",
-                "hire_chat_id": "oc_admin_dm",
-                "planned_bot_principal_id": bot_id,
-                "provisioning_attempt_id": f"attempt_{suffix}",
-            },
-        )
-        effect_payload = {
-            "effect_id": "channel-start:1",
-            "effect_type": "employee_channel_start",
-        }
-        committed_payload = {
-            **effect_payload,
-            "metadata": {
-                "app_id": f"cli_{suffix}",
-                "generation": "1",
-                "identity_app_id": f"cli_{suffix}",
-                "connection_id": f"conn_{suffix}",
-                "channel_verified_at": "1.0",
-            },
-        }
-        for event in (
-            created,
-            JournalEvent("hire.effect.prepared", intent_id, effect_payload),
-            JournalEvent("hire.effect.executing", intent_id, effect_payload),
-            JournalEvent("hire.effect.committed", intent_id, committed_payload),
-            JournalEvent(
-                "employee.state_changed",
-                agent_id,
-                {"state": "action_required"},
-            ),
-        ):
-            sequence += 1
-            frames.append(Frame(sequence, (event,)))
-    sequence += 1
-    frames.append(
-        Frame(
-            sequence,
-            (
-                JournalEvent(
-                    "hire.channel.phase_only_recovery",
-                    "hire_one",
-                    {"generation": 1},
-                ),
-                JournalEvent(
-                    "employee.state_changed",
-                    "agt_one",
-                    {"state": "validating"},
-                ),
-                JournalEvent(
-                    "hire.channel.phase_only_recovery",
-                    "hire_two",
-                    {"generation": 1},
-                ),
-                JournalEvent(
-                    "employee.state_changed",
-                    "agt_two",
-                    {"state": "validating"},
-                ),
-            ),
-            epoch=2,
-        )
-    )
-
-    projection = HireProjection.rebuild(frames)  # type: ignore[arg-type]
-
-    assert projection.get("hire_one").phase is HirePhase.VALIDATING  # type: ignore[union-attr]
-    assert projection.get("hire_two").phase is HirePhase.VALIDATING  # type: ignore[union-attr]
-
-
-def test_batch_recovery_uses_one_journal_commit_on_anchor_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = _service(_writer(tmp_path, 3))
-    states = {
-        suffix: DurableHireState(
-            intent_id=f"hire_{suffix}",
-            agent_id=f"agt_{suffix}",
-            phase=HirePhase.ACTION_REQUIRED,
-            channel_generation=1,
-        )
-        for suffix in ("one", "two")
-    }
-    service._hire_projection = HireProjection(  # noqa: SLF001
-        states={state.intent_id: state for state in states.values()}
-    )
-    service.projection_state.employees.update(
-        {
-            state.agent_id: SimpleNamespace(
-                worker_type=WorkerType.VISIBLE,
-                state=EmployeeState.ACTION_REQUIRED,
-            )
-            for state in states.values()
-        }
-    )
-    monkeypatch.setattr(
-        service,
-        "_has_exact_replay_safe_recovery_exhausted_history",
-        lambda _state, _frames, *, recovery_writer_epoch: (
-            recovery_writer_epoch == service._writer.writer_epoch  # noqa: SLF001
-        ),
-    )
-    monkeypatch.setattr(hire_service, "validate_workforce_events", lambda *_args: None)
-    commits: list[tuple[JournalEvent, ...]] = []
-
-    def fail_anchor(events, *_args, **_kwargs):
-        commits.append(tuple(events))
-        return SimpleNamespace(state=hire_service.CommitState.DURABLE_NOT_ANCHORED)
-
-    monkeypatch.setattr(service._writer, "commit", fail_anchor)  # noqa: SLF001
-
-    result = service.recover_replay_safe_action_required()
-
-    assert result == hire_service.ActionRequiredRecoveryResult(2, (), 0, 2)
-    assert len(commits) == 1
-    assert [event.event_type for event in commits[0]] == [
-        "hire.channel.phase_only_recovery",
-        "employee.state_changed",
-        "hire.channel.phase_only_recovery",
-        "employee.state_changed",
-    ]
-
-
 def test_runtime_summary_preserves_active_intent_when_peer_isolation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1647,13 +888,8 @@ def test_runtime_summary_preserves_active_intent_when_peer_isolation_fails(
         def recover(self):
             return SimpleNamespace(states=states)
 
-        def recover_replay_safe_action_required(self):
-            return hire_service.ActionRequiredRecoveryResult(
-                2,
-                tuple(states),
-                0,
-                0,
-            )
+        def begin_channel_revalidation(self, _intent_id, *, observed_generation):
+            return None
 
         def list_states(self):
             return tuple(states.values())
@@ -1688,7 +924,7 @@ def test_runtime_summary_preserves_active_intent_when_peer_isolation_fails(
     monkeypatch.setattr(runtime, "_configure_intent", configure)
     monkeypatch.setattr(runtime, "_retry_recovery_intent", fail_isolation)
     try:
-        assert runtime.recover() == composition.EmployeeRecoverySummary(2, 1, 0, 1)
+        assert runtime.recover() == composition.EmployeeRecoverySummary()
         assert monitor_starts == []
     finally:
         runtime._closing = True  # noqa: SLF001
@@ -1885,208 +1121,6 @@ def test_channel_acceptance_notifies_even_when_fast_admission_fails(
         )
 
     assert runtime._employee_handoff_revision == revision + 1  # noqa: SLF001
-
-
-def test_team_projection_failure_after_acceptance_is_left_for_periodic_admission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    acceptance_id = "acc_team"
-    agent_id = "agt_team"
-    runtime = EmployeeDepartmentRuntime()
-    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        list_states=lambda: (
-            SimpleNamespace(
-                agent_id=agent_id,
-                tenant_key="tenant-a",
-                phase=HirePhase.ACTIVE,
-                channel_generation=2,
-                bot_principal_id="bot_team",
-                app_id="cli_team",
-            ),
-        )
-    )
-    runtime._channels = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        status=lambda observed: SimpleNamespace(
-            state=ChannelProcessState.READY,
-            generation=2,
-            ready_metadata={"connection_id": "conn_team"},
-        )
-        if observed == agent_id
-        else None
-    )
-    events: list[str] = []
-    accepted: list[object] = []
-
-    def accept(metadata, payload, *, request_id):
-        events.append("accept")
-        accepted.append((metadata, payload, request_id))
-        return SimpleNamespace(
-            acceptance=SimpleNamespace(acceptance_id=acceptance_id)
-        )
-
-    runtime._ingress = SimpleNamespace(accept=accept)  # type: ignore[assignment]  # noqa: SLF001
-    ledger_attempts: list[None] = []
-
-    def fail_ledger(**_kwargs) -> None:
-        events.append("ledger")
-        ledger_attempts.append(None)
-        raise RuntimeError("transient group ledger failure")
-
-    runtime._group_ledger = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        publish=fail_ledger
-    )
-    admission_attempts: list[str] = []
-
-    def project_then_fail(observed: str) -> None:
-        events.append("admission")
-        admission_attempts.append(observed)
-        runtime._group_ledger.publish()
-
-    monkeypatch.setattr(runtime, "_admit_employee_ingress_once", project_then_fail)
-    backend = composition._RuntimeTeamBackend(runtime, lambda *_args: None)
-
-    observed = backend.submit(
-        run_id="run_team",
-        step_id="step_build",
-        target=composition.TeamTarget(agent_id, "Atlas"),
-        tenant_key="tenant-a",
-        chat_id="oc_team",
-        message_id="om_team",
-        requester_principal_id="ou_owner",
-        instruction="implement the feature",
-        deadline_at="2026-08-12T01:00:00Z",
-    )
-
-    assert observed == acceptance_id
-    assert ledger_attempts == [None]
-    assert len(accepted) == 1
-    assert admission_attempts == [acceptance_id]
-    assert events == ["accept", "admission", "ledger"]
-
-
-def test_team_ingress_accept_failure_does_not_publish_group_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_id = "agt_team"
-    runtime = EmployeeDepartmentRuntime()
-    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        list_states=lambda: (
-            SimpleNamespace(
-                agent_id=agent_id,
-                tenant_key="tenant-a",
-                phase=HirePhase.ACTIVE,
-                channel_generation=2,
-                bot_principal_id="bot_team",
-                app_id="cli_team",
-            ),
-        )
-    )
-    runtime._channels = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        status=lambda _observed: SimpleNamespace(
-            state=ChannelProcessState.READY,
-            generation=2,
-            ready_metadata={"connection_id": "conn_team"},
-        )
-    )
-
-    def fail_accept(*_args, **_kwargs):
-        raise RuntimeError("durable Inbox unavailable")
-
-    runtime._ingress = SimpleNamespace(accept=fail_accept)  # type: ignore[assignment]  # noqa: SLF001
-    ledger_attempts: list[None] = []
-    runtime._group_ledger = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        publish=lambda **_kwargs: ledger_attempts.append(None)
-    )
-    admission_attempts: list[str] = []
-    monkeypatch.setattr(
-        runtime,
-        "_admit_employee_ingress_once",
-        lambda observed: admission_attempts.append(observed),
-    )
-    backend = composition._RuntimeTeamBackend(runtime, lambda *_args: None)
-
-    with pytest.raises(RuntimeError, match="durable Inbox unavailable"):
-        backend.submit(
-            run_id="run_team",
-            step_id="step_build",
-            target=composition.TeamTarget(agent_id, "Atlas"),
-            tenant_key="tenant-a",
-            chat_id="oc_team",
-            message_id="om_team",
-            requester_principal_id="ou_owner",
-            instruction="implement the feature",
-            deadline_at="2026-08-12T01:00:00Z",
-        )
-
-    assert ledger_attempts == []
-    assert admission_attempts == []
-
-
-def test_team_acceptance_attempts_fast_admission_and_notifies_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    acceptance_id = "acc_team"
-    agent_id = "agt_team"
-    runtime = EmployeeDepartmentRuntime()
-    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        list_states=lambda: (
-            SimpleNamespace(
-                agent_id=agent_id,
-                tenant_key="tenant-a",
-                phase=HirePhase.ACTIVE,
-                channel_generation=2,
-                bot_principal_id="bot_team",
-                app_id="cli_team",
-            ),
-        )
-    )
-    runtime._channels = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        status=lambda observed: SimpleNamespace(
-            state=ChannelProcessState.READY,
-            generation=2,
-            ready_metadata={"connection_id": "conn_team"},
-        )
-        if observed == agent_id
-        else None
-    )
-    runtime._ingress = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        accept=lambda *_args, **_kwargs: SimpleNamespace(
-            acceptance=SimpleNamespace(acceptance_id=acceptance_id)
-        )
-    )
-    runtime._group_ledger = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
-        publish=lambda **_kwargs: None
-    )
-    admission_attempts: list[str] = []
-    notifications: list[None] = []
-
-    def fail_admission(observed: str) -> None:
-        admission_attempts.append(observed)
-        raise RuntimeError("transient admission failure")
-
-    monkeypatch.setattr(runtime, "_admit_employee_ingress_once", fail_admission)
-    monkeypatch.setattr(
-        runtime,
-        "_notify_employee_handoff_progress",
-        lambda: notifications.append(None),
-    )
-    backend = composition._RuntimeTeamBackend(runtime, lambda *_args: None)
-
-    observed = backend.submit(
-        run_id="run_team",
-        step_id="step_build",
-        target=composition.TeamTarget(agent_id, "Atlas"),
-        tenant_key="tenant-a",
-        chat_id="oc_team",
-        message_id="om_team",
-        requester_principal_id="ou_owner",
-        instruction="implement the feature",
-        deadline_at="2026-08-12T01:00:00Z",
-    )
-
-    assert observed == acceptance_id
-    assert admission_attempts == [acceptance_id]
-    assert notifications == [None]
 
 
 def test_channel_acceptance_admits_during_dispatch_exception_backoff(

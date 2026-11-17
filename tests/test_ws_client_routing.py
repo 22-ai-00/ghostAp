@@ -20,8 +20,6 @@ from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import (
     FeishuWSClient,
     _employee_hire_status_uuid,
-    _main_bot_outbound_wiring,
-    _visible_employee_runtime_requires_outbound_audit,
 )
 from src.mode import InteractionMode
 from src.project import ProjectContext
@@ -46,7 +44,6 @@ def mock_ws_client():
             fire_service=object(),
             membership_service=object(),
             data_composition=object(),
-            team_service=object(),
             main_bot_outbound_audit=audit,
             readiness=lambda: SimpleNamespace(ready=True),
             bind_main_bot_warning_transport=MagicMock(),
@@ -2886,27 +2883,6 @@ def test_employee_department_runtime_is_wired_and_enabled_by_default(
     )
     assert dict(material.credential_env) == {}
     assert material.provider_files["traex_auth_json"].endswith("/.trae/cli/auth.json")
-
-
-def test_visible_employee_runtime_without_audit_fails_main_bot_outbound_closed() -> None:
-    audit, failure = _main_bot_outbound_wiring(
-        SimpleNamespace(main_bot_outbound_audit=None),
-        required=True,
-    )
-
-    assert failure is None
-    with pytest.raises(RuntimeError, match="audit.*unavailable"):
-        audit("tenant-a", "reply", "om_message")
-
-
-def test_dormant_employee_runtime_does_not_require_main_bot_outbound_audit() -> None:
-    assert _main_bot_outbound_wiring(None, required=False) == (None, None)
-
-
-def test_invalid_visible_employee_limit_shape_requires_outbound_audit() -> None:
-    settings = SimpleNamespace(autonomous_visible_employee_limit=MagicMock())
-
-    assert _visible_employee_runtime_requires_outbound_audit(settings) is True
 
 
 def test_employee_registration_notifier_explains_pending_oauth_state(

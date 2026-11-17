@@ -125,11 +125,6 @@ def _occurrence_hash(value: str) -> str:
 class DataKind(str, Enum):
     L1_MEMORY = "l1_memory"
     MEMORY_SUMMARY = "memory_summary"
-    SKILL_PROFILE = "skill_profile"
-    REASONING = "reasoning"
-    KNOWLEDGE_PAGE = "knowledge_page"
-    KNOWLEDGE_INDEX = "knowledge_index"
-    KNOWLEDGE_REVIEW = "knowledge_review"
 
 
 @dataclass(frozen=True)
@@ -642,8 +637,6 @@ class EmployeeDataDocumentV1:
         if self.kind in {
             DataKind.L1_MEMORY,
             DataKind.MEMORY_SUMMARY,
-            DataKind.KNOWLEDGE_PAGE,
-            DataKind.KNOWLEDGE_INDEX,
         }:
             if self.content_type != "text/markdown":
                 raise ValueError("Markdown documents must use text/markdown")
@@ -671,11 +664,7 @@ class EmployeeDataDocumentV1:
         else:
             if chat_id or thread:
                 raise ValueError("chat metadata is only valid for memory_summary")
-            if self.kind in {
-                DataKind.L1_MEMORY,
-                DataKind.SKILL_PROFILE,
-                DataKind.KNOWLEDGE_INDEX,
-            } and self.source_id != self.kind.value:
+            if self.kind is DataKind.L1_MEMORY and self.source_id != self.kind.value:
                 raise ValueError("document source_id does not match kind")
 
     @staticmethod

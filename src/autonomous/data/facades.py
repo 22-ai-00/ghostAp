@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import secrets
@@ -50,20 +49,6 @@ class EmployeeDocumentMaterializer:
         elif kind is DataKind.MEMORY_SUMMARY:
             safe_id = hashlib.sha256(source_id.encode()).hexdigest()[:16]
             relative = f"memory/summary_{safe_id}.md"
-        elif kind is DataKind.SKILL_PROFILE:
-            relative = "skill_profile.json"
-        elif kind is DataKind.REASONING:
-            safe_id = hashlib.sha256(source_id.encode()).hexdigest()
-            relative = f"reasoning/{safe_id}.json"
-        elif kind is DataKind.KNOWLEDGE_PAGE:
-            if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", source_id) is None:
-                raise ValueError("invalid knowledge page id")
-            relative = f"workspace/wiki/{source_id}.md"
-        elif kind is DataKind.KNOWLEDGE_INDEX:
-            relative = "workspace/wiki/index.md"
-        elif kind is DataKind.KNOWLEDGE_REVIEW:
-            safe_id = hashlib.sha256(source_id.encode()).hexdigest()
-            relative = f"knowledge/review/{safe_id}.json"
         else:
             raise ValueError(f"unsupported kind: {kind}")
         return DocumentPath(
@@ -219,16 +204,6 @@ class EmployeeMemoryFacade:
                 DataKind.MEMORY_SUMMARY,
                 source_id,
             )
-
-    def read_skill_profile(self, agent_id: str) -> dict | None:
-        """Read skill profile JSON."""
-        content = self._read_canonical(agent_id, DataKind.SKILL_PROFILE, "skill_profile")
-        if content is None:
-            return None
-        try:
-            return json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return None
 
     def is_canonical(self, agent_id: str) -> bool:
         """Check if agent has any canonical documents."""

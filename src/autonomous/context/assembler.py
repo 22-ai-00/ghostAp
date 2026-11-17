@@ -25,7 +25,6 @@ from .models import (
 )
 from .source import EmployeeScopedMessageSource, MessagePage, ResolvedThread
 
-_MAX_STABILITY_ATTEMPTS = 2
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -65,31 +64,20 @@ class EmployeeThreadContext:
             resolved = self._checked_call(self._source.resolve_thread, deadline)
             self._validate_binding(scope, resolved)
             stable_thread = self._stable_thread(scope, resolved, deadline)
-            second_group: list[ContextMessage] = []
+            group_window: list[ContextMessage] = []
             if (
                 scope.authorization_scope
                 is EmployeeAuthorizationScope.MANAGED_GROUP
             ):
-                first_group = self._fetch_group_window(
+                group_window = self._fetch_group_window(
                     scope,
                     stable_thread,
                     deadline,
                 )
-                second_group = self._fetch_group_window(
-                    scope,
-                    stable_thread,
-                    deadline,
-                )
-                if self._revision_digest(first_group) != self._revision_digest(
-                    second_group
-                ):
-                    raise ContextUnavailableError(
-                        ContextUnavailableReason.REVISION
-                    )
             thread, group = self._reconcile_layers(
                 scope,
                 stable_thread,
-                second_group,
+                group_window,
             )
             watermark = self._watermark(scope, resolved, thread)
             return self._apply_budget(
@@ -168,21 +156,10 @@ class EmployeeThreadContext:
         resolved: ResolvedThread,
         deadline: float,
     ) -> list[ContextMessage]:
-        saw_current = False
-        for _ in range(_MAX_STABILITY_ATTEMPTS):
-            first = self._thread_traversal(scope, resolved, deadline)
-            second = self._thread_traversal(scope, resolved, deadline)
-            saw_current = saw_current or first is not None or second is not None
-            if first is None or second is None:
-                continue
-            if self._revision_digest(first) == self._revision_digest(second):
-                return second
-        reason = (
-            ContextUnavailableReason.REVISION
-            if saw_current
-            else ContextUnavailableReason.CURRENT_MESSAGE
-        )
-        raise ContextUnavailableError(reason)
+        messages = self._thread_traversal(scope, resolved, deadline)
+        if messages is None:
+            raise ContextUnavailableError(ContextUnavailableReason.CURRENT_MESSAGE)
+        return messages
 
     def _thread_traversal(
         self,

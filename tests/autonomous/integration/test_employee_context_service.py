@@ -149,7 +149,7 @@ class _SourceFactory:
         self.source = _FakeSource(
             traversals=[
                 _pages(thread)
-                for _ in range(assembly_attempts * 2)
+                for _ in range(assembly_attempts)
             ],
         )
         self.calls = []
@@ -281,7 +281,7 @@ def test_owner_p2p_reads_only_thread_and_employee_l1() -> None:
     ]
     source_factory = _SourceFactory()
     source_factory.source = _FakeSource(
-        traversals=[list(pages), list(pages)],
+        traversals=[list(pages)],
     )
 
     class HostileLedger:
@@ -317,7 +317,7 @@ def test_owner_p2p_reads_only_thread_and_employee_l1() -> None:
     assert built.backend.calls == []
     assert built.source_factory.source.chat_calls == 0
     assert built.source_factory.source.reset_calls == 0
-    assert built.source_factory.source.thread_calls == 4
+    assert built.source_factory.source.thread_calls == 2
     with pytest.raises(ContextUnavailableError) as raised:
         built.service.assemble_canonical_partial(
             request,
@@ -343,7 +343,7 @@ def test_budget_preserves_full_topic_and_l1_before_recent_group() -> None:
             self.chat_calls += 1
             return MessagePage((group,), False)
 
-    source = Source(traversals=[list(thread_pages), list(thread_pages)])
+    source = Source(traversals=[list(thread_pages)])
     source_factory = _SourceFactory()
     source_factory.source = source
     built = _composition(
@@ -371,9 +371,9 @@ def test_budget_preserves_full_topic_and_l1_before_recent_group() -> None:
         ContextLayer.L2_GROUP,
         ContextLayer.GROUP_RECENT,
     )
-    assert source.thread_calls == 4
-    assert source.chat_calls == 2
-    assert source.reset_calls == 2
+    assert source.thread_calls == 2
+    assert source.chat_calls == 1
+    assert source.reset_calls == 1
 
 
 def test_topic_that_alone_exceeds_budget_fails_instead_of_partial_trim() -> None:

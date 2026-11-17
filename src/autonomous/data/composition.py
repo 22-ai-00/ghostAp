@@ -49,8 +49,6 @@ def _contains_unmigrated_employee_data(agents_root: str | Path) -> bool:
         "execution_history.jsonl",
         "MEMORY.md",
         "memory/MEMORY.md",
-        "skill_profile.json",
-        "reasoning",
     )
     for entry in root.iterdir():
         try:
@@ -80,7 +78,6 @@ class EmployeeDataComposition:
     memory_query: EmployeeMemoryQuery
     context_factory: EmployeeDataRequestContextFactory
     workspace_projector: EmployeeWorkspaceProjector | None = None
-    knowledge_service: Any = None
 
     def record_terminal(
         self,
@@ -150,12 +147,6 @@ class EmployeeDataComposition:
                 thread_root_id=command.thread_root_id,
             )
             if command.kind is DataKind.MEMORY_SUMMARY
-            else command.source_id
-            if command.kind in {
-                DataKind.REASONING,
-                DataKind.KNOWLEDGE_PAGE,
-                DataKind.KNOWLEDGE_REVIEW,
-            }
             else command.kind.value
         )
         identity = command.idempotency_key or secrets.token_hex(16)
@@ -222,22 +213,12 @@ class EmployeeDataComposition:
             content_hash=content_hash,
         )
 
-    def enqueue_knowledge_terminal(
-        self,
-        terminal: AuthenticatedExecutionTerminal,
-    ) -> str:
-        if self.knowledge_service is None:
-            raise RuntimeError("employee knowledge service is unavailable")
-        return self.knowledge_service.enqueue_terminal(terminal)
-
     def rebuild_all(self) -> None:
         """Full projection rebuild from Journal replay."""
         snapshot = self.service.rebuild_projection()
         self.service.verify_live_blobs()
         self.history_materializer.materialize_all(snapshot)
         if self.workspace_projector is not None:
-            # Rebuild the deterministic control skeleton first; committed
-            # knowledge documents then overlay only managed Wiki leaves.
             self.workspace_projector.rebuild_all()
         agent_ids = {
             metadata.agent_id
@@ -250,8 +231,6 @@ class EmployeeDataComposition:
                 agent_id,
                 self.service.read_blob,
             )
-        if self.knowledge_service is not None:
-            self.knowledge_service.project_all()
 
     def gc_unreferenced_blobs(self) -> int:
         """Quarantine blobs not referenced by any projected record or document."""
@@ -259,8 +238,6 @@ class EmployeeDataComposition:
 
     def close(self) -> None:
         """Release the owned encrypted BlobStore; the shared Writer is external."""
-        if self.knowledge_service is not None:
-            self.knowledge_service.close()
         self.service.close()
 
 
@@ -326,8 +303,6 @@ def build_employee_data_composition(
     )
     from ..gateway.projection import rebuild_gateway_projection
     from ..journal.projections import ProjectionRepository
-    from ..team.models import TeamAssignmentStatus, TeamRunPhase
-    from ..team.projection import rebuild_team_projection
 
     def workspace_source_provider(
         tenant_key: str,
@@ -342,67 +317,6 @@ def build_employee_data_composition(
             or employee.state is EmployeeState.ARCHIVED
         ):
             raise KeyError(agent_id)
-        data_snapshot = service.rebuild_projection()
-        documents = tuple(
-            document
-            for document in data_snapshot.employee_documents.values()
-            if document.tenant_key == tenant_key
-            and document.agent_id == agent_id
-            and not document.tombstoned
-        )
-        knowledge_generation = max(
-            (
-                document.version
-                for document in documents
-                if document.kind
-                in {DataKind.KNOWLEDGE_PAGE, DataKind.KNOWLEDGE_INDEX}
-            ),
-            default=0,
-        )
-        source_refs = tuple(
-            (
-                document.source_id,
-                document.content_hash,
-                document.kind.value,
-                "employee",
-            )
-            for document in sorted(
-                (
-                    item
-                    for item in documents
-                    if item.kind is DataKind.KNOWLEDGE_PAGE
-                    and data_snapshot.latest_employee_document.get(
-                        (
-                            item.tenant_key,
-                            item.agent_id,
-                            item.kind.value,
-                            item.source_id,
-                        )
-                    )
-                    == item.document_id
-                ),
-                key=lambda item: (item.source_id, item.version),
-            )[-100:]
-        )
-        team = rebuild_team_projection(frames)
-        active_team_assignments = tuple(
-            assignment
-            for assignment in team.assignments.values()
-            if assignment.agent_id == agent_id
-            and assignment.status
-            in {
-                TeamAssignmentStatus.CREATED,
-                TeamAssignmentStatus.CLAIMED,
-                TeamAssignmentStatus.RUNNING,
-            }
-            and team.runs[assignment.run_id].tenant_key == tenant_key
-            and team.runs[assignment.run_id].phase
-            not in {
-                TeamRunPhase.COMPLETED,
-                TeamRunPhase.BLOCKED,
-                TeamRunPhase.CANCELED,
-            }
-        )
         gateway = rebuild_gateway_projection(frames)
         active_attempts = tuple(
             attempt
@@ -413,12 +327,7 @@ def build_employee_data_composition(
             and not attempt.terminal_status
         )
         active_assignment_id = (
-            sorted(
-                active_team_assignments,
-                key=lambda item: item.assignment_id,
-            )[-1].assignment_id
-            if active_team_assignments
-            else max(
+            max(
                 active_attempts,
                 key=lambda item: item.dispatch_sequence,
             ).binding.task_id
@@ -443,12 +352,12 @@ def build_employee_data_composition(
             identity_version=employee.aggregate_version,
             projection_sequence=workforce.cursor_sequence,
             projection_hash=workforce.cursor_hash,
-            knowledge_generation=knowledge_generation,
+            knowledge_generation=0,
             active_assignment_id=active_assignment_id,
             checkpoint_ref=(
                 f"journal:{checkpoint_sequence}" if checkpoint_sequence else ""
             ),
-            source_refs=source_refs,
+            source_refs=(),
         )
 
     workspace_projector = EmployeeWorkspaceProjector(
@@ -456,7 +365,7 @@ def build_employee_data_composition(
         state_provider=lambda: ProjectionRepository().rebuild(writer.replay()),
         source_provider=workspace_source_provider,
     )
-    composition = EmployeeDataComposition(
+    return EmployeeDataComposition(
         service=service,
         state=state,
         history_materializer=history_mat,
@@ -467,29 +376,3 @@ def build_employee_data_composition(
         context_factory=context_factory,
         workspace_projector=workspace_projector,
     )
-    from ..knowledge.service import EmployeeKnowledgeService
-
-    principals = frozenset(admin_principal_ids) | {
-        main_bot_app_id,
-        "main_bot",
-    }
-
-    def authorize_knowledge(request: Any, _source_id: str) -> bool:
-        if request.requester_principal_id in principals:
-            return True
-        owners = {
-            item.owner_principal_id
-            for item in state.employee_documents.values()
-            if item.tenant_key == request.tenant_key
-            and item.agent_id == request.agent_id
-            and not item.tombstoned
-        }
-        return request.requester_principal_id in owners
-
-    composition.knowledge_service = EmployeeKnowledgeService(
-        writer=writer,
-        data_composition=composition,
-        authorizer=authorize_knowledge,
-        agents_root=agents_root,
-    )
-    return composition

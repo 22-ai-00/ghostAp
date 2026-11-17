@@ -7,7 +7,6 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from ..authorization import EmployeeAuthorizationScope
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
 from .models import DispatchBinding, GatewayExecutionStatus
 
@@ -23,33 +22,6 @@ _GATEWAY_EVENTS = frozenset(
         ATTEMPT_TERMINAL,
     }
 )
-_CURRENT_TEAM_BINDING_FIELDS = frozenset(
-    {"team_chat_id", "team_identity", "team_root_identity"}
-)
-_LEGACY_SLOCK_BINDING_FIELDS = frozenset(
-    {"slock_chat_id", "slock_engine_identity", "slock_root_identity"}
-)
-_CURRENT_BINDING_FIELDS = frozenset(DispatchBinding.__dataclass_fields__)
-_EFFECTIVE_INPUT_BINDING_FIELDS = frozenset(
-    {
-        "effective_input_kind",
-        "effective_input_digest",
-        "target_bot_open_id_digest",
-        "prompt_digest",
-    }
-)
-_PRE_EFFECTIVE_BINDING_FIELDS = (
-    _CURRENT_BINDING_FIELDS - _EFFECTIVE_INPUT_BINDING_FIELDS
-)
-_SCOPE_BINDING_FIELDS = frozenset(
-    {"authorization_scope", "source_requester_principal_id"}
-)
-_LEGACY_TEAM_BINDING_FIELDS = (
-    _PRE_EFFECTIVE_BINDING_FIELDS - _SCOPE_BINDING_FIELDS
-)
-_LEGACY_SLOCK_BINDING_FIELDS_EXACT = (
-    _LEGACY_TEAM_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
-) | _LEGACY_SLOCK_BINDING_FIELDS
 
 
 class GatewayProjectionError(RuntimeError):
@@ -94,74 +66,6 @@ class GatewayProjectionState:
 
 def is_gateway_event(event_type: str) -> bool:
     return event_type in _GATEWAY_EVENTS
-
-
-def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
-    """Normalize the one authenticated pre-team binding schema during replay."""
-
-    legacy_shape = False
-    if isinstance(value, dict):
-        # Historical bindings retained this now-removed execution-policy
-        # label.  Strip it before exact legacy-shape matching just as
-        # ``DispatchBinding.from_dict`` does for the current shape.
-        normalized = dict(value)
-        normalized.pop("security_profile", None)
-        value = normalized
-    if isinstance(value, dict) and set(value) in {
-        _LEGACY_SLOCK_BINDING_FIELDS_EXACT,
-    }:
-        legacy_shape = True
-        normalized = dict(value)
-        normalized["team_chat_id"] = normalized.pop("slock_chat_id")
-        normalized["team_identity"] = normalized.pop("slock_engine_identity")
-        normalized["team_root_identity"] = normalized.pop("slock_root_identity")
-        value = normalized
-    if isinstance(value, dict) and set(value) == _LEGACY_TEAM_BINDING_FIELDS:
-        legacy_shape = True
-        normalized = dict(value)
-        normalized["authorization_scope"] = (
-            EmployeeAuthorizationScope.MANAGED_GROUP.value
-        )
-        normalized["source_requester_principal_id"] = normalized[
-            "requester_principal_id"
-        ]
-        value = normalized
-    if isinstance(value, dict) and set(value) == _PRE_EFFECTIVE_BINDING_FIELDS:
-        legacy_shape = True
-        normalized = dict(value)
-        normalized.update(
-            effective_input_kind="",
-            effective_input_digest="",
-            target_bot_open_id_digest="",
-            prompt_digest="",
-        )
-        value = normalized
-    if legacy_shape and isinstance(value, dict):
-        if value.get("schema_version") != 1:
-            raise ValueError("legacy dispatch binding requires schema version 1")
-        normalized = dict(value)
-        normalized["schema_version"] = 1
-        value = normalized
-        return DispatchBinding(**_binding_constructor_values(value))
-    return DispatchBinding.from_dict(value)
-
-
-def _binding_constructor_values(value: dict[str, object]) -> dict[str, object]:
-    """Convert one exact replay-only binding mapping to constructor values."""
-
-    normalized = dict(value)
-    try:
-        normalized["authorization_scope"] = EmployeeAuthorizationScope(
-            normalized["authorization_scope"]
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid dispatch authorization scope") from exc
-    if not isinstance(normalized.get("permissions"), list) or not isinstance(
-        normalized.get("capabilities"),
-        list,
-    ):
-        raise ValueError("dispatch authority collections must be JSON arrays")
-    return normalized
 
 
 def _reduce_gateway_event(
@@ -270,7 +174,7 @@ def _validate_cross_domain_atomicity(
 ) -> None:
     for event in bound:
         try:
-            binding = _dispatch_binding_from_journal(event.payload["binding"])
+            binding = DispatchBinding.from_dict(event.payload["binding"])
         except (KeyError, TypeError, ValueError) as exc:
             raise GatewayProjectionError("invalid attempt binding") from exc
         router_dispatch = [
@@ -326,7 +230,7 @@ def _reduce_bound(
     if set(event.payload) != {"binding"}:
         raise GatewayProjectionError("attempt binding must use exact schema")
     try:
-        binding = _dispatch_binding_from_journal(event.payload["binding"])
+        binding = DispatchBinding.from_dict(event.payload["binding"])
     except (TypeError, ValueError) as exc:
         raise GatewayProjectionError("invalid attempt binding") from exc
     if binding.attempt_id != event.aggregate_id:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
@@ -22,17 +23,16 @@ from ..data.models import (
     ExecutionHistoryRecordV1,
     SafeExecutionSummary,
 )
-from ..data.ports import AuthenticatedExecutionTerminal, EmployeeDataSink, PublishEmployeeDocumentCommand
+from ..data.ports import EmployeeDataSink, PublishEmployeeDocumentCommand
 from ..data.service import EmployeeDataService
 from ..domain import EmployeeState, WorkerType
-from ..ingress.models import parse_canonical_utc
 from ..ingress.targeted_task import TARGETED_TASK_INPUT_KIND
 from ..journal.frame import JournalEvent
 from ..journal.projections import apply_frame
 from ..journal.writer import CommitState, JournalWriter
 from ..runtime.employee_supervisor import EmployeeRuntimeSupervisor
+from ..runtime.session_host import EmployeeSessionHost
 from ..supervisor.channel_models import ChannelProcessState
-from ..team.runtime import TeamRuntimeResolutionError, team_runtime_guard
 from ..workforce.registry import ProjectedAgentRegistry
 from .context_prompt import (
     EmployeePromptRenderError,
@@ -74,23 +74,19 @@ _TRANSIENT_CONTEXT_REASONS = frozenset(
         ContextUnavailableReason.SOURCE,
     }
 )
-_TEAM_ASSIGNMENT_FIELDS = frozenset(
-    {
-        "type",
-        "message_type",
-        "chat_type",
-        "content",
-        "team_instruction",
-        "sender_id",
-        "sender_id_type",
-        "sender_type",
-        "sender_tenant_key",
-        "feishu_thread_id",
-        "team_run_id",
-        "team_step_id",
-        "team_deadline_at",
-    }
-)
+
+
+class _ExecutionCoordinateUnavailableError(RuntimeError):
+    """Execution binding coordinates cannot be resolved."""
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectExecutionBinding:
+    engine_identity: str
+    chat_id: str
+    root_identity: str
+    canonical_root: str
+    engine: object
 
 
 class EmployeeDispatchError(RuntimeError):
@@ -169,14 +165,6 @@ class EmployeeCancellationOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class TeamAttemptSnapshot:
-    status: str
-    output: str = ""
-    history_record_id: str = ""
-    error_code: str = ""
-
-
-@dataclass(frozen=True, slots=True)
 class EmployeeScopedAttemptStatus:
     """Minimal Journal-backed task counts for one authorized conversation."""
 
@@ -233,7 +221,8 @@ class EmployeeDispatchCoordinator:
         data_service: EmployeeDataService,
         data_sink: EmployeeDataSink | None = None,
         channel_supervisor: object,
-        team_runtime: object,
+        team_runtime: object | None = None,
+        session_host: object | None = None,
         context_service: object,
         environment_provider: EnvironmentProvider,
         registry_factory: RegistryFactory | None = None,
@@ -255,6 +244,8 @@ class EmployeeDispatchCoordinator:
         self._data_sink = data_sink
         self._channels = channel_supervisor
         self._team_runtime = team_runtime
+        self._owns_session_host = session_host is None
+        self._session_host = session_host or EmployeeSessionHost()
         self._context = context_service
         self._environment_provider = environment_provider
         self._registry_factory = registry_factory or ProjectedAgentRegistry
@@ -286,6 +277,35 @@ class EmployeeDispatchCoordinator:
         close = getattr(self._gateway, "close", None)
         if callable(close):
             close()
+        if self._owns_session_host:
+            self._session_host.close()
+
+    @contextmanager
+    def _resolve_execution_binding(self, *, chat_id: str, workspace_path: str):
+        if self._team_runtime is not None:
+            try:
+                guard = self._team_runtime.employee_activation_guard(chat_id=chat_id)
+                binding = guard.__enter__()
+            except Exception as exc:
+                raise _ExecutionCoordinateUnavailableError(str(exc)) from exc
+            try:
+                yield binding
+            except BaseException as exc:
+                if not guard.__exit__(type(exc), exc, exc.__traceback__):
+                    raise
+            else:
+                guard.__exit__(None, None, None)
+            return
+        if not isinstance(chat_id, str) or not chat_id:
+            raise _ExecutionCoordinateUnavailableError("team chat coordinate is required")
+        canonical_root = os.path.realpath(workspace_path or os.getcwd())
+        yield _DirectExecutionBinding(
+            engine_identity=hashlib.sha256(f"team\0{chat_id}".encode("utf-8")).hexdigest(),
+            chat_id=chat_id,
+            root_identity=hashlib.sha256(f"root\0{canonical_root}".encode("utf-8")).hexdigest(),
+            canonical_root=canonical_root,
+            engine=self._session_host,
+        )
 
     @property
     def state(self) -> GatewayProjectionState:
@@ -304,7 +324,7 @@ class EmployeeDispatchCoordinator:
         for _attempt in range(3):
             captured_head = self._presynchronize_domains()
             try:
-                with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
+                with self._dispatch_commit_guard(captured_head):
                     queued = tuple(
                         sorted(
                             (
@@ -547,59 +567,6 @@ class EmployeeDispatchCoordinator:
         grant = self._router.peek_dispatch_candidate()
         if grant is None:
             return None
-        part = (
-            grant.payload.normalized_parts[0]
-            if len(grant.payload.normalized_parts) == 1
-            else None
-        )
-        is_team_assignment = grant.record.event_type == "ghostap.team.assignment.v1"
-        team_instruction = ""
-        team_deadline: datetime | None = None
-        if is_team_assignment:
-            valid_team_part = isinstance(part, Mapping) and frozenset(part) == _TEAM_ASSIGNMENT_FIELDS
-            if valid_team_part:
-                team_instruction = part.get("team_instruction")  # type: ignore[assignment]
-                valid_team_part = (
-                    isinstance(team_instruction, str)
-                    and bool(team_instruction)
-                    and team_instruction == team_instruction.strip()
-                    and len(team_instruction) <= 14_000
-                    and part.get("type") == "team_assignment"
-                    and part.get("content") == team_instruction
-                    and all(
-                        isinstance(part.get(key), str)
-                        and bool(part.get(key))
-                        and part.get(key) == str(part.get(key)).strip()
-                        for key in (
-                            "sender_id",
-                            "sender_tenant_key",
-                            "team_run_id",
-                            "team_step_id",
-                        )
-                    )
-                )
-            if not valid_team_part:
-                self._router.reject_dispatch_candidate(
-                    grant.record.acceptance_id,
-                    reason_code="team_assignment_invalid",
-                )
-                return None
-            try:
-                team_deadline = parse_canonical_utc(
-                    part["team_deadline_at"], "team_deadline_at"
-                )
-            except (TypeError, ValueError):
-                self._router.reject_dispatch_candidate(
-                    grant.record.acceptance_id,
-                    reason_code="team_assignment_invalid",
-                )
-                return None
-            if not self._team_assignment_effect_is_active(part):
-                self._router.reject_dispatch_candidate(
-                    grant.record.acceptance_id,
-                    reason_code="team_step_inactive",
-                )
-                return None
         try:
             snapshot = self._context.assemble(grant.request)
         except ContextUnavailableError as exc:
@@ -612,15 +579,10 @@ class EmployeeDispatchCoordinator:
                     )
                     return None
                 try:
-                    causal_event_id = (
-                        f"{part['team_run_id']}:{part['team_step_id']}"
-                        if is_team_assignment
-                        else ""
-                    )
                     snapshot = partial(
                         grant.request,
                         warning_reason=exc.reason,
-                        causal_event_id=causal_event_id,
+                        causal_event_id="",
                     )
                 except ContextUnavailableError:
                     record = self._router.defer_dispatch_candidate(
@@ -644,12 +606,6 @@ class EmployeeDispatchCoordinator:
                 )
                 return None
         self._validate_context_watermark(grant.request, snapshot)
-        if team_deadline is not None and team_deadline <= self._clock():
-            self._router.reject_dispatch_candidate(
-                grant.record.acceptance_id,
-                reason_code="team_step_expired",
-            )
-            return None
 
         registry = self._registry_factory(self._hire.projection_state)
         employee = registry.get(grant.request.tenant_key, grant.request.agent_id)
@@ -669,11 +625,6 @@ class EmployeeDispatchCoordinator:
         if employee is None or agent is None or projected_binding is None:
             raise EmployeeDispatchError("employee authority is unavailable")
         system_instruction = agent.system_prompt
-        if team_instruction:
-            system_instruction = (
-                f"{system_instruction}\n\n## TEAM_COORDINATOR_INSTRUCTION\n"
-                f"{team_instruction}"
-            )
         try:
             current_message_override = None
             if grant.targeted_task is not None:
@@ -731,23 +682,15 @@ class EmployeeDispatchCoordinator:
         except Exception:
             raise EmployeeDispatchError("employee environment projection failed") from None
         captured_head = self._presynchronize_domains()
-        if team_instruction and not self._team_assignment_effect_is_active(part):
-            self._router.reject_dispatch_candidate(
-                grant.record.acceptance_id,
-                reason_code="team_step_inactive",
-            )
-            return None
-        # Detect a team stop committed during the lock-free effect scan before
-        # entering any Team activation boundary; the guarded check below is
-        # repeated to close later races as well.
         self._require_presynchronized_head(captured_head)
 
         try:
-            activation_context = self._team_runtime.employee_activation_guard(
-                chat_id=grant.request.chat_id,
-            )
-            with activation_context as team_binding, self._dispatch_commit_guard(
-                captured_head
+            with (
+                self._resolve_execution_binding(
+                    chat_id=grant.request.chat_id,
+                    workspace_path=agent.workspace_path,
+                ) as team_binding,
+                self._dispatch_commit_guard(captured_head),
             ):
                 current_registry = self._registry_factory(self._hire.projection_state)
                 current = current_registry.get(
@@ -839,28 +782,13 @@ class EmployeeDispatchCoordinator:
                 )
                 result = self._commit_events_unlocked(events)
                 self._apply_committed_frame_unlocked(result.frame)
-        except TeamRuntimeResolutionError:
+        except _ExecutionCoordinateUnavailableError:
             self._router.reject_dispatch_candidate(
                 grant.record.acceptance_id,
                 reason_code="team_unavailable",
             )
             return None
         timeout_seconds = self._timeout_seconds
-        if team_deadline is not None:
-            timeout_seconds = min(
-                timeout_seconds,
-                (team_deadline - self._clock()).total_seconds(),
-            )
-            if timeout_seconds <= 0:
-                self.finalize_attempt(
-                    binding.attempt_id,
-                    GatewayExecutionResult(
-                        GatewayExecutionStatus.TIMEOUT,
-                        safe_error_code="team_step_deadline_expired",
-                    ),
-                    request_text=rendered.prompt,
-                )
-                return None
         permit = self._gateway.issue_permit(
             binding=binding,
             prompt=rendered.prompt,
@@ -872,39 +800,6 @@ class EmployeeDispatchCoordinator:
         if self._attempt_lifecycle is not None:
             self._attempt_lifecycle.queued(binding)
         return PreparedEmployeeDispatch(binding, permit, rendered.prompt)
-
-    def _team_assignment_effect_is_active(
-        self,
-        part: Mapping[str, object] | None,
-    ) -> bool:
-        """Read the owning team effect before the Journal-head CAS section."""
-
-        if part is None:
-            return False
-        run_id = part.get("team_run_id")
-        step_id = part.get("team_step_id")
-        if not isinstance(run_id, str) or not run_id:
-            return False
-        if not isinstance(step_id, str) or not step_id:
-            return False
-        # The second coordinate is replay-only compatibility for historical
-        # journals. No active path writes the retired event shape.
-        effect_coordinates = {
-            (f"{run_id}:assignment:{step_id}", "team.v2.effect."),
-            (f"{run_id}:{step_id}", "team.effect."),
-        }
-        state = ""
-        for frame in self._writer.replay():
-            for event in frame.events:
-                if event.payload.get("effect_type") != "employee_dispatch":
-                    continue
-                for aggregate_id, event_prefix in effect_coordinates:
-                    if event.aggregate_id == aggregate_id and event.event_type.startswith(
-                        event_prefix
-                    ):
-                        state = event.event_type.rsplit(".", 1)[-1]
-                        break
-        return state in {"prepared", "executing"}
 
     def _presynchronize_domains(self) -> tuple[int, str]:
         """Perform potentially full projection repair before the commit section."""
@@ -970,57 +865,6 @@ class EmployeeDispatchCoordinator:
             result,
             request_text=prompt,
         )
-
-    def team_attempt_result(self, acceptance_id: str) -> TeamAttemptSnapshot | None:
-        """Read Router, Gateway, and History at one verified Journal head."""
-
-        if not isinstance(acceptance_id, str) or not acceptance_id.startswith("acc_"):
-            raise ValueError("team acceptance_id is required")
-        for _attempt in range(3):
-            captured_head = self._presynchronize_domains()
-            with self._projection_sync_lock:
-                gateway = self._gateway_state.clone()
-            router = self._router.state.clone()
-            attempt_id = gateway.attempt_by_acceptance_id.get(acceptance_id)
-            snapshot: TeamAttemptSnapshot | None = None
-            if attempt_id:
-                lifecycle = gateway.attempts.get(attempt_id)
-                if lifecycle is not None and lifecycle.terminal_status:
-                    try:
-                        payload = self._data.get_history_payload(
-                            lifecycle.history_record_id
-                        )
-                    except Exception:
-                        snapshot = TeamAttemptSnapshot(
-                            "action_required",
-                            history_record_id=lifecycle.history_record_id,
-                            error_code="team_history_unavailable",
-                        )
-                    else:
-                        completed = lifecycle.terminal_status == "completed"
-                        snapshot = TeamAttemptSnapshot(
-                            lifecycle.terminal_status,
-                            output=payload.result_text if completed else "",
-                            history_record_id=lifecycle.history_record_id,
-                            error_code="" if completed else payload.error_detail,
-                        )
-            if snapshot is None:
-                routed = router.by_acceptance_id.get(acceptance_id)
-                if routed is not None and routed.state == "terminal":
-                    status = {
-                        "team_step_expired": "timeout",
-                        "team_step_canceled": "canceled",
-                    }.get(routed.reason_code, "action_required")
-                    snapshot = TeamAttemptSnapshot(
-                        status,
-                        error_code=routed.reason_code,
-                    )
-            try:
-                self._require_presynchronized_head(captured_head)
-            except _ProjectionHeadChanged:
-                continue
-            return snapshot
-        raise EmployeeDispatchError("team attempt result head remained unstable")
 
     def dispatch_next(self) -> FinalizedEmployeeAttempt | None:
         prepared = self.prepare_next()
@@ -1122,48 +966,6 @@ class EmployeeDispatchCoordinator:
                 attempt_id=live[0].binding.attempt_id,
             )
 
-    def request_team_cancel(
-        self,
-        *,
-        acceptance_id: str,
-        team_run_id: str,
-        team_step_id: str,
-    ) -> EmployeeCancellationOutcome:
-        """Cancel only the attempt bound to the encrypted Team assignment owner."""
-
-        if not all(
-            isinstance(value, str) and value and value == value.strip()
-            for value in (acceptance_id, team_run_id, team_step_id)
-        ) or not acceptance_id.startswith("acc_"):
-            raise ValueError("team cancellation coordinates are required")
-        try:
-            payload = self._ingress.get_payload(acceptance_id)
-        except Exception:
-            raise EmployeeDispatchError("team cancellation authority unavailable") from None
-        part = (
-            payload.normalized_parts[0]
-            if len(payload.normalized_parts) == 1
-            else None
-        )
-        if (
-            not isinstance(part, Mapping)
-            or part.get("type") != "team_assignment"
-            or part.get("team_run_id") != team_run_id
-            or part.get("team_step_id") != team_step_id
-        ):
-            raise EmployeeDispatchError("team cancellation owner mismatch")
-        requester = part.get("sender_id")
-        if not isinstance(requester, str) or not requester:
-            raise EmployeeDispatchError("team cancellation requester unavailable")
-        with self._terminal_lock:
-            return self._anchor_cancellation(
-                requester_principal_id=requester,
-                command_acceptance_id=acceptance_id,
-                acceptance_id=acceptance_id,
-                queued_reason="team_step_canceled",
-                owner_is_active=lambda: self._team_assignment_effect_is_active(part),
-            )
-
     def _anchor_cancellation(
         self,
         *,
@@ -1179,7 +981,7 @@ class EmployeeDispatchCoordinator:
             captured_head = self._presynchronize_domains()
             owner_active = owner_is_active is None or owner_is_active()
             try:
-                with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
+                with self._dispatch_commit_guard(captured_head):
                     current_id = attempt_id or self._gateway_state.attempt_by_acceptance_id.get(
                         acceptance_id, ""
                     )
@@ -1269,7 +1071,7 @@ class EmployeeDispatchCoordinator:
             for _attempt in range(3):
                 captured_head = self._presynchronize_domains()
                 try:
-                    with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
+                    with self._dispatch_commit_guard(captured_head):
                         lifecycle = self._gateway_state.attempts.get(attempt_id)
                         if lifecycle is None:
                             raise EmployeeDispatchError(
@@ -1517,31 +1319,6 @@ class EmployeeDispatchCoordinator:
             "## Last Result\n\n"
             f"{output}"
         ).encode("utf-8")
-        skill_profile = json.dumps(
-            {
-                "agent_id": binding.agent_id,
-                "effort": binding.effort,
-                "last_attempt_id": binding.attempt_id,
-                "model": binding.model,
-                "profile": binding.profile,
-                "tool": binding.tool,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        reasoning = json.dumps(
-            {
-                "attempt_id": binding.attempt_id,
-                "request_digest": hashlib.sha256(request_text.encode("utf-8")).hexdigest(),
-                "result_digest": hashlib.sha256(result.output.encode("utf-8")).hexdigest(),
-                "status": result.status.value,
-                "task_id": binding.task_id,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
         documents = (
             (DataKind.L1_MEMORY, DataKind.L1_MEMORY.value, l1, "text/markdown", {}),
             (
@@ -1550,20 +1327,6 @@ class EmployeeDispatchCoordinator:
                 output.encode("utf-8"),
                 "text/markdown",
                 {"chat_id": binding.chat_id, "thread_root_id": binding.thread_root_id},
-            ),
-            (
-                DataKind.SKILL_PROFILE,
-                DataKind.SKILL_PROFILE.value,
-                skill_profile,
-                "application/json",
-                {},
-            ),
-            (
-                DataKind.REASONING,
-                binding.task_id,
-                reasoning,
-                "application/json",
-                {},
             ),
         )
         for kind, source_id, content, content_type, scope in documents:
@@ -1580,17 +1343,6 @@ class EmployeeDispatchCoordinator:
                     source_id=source_id,
                     content=content,
                     content_type=content_type,
-                )
-            )
-        enqueue_knowledge = getattr(sink, "enqueue_knowledge_terminal", None)
-        if callable(enqueue_knowledge):
-            enqueue_knowledge(
-                AuthenticatedExecutionTerminal(
-                    attempt_id=binding.attempt_id,
-                    status="completed",
-                    request_text=request_text,
-                    result_text=result.output,
-                    error_detail="",
                 )
             )
 

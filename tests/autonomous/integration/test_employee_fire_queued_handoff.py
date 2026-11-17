@@ -30,7 +30,6 @@ from src.autonomous.outbox.lifecycle import EmployeeOutboxLifecycle
 from src.autonomous.outbox.models import employee_outbox_id
 from src.autonomous.outbox.projection import OutboxProjectionState
 from src.autonomous.outbox.service import EmployeeOutboxService
-from src.autonomous.provisioning import hire_service
 from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 from src.autonomous.provisioning.fire_authority import JournalFireAuthority
 from src.autonomous.provisioning.fire_effects import (
@@ -562,9 +561,6 @@ def test_runtime_recovery_retries_transient_retirement_channel_start(
 
         def recover(self):
             return None
-
-        def recover_replay_safe_action_required(self):
-            return hire_service.ActionRequiredRecoveryResult(0, (), 0, 0)
 
         def list_states(self):
             return ()

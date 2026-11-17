@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -14,9 +14,6 @@ from ..journal.frame import JournalEvent, TransactionFrame
 
 class HireProjectionError(RuntimeError):
     """A durable hire event stream violates the Saga contract."""
-
-
-ACTIVATION_CHALLENGE_RENEWAL_LEAD_SECONDS = 30.0
 
 
 class HirePhase(str, Enum):
@@ -71,13 +68,7 @@ class DurableHireState:
     channel_identity_app_id: str = ""
     channel_connection_id: str = ""
     channel_verified_at: float = 0.0
-    verification_nonce: str = field(default="", repr=False)
-    verification_issued_at: float = 0.0
-    verification_expires_at: float = 0.0
     verification_consumed: bool = False
-    activation_ingress_event_id: str = ""
-    activation_ingress_message_id: str = ""
-    activation_send_request_id: str = ""
     activation_source: str = ""
     activation_verified_at: float = 0.0
     phase: HirePhase = HirePhase.PROVISIONING_APP
@@ -284,29 +275,7 @@ class HireProjection:
         bot_intents: dict[str, str] = {}
         existing_app_intents: dict[str, str] = {}
         for frame in frames:
-            phase_only_recovery_intents: set[str] = set()
-            phase_only_recovery_frame = any(
-                event.event_type == "hire.channel.phase_only_recovery"
-                for event in frame.events
-            )
-            if phase_only_recovery_frame:
-                if len(frame.events) % 2:
-                    raise HireProjectionError(
-                        "invalid phase-only channel recovery frame"
-                    )
-                for marker_index in range(0, len(frame.events), 2):
-                    marker = frame.events[marker_index]
-                    companion = frame.events[marker_index + 1]
-                    if (
-                        marker.event_type != "hire.channel.phase_only_recovery"
-                        or companion.event_type != "employee.state_changed"
-                        or companion.payload
-                        != {"state": HirePhase.VALIDATING.value}
-                    ):
-                        raise HireProjectionError(
-                            "invalid phase-only channel recovery frame"
-                        )
-            for event_index, event in enumerate(frame.events):
+            for event in frame.events:
                 created = _created_state(event, frame.sequence)
                 if created is not None:
                     if created.intent_id in states or created.agent_id in agent_intents:
@@ -363,38 +332,6 @@ class HireProjection:
                         last_sequence=frame.sequence,
                     )
                     continue
-                if event.event_type == "hire.channel.phase_only_recovery":
-                    generation = event.payload.get("generation")
-                    companion = (
-                        frame.events[event_index + 1]
-                        if phase_only_recovery_frame
-                        and event_index % 2 == 0
-                        else None
-                    )
-                    if (
-                        set(event.payload) != {"generation"}
-                        or event.aggregate_id != current.intent_id
-                        or current.phase is not HirePhase.ACTION_REQUIRED
-                        or isinstance(generation, bool)
-                        or not isinstance(generation, int)
-                        or generation <= 0
-                        or generation != current.channel_generation
-                        or companion is None
-                        or companion.event_type != "employee.state_changed"
-                        or companion.aggregate_id != current.agent_id
-                        or companion.payload
-                        != {"state": HirePhase.VALIDATING.value}
-                    ):
-                        raise HireProjectionError(
-                            "invalid phase-only channel recovery marker"
-                    )
-                    phase_only_recovery_intents.add(intent_id)
-                    states[intent_id] = replace(
-                        current,
-                        automatic_reactivation_generation=generation,
-                        last_sequence=frame.sequence,
-                    )
-                    continue
                 if event.event_type == "hire.requester_identity_bound":
                     if set(event.payload) != {"requester_union_id"}:
                         raise HireProjectionError("invalid requester identity payload")
@@ -423,17 +360,8 @@ class HireProjection:
                         phase = HirePhase(_required_string(event.payload, "state"))
                     except ValueError as exc:
                         raise HireProjectionError("invalid hire phase") from exc
-                    phase_only_recovery = (
-                        current.phase is HirePhase.ACTION_REQUIRED
-                        and phase is HirePhase.VALIDATING
-                        and intent_id in phase_only_recovery_intents
-                    )
-                    if (
-                        phase not in _ALLOWED_PHASE_SUCCESSORS[current.phase]
-                        and not phase_only_recovery
-                    ):
+                    if phase not in _ALLOWED_PHASE_SUCCESSORS[current.phase]:
                         raise HireProjectionError("invalid hire phase transition")
-                    phase_only_recovery_intents.discard(intent_id)
                     states[intent_id] = replace(
                         current,
                         phase=phase,
@@ -462,201 +390,6 @@ class HireProjection:
                         current,
                         app_id=app_id,
                         credential_ref=credential_ref,
-                        last_sequence=frame.sequence,
-                    )
-                    continue
-                if event.event_type in {
-                    "hire.verification.challenge_issued",
-                    "hire.verification.challenge_reissued",
-                }:
-                    expected_keys = {
-                        "tenant_key",
-                        "app_id",
-                        "agent_id",
-                        "generation",
-                        "requester_principal_id",
-                        "requester_union_id",
-                        "expected_slash_spec_hash",
-                        "nonce",
-                        "issued_at",
-                        "expires_at",
-                    }
-                    legacy_keys = expected_keys - {"requester_union_id"}
-                    if set(event.payload) != expected_keys and set(event.payload) != legacy_keys:
-                        raise HireProjectionError("invalid verification challenge payload")
-                    generation = event.payload["generation"]
-                    issued_at = event.payload["issued_at"]
-                    expires_at = event.payload["expires_at"]
-                    initial_challenge = (
-                        event.event_type == "hire.verification.challenge_issued"
-                        and current.phase is HirePhase.VALIDATING
-                    )
-                    renewed_challenge = (
-                        event.event_type == "hire.verification.challenge_issued"
-                        and current.phase is HirePhase.READY_PENDING_VERIFICATION
-                        and not current.verification_consumed
-                        and current.verification_expires_at > 0
-                        and isinstance(event.payload.get("nonce"), str)
-                        and event.payload.get("nonce") != current.verification_nonce
-                        and isinstance(issued_at, (int, float))
-                        and not isinstance(issued_at, bool)
-                        and float(issued_at)
-                        >= current.verification_expires_at
-                        - ACTIVATION_CHALLENGE_RENEWAL_LEAD_SECONDS
-                        and isinstance(expires_at, (int, float))
-                        and not isinstance(expires_at, bool)
-                        and float(expires_at) > current.verification_expires_at
-                    )
-                    audit_collision_reissue = (
-                        event.event_type == "hire.verification.challenge_reissued"
-                        and current.phase is HirePhase.READY_PENDING_VERIFICATION
-                        and not current.verification_consumed
-                        and current.verification_expires_at > 0
-                        and isinstance(event.payload.get("nonce"), str)
-                        and event.payload.get("nonce") != current.verification_nonce
-                        and isinstance(issued_at, (int, float))
-                        and not isinstance(issued_at, bool)
-                        and float(issued_at) > current.verification_issued_at
-                        and isinstance(expires_at, (int, float))
-                        and not isinstance(expires_at, bool)
-                        and float(expires_at) > float(issued_at)
-                    )
-                    if (
-                        event.aggregate_id != current.intent_id
-                        or not (
-                            initial_challenge
-                            or renewed_challenge
-                            or audit_collision_reissue
-                        )
-                        or event.payload["tenant_key"] != current.tenant_key
-                        or event.payload["app_id"] != current.app_id
-                        or event.payload["agent_id"] != current.agent_id
-                        or event.payload["requester_principal_id"]
-                        != current.requester_principal_id
-                        or (
-                            "requester_union_id" in event.payload
-                            and event.payload["requester_union_id"]
-                            != current.requester_union_id
-                        )
-                        or event.payload["expected_slash_spec_hash"]
-                        != current.slash_spec_hash
-                        or isinstance(generation, bool)
-                        or not isinstance(generation, int)
-                        or generation != current.channel_generation
-                        or isinstance(issued_at, bool)
-                        or not isinstance(issued_at, (int, float))
-                        or isinstance(expires_at, bool)
-                        or not isinstance(expires_at, (int, float))
-                        or expires_at <= issued_at
-                    ):
-                        raise HireProjectionError("invalid verification challenge binding")
-                    nonce = _required_string(event.payload, "nonce")
-                    states[intent_id] = replace(
-                        current,
-                        verification_nonce=nonce,
-                        verification_issued_at=float(issued_at),
-                        verification_expires_at=float(expires_at),
-                        verification_consumed=False,
-                        activation_ingress_event_id="",
-                        activation_ingress_message_id="",
-                        activation_send_request_id="",
-                        activation_source="",
-                        activation_verified_at=0.0,
-                        last_sequence=frame.sequence,
-                    )
-                    continue
-                if event.event_type == "hire.verification.nonce_consumed":
-                    if set(event.payload) != {"nonce", "consumed_at"}:
-                        raise HireProjectionError("invalid verification nonce payload")
-                    consumed_at = event.payload["consumed_at"]
-                    if (
-                        event.aggregate_id != current.intent_id
-                        or current.phase
-                        not in {
-                            HirePhase.CONFIGURING,
-                            HirePhase.VALIDATING,
-                            HirePhase.READY_PENDING_VERIFICATION,
-                        }
-                        or _required_string(event.payload, "nonce")
-                        != current.verification_nonce
-                        or isinstance(consumed_at, bool)
-                        or not isinstance(consumed_at, (int, float))
-                        or not (
-                            current.verification_issued_at
-                            <= float(consumed_at)
-                            <= current.verification_expires_at
-                        )
-                    ):
-                        raise HireProjectionError("invalid verification nonce consumption")
-                    states[intent_id] = replace(
-                        current,
-                        verification_consumed=True,
-                        last_sequence=frame.sequence,
-                    )
-                    continue
-                if event.event_type == "hire.activation.verified":
-                    expected_keys = {
-                        "tenant_key",
-                        "app_id",
-                        "agent_id",
-                        "generation",
-                        "nonce",
-                        "slash_spec_hash",
-                        "channel_connection_id",
-                        "ingress_event_id",
-                        "ingress_message_id",
-                        "employee_send_request_id",
-                        "reply_app_id",
-                        "main_bot_send_count",
-                        "sender_union_id",
-                        "verified_at",
-                    }
-                    legacy_keys = expected_keys - {"sender_union_id"}
-                    verified_at = event.payload.get("verified_at")
-                    if set(event.payload) != expected_keys and set(event.payload) != legacy_keys:
-                        raise HireProjectionError("invalid activation evidence payload")
-                    if (
-                        event.aggregate_id != current.intent_id
-                        or current.phase is not HirePhase.READY_PENDING_VERIFICATION
-                        or not current.verification_consumed
-                        or event.payload["tenant_key"] != current.tenant_key
-                        or event.payload["app_id"] != current.app_id
-                        or event.payload["agent_id"] != current.agent_id
-                        or event.payload["generation"] != current.channel_generation
-                        or event.payload["nonce"] != current.verification_nonce
-                        or event.payload["slash_spec_hash"] != current.slash_spec_hash
-                        or event.payload["channel_connection_id"]
-                        != current.channel_connection_id
-                        or event.payload["reply_app_id"] != current.app_id
-                        or event.payload["main_bot_send_count"] != 0
-                        or (
-                            "sender_union_id" in event.payload
-                            and event.payload["sender_union_id"]
-                            != current.requester_union_id
-                        )
-                        or isinstance(verified_at, bool)
-                        or not isinstance(verified_at, (int, float))
-                        or not math.isfinite(float(verified_at))
-                        or not (
-                            current.verification_issued_at
-                            <= float(verified_at)
-                            <= current.verification_expires_at
-                        )
-                    ):
-                        raise HireProjectionError("invalid activation evidence binding")
-                    states[intent_id] = replace(
-                        current,
-                        activation_ingress_event_id=_required_string(
-                            event.payload, "ingress_event_id"
-                        ),
-                        activation_ingress_message_id=_required_string(
-                            event.payload, "ingress_message_id"
-                        ),
-                        activation_send_request_id=_required_string(
-                            event.payload, "employee_send_request_id"
-                        ),
-                        activation_source="status",
-                        activation_verified_at=float(verified_at),
                         last_sequence=frame.sequence,
                     )
                     continue
@@ -813,15 +546,10 @@ class HireProjection:
                     channel_verified_at=channel_verified_at,
                     last_sequence=frame.sequence,
                 )
-            if phase_only_recovery_intents:
-                raise HireProjectionError(
-                    "phase-only channel recovery marker was not consumed"
-                )
         return cls(MappingProxyType(states))
 
 
 __all__ = [
-    "ACTIVATION_CHALLENGE_RENEWAL_LEAD_SECONDS",
     "DurableHireState",
     "HireEffectState",
     "HirePhase",
