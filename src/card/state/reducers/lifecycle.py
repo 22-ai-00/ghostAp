@@ -111,36 +111,59 @@ def _archived_status_text(payload: dict) -> str:
     return UI_TEXT["card_lifecycle_archived"]
 
 
-def _running_buttons(engine_type: str | None, compact: bool = False) -> tuple[ButtonSpec, ...]:
+def _running_buttons(
+    engine_type: str | None,
+    compact: bool = False,
+    *,
+    allow_programming_stop: bool = False,
+) -> tuple[ButtonSpec, ...]:
     """Build buttons for running state (stop button + mode toggle).
 
     Mode toggle button shows target mode with current state context:
     - In compact mode: button says "切换完整模式" (switch TO full)
     - In full mode: button says "切换精简模式" (switch TO compact)
     """
-    if not engine_type or engine_type not in _STOP_ACTIONS:
-        return ()
-    mode_btn = ButtonSpec(
-        text=UI_TEXT["card_btn_mode_full"] if compact else UI_TEXT["card_btn_mode_compact"],
-        action_id=ButtonIntent.MODE_FULL if compact else ButtonIntent.MODE_COMPACT,
-        type="default",
-    )
-    stop_btn = ButtonSpec(
-        text=UI_TEXT["card_btn_stop"],
-        action_id=_STOP_ACTIONS[engine_type],
-        type="default",
-        confirm=UI_TEXT["card_btn_stop_confirm"],
-    )
-    return (mode_btn, stop_btn)
+    if engine_type and engine_type in _STOP_ACTIONS:
+        mode_btn = ButtonSpec(
+            text=UI_TEXT["card_btn_mode_full"] if compact else UI_TEXT["card_btn_mode_compact"],
+            action_id=ButtonIntent.MODE_FULL if compact else ButtonIntent.MODE_COMPACT,
+            type="default",
+        )
+        stop_btn = ButtonSpec(
+            text=UI_TEXT["card_btn_stop"],
+            action_id=_STOP_ACTIONS[engine_type],
+            type="default",
+            confirm=UI_TEXT["card_btn_stop_confirm"],
+        )
+        return (mode_btn, stop_btn)
+    if not engine_type and allow_programming_stop:
+        return (
+            ButtonSpec(
+                text=UI_TEXT["card_btn_stop"],
+                action_id=ButtonIntent.PROGRAMMING_STOP,
+                type="default",
+                confirm=UI_TEXT["card_btn_stop_confirm"],
+            ),
+        )
+    return ()
 
 
-def _stopping_buttons(engine_type: str | None) -> tuple[ButtonSpec, ...]:
+def _stopping_buttons(
+    engine_type: str | None,
+    *,
+    allow_programming_stop: bool = False,
+) -> tuple[ButtonSpec, ...]:
     """Build disabled stop button for STOPPING intermediate state."""
-    if not engine_type or engine_type not in _STOP_ACTIONS:
+    stop_action: str | None = None
+    if engine_type and engine_type in _STOP_ACTIONS:
+        stop_action = _STOP_ACTIONS[engine_type]
+    elif not engine_type and allow_programming_stop:
+        stop_action = ButtonIntent.PROGRAMMING_STOP
+    if stop_action is None:
         return ()
     return (ButtonSpec(
         text=UI_TEXT["card_btn_stop"],
-        action_id=_STOP_ACTIONS[engine_type],
+        action_id=stop_action,
         type="default",
         disabled=True,
         disabled_text=UI_TEXT.get("card_btn_stopping", "正在停止…"),
@@ -151,12 +174,17 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
     """Handle lifecycle events: STARTED, COMPLETED, FAILED, CANCELLED, PAUSED, RESUMED."""
     payload = event.payload or {}
     now = payload.get("_now") if payload else None
+    allow_prog_stop = bool(state.metadata.allow_programming_stop and not state.metadata.is_subagent)
     match event.type:
         case CardEventType.STARTED:
             header = build_header(state.metadata, "running")
             return replace(state, terminal="running", header=header,
                            footer=FooterState(status="thinking", status_text=UI_TEXT["card_lifecycle_thinking"]),
-                           buttons=_running_buttons(state.metadata.engine_type, state.metadata.compact))
+                           buttons=_running_buttons(
+                               state.metadata.engine_type,
+                               state.metadata.compact,
+                               allow_programming_stop=allow_prog_stop,
+                           ))
 
         case CardEventType.STOPPING:
             # Intermediate state: user clicked stop, awaiting engine acknowledgement
@@ -172,7 +200,14 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                 warning_banner=_stopping_status,
                 warning_type="info",
             )
-            return replace(state, buttons=_stopping_buttons(state.metadata.engine_type), footer=footer)
+            return replace(
+                state,
+                buttons=_stopping_buttons(
+                    state.metadata.engine_type,
+                    allow_programming_stop=allow_prog_stop,
+                ),
+                footer=footer,
+            )
 
         case CardEventType.COMPLETED:
             # Idempotency guard: prevent duplicate terminal transitions
@@ -391,7 +426,11 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
             header = build_header(state.metadata, "running")
             return replace(state, terminal="running", header=header,
                            footer=FooterState(status="thinking", status_text=UI_TEXT["card_lifecycle_thinking"]),
-                           buttons=_running_buttons(state.metadata.engine_type, state.metadata.compact))
+                           buttons=_running_buttons(
+                               state.metadata.engine_type,
+                               state.metadata.compact,
+                               allow_programming_stop=allow_prog_stop,
+                           ))
 
         case CardEventType.BLOCKED:
             header = build_header(state.metadata, "blocked")
@@ -414,7 +453,11 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
             new_meta = replace(state.metadata, compact=compact)
             # Only update buttons if currently running (non-terminal or running terminal)
             if state.terminal == "running":
-                new_buttons = _running_buttons(new_meta.engine_type, compact)
+                new_buttons = _running_buttons(
+                    new_meta.engine_type,
+                    compact,
+                    allow_programming_stop=bool(new_meta.allow_programming_stop and not new_meta.is_subagent),
+                )
             else:
                 new_buttons = state.buttons
             return replace(state, metadata=new_meta, buttons=new_buttons)
@@ -422,11 +465,16 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
         case CardEventType.STOP_ESCALATED:
             # Escalate: replace buttons with danger force-stop button
             engine_type = state.metadata.engine_type
-            if not engine_type or engine_type not in _STOP_ACTIONS:
+            stop_action = None
+            if engine_type and engine_type in _STOP_ACTIONS:
+                stop_action = _STOP_ACTIONS[engine_type]
+            elif not engine_type and allow_prog_stop:
+                stop_action = ButtonIntent.PROGRAMMING_STOP
+            if stop_action is None:
                 return state
             force_buttons = (ButtonSpec(
                 text=UI_TEXT.get("card_btn_force_stop", "⚠️ 强制停止"),
-                action_id=_STOP_ACTIONS[engine_type],
+                action_id=stop_action,
                 type="danger",
                 confirm=UI_TEXT.get("card_btn_confirm_stop_title_danger", "强制停止当前任务"),
             ),)

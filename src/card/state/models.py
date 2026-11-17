@@ -65,6 +65,7 @@ class CardMetadata:
     live_ticker_frame: str | None = None
     subagents: tuple[dict, ...] = ()
     programming_text_sections: bool = False
+    allow_programming_stop: bool = False
     # Ordinary programming cards use a semantic continuation boundary instead
     # of the generic reducer's raw 100-block/50-tool retention window.
     retain_full_history: bool = False

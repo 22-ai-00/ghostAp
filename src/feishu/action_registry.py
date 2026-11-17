@@ -262,5 +262,6 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
             logger.warning("engine_stop rejected: unknown engine_type=%s", engine_type)
 
     actions[action_ids.ENGINE_STOP] = _handle_engine_stop
+    actions[action_ids.PROGRAMMING_STOP] = system.handle_programming_stop
     _REGISTERED_ACTION_TYPES = frozenset(actions)
     return actions

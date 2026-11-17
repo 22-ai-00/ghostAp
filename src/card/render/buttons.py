@@ -9,6 +9,7 @@ from src.card.actions.dispatch import (
     ENGINE_STOP,
     MODE_COMPACT,
     MODE_FULL,
+    PROGRAMMING_STOP,
     SHOW_STATUS,
     SPEC_STOP,
 )
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 INTENT_TO_ACTION_ID: dict[str, str] = {
     ButtonIntent.SPEC_STOP: SPEC_STOP,
     ButtonIntent.ENGINE_STOP: ENGINE_STOP,
+    ButtonIntent.PROGRAMMING_STOP: PROGRAMMING_STOP,
     ButtonIntent.MODE_FULL: MODE_FULL,
     ButtonIntent.MODE_COMPACT: MODE_COMPACT,
     ButtonIntent.SHOW_STATUS: SHOW_STATUS,
@@ -32,10 +34,11 @@ if _missing_intents:
     raise RuntimeError(f"Button intents without action mapping: {sorted(_missing_intents)}")
 del _missing_intents
 
-_DESTRUCTIVE_ACTIONS = frozenset({ENGINE_STOP, SPEC_STOP})
+_DESTRUCTIVE_ACTIONS = frozenset({ENGINE_STOP, SPEC_STOP, PROGRAMMING_STOP})
 _CONFIRM_TITLE_MAP = {
     ButtonIntent.ENGINE_STOP: "card_btn_confirm_stop_title_normal",
     ButtonIntent.SPEC_STOP: "card_btn_confirm_stop_title_normal",
+    ButtonIntent.PROGRAMMING_STOP: "card_btn_confirm_stop_title_normal",
 }
 _LEADING_EMOJI_RE = re.compile(
     r"^[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+\s*"

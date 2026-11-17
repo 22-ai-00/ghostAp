@@ -105,6 +105,8 @@ class _ActiveProgrammingRun:
     events: deque[str] = field(
         default_factory=lambda: deque(maxlen=_BTW_EVENT_LIMIT)
     )
+    session: object | None = field(default=None, repr=False)
+    prog_session: object | None = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _btw_inflight: bool = field(default=False, repr=False)
 
@@ -1736,6 +1738,9 @@ class ProgrammingModeHandler(BaseHandler):
         image_failures = [0]
         child_lifecycle_proof = AuthoritativeChildLifecycleProof()
         active_run = self._get_active_programming_run(chat_id, project)
+        if active_run is not None:
+            active_run.session = session
+            active_run.prog_session = prog_session
         def on_event(event) -> None:
             update_count[0] += 1
             child_lifecycle_proof.observe_event(event)
@@ -1793,6 +1798,8 @@ class ProgrammingModeHandler(BaseHandler):
                 startup_budget_s=startup_budget_s,
             )
             active_session[0] = replacement
+            if active_run is not None:
+                active_run.session = replacement
             return replacement
 
         def _retire_session(
@@ -1820,6 +1827,8 @@ class ProgrammingModeHandler(BaseHandler):
             window_prompt: str,
         ):
             active_session[0] = window_session
+            if active_run is not None:
+                active_run.session = window_session
             return run_prompt_with_continuation(
                 window_session,
                 window_prompt,
@@ -2147,6 +2156,7 @@ class ProgrammingModeHandler(BaseHandler):
         try:
             if project:
                 final_session = active_session[0]
+                raw_user_text = _finalization_task_text or text
                 if (
                     id(final_session) in retired_session_objects
                     or getattr(final_session, "_force_dead", False) is True
@@ -2156,20 +2166,22 @@ class ProgrammingModeHandler(BaseHandler):
                 else:
                     self._update_snapshot_on_project(
                         project,
-                        text,
+                        raw_user_text,
                         final_session.message_count,
                         final_session.session_id,
                     )
-                project.add_conversation("user", text, message_id)
+                project.add_conversation("user", raw_user_text, message_id)
                 project.add_conversation("assistant", final_response)
                 source = (
                     self.context_source.value
                     if isinstance(self.context_source, ContextSourceMode)
                     else self.mode_key
                 )
+                modified_files = sorted(getattr(result, "modified_files", None) or ())
                 self.context_manager.update_context(
                     project.project_id,
-                    conversation={"role": "user", "content": text, "source_mode": source, "message_id": message_id},
+                    conversation={"role": "user", "content": raw_user_text, "source_mode": source, "message_id": message_id},
+                    file_changes=modified_files or None,
                     chat_id=chat_id,
                 )
                 self.context_manager.update_context(
@@ -2202,6 +2214,79 @@ class ProgrammingModeHandler(BaseHandler):
             _root_path=_root_path,
             _finalization_task_text=_finalization_task_text,
         )
+
+    def stop_active_run(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        """Cancel the running prompt immediately without exiting programming mode."""
+        from ...thread import get_current_thread_id
+
+        if thread_id is None:
+            thread_id = get_current_thread_id()
+        pid = project.project_id if project else None
+        cancelled = False
+
+        active_run = self._get_active_programming_run(chat_id, project)
+        if active_run is not None:
+            cancelled = True
+            prog_session = getattr(active_run, "prog_session", None)
+            if prog_session is not None and callable(getattr(prog_session, "mark_stopping", None)):
+                try:
+                    prog_session.mark_stopping()
+                except Exception:
+                    logger.debug("Failed to mark active programming card stopping", exc_info=True)
+            run_session = getattr(active_run, "session", None)
+            if run_session is not None and callable(getattr(run_session, "cancel", None)):
+                try:
+                    run_session.cancel(wait=False)
+                except Exception:
+                    logger.debug("Failed to cancel active programming run session", exc_info=True)
+
+        manager = self._get_session_manager()
+        if manager is not None and callable(getattr(manager, "cancel_session", None)):
+            try:
+                if manager.cancel_session(chat_id, project_id=pid, thread_id=thread_id, wait=False):
+                    cancelled = True
+            except Exception:
+                logger.debug("Failed to cancel managed programming session", exc_info=True)
+        return cancelled
+
+    def clear_session_context(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Reset conversation & live session while preserving mode, tool, and model."""
+        from ...thread import get_current_thread_id
+
+        if thread_id is None:
+            thread_id = get_current_thread_id()
+        pid = project.project_id if project else None
+        manager = self._get_session_manager()
+        if manager is not None and callable(getattr(manager, "end_session", None)):
+            try:
+                manager.end_session(chat_id, project_id=pid, thread_id=thread_id)
+            except Exception:
+                logger.debug("Failed to end session during clear_session_context", exc_info=True)
+        if project is not None:
+            if hasattr(project, "clear_session_state"):
+                project.clear_session_state(self.mode_key)
+            else:
+                history = getattr(project, "conversation_history", None)
+                if isinstance(history, list):
+                    history.clear()
+            store = getattr(self.context_manager, "store", None)
+            if store is not None and callable(getattr(store, "clear", None)):
+                try:
+                    store.clear(pid, chat_id=chat_id)
+                except TypeError:
+                    pass
 
     # ------------------------------------------------------------------
     # show_info

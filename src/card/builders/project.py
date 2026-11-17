@@ -190,6 +190,7 @@ class ProjectBuilder:
         footer: Optional[str] = None,
         image_keys: Optional[list[str]] = None,
         banner: Optional[dict] = None,
+        working_dir: Optional[str] = None,
     ) -> tuple[str, str]:
         effective_mode = resolve_project_programming_mode(project)
 
@@ -197,6 +198,7 @@ class ProjectBuilder:
             project,
             title,
             content,
+            working_dir=working_dir,
             show_buttons=show_buttons,
             mode=effective_mode,
             extra_buttons=extra_buttons,

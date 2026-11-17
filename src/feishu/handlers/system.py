@@ -22,7 +22,7 @@ from ...acp.native_commands import (
     resolve_smart_mode_native_command,
 )
 from ...acp.providers import get_providers  # noqa: F401
-from ...card.backend_meta import VISIBLE_BACKEND_METAS
+from ...card.backend_meta import VISIBLE_BACKEND_METAS, get_backend_meta
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
 from ...card.ui_text import UI_TEXT
@@ -289,6 +289,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, t, p),
             "/cmds": lambda m, c, t, p: self.show_tool_commands(m, c, t, p),
+            "/stop": lambda m, c, t, p: self.stop_current_task(m, c, p),
+            "/clear": lambda m, c, t, p: self.handle_clear_command(m, c, p),
+            "/reset": lambda m, c, t, p: self.handle_clear_command(m, c, p),
+            "/sh": lambda m, c, t, p: self.handle_sh_command(m, c, "", p),
+            "/shell": lambda m, c, t, p: self.handle_sh_command(m, c, "", p),
+            "/ask": lambda m, c, t, p: self.handle_ask_command(m, c, "", p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
             "/tools_status": lambda m, c, t, p: self.show_tools_status(m, c, p),
@@ -847,6 +853,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/trace",
             "/acp",
             "/cmds",
+            "/stop",
+            "/clear",
+            "/reset",
+            "/sh",
+            "/shell",
+            "/ask",
             "/menu",
             "/tools",
             "/tools_status",
@@ -873,6 +885,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/new",
             "/new-chat",
             "/close",
+            "/sh",
+            "/shell",
+            "/ask",
+            "/clear",
+            "/reset",
             "/tasks",
             "/diff",
             "/trace",
@@ -991,6 +1008,15 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             return
         if text_lower == "/close":
             self._handle_close_args(message_id, chat_id, m.args)
+            return
+        if text_lower == "/clear":
+            self.handle_clear_command(message_id, chat_id, project)
+            return
+        if text_lower == "/sh":
+            self.handle_sh_command(message_id, chat_id, m.args, project)
+            return
+        if text_lower == "/ask":
+            self.handle_ask_command(message_id, chat_id, m.args, project)
             return
         if text_lower in self._DIRECT_TOOL_COMMAND_TO_MODE:
             self._handle_direct_mode_enter_with_args(
@@ -1146,6 +1172,254 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     # /model command — list/switch models for current ACP tool
     # ------------------------------------------------------------------
 
+
+    # ------------------------------------------------------------------
+    # Session controls (/stop, /clear, /sh, /ask)
+    # ------------------------------------------------------------------
+    def stop_current_task(
+        self,
+        message_id: str,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Cancel any active running task immediately while staying in current mode."""
+        active_key = self._resolve_active_programming_mode_key(chat_id, project)
+        if active_key:
+            try:
+                handler = self.get_handler(active_key)
+            except Exception:
+                handler = None
+            if handler is not None and callable(getattr(handler, "stop_active_run", None)):
+                if handler.stop_active_run(chat_id, project):
+                    self.reply_text(message_id, UI_TEXT["system_stop_sent_keep_mode"])
+                    return
+
+        # Fallback: stop any running engine lane (Workflow / Deep / Spec) in this context
+        try:
+            wf_mgr = getattr(self.ctx, "workflow_engine_manager", None)
+            wf_handler = self.get_handler("workflow")
+        except Exception:
+            wf_mgr, wf_handler = None, None
+        if wf_mgr is not None and wf_handler is not None and callable(getattr(wf_mgr, "get", None)):
+            root_path = project.root_path if project else self.get_working_dir(chat_id)
+            wf_engine = wf_mgr.get(chat_id, root_path)
+            if wf_engine is not None and getattr(getattr(wf_engine, "status", None), "value", None) not in {
+                "completed",
+                "failed",
+                "cancelled",
+                None,
+            }:
+                wf_handler.stop_workflow(message_id, chat_id, project)
+                return
+
+        try:
+            deep_mgr = getattr(self.ctx, "deep_engine_manager", None)
+            deep_handler = self.get_handler("deep")
+        except Exception:
+            deep_mgr, deep_handler = None, None
+        if deep_mgr is not None and deep_handler is not None and callable(getattr(deep_mgr, "list_engines", None)):
+            engines = deep_mgr.list_engines(chat_id)
+            if isinstance(engines, list) and any(
+                getattr(getattr(getattr(e, "project", None), "status", None), "value", None)
+                in {"executing", "running", "planning", "analyzing"}
+                for e in engines
+            ):
+                deep_handler.stop_deep_engine(message_id, chat_id, project)
+                return
+
+        try:
+            spec_mgr = getattr(self.ctx, "spec_engine_manager", None)
+            spec_handler = self.get_handler("spec")
+        except Exception:
+            spec_mgr, spec_handler = None, None
+        if spec_mgr is not None and spec_handler is not None and callable(getattr(spec_mgr, "list_engines", None)):
+            engines = spec_mgr.list_engines(chat_id)
+            if isinstance(engines, list) and any(
+                getattr(getattr(getattr(e, "project", None), "status", None), "value", None)
+                in {"executing", "running", "planning", "analyzing"}
+                for e in engines
+            ):
+                spec_handler.stop_spec_engine(message_id, chat_id, project)
+                return
+
+        self.reply_text(message_id, UI_TEXT["system_stop_nothing_running"])
+
+    def handle_programming_stop(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: Optional[str],
+        value: dict,
+    ) -> None:
+        """Card callback stopping an active ordinary programming run cleanly."""
+        project = self._action_project(chat_id, project_id) if project_id else (
+            self.project_manager.get_active_project(chat_id)
+        )
+        thread_id = (value or {}).get("thread_id")
+        candidates: list[str] = []
+        active_key = self._resolve_active_programming_mode_key(chat_id, project)
+        if active_key:
+            candidates.append(active_key)
+        for fallback in (
+            str((value or {}).get("tool_name") or "").strip().lower(),
+            getattr(project, "acp_tool_name", None) if project else None,
+        ):
+            if fallback and fallback in PROGRAMMING_MODE_VALUES and fallback not in candidates:
+                candidates.append(fallback)
+        for key in PROGRAMMING_MODE_VALUES:
+            if key not in candidates:
+                candidates.append(key)
+
+        for key in candidates:
+            try:
+                handler = self.get_handler(key)
+            except Exception:
+                handler = None
+            if handler is not None and callable(getattr(handler, "stop_active_run", None)):
+                if handler.stop_active_run(chat_id, project, thread_id=thread_id):
+                    self.reply_text(message_id, UI_TEXT["system_stop_sent_keep_mode"])
+                    return
+        self.reply_text(message_id, UI_TEXT["system_stop_nothing_running"])
+
+    def handle_clear_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Clear session & context history while preserving active tool, model, and mode."""
+        target_project = project or self.project_manager.get_active_project(chat_id)
+        active_key = self._resolve_active_programming_mode_key(chat_id, target_project)
+        target_tool = active_key or self._resolve_current_acp_tool(chat_id, target_project)
+        try:
+            handler = self.get_handler(target_tool)
+        except Exception:
+            handler = None
+        if handler is not None and callable(getattr(handler, "clear_session_context", None)):
+            handler.clear_session_context(chat_id, target_project)
+        if target_project is not None and callable(getattr(self.project_manager, "save_projects", None)):
+            self.project_manager.save_projects()
+        saved_model = getattr(target_project, "acp_model_name", None) if target_project else None
+        self.reply_text(
+            message_id,
+            UI_TEXT["system_clear_done"].format(tool=target_tool, model=saved_model or "default"),
+        )
+
+    def handle_sh_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        args: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Execute a one-off shell command even inside programming mode."""
+        cmd = str(args or "").strip()
+        if not cmd:
+            self.reply_text(message_id, UI_TEXT["system_sh_usage"])
+            return
+        cwd = (
+            project.root_path
+            if project is not None and getattr(project, "root_path", None)
+            else None
+        ) or self.get_working_dir(chat_id)
+        self.add_reaction(message_id, EmojiReaction.on_processing())
+        self.submit_shell_command(message_id, chat_id, cmd, cwd, project)
+
+    def handle_ask_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        args: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Ask a second-opinion question via a temporary session without altering mode or config."""
+        raw = str(args or "").strip()
+        parts = raw.split(maxsplit=1) if raw else []
+        if len(parts) < 2 or not parts[1].strip():
+            self.reply_text(message_id, UI_TEXT["system_ask_usage"])
+            return
+
+        token, question = parts[0].strip(), parts[1].strip()
+        tool_name = normalize_native_tool_key(token)
+        if tool_name not in STATIC_TOOL_NATIVE_COMMANDS and tool_name not in PROGRAMMING_MODE_VALUES:
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_acp_unsupported_tool"].format(tool_name=token),
+            )
+            return
+
+        if is_blocked_native_command(question):
+            parsed = parse_slash_command(question)
+            blocked_name = parsed[0] if parsed else question.lstrip("/").split(maxsplit=1)[0].casefold()
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
+            )
+            return
+
+        if not is_programming_tool_available(
+            tool_name,
+            allow_sync_probe=True,
+            trigger_async_probe=False,
+        ):
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_ask_tool_unavailable"].format(tool=tool_name),
+            )
+            return
+
+        from ...agent_session import close_session_safely, create_auxiliary_session
+        from ...utils.errors import get_error_detail
+
+        target_project = project or self.project_manager.get_active_project(chat_id)
+        cwd = (
+            target_project.root_path
+            if target_project is not None and getattr(target_project, "root_path", None)
+            else None
+        ) or self.get_working_dir(chat_id)
+        model_name = (
+            getattr(target_project, "acp_model_name", None)
+            if target_project is not None and getattr(target_project, "acp_tool_name", None) == tool_name
+            else None
+        )
+        self.add_reaction(message_id, EmojiReaction.on_processing())
+        aux_session = None
+        try:
+            startup_timeout = max(
+                5.0,
+                float(getattr(self.settings, "acp_startup_timeout", 30) or 30),
+            )
+            aux_session = create_auxiliary_session(
+                agent_type=tool_name,
+                cwd=cwd,
+                model_name=model_name,
+                thread_id=f"ask-{message_id}",
+                startup_timeout=startup_timeout,
+                startup_retries=1,
+                startup_log_failures=False,
+            )
+            prompt_text = (
+                question
+                if parse_slash_command(question) is not None
+                else f"请以只读咨询助手的身份直接回答以下问题，不要修改任何工作区文件：\n\n{question}"
+            )
+            result = aux_session.send_prompt(prompt_text, timeout=120)
+            answer = (getattr(result, "text", None) or "").strip() or UI_TEXT["mode_exec_complete"]
+            meta = get_backend_meta(tool_name)
+            tool_display = meta.display_name if meta else tool_name.capitalize()
+            _, card_content = ProjectBuilder.build_smart_response_card(
+                project=target_project,
+                title=UI_TEXT["system_ask_title"].format(tool=tool_display),
+                content=answer,
+                working_dir=cwd,
+                show_buttons=False,
+            )
+            self.reply_card(message_id, card_content)
+        except Exception as exc:
+            self.reply_error(message_id, get_error_detail(exc))
+        finally:
+            if aux_session is not None:
+                close_session_safely(aux_session, timeout=2.0)
 
     # ------------------------------------------------------------------
     # Exit current mode

@@ -8,7 +8,7 @@ from typing import Deque, Optional
 from ..tasking import TaskEvent, TaskPriority, TaskSpec, TaskStatus
 
 logger = logging.getLogger(__name__)
-_SYSTEM_GATE_TASK_TYPES = frozenset({"system_help", "system_exit"})
+_SYSTEM_GATE_TASK_TYPES = frozenset({"system_help", "system_exit", "system_stop"})
 
 @dataclass(frozen=True)
 class _PendingExit:

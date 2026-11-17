@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -196,6 +197,31 @@ class UnifiedContext:
             )
         )
 
+    def add_file_changes(
+        self,
+        files: Iterable[str],
+        source_mode: ContextSourceMode,
+    ) -> list[ContextEntry]:
+        """Record deduplicated modified file paths into the unified context stream."""
+        added: list[ContextEntry] = []
+        seen: set[str] = set()
+        for raw_path in files:
+            path = str(raw_path or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            added.append(
+                self.add_entry(
+                    ContextEntry(
+                        entry_type=ContextEntryType.FILE_CHANGE,
+                        source_mode=source_mode,
+                        content=path,
+                        metadata={"path": path},
+                    )
+                )
+            )
+        return added
+
     def get_entries_by_type(
         self,
         entry_type: ContextEntryType,
@@ -327,6 +353,8 @@ class ProjectContextManager:
         session_snapshot: Optional[dict] = None,
         mode_transition: Optional[dict] = None,
         deep_result: Optional[dict] = None,
+        file_changes: Optional[Iterable[str]] = None,
+        source_mode: Optional[str] = None,
         chat_id: str = "",
     ) -> int:
         """Append the production context payloads and return the added count."""
@@ -362,4 +390,16 @@ class ProjectContextManager:
         if deep_result:
             context.add_deep_engine_result(deep_result["data"])
             added += 1
+        if file_changes:
+            raw_source = (
+                source_mode
+                or (conversation.get("source_mode") if conversation else None)
+                or (session_snapshot.get("source_mode") if session_snapshot else None)
+            )
+            added += len(
+                context.add_file_changes(
+                    file_changes,
+                    self._source(raw_source, ContextSourceMode.SMART),
+                )
+            )
         return added

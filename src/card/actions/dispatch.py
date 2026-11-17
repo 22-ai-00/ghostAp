@@ -19,6 +19,7 @@ SPEC_STOP = "spec_stop"  # Force-stop current Spec engine execution
 # Generic engine actions
 # ---------------------------------------------------------------------------
 ENGINE_STOP = "engine_stop"  # Generic stop — routed by engine_type at dispatch time
+PROGRAMMING_STOP = "programming_stop"  # Stop active ordinary programming turn without exiting mode
 ENGINE_RESTART = "engine_restart"  # Restart engine after TTL timeout or completion
 TTL_KEEP_ALIVE = "ttl_keep_alive"  # User requests to keep session alive (reset idle timer)
 MODE_FULL = "mode_full"  # Switch card to full (detailed) view mode
@@ -112,4 +113,5 @@ def build_common_action_registry() -> dict[str, Callable[[dict], CardEvent]]:
         MODE_FULL: lambda p: CardEvent.mode_toggled(compact=False),
         MODE_COMPACT: lambda p: CardEvent.mode_toggled(compact=True),
         ENGINE_STOP: lambda p: CardEvent(type=CardEventType.STOPPING),
+        PROGRAMMING_STOP: lambda p: CardEvent(type=CardEventType.STOPPING),
     }

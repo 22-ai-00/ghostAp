@@ -353,6 +353,20 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
             {"tag": "markdown", "content": " · ".join(meta_parts), "text_size": "notation"}
         )
 
+    if (
+        not state.metadata.is_subagent
+        and not state.metadata.engine_type
+        and state.metadata.allow_programming_stop
+        and state.terminal == "running"
+        and elapsed_seconds is not None
+        and elapsed_seconds >= 20
+    ):
+        hint_text = UI_TEXT.get("card_footer_running_controls_hint")
+        if hint_text:
+            elements.append(
+                {"tag": "markdown", "content": hint_text, "text_size": "notation"}
+            )
+
     # Blocked reason as visible text below footer status
     if (
         not state.metadata.is_subagent

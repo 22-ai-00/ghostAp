@@ -131,6 +131,7 @@ def build_programming_metadata(
         engine_type=None,  # Programming mode is not an engine
         working_dir=working_dir,
         programming_text_sections=True,
+        allow_programming_stop=True,
         retain_full_history=True,
     )
 
@@ -589,6 +590,10 @@ class ProgrammingCardSession:
                     for session in self._failed_retired_sessions
                 )
             )
+
+    def mark_stopping(self) -> None:
+        """Transition an active programming card immediately to the stopping state."""
+        self._dispatch_card_event(CardEvent(type=CardEventType.STOPPING))
 
     def abort(self) -> None:
         """Stop local activity and close the card session without more delivery."""

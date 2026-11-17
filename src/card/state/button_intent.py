@@ -21,6 +21,9 @@ class ButtonIntent(str, Enum):
     # Spec engine
     SPEC_STOP = "intent.spec.stop"
 
+    # Ordinary programming turn stop
+    PROGRAMMING_STOP = "intent.programming.stop"
+
     # View mode toggle
     MODE_FULL = "intent.mode.full"
     MODE_COMPACT = "intent.mode.compact"

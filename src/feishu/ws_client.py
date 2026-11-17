@@ -2406,6 +2406,8 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                     task_type = "system_help"
                 elif tl in {"/exit", "/quit"}:
                     task_type = "system_exit"
+                elif tl == "/stop":
+                    task_type = "system_stop"
             spec = TaskSpec(
                 chat_id=chat_id,
                 name="process_message",

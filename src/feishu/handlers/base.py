@@ -909,6 +909,14 @@ class BaseHandler:
         """Record a mode switch into the unified context and build a bridge summary."""
         from_source = self.mode_to_context_source(from_mode)
         to_source = self.mode_to_context_source(to_mode)
+        if from_source == to_source:
+            logger.debug(
+                "[模式切换] 跳过同模式空切换 project=%s: %s -> %s",
+                project_id,
+                from_source.value,
+                to_source.value,
+            )
+            return
         logger.info(
             "[模式切换] project=%s: %s -> %s, reason=%s", project_id, from_source.value, to_source.value, reason
         )

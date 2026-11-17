@@ -409,7 +409,7 @@ class IntentRecognizer:
         self.settings = get_settings()
         self.intent_matcher = self._build_intent_matcher()
 
-    EXIT_KEYWORDS = {"退出", "结束", "exit", "quit", "不用了", "算了", "停止"}
+    EXIT_KEYWORDS = {"退出", "结束", "exit", "quit", "不用了", "算了"}
     PROJECT_SWITCH_KEYWORDS = {"切换项目", "换项目", "换到项目", "去项目", "打开项目"}
     PROJECT_LIST_KEYWORDS = {"项目列表", "所有项目", "有哪些项目", "看看项目"}
     DIR_KEYWORDS = {"切换目录", "去目录", "进入目录", "当前目录", "上级目录", "cd "}

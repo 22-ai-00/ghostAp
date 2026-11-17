@@ -131,6 +131,10 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
     _action("/cmds", "查看当前工具原生命令与 Skills", "/cmds [工具]", aliases=("/commands", "/tool_cmds"), protects_from_auto_activation=True),
     _action("/model", "自适应查看或设置当前编程工具模型", "/model [模型名|default]"),
+    _action("/stop", "立即停止当前运行中的任务（保持当前模式）", protects_from_auto_activation=True),
+    _action("/clear", "清空当前会话上下文（保留当前工具与模型）", aliases=("/reset",), protects_from_auto_activation=True),
+    _action("/sh", "在当前项目目录直接执行 Shell 命令", "/sh <命令>", aliases=("/shell",), protects_from_auto_activation=True, slash_discoverable=False),
+    _action("/ask", "向指定工具发起一次性零副作用咨询", "/ask <工具> <问题>", protects_from_auto_activation=True, slash_discoverable=False),
     _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_claude_w", "/exit_claude_w", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_codex_w", "/exit_codex_w", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok", "/end_dsh", "/exit_dsh", "/end_agy", "/exit_agy")),
     _action("/btw", "在当前编程会话中提出旁路问题", "/btw <问题>"),
     _action("/coco_status", "查看 Coco 会话状态"),
@@ -197,7 +201,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
 # from Feishu automatically on the next startup.
 HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     # tool introspection / low-level ACP
-    "/tools", "/tools_status", "/acp", "/btw",
+    "/tools", "/tools_status", "/acp", "/btw", "/sh", "/ask",
     "/coco_status",
     "/coco_info", "/claude_info", "/aiden_info", "/codex_info",
     "/gemini_info", "/traex_info", "/grok_info", "/dsh_info", "/agy_info",

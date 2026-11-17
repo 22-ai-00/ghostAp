@@ -257,6 +257,15 @@ class ProjectContext:
             self.conversation_history = self.conversation_history[-self.max_history_size :]
         self.touch()
 
+    def clear_session_state(self, mode_type: Optional[str] = None) -> None:
+        """Clear conversation history and active snapshot while keeping mode/tool/model config."""
+        with self._chat_lock:
+            self.conversation_history.clear()
+            if mode_type and mode_type in self._MODE_ATTRS:
+                _, snap_attr = self._MODE_ATTRS[mode_type]
+                setattr(self, snap_attr, None)
+            self.touch()
+
     # ── Mode name → (mode_flag_attr, snapshot_attr) mapping ──
     _MODE_ATTRS: ClassVar[dict[str, tuple[str, str]]] = {
         "coco": ("coco_mode", "coco_session_snapshot"),
