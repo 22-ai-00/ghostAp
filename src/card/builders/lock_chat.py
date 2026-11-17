@@ -37,6 +37,7 @@ def build_chat_lock_card(
     locked_at_wall: Optional[float] = None,
     max_duration_seconds: Optional[int] = None,
     allowed_commands_display: Optional[str] = None,
+    chat_id: str = "",
 ) -> tuple[str, list[dict]]:
     """Build a Markdown prompt + action buttons for a chat-level lock.
 
@@ -115,16 +116,19 @@ def build_chat_lock_card(
         f"\n{UI_TEXT['chat_lock_p2p_guide']}"
     )
 
+    _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+    _status_val = {
+        "action": "retry_command",
+        "_t": "/status",
+        "_s": _status_sig,
+    }
     buttons: list[dict] = [
         {
             "tag": "button",
             "text": {"tag": "plain_text", "content": UI_TEXT["chat_lock_btn_status"]},
             "type": "default",
-            "value": {
-                "action": "retry_command",
-                "_t": "/status",
-                "_s": _compute_command_sig("/status"),
-            },
+            "value": _status_val,
+            "behaviors": [{"type": "callback", "value": dict(_status_val)}],
         },
     ]
     if app_id:
@@ -172,11 +176,14 @@ def build_lock_success_card(
             by_line = UI_TEXT["lock_success_lock_broadcast_by"].format(name=locker_name) if locker_name else ""
             md = UI_TEXT["lock_success_lock_broadcast"].format(by_line=by_line)
             md += UI_TEXT["lock_success_lock_broadcast_hint"]
+            _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+            _status_val = {"action": "retry_command", "_t": "/status", "_s": _status_sig}
             buttons: list[dict] = [{
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": UI_TEXT["chat_lock_btn_status"]},
                 "type": "default",
-                "value": {"action": "retry_command", "_t": "/status", "_s": _compute_command_sig("/status")},
+                "value": _status_val,
+                "behaviors": [{"type": "callback", "value": dict(_status_val)}],
             }]
             if app_id:
                 buttons.append({
@@ -194,17 +201,19 @@ def build_lock_success_card(
             md = UI_TEXT["lock_success_lock_reply"].format(lock_undo_window_display=_undo_display)
             # Use v2 signing for /unlock when chat_id is available
             _unlock_sig = sign_command("/unlock", chat_id) if chat_id else _compute_command_sig("/unlock")
+            _undo_val = {
+                "action": "retry_command",
+                "_t": "/unlock",
+                "_s": _unlock_sig,
+                "_ul": True,
+                "_ue": int(_t_wall.time()) + lock_undo_window_seconds,
+            }
             undo_buttons: list[dict] = [{
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": UI_TEXT["lock_success_lock_undo_btn"]},
                 "type": "default",
-                "value": {
-                    "action": "retry_command",
-                    "_t": "/unlock",
-                    "_s": _unlock_sig,
-                    "_ul": True,
-                    "_ue": int(_t_wall.time()) + lock_undo_window_seconds,
-                },
+                "value": _undo_val,
+                "behaviors": [{"type": "callback", "value": dict(_undo_val)}],
             }]
         else:
             if locker_name:
@@ -218,11 +227,14 @@ def build_lock_success_card(
     if variant == "broadcast":
         by_line = UI_TEXT["lock_success_lock_broadcast_by"].format(name=locker_name) if locker_name else ""
         md = UI_TEXT["lock_success_unlock_broadcast"].format(by_line=by_line)
+        _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+        _status_val = {"action": "retry_command", "_t": "/status", "_s": _status_sig}
         buttons: list[dict] = [{
             "tag": "button",
             "text": {"tag": "plain_text", "content": UI_TEXT["chat_lock_btn_status"]},
             "type": "default",
-            "value": {"action": "retry_command", "_t": "/status", "_s": _compute_command_sig("/status")},
+            "value": _status_val,
+            "behaviors": [{"type": "callback", "value": dict(_status_val)}],
         }]
         return md, buttons
     if message:

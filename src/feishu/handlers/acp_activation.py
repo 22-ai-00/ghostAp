@@ -524,17 +524,94 @@ class ACPActivationMixin:
             return
         previous_tool = str(getattr(project, "acp_tool_name", "") or "").strip()
         model_name = getattr(project, "acp_model_name", None) if previous_tool == requested else None
+        active_key = self._resolve_active_programming_mode_key(chat_id, project)
         if not self.project_manager.commit_acp_configuration(
             project, tool_name=requested, model_name=model_name
         ):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
+        sync_note = ""
+        if active_key and active_key != requested:
+            if self._sync_live_acp_tool_switch(chat_id, project, old_tool=active_key, new_tool=requested):
+                sync_note = f"\n🔄 当前会话已从 `{active_key}` 切换到 `{requested}`。"
         self.reply_text(
             message_id,
             _system_module().UI_TEXT["system_acp_config_saved"].format(
                 tool=requested, model=model_name or "default"
-            ),
+            )
+            + sync_note,
         )
+
+    def _sync_live_acp_tool_switch(
+        self,
+        chat_id: str,
+        project: "ProjectContext",
+        *,
+        old_tool: str,
+        new_tool: str,
+    ) -> bool:
+        """Retire old live session and align mode state when /acp switches active tool."""
+        pid = project.project_id
+        try:
+            old_handler = self.get_handler(old_tool)
+        except Exception:
+            old_handler = None
+        if old_handler is not None:
+            mgr_getter = getattr(old_handler, "_get_session_manager", None)
+            manager = mgr_getter() if callable(mgr_getter) else None
+            if manager is not None and callable(getattr(manager, "get_session", None)):
+                live_session = manager.get_session(chat_id, project_id=pid)
+                if live_session is not None and isinstance(getattr(live_session, "session_id", None), str):
+                    retire = getattr(manager, "retire_session", None) or getattr(manager, "end_session", None)
+                    if callable(retire):
+                        retire(chat_id, project_id=pid)
+        try:
+            new_mode = _system_module().InteractionMode(new_tool)
+        except ValueError:
+            return False
+        project.set_programming_mode(new_tool, True)
+        enter_fn = getattr(self.mode_manager, "enter_programming_mode", None)
+        if callable(enter_fn):
+            enter_fn(chat_id, new_mode, project_id=pid)
+        return True
+
+    def _sync_live_acp_model(
+        self,
+        chat_id: str,
+        project: "ProjectContext",
+        tool_name: str,
+        model_name: Optional[str],
+    ) -> str:
+        """Update or retire the live session so /model takes effect immediately."""
+        pid = project.project_id
+        try:
+            handler = self.get_handler(tool_name)
+        except Exception:
+            handler = None
+        if handler is None:
+            return ""
+        if callable(getattr(handler, "_enter_mode_on_manager", None)) and hasattr(handler, "current_model"):
+            handler.current_model = model_name
+        mgr_getter = getattr(handler, "_get_session_manager", None)
+        manager = mgr_getter() if callable(mgr_getter) else None
+        if manager is None or not callable(getattr(manager, "get_session", None)):
+            return ""
+        live_session = manager.get_session(chat_id, project_id=pid)
+        if live_session is None or not isinstance(getattr(live_session, "session_id", None), str):
+            return ""
+        if model_name is not None:
+            set_model = getattr(live_session, "set_model", None)
+            if callable(set_model):
+                try:
+                    if bool(set_model(model_name)):
+                        return "\n🔄 已热更新当前活跃会话模型。"
+                except Exception:
+                    logger.warning("[ACP] live session set_model failed", exc_info=True)
+        retire = getattr(manager, "retire_session", None) or getattr(manager, "end_session", None)
+        if callable(retire):
+            retire(chat_id, project_id=pid)
+            return "\n🔄 已重置当前活跃会话，下条消息将使用新模型启动。"
+        return ""
 
     def _fetch_acp_models(
         self,
@@ -705,6 +782,31 @@ class ACPActivationMixin:
             pending_group=group,
             pending_profile=profile,
             pending_effort=effort,
+            show_loading=False,
+        )
+
+    def handle_open_acp_model_picker(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: Optional[str],
+        value: dict,
+    ) -> None:
+        """Open the model picker immediately using cached models when available."""
+        project = self._action_project(chat_id, project_id)
+        if project is None:
+            self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
+            return
+        tool = str(value.get("tool_name") or "").strip().lower()
+        self.show_explicit_acp_model_selection(
+            message_id,
+            chat_id,
+            tool,
+            project,
+            origin_message_id=message_id,
+            pending_group=str(value.get("model_group") or "").strip() or None,
+            pending_profile=str(value.get("model_profile") or "").strip() or None,
+            pending_effort=str(value.get("model_effort") or "").strip() or None,
             show_loading=False,
         )
 
@@ -1422,6 +1524,16 @@ class ACPActivationMixin:
                 current_model=current_model,
             )
         )
+        if requested.lower() in {"list", "ls"}:
+            self.reply_text(
+                message_id,
+                _system_module().UI_TEXT["system_model_config_summary"].format(
+                    tool=tool_name,
+                    current=current_model or "default",
+                    available=" · ".join(f"`{name}`" for name in model_names) or "default",
+                ),
+            )
+            return
         model_name = None if requested.lower() == "default" else requested
         if model_name and model_names and model_name not in model_names:
             self.reply_error(
@@ -1450,10 +1562,12 @@ class ACPActivationMixin:
         ):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
+        sync_note = self._sync_live_acp_model(chat_id, project, tool_name, model_name)
         self.reply_text(
             message_id,
             _system_module().UI_TEXT["system_model_config_saved"].format(
                 tool=tool_name,
                 model=model_name or "default",
-            ),
+            )
+            + sync_note,
         )

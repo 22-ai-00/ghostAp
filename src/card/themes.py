@@ -120,14 +120,22 @@ TERMINAL_TEMPLATES: dict[str, str] = {
 }
 
 # Header template colors by mode name (when running)
-MODE_TEMPLATES: dict[str, str] = {
-    "Coco": "blue",
-    "Claude": "purple",
-    "Gemini": "turquoise",
-    "AGY": "wathet",
-    "Deep": "violet",
-    "Deep Agent": "violet",
-    "Spec": "green",
-    "Spec Engine": "green",
-    "Smart": "turquoise",
-}
+def _build_mode_templates() -> dict[str, str]:
+    from .backend_meta import ALL_BACKEND_METAS
+
+    templates = {
+        meta.display_name: meta.template_color for meta in ALL_BACKEND_METAS
+    }
+    templates.update(
+        {
+            "Deep": "violet",
+            "Deep Agent": "violet",
+            "Spec": "green",
+            "Spec Engine": "green",
+            "Smart": "turquoise",
+        }
+    )
+    return templates
+
+
+MODE_TEMPLATES: dict[str, str] = _build_mode_templates()

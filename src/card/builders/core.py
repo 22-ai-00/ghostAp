@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 from src.mode.manager import InteractionMode
 
+from ..backend_meta import get_backend_meta, resolve_project_programming_mode
 from ..shared import (
     build_mode_buttons,
 )
@@ -113,56 +114,30 @@ class CoreBuilder:
         mode: Optional[InteractionMode] = None,
     ) -> str:
         # Resolve mode from project if not provided directly
-        effective_mode = mode
-        if effective_mode is None and project:
-            if getattr(project, "claude_mode", False):
-                effective_mode = InteractionMode.CLAUDE
-            elif getattr(project, "gemini_mode", False):
-                effective_mode = InteractionMode.GEMINI
-            elif getattr(project, "traex_mode", False):
-                effective_mode = InteractionMode.TRAEX
-            elif getattr(project, "grok_mode", False):
-                effective_mode = InteractionMode.GROK
-            elif getattr(project, "dsh_mode", False):
-                effective_mode = InteractionMode.DSH
-            elif getattr(project, "agy_mode", False):
-                effective_mode = InteractionMode.AGY
-            elif getattr(project, "coco_mode", False):
-                effective_mode = InteractionMode.COCO
+        effective_mode = mode if mode is not None else resolve_project_programming_mode(project)
 
         if not project:
-            if effective_mode == InteractionMode.CLAUDE:
-                return UI_TEXT["claude_mode_title"]
-            elif effective_mode == InteractionMode.GEMINI:
-                return UI_TEXT["gemini_mode_title"]
-            elif effective_mode == InteractionMode.TRAEX:
-                return UI_TEXT["system_mode_traex"]
-            elif effective_mode == InteractionMode.GROK:
-                return UI_TEXT["system_mode_grok"]
-            elif effective_mode == InteractionMode.DSH:
-                return UI_TEXT["system_mode_dsh"]
-            elif effective_mode == InteractionMode.AGY:
-                return UI_TEXT["system_mode_agy"]
+            no_project_titles = {
+                InteractionMode.CLAUDE: UI_TEXT["claude_mode_title"],
+                InteractionMode.GEMINI: UI_TEXT["gemini_mode_title"],
+                InteractionMode.TRAEX: UI_TEXT["system_mode_traex"],
+                InteractionMode.GROK: UI_TEXT["system_mode_grok"],
+                InteractionMode.DSH: UI_TEXT["system_mode_dsh"],
+                InteractionMode.AGY: UI_TEXT["system_mode_agy"],
+            }
+            if effective_mode in no_project_titles:
+                return no_project_titles[effective_mode]
+            meta = get_backend_meta(effective_mode) if effective_mode is not None else None
+            if meta is not None and meta.mode_key != "coco":
+                return f"{meta.emoji} {meta.display_name}"
             mode_icon = "🤖" if effective_mode == InteractionMode.COCO else "🧠"
             mode_name = UI_TEXT["coco_mode_title"] if effective_mode == InteractionMode.COCO else UI_TEXT["smart_mode_title"]
             return f"{mode_icon} {mode_name}"
 
-        if effective_mode == InteractionMode.CLAUDE:
-            return f"🔮 {project.project_name} · Claude"
-        elif effective_mode == InteractionMode.GEMINI:
-            return f"✨ {project.project_name} · Gemini"
-        elif effective_mode == InteractionMode.TRAEX:
-            return f"🚀 {project.project_name} · Traex"
-        elif effective_mode == InteractionMode.GROK:
-            return f"🌌 {project.project_name} · Grok"
-        elif effective_mode == InteractionMode.DSH:
-            return f"🧭 {project.project_name} · DSH"
-        elif effective_mode == InteractionMode.AGY:
-            return f"🪐 {project.project_name} · AGY"
-        elif effective_mode == InteractionMode.COCO:
-            return f"🤖 {project.project_name} · Coco"
-        else:
-            return f"🧠 {project.project_name}"
+        meta = get_backend_meta(effective_mode) if effective_mode is not None else None
+        if meta is not None:
+            return f"{meta.emoji} {project.project_name} · {meta.display_name}"
+        return f"🧠 {project.project_name}"
 
     @staticmethod
     def _build_directory_element(project: Optional[ProjectContext], working_dir: Optional[str] = None) -> dict:
@@ -193,22 +168,7 @@ class CoreBuilder:
         except Exception:
             logger.debug("failed to get thread_id", exc_info=True)
 
-        effective_mode = mode
-        if effective_mode is None and project:
-            if getattr(project, "claude_mode", False):
-                effective_mode = InteractionMode.CLAUDE
-            elif getattr(project, "gemini_mode", False):
-                effective_mode = InteractionMode.GEMINI
-            elif getattr(project, "traex_mode", False):
-                effective_mode = InteractionMode.TRAEX
-            elif getattr(project, "grok_mode", False):
-                effective_mode = InteractionMode.GROK
-            elif getattr(project, "dsh_mode", False):
-                effective_mode = InteractionMode.DSH
-            elif getattr(project, "agy_mode", False):
-                effective_mode = InteractionMode.AGY
-            elif getattr(project, "coco_mode", False):
-                effective_mode = InteractionMode.COCO
+        effective_mode = mode if mode is not None else resolve_project_programming_mode(project)
 
         return build_mode_buttons(effective_mode, project_id, thread_root_id=thread_root_id, button_size=button_size)
 

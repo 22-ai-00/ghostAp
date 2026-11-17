@@ -132,16 +132,18 @@ def build_repo_lock_card(
         _retry_label = UI_TEXT["repo_lock_btn_retry"]
         # Use v2 signing (nonce+exp+chat_id) when chat_id is available
         _sig = sign_command(command_text, chat_id) if chat_id else _compute_command_sig(command_text)
+        _retry_val = {
+            "action": "retry_command",
+            "_t": command_text,
+            "_s": _sig,
+            "_rc": _next_count,
+        }
         buttons.append({
             "tag": "button",
             "text": {"tag": "plain_text", "content": _retry_label},
             "type": "primary",
-            "value": {
-                "action": "retry_command",
-                "_t": command_text,
-                "_s": _sig,
-                "_rc": _next_count,
-            },
+            "value": _retry_val,
+            "behaviors": [{"type": "callback", "value": dict(_retry_val)}],
         })
     elif command_text:
         # Command too long for card action payload; hint user to resend manually

@@ -22,6 +22,7 @@ from ...acp.native_commands import (
     resolve_smart_mode_native_command,
 )
 from ...acp.providers import get_providers  # noqa: F401
+from ...card.backend_meta import VISIBLE_BACKEND_METAS
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
 from ...card.ui_text import UI_TEXT
@@ -1362,22 +1363,9 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         """Show a list of all available ACP tools with quick access buttons."""
         # Only user-visible programming tools; hidden bridges (e.g. claude-w)
         # stay out of the discovery surfaces even though they are full modes.
-        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"]
-        emojis = {
-            "coco": "🤖",
-            "claude": "🔮",
-            "aiden": "🎯",
-            "codex": "💻",
-            "gemini": "✨",
-            "traex": "🚀",
-            "grok": "🌌",
-            "dsh": "🧭",
-            "agy": "🪐",
-        }
-
-        # Cached-first availability check: avoid blocking user-path on external probe.
         tools = []
-        for name in names:
+        for meta in VISIBLE_BACKEND_METAS:
+            name = meta.mode_key
             is_available = is_programming_tool_available(
                 name,
                 allow_sync_probe=False,
@@ -1387,7 +1375,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             tools.append(
                 {
                     "name": name,
-                    "emoji": emojis.get(name, "🤖"),
+                    "emoji": meta.emoji,
                     "description": desc,
                     "available": is_available,
                 }
@@ -1398,17 +1386,14 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
 
     def show_tools_status(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show detailed status of all tools with availability and session info."""
-        # Define tool metadata
+        # Define tool metadata from unified SSOT
         tool_defs = [
-            {"name": "coco", "emoji": "🤖", "manager": self.ctx.coco_manager},
-            {"name": "claude", "emoji": "🔮", "manager": self.ctx.claude_manager},
-            {"name": "aiden", "emoji": "🎯", "manager": self.ctx.aiden_manager},
-            {"name": "codex", "emoji": "💻", "manager": self.ctx.codex_manager},
-            {"name": "gemini", "emoji": "✨", "manager": self.ctx.gemini_manager},
-            {"name": "traex", "emoji": "🚀", "manager": self.ctx.traex_manager},
-            {"name": "grok", "emoji": "🌌", "manager": self.ctx.grok_manager},
-            {"name": "dsh", "emoji": "🧭", "manager": self.ctx.dsh_manager},
-            {"name": "agy", "emoji": "🪐", "manager": self.ctx.agy_manager},
+            {
+                "name": meta.mode_key,
+                "emoji": meta.emoji,
+                "manager": getattr(self.ctx, f"{meta.mode_key}_manager", None),
+            }
+            for meta in VISIBLE_BACKEND_METAS
         ]
 
         def _format_last_used(ts: float) -> str:

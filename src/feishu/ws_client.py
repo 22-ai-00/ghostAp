@@ -932,38 +932,40 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                     import json as _json
                     from pathlib import Path as _Path
 
-                    from ..card.builders.lock_common import _compute_command_sig
+                    from ..card.builders.lock_common import sign_command
                     from ..card.ui_text import UI_TEXT
                     repo_name = _Path(root_path).name or root_path
                     _text = UI_TEXT["repo_lock_released_notify"].format(repo_name=repo_name)
-                    _btn = {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "📊 查看状态"},
-                        "type": "default",
-                        "value": {"action": "retry_command", "_t": "/status", "_s": _compute_command_sig("/status")},
-                    }
-                    _card = _json.dumps({
-                        "schema": "2.0",
-                        "config": {"wide_screen_mode": True},
-                        "body": {"elements": [
-                            {"tag": "markdown", "content": _text},
-                            {
-                                "tag": "column_set",
-                                "flex_mode": "none",
-                                "background_style": "default",
-                                "columns": [
-                                    {
-                                        "tag": "column",
-                                        "width": "weighted",
-                                        "weight": 1,
-                                        "elements": [_btn],
-                                    }
-                                ],
-                            },
-                        ]},
-                    }, ensure_ascii=False)
                     for _cid in blocked_chat_ids:
                         try:
+                            _btn_val = {"action": "retry_command", "_t": "/status", "_s": sign_command("/status", _cid)}
+                            _btn = {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "📊 查看状态"},
+                                "type": "default",
+                                "value": _btn_val,
+                                "behaviors": [{"type": "callback", "value": dict(_btn_val)}],
+                            }
+                            _card = _json.dumps({
+                                "schema": "2.0",
+                                "config": {"wide_screen_mode": True},
+                                "body": {"elements": [
+                                    {"tag": "markdown", "content": _text},
+                                    {
+                                        "tag": "column_set",
+                                        "flex_mode": "none",
+                                        "background_style": "default",
+                                        "columns": [
+                                            {
+                                                "tag": "column",
+                                                "width": "weighted",
+                                                "weight": 1,
+                                                "elements": [_btn],
+                                            }
+                                        ],
+                                    },
+                                ]},
+                            }, ensure_ascii=False)
                             _send_card(_cid, _card)
                         except Exception as _inner:
                             logger.debug("Failed to notify release to chat=%s: %s", _cid[:12], _inner)

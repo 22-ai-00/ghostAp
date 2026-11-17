@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
+from src.card.backend_meta import ALL_BACKEND_METAS, get_backend_meta
 from src.card.events import CardEvent, CardEventType
 from src.card.events.payloads import OPAQUE_TOOL_CALL_ID_KEY
 from src.card.events.projector import (
@@ -50,17 +51,7 @@ logger = logging.getLogger(__name__)
 
 # Mode name → (mode_emoji, display_name)
 _MODE_DISPLAY: dict[str, tuple[str, str]] = {
-    "coco": ("🤖", "Coco"),
-    "claude": ("🧠", "Claude"),
-    "claude_w": ("🪄", "Claude-W"),
-    "aiden": ("⚡", "Aiden"),
-    "codex": ("📝", "Codex"),
-    "codex_w": ("🌩️", "Codex-W"),
-    "gemini": ("💎", "Gemini"),
-    "traex": ("🚀", "Traex"),
-    "grok": ("🌌", "Grok"),
-    "dsh": ("🧭", "DSH"),
-    "agy": ("🪐", "AGY"),
+    meta.mode_key: (meta.emoji, meta.display_name) for meta in ALL_BACKEND_METAS
 }
 
 _TOOL_CARD_EVENT_TYPES = frozenset({
@@ -128,7 +119,8 @@ def build_programming_metadata(
         working_dir: Current project/session working directory for v2 header.
     """
     mode_key = mode_name.lower()
-    emoji, display = _MODE_DISPLAY.get(mode_key, ("🤖", mode_name))
+    meta = get_backend_meta(mode_key)
+    emoji, display = (meta.emoji, meta.display_name) if meta else _MODE_DISPLAY.get(mode_key, ("🤖", mode_name))
 
     return CardMetadata(
         project_name=project_name,

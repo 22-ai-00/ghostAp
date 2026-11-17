@@ -1041,7 +1041,7 @@ class SystemBuilder:
         tool = str(tool_name or "").strip().lower()
         model = str(model_name or UI_TEXT["system_acp_default_model_option"])
         switch_value = {
-            "action": action_ids.REFRESH_ACP_MODELS,
+            "action": action_ids.OPEN_ACP_MODEL_PICKER,
             "tool_name": tool,
             "project_id": project_id,
             "current_model": model_name,

@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -8,6 +9,8 @@ if TYPE_CHECKING:
 from ..card.actions import dispatch as action_ids
 from ..card.ui_text import UI_TEXT
 from ..mode import PROGRAMMING_MODES, InteractionMode
+from ..utils.signing import VerifyResult, verify_command_sig
+from .slash_command_parser import SlashCommandParser
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,8 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     )
     actions.update({
         action_ids.FORCE_RELEASE_REPO_LOCK: system.handle_force_release_repo_lock,
+        action_ids.CONFIRM_FORCE_RELEASE: system.handle_confirm_force_release,
+        action_ids.CONFIRM_LOCK: system.handle_confirm_lock,
         action_ids.CANCEL_LOCK: system.handle_cancel_lock,
         action_ids.CANCEL_FORCE_RELEASE: system.handle_cancel_force_release,
     })
@@ -167,9 +172,68 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         action_ids.SELECT_ACP_MODEL_EFFORT,
     ):
         actions[action] = system.handle_acp_model_cascade_select
+    actions[action_ids.OPEN_ACP_MODEL_PICKER] = system.handle_open_acp_model_picker
     actions[action_ids.REFRESH_ACP_MODELS] = system.handle_refresh_acp_models
     actions[action_ids.SHOW_TOOL_COMMANDS] = system.handle_show_tool_commands
     actions[action_ids.RUN_NATIVE_TOOL_COMMAND] = system.handle_run_native_tool_command
+
+    def _handle_continue_dev(mid, cid, pid, val):
+        project = _resolve_project(client, pid, cid)
+        if project is None:
+            base.reply_text(mid, UI_TEXT["lock_project_not_found_hint"])
+            return
+        saved_tool = getattr(project, "acp_tool_name", None)
+        if saved_tool:
+            system.handle_enter_acp_saved_selection(mid, cid, saved_tool, project)
+        else:
+            system.show_tools_list(mid, cid, project)
+
+    actions[action_ids.CONTINUE_DEV] = _handle_continue_dev
+    actions[action_ids.NEW_PROJECT_PROMPT] = (
+        lambda mid, cid, pid, val: base.reply_text(mid, UI_TEXT["project_new_usage_prompt"])
+    )
+
+    def _handle_retry_command(mid, cid, pid, val):
+        payload = val or {}
+        cmd = str(payload.get("_t") or "").strip()
+        sig = str(payload.get("_s") or "").strip()
+        if not cmd:
+            base.reply_error(mid, "⛔ 缺少待重放的命令。")
+            return
+        verify_res = verify_command_sig(cmd, sig, chat_id=cid)
+        if not verify_res:
+            if verify_res is VerifyResult.EXPIRED:
+                base.reply_error(mid, "⏰ 该操作按钮已过期，请直接重新发送命令。")
+            elif verify_res is VerifyResult.NONCE_REUSED:
+                base.reply_error(mid, "⚠️ 该操作按钮已执行过，无需重复点击。")
+            else:
+                base.reply_error(mid, "⛔ 命令签名校验失败，已拒绝执行。")
+            return
+        if payload.get("_ul"):
+            raw_ue = payload.get("_ue")
+            try:
+                if raw_ue is not None and time.time() > float(raw_ue):
+                    base.reply_error(mid, "⏰ 撤销锁定窗口已过，如需解锁请发送 `/unlock`。")
+                    return
+            except (TypeError, ValueError):
+                base.reply_error(mid, "⛔ 无效的撤销窗口参数。")
+                return
+        project = _resolve_project(client, pid, cid)
+        parsed = SlashCommandParser.parse(cmd)
+        if parsed is not None and system.is_interceptable_command_match(parsed):
+            system.handle_intercepted_command(mid, cid, cmd, project, command_match=parsed)
+            return
+        dispatcher = getattr(client, "_dispatcher", None)
+        process_fn = getattr(dispatcher, "process_with_intent", None) if dispatcher is not None else None
+        if callable(process_fn):
+            process_fn(mid, cid, cmd, project)
+            return
+        if project is not None and getattr(project, "root_path", None):
+            system.submit_shell_command(mid, cid, cmd, project.root_path, project)
+        else:
+            base.reply_text(mid, UI_TEXT["lock_project_not_found_hint"])
+
+    actions[action_ids.RETRY_COMMAND] = _handle_retry_command
 
     # Deep Engine
     actions[action_ids.SHOW_DEEP_STATUS] = (

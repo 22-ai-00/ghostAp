@@ -93,7 +93,7 @@ class LockCommandsMixin:
                     else:
                         self.reply_text(message_id, _reply)
                 if not result.idempotent:
-                    _broadcast = build_lock_success_card("lock", variant="broadcast", locker_name=sender_name, app_id=_app_id)
+                    _broadcast = build_lock_success_card("lock", variant="broadcast", locker_name=sender_name, app_id=_app_id, chat_id=chat_id)
                     if isinstance(_broadcast, tuple):
                         from ...card.builders.project import ProjectBuilder
                         _md, _btns = _broadcast
@@ -121,7 +121,7 @@ class LockCommandsMixin:
             else:
                 self.reply_text(message_id, build_lock_success_card(action, message=idempotent_msg))
             if not result.idempotent:
-                _unlock_broadcast = build_lock_success_card("unlock", variant="broadcast", locker_name=sender_name)
+                _unlock_broadcast = build_lock_success_card("unlock", variant="broadcast", locker_name=sender_name, chat_id=chat_id)
                 if isinstance(_unlock_broadcast, tuple):
                     from ...card.builders.project import ProjectBuilder as _PB3
                     _md, _btns = _unlock_broadcast

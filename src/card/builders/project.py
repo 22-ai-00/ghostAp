@@ -7,6 +7,7 @@ from urllib.parse import quote
 from src.mode.manager import InteractionMode
 from src.project.context import ProjectStatus
 
+from ..backend_meta import get_backend_meta, resolve_project_programming_mode
 from ..shared import (
     apply_compact_style,
     build_responsive_layout,
@@ -47,6 +48,24 @@ class ProjectBuilder:
                 "multi_url": ProjectBuilder._build_project_chat_multi_url(chat_id),
             }
         )
+
+    @staticmethod
+    def _callback_button(
+        text: str,
+        value: dict,
+        *,
+        button_type: str = "default",
+        compact: bool = False,
+    ) -> dict:
+        payload = dict(value)
+        button = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text},
+            "type": button_type,
+            "value": payload,
+            "behaviors": [{"type": "callback", "value": payload}],
+        }
+        return apply_compact_style(button) if compact else button
 
     @staticmethod
     def build_project_info_content(project: ProjectContext, global_working_dir: str) -> str:
@@ -172,22 +191,7 @@ class ProjectBuilder:
         image_keys: Optional[list[str]] = None,
         banner: Optional[dict] = None,
     ) -> tuple[str, str]:
-        effective_mode = None
-        if project:
-            if getattr(project, "claude_mode", False):
-                effective_mode = InteractionMode.CLAUDE
-            elif getattr(project, "gemini_mode", False):
-                effective_mode = InteractionMode.GEMINI
-            elif getattr(project, "traex_mode", False):
-                effective_mode = InteractionMode.TRAEX
-            elif getattr(project, "grok_mode", False):
-                effective_mode = InteractionMode.GROK
-            elif getattr(project, "dsh_mode", False):
-                effective_mode = InteractionMode.DSH
-            elif getattr(project, "agy_mode", False):
-                effective_mode = InteractionMode.AGY
-            elif getattr(project, "coco_mode", False):
-                effective_mode = InteractionMode.COCO
+        effective_mode = resolve_project_programming_mode(project)
 
         return ProjectBuilder._build_response_card_inner(
             project,
@@ -301,13 +305,11 @@ class ProjectBuilder:
                 {"tag": "markdown", "content": UI_TEXT["project_board_empty_content"]},
                 *build_responsive_layout(
                     [
-                        apply_compact_style(
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_new"]},
-                                "type": "primary",
-                                "value": {"action": "new_project_prompt"},
-                            }
+                        ProjectBuilder._callback_button(
+                            UI_TEXT["project_board_btn_new"],
+                            {"action": "new_project_prompt"},
+                            button_type="primary",
+                            compact=True,
                         )
                     ]
                 ),
@@ -339,18 +341,29 @@ class ProjectBuilder:
             current_marker = UI_TEXT["project_board_current_marker"] if is_current else ""
 
             mode_info = ""
-            if project.claude_mode:
+            active_mode = resolve_project_programming_mode(project)
+            if active_mode is not None:
+                meta = get_backend_meta(active_mode)
                 query_count = 0
-                if project.claude_session_snapshot:
-                    query_count = project.claude_session_snapshot.query_count
-                mode_info = UI_TEXT["project_board_claude_info"].format(count=query_count)
-            elif project.coco_mode:
-                query_count = 0
-                if project.coco_session_snapshot:
-                    query_count = project.coco_session_snapshot.query_count
-                mode_info = UI_TEXT["project_board_coco_info"].format(count=query_count)
+                if meta is not None:
+                    snap = getattr(project, meta.project_snapshot_attr, None)
+                    if snap:
+                        query_count = getattr(snap, "query_count", 0) or 0
+                if active_mode == InteractionMode.CLAUDE:
+                    mode_info = UI_TEXT["project_board_claude_info"].format(count=query_count)
+                elif active_mode == InteractionMode.COCO:
+                    mode_info = UI_TEXT["project_board_coco_info"].format(count=query_count)
+                elif meta is not None:
+                    mode_info = f" · {meta.emoji} {meta.display_name}({query_count})"
             elif project.status == ProjectStatus.BUSY and project.current_task:
                 mode_info = UI_TEXT["project_board_busy_info"].format(task_type=project.current_task.task_type)
+            else:
+                saved_tool = getattr(project, "acp_tool_name", None)
+                meta = get_backend_meta(saved_tool) if saved_tool else None
+                if meta is not None:
+                    saved_model = getattr(project, "acp_model_name", None)
+                    model_suffix = f"/{saved_model}" if saved_model else ""
+                    mode_info = f" · {meta.emoji} {meta.display_name}{model_suffix}"
 
             last_active = CoreBuilder._format_time_ago(project.last_active)
 
@@ -365,30 +378,26 @@ class ProjectBuilder:
             buttons = []
             if not is_current:
                 buttons.append(
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_switch"]},
-                        "type": "primary",
-                        "value": {"action": "switch_to", "project_id": project.project_id},
-                    }
+                    ProjectBuilder._callback_button(
+                        UI_TEXT["project_board_btn_switch"],
+                        {"action": "switch_to", "project_id": project.project_id},
+                        button_type="primary",
+                    )
                 )
             else:
                 buttons.append(
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_continue"]},
-                        "type": "primary",
-                        "value": {"action": "continue_dev", "project_id": project.project_id},
-                    }
+                    ProjectBuilder._callback_button(
+                        UI_TEXT["project_board_btn_continue"],
+                        {"action": "continue_dev", "project_id": project.project_id},
+                        button_type="primary",
+                    )
                 )
 
             buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_detail"]},
-                    "type": "default",
-                    "value": {"action": "show_detail", "project_id": project.project_id},
-                }
+                ProjectBuilder._callback_button(
+                    UI_TEXT["project_board_btn_detail"],
+                    {"action": "show_detail", "project_id": project.project_id},
+                )
             )
             group_button = ProjectBuilder._build_project_group_jump_button(project)
             if group_button:
@@ -405,22 +414,18 @@ class ProjectBuilder:
         pagination_buttons = []
         if page > 1:
             pagination_buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_prev"]},
-                    "type": "default",
-                    "value": {"action": "switch_board_page", "page": page - 1},
-                }
+                ProjectBuilder._callback_button(
+                    UI_TEXT["project_board_btn_prev"],
+                    {"action": "switch_board_page", "page": page - 1},
+                )
             )
 
         if page < total_pages:
             pagination_buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_next"]},
-                    "type": "default",
-                    "value": {"action": "switch_board_page", "page": page + 1},
-                }
+                ProjectBuilder._callback_button(
+                    UI_TEXT["project_board_btn_next"],
+                    {"action": "switch_board_page", "page": page + 1},
+                )
             )
 
         if pagination_buttons:
@@ -440,18 +445,14 @@ class ProjectBuilder:
         elements.extend(
             build_responsive_layout(
                 [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_new"]},
-                        "type": "default",
-                        "value": {"action": "new_project_prompt"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_refresh"]},
-                        "type": "default",
-                        "value": {"action": "refresh_board"},
-                    },
+                    ProjectBuilder._callback_button(
+                        UI_TEXT["project_board_btn_new"],
+                        {"action": "new_project_prompt"},
+                    ),
+                    ProjectBuilder._callback_button(
+                        UI_TEXT["project_board_btn_refresh"],
+                        {"action": "refresh_board"},
+                    ),
                 ]
             )
         )
@@ -474,13 +475,10 @@ class ProjectBuilder:
         if group_button:
             buttons.append(group_button)
         buttons.append(
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_title"]},
-                    "type": "default",
-                    "value": {"action": "show_board"},
-                }
+            ProjectBuilder._callback_button(
+                UI_TEXT["project_board_title"],
+                {"action": "show_board"},
+                compact=True,
             )
         )
 
@@ -501,29 +499,21 @@ class ProjectBuilder:
             f"\n• {UI_TEXT['system_theme_color_label']}{project.emoji_prefix} {project.theme_color}"
 
         buttons = [
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_btn_start_coco"]},
-                    "type": "primary",
-                    "value": {"action": "enter_coco", "project_id": project.project_id},
-                }
+            ProjectBuilder._callback_button(
+                UI_TEXT["project_btn_start_coco"],
+                {"action": "enter_coco", "project_id": project.project_id},
+                button_type="primary",
+                compact=True,
             ),
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_btn_start_claude"]},
-                    "type": "default",
-                    "value": {"action": "enter_claude", "project_id": project.project_id},
-                }
+            ProjectBuilder._callback_button(
+                UI_TEXT["project_btn_start_claude"],
+                {"action": "enter_claude", "project_id": project.project_id},
+                compact=True,
             ),
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_title"]},
-                    "type": "default",
-                    "value": {"action": "show_board"},
-                }
+            ProjectBuilder._callback_button(
+                UI_TEXT["project_board_title"],
+                {"action": "show_board"},
+                compact=True,
             ),
         ]
 

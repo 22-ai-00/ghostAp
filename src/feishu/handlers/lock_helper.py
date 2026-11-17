@@ -380,6 +380,7 @@ class LockHelper:
                 app_id=_app_id,
                 locked_at_wall=_lock_entry.locked_at_wall if _lock_entry else None,
                 max_duration_seconds=getattr(self._h.settings, "chat_lock_max_duration", None),
+                chat_id=chat_id,
             )
             msg_type, card_json = ProjectBuilder.build_project_response_card(
                 project=None,
@@ -413,14 +414,16 @@ class LockHelper:
         except Exception:
             logger.debug("Failed to add throttled chat-lock emoji reaction", exc_info=True)
         try:
-            from ...card.builders.lock import _build_p2p_multi_url, _compute_command_sig
+            from ...card.builders.lock import _build_p2p_multi_url, sign_command
             from ...card.builders.project import ProjectBuilder
             _md = UI_TEXT["chat_locked_throttled_reply_md"].format(name=_name)
+            _status_val = {"action": "retry_command", "_t": "/status", "_s": sign_command("/status", chat_id)}
             _buttons = [{
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": UI_TEXT["chat_lock_btn_status"]},
                 "type": "default",
-                "value": {"action": "retry_command", "_t": "/status", "_s": _compute_command_sig("/status")},
+                "value": _status_val,
+                "behaviors": [{"type": "callback", "value": dict(_status_val)}],
             }]
             _app_id = ""
             try:

@@ -289,7 +289,7 @@ def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> No
     assert 8 <= len(ready_card["config"]["summary"]["content"]) <= 60
     assert ready_actions == [
         {
-            "action": action_ids.REFRESH_ACP_MODELS,
+            "action": action_ids.OPEN_ACP_MODEL_PICKER,
             "tool_name": "codex",
             "project_id": "project-3",
             "current_model": "gpt-5.6-sol/high",

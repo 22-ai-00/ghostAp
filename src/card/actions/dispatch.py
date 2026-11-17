@@ -59,6 +59,7 @@ WORKFLOW_AGENT_SELECTION_ACTIONS = frozenset(
 # Explicit ACP model selection actions
 # ---------------------------------------------------------------------------
 SELECT_ACP_MODEL = "select_acp_model"
+OPEN_ACP_MODEL_PICKER = "open_acp_model_picker"
 REFRESH_ACP_MODELS = "refresh_acp_models"
 SELECT_ACP_MODEL_GROUP = "select_acp_model_group"
 SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"

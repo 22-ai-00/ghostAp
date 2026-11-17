@@ -448,6 +448,7 @@ UI_TEXT = {
     "project_board_busy_info": " | ⏳ {task_type}",
     "project_board_page_info": "第 {page}/{total} 页",
     "project_board_btn_new": "➕ 新建项目",
+    "project_new_usage_prompt": "📂 创建新项目请发送：`/new <项目名> <目录路径>`\n\n例如：`/new myapp ~/code/myapp`",
     "project_board_btn_switch": "切换到此项目",
     "project_board_btn_continue": "继续开发",
     "project_board_btn_detail": "查看详情",

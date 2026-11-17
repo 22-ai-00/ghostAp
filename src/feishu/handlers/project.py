@@ -81,7 +81,7 @@ class ProjectHandler(BaseHandler):
     # Context preserve / restore
     # ------------------------------------------------------------------
     def preserve_project_context(self, chat_id: str, project: "ProjectContext"):
-        from ...mode import InteractionMode
+        from ...mode import PROGRAMMING_MODES
 
         pid = project.project_id
         current_mode = self.mode_manager.get_mode(chat_id, project_id=pid)
@@ -92,48 +92,31 @@ class ProjectHandler(BaseHandler):
             current_mode.value if hasattr(current_mode, "value") else current_mode,
         )
 
-        if current_mode == InteractionMode.COCO:
-            session = self.ctx.coco_manager.get_session(chat_id, project_id=pid)
-            if session:
-                project.update_coco_snapshot(query=session.last_query, query_count=session.message_count)
-                self.context_manager.update_context(
-                    pid,
-                    session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.COCO.value},
-                    chat_id=chat_id,
-                )
-        elif current_mode == InteractionMode.CLAUDE:
-            session = self.ctx.claude_manager.get_session(chat_id, project_id=pid)
-            if session:
-                project.update_claude_snapshot(
-                    query=session.last_query, query_count=session.message_count, session_id=session.session_id
-                )
-                self.context_manager.update_context(
-                    pid,
-                    session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.CLAUDE.value},
-                    chat_id=chat_id,
-                )
-        elif current_mode == InteractionMode.CLAUDE_W:
-            session = self.ctx.claude_w_manager.get_session(chat_id, project_id=pid)
-            if session:
-                project.update_claude_w_snapshot(
-                    query=session.last_query, query_count=session.message_count, session_id=session.session_id
-                )
-                self.context_manager.update_context(
-                    pid,
-                    session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.CLAUDE_W.value},
-                    chat_id=chat_id,
-                )
-        elif current_mode == InteractionMode.CODEX_W:
-            session = self.ctx.codex_w_manager.get_session(chat_id, project_id=pid)
-            if session:
-                project.update_codex_w_snapshot(
-                    query=session.last_query, query_count=session.message_count, session_id=session.session_id
-                )
-                self.context_manager.update_context(
-                    pid,
-                    session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.CODEX_W.value},
-                    chat_id=chat_id,
-                )
+        if current_mode not in PROGRAMMING_MODES:
+            return
+        mode_key = current_mode.value
+        manager = getattr(self.ctx, f"{mode_key}_manager", None)
+        if manager is None or not hasattr(manager, "get_session"):
+            return
+        session = manager.get_session(chat_id, project_id=pid)
+        if not session:
+            return
+        project.update_programming_snapshot(
+            mode_key,
+            query=session.last_query,
+            query_count=session.message_count,
+            session_id=session.session_id,
+        )
+        source_value = (
+            ContextSourceMode(mode_key).value
+            if mode_key in ContextSourceMode._value2member_map_
+            else ContextSourceMode.SMART.value
+        )
+        self.context_manager.update_context(
+            pid,
+            session_snapshot={"data": session.to_snapshot(), "source_mode": source_value},
+            chat_id=chat_id,
+        )
 
     def restore_project_context(self, project: "ProjectContext", *, chat_id: str = "") -> dict:
         ctx = self.context_manager.store.get(project.project_id, chat_id=chat_id)
@@ -263,14 +246,27 @@ class ProjectHandler(BaseHandler):
         restore_info = self.restore_project_context(project, chat_id=chat_id)
         self.context_manager.store.get_or_create(project.project_id, chat_id=chat_id)
 
-        if auto_enter_coco and coco_handler:
-            coco_handler.enter_mode(message_id, chat_id, project=project)
-        else:
-            msg_type, card_content = ProjectBuilder.build_project_switch_notification_card(project, restore_info)
+        from ...project.context import ProjectContext as _ProjectContext
 
-            response_id = self.reply_card(message_id, card_content)
-            if response_id:
-                self.register_message_project(response_id, project)
+        saved_tool = _ProjectContext.normalize_acp_tool_name(getattr(project, "acp_tool_name", None))
+        if auto_enter_coco:
+            if saved_tool:
+                target_handler = coco_handler if (saved_tool == "coco" and coco_handler) else self.get_handler(saved_tool)
+                if target_handler and hasattr(target_handler, "enter_mode"):
+                    enter_kwargs: dict = {"project": project}
+                    if saved_tool != "coco":
+                        enter_kwargs["model_override"] = getattr(project, "acp_model_name", None)
+                    target_handler.enter_mode(message_id, chat_id, **enter_kwargs)
+                    return
+            elif getattr(project, "coco_mode", False) is True and coco_handler:
+                coco_handler.enter_mode(message_id, chat_id, project=project)
+                return
+
+        msg_type, card_content = ProjectBuilder.build_project_switch_notification_card(project, restore_info)
+
+        response_id = self.reply_card(message_id, card_content)
+        if response_id:
+            self.register_message_project(response_id, project)
 
     def close_project(self, message_id: str, chat_id: str, name: str):
         project, hint = self.project_manager.find_project_by_name_with_hint(name, chat_id=chat_id)
