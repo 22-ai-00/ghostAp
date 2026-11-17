@@ -27,6 +27,8 @@ def apply_compact_style(
         if not skip_compact and button_count is not None and button_count > 2:
             resolved_size = "small"
         button.setdefault("size", resolved_size)
+        if not button.get("disabled") and "behaviors" not in button and isinstance(button.get("value"), dict):
+            button["behaviors"] = [{"type": "callback", "value": dict(button["value"])}]
     return button
 
 

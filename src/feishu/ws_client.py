@@ -1375,6 +1375,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                         "text": {"tag": "plain_text", "content": UI_TEXT["eviction_notify_btn_rebind"]},
                         "type": "primary",
                         "value": {"action": "show_board"},
+                        "behaviors": [{"type": "callback", "value": {"action": "show_board"}}],
                     }
                 ]
                 msg_type, card_json = ProjectBuilder.build_project_response_card(

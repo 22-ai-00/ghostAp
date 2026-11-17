@@ -1510,15 +1510,17 @@ class SystemBuilder:
             if not is_available:
                 btn_text += " ⚠️"
 
-            buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_text},
-                    "type": "primary" if is_available else "default",
-                    "disabled": not is_available,
-                    "value": {"action": f"enter_{tool_name}", "project_id": project.project_id if project else None},
-                }
-            )
+            _btn_val = {"action": f"enter_{tool_name}", "project_id": project.project_id if project else None}
+            _btn = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn_text},
+                "type": "primary" if is_available else "default",
+                "disabled": not is_available,
+                "value": _btn_val,
+            }
+            if is_available:
+                _btn["behaviors"] = [{"type": "callback", "value": dict(_btn_val)}]
+            buttons.append(_btn)
 
         elements.extend(build_responsive_layout(buttons))
 
@@ -1588,12 +1590,14 @@ class SystemBuilder:
         action_buttons = []
         for tool in tools:
             if tool.get("available", False):
+                _status_btn_val = {"action": f"enter_{tool['name']}", "project_id": project.project_id if project else None}
                 action_buttons.append(
                     {
                         "tag": "button",
                         "text": {"tag": "plain_text", "content": UI_TEXT["system_tools_status_btn_enter"].format(name=tool['name'].capitalize())},
                         "type": "default",
-                        "value": {"action": f"enter_{tool['name']}", "project_id": project.project_id if project else None},
+                        "value": _status_btn_val,
+                        "behaviors": [{"type": "callback", "value": dict(_status_btn_val)}],
                     }
                 )
 

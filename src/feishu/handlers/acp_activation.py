@@ -938,6 +938,7 @@ class ACPActivationMixin:
             model_name,
             project,
             pending_prompt=pending_prompt,
+            explicit_card=not bool(pending_prompt),
         )
 
     def _activate_acp_selection(

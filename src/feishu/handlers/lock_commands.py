@@ -105,7 +105,7 @@ class LockCommandsMixin:
                     else:
                         self.send_text_to_chat(chat_id, _broadcast)
             else:
-                self._reply_lock_permission_error(message_id, result)
+                self._reply_lock_permission_error(message_id, result, chat_id=chat_id)
             return
 
         # /unlock — execute directly (symmetric with /lock)
@@ -133,9 +133,9 @@ class LockCommandsMixin:
                 else:
                     self.send_text_to_chat(chat_id, _unlock_broadcast)
         else:
-            self._reply_lock_permission_error(message_id, result)
+            self._reply_lock_permission_error(message_id, result, chat_id=chat_id)
 
-    def _reply_lock_permission_error(self, message_id: str, result) -> None:
+    def _reply_lock_permission_error(self, message_id: str, result, *, chat_id: str = "") -> None:
         """Reply with an actionable card for lock/unlock permission failures."""
         from ...chat_lock import ChatLockCode
 
@@ -161,12 +161,15 @@ class LockCommandsMixin:
         }
         if result.code in _non_admin_codes:
             try:
+                from ...card.builders.lock import sign_command
                 from ...card.builders.project import ProjectBuilder as _PB3
+                _status_val = {"action": "retry_command", "_t": "/status", "_s": sign_command("/status", chat_id)}
                 _buttons: list[dict] = [{
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": UI_TEXT["chat_lock_btn_status"]},
                     "type": "default",
-                    "value": {"action": "retry_command", "_t": "/status"},
+                    "value": _status_val,
+                    "behaviors": [{"type": "callback", "value": dict(_status_val)}],
                 }]
                 _app_id = getattr(self.settings, "app_id", "") or ""
                 if _app_id:
@@ -219,6 +222,7 @@ class LockCommandsMixin:
             "text": {"tag": "plain_text", "content": retry_button_label},
             "type": retry_button_type,
             "value": retry_button_value,
+            "behaviors": [{"type": "callback", "value": dict(retry_button_value)}],
         }]
         msg_type, card_json = ProjectBuilder.build_project_response_card(
             project=None,

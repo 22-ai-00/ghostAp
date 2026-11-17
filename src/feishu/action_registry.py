@@ -223,7 +223,7 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         if parsed is not None and system.is_interceptable_command_match(parsed):
             system.handle_intercepted_command(mid, cid, cmd, project, command_match=parsed)
             return
-        dispatcher = getattr(client, "_dispatcher", None)
+        dispatcher = getattr(client, "_message_dispatcher", None) or getattr(client, "_dispatcher", None)
         process_fn = getattr(dispatcher, "process_with_intent", None) if dispatcher is not None else None
         if callable(process_fn):
             process_fn(mid, cid, cmd, project)

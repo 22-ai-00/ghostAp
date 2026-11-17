@@ -509,7 +509,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         value: dict,
     ) -> None:
         """Card callback opening the `/cmds` card for the specified tool."""
-        project = (self.project_manager.get_project(project_id) if project_id else None) or (
+        project = (self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else None) or (
             self.project_manager.get_active_project(chat_id)
         )
         tool_name = str((value or {}).get("tool_name") or "").strip()
@@ -544,7 +544,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
                 UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
             )
             return
-        project = (self.project_manager.get_project(project_id) if project_id else None) or (
+        project = (self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else None) or (
             self.project_manager.get_active_project(chat_id)
         )
         self._handle_direct_mode_enter_with_args(
@@ -1306,8 +1306,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             handler = None
         if handler is not None and callable(getattr(handler, "clear_session_context", None)):
             handler.clear_session_context(chat_id, target_project)
-        if target_project is not None and callable(getattr(self.project_manager, "save_projects", None)):
-            self.project_manager.save_projects()
+        if target_project is not None:
+            if callable(getattr(self.project_manager, "persist_project_context", None)):
+                self.project_manager.persist_project_context(target_project)
+            elif callable(getattr(self.project_manager, "save_projects", None)):
+                self.project_manager.save_projects()
         saved_model = getattr(target_project, "acp_model_name", None) if target_project else None
         self.reply_text(
             message_id,

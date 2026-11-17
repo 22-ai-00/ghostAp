@@ -156,14 +156,16 @@ def build_repo_lock_card(
             "multi_url": _build_p2p_multi_url(app_id),
         })
     if is_admin and repo_token:
+        _force_rel_val = {
+            "action": "force_release_repo_lock",
+            "_tk": repo_token,
+        }
         buttons.append({
             "tag": "button",
             "text": {"tag": "plain_text", "content": UI_TEXT["repo_lock_btn_force_release"]},
             "type": "danger",
-            "value": {
-                "action": "force_release_repo_lock",
-                "_tk": repo_token,
-            },
+            "value": _force_rel_val,
+            "behaviors": [{"type": "callback", "value": dict(_force_rel_val)}],
         })
 
     return markdown, buttons
@@ -223,20 +225,23 @@ def build_force_release_confirm_card(
     }
     if holder_chat_id:
         _confirm_value["_hcid"] = holder_chat_id
+    _cancel_val = {
+        "action": "cancel_force_release",
+    }
     buttons = [
         {
             "tag": "button",
             "text": {"tag": "plain_text", "content": UI_TEXT["lock_force_release_btn_confirm"]},
             "type": "danger",
             "value": _confirm_value,
+            "behaviors": [{"type": "callback", "value": dict(_confirm_value)}],
         },
         {
             "tag": "button",
             "text": {"tag": "plain_text", "content": UI_TEXT["lock_btn_cancel"]},
             "type": "default",
-            "value": {
-                "action": "cancel_force_release",
-            },
+            "value": _cancel_val,
+            "behaviors": [{"type": "callback", "value": dict(_cancel_val)}],
         },
     ]
     return markdown, buttons

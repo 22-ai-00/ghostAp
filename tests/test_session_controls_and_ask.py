@@ -212,7 +212,7 @@ def test_clear_and_sh_commands_keep_mode_and_execute_cleanly() -> None:
     assert project.codex_mode is True
     assert project.acp_tool_name == "codex"
     assert project.acp_model_name == "gpt-5.6-sol"
-    proj_mgr.save_projects.assert_called_once()
+    proj_mgr.persist_project_context.assert_called_once_with(project)
 
     # /sh passes through control gate in active mode and submits shell command
     sh_match = SlashCommandParser.parse("/sh git status")

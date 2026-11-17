@@ -91,15 +91,17 @@ class DeepBuilder:
         else:
             action_name = f"{state.action_prefix}_{action_key}"
 
+        _val = {
+            "action": action_name,
+            "project_id": state.project_id or state.engine_project_id,
+            "deep_project_id": state.engine_project_id,
+        }
         btn = {
             "tag": "button",
             "text": {"tag": "plain_text", "content": config["text"]},
             "type": config["type"],
-            "value": {
-                "action": action_name,
-                "project_id": state.project_id or state.engine_project_id,
-                "deep_project_id": state.engine_project_id,
-            },
+            "value": _val,
+            "behaviors": [{"type": "callback", "value": dict(_val)}],
         }
 
         # Add confirm dialog for danger buttons (only stop_danger requires confirmation)
