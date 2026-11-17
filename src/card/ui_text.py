@@ -258,19 +258,16 @@ UI_TEXT = {
     "system_menu_btn_help": "📖 帮助",
     "system_help_title": "📖 GhostAP 使用帮助",
     "system_help_status_header": "**当前状态** · {mode} · 项目: {project}\n<font color='grey'>{cwd}</font>",
-    "system_help_section_modes": "🔄 编程模式切换",
+    "system_help_section_modes": "🔄 编程模式切换与工具命令",
     "system_help_section_modes_body": (
-        "`/coco` · 进入 Coco 编程模式（字节跳动 AI）\n"
-        "`/claude` · 进入 Claude 编程模式（Anthropic AI）\n"
-        "`/aiden` · 进入 Aiden 编程模式\n"
-        "`/codex` · 进入 Codex 编程模式\n"
-        "`/gemini` · 进入 Gemini 编程模式\n"
-        "`/traex` · 进入 Traex 编程模式\n"
-        "`/grok` · 进入 Grok 编程模式（xAI Grok Build）\n"
-        "`/dsh` · 进入 DSH 编程模式（DeepSeek Harness）\n"
-        "`/agy` · 进入 AGY 编程模式（Google Antigravity）\n"
-        "`/exit` · 退出当前编程模式\n"
-        "`/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/gemini_info` · `/traex_info` · `/grok_info` · `/dsh_info` · `/agy_info` · 查看会话/模型信息"
+        "`/coco` · `/claude` · `/aiden` · `/codex` · `/gemini` · `/traex` · `/grok` · `/dsh` · `/agy` · 进入对应编程模式\n"
+        "`/<工具> <需求>` · 单句直达对应工具执行任务（如 `/agy /swarm 修复测试`）\n"
+        "`/cmds [工具]` · 查看工具原生 `/` 命令与 Skills（如 `/swarm`、`/review`、`/compact`）\n"
+        "`/model [模型|list|default]` · `/acp [工具]` · 查看或热切换工具与模型\n"
+        "`/stop` · 立即停止当前任务（保持模式）  ·  `/clear` · 清空上下文（保留工具与模型）\n"
+        "`/sh <命令>` · 直接执行 Shell  ·  `/ask <工具> <问题>` · 零副作用旁路咨询\n"
+        "`/info` · `/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/gemini_info` · `/traex_info` · `/grok_info` · `/dsh_info` · `/agy_info` · 会话详情\n"
+        "`/exit` · 退出当前编程模式回到 Smart"
     ),
     "system_help_section_deep": "💭 Deep Engine · 复杂任务一次交付",
     "system_help_section_deep_body": (
@@ -292,7 +289,7 @@ UI_TEXT = {
         "`/new <名称> [路径]` · 创建新项目\n"
         "`/new-chat <名称> [后缀] [路径]` · 创建/绑定项目群\n"
         "`/switch <名称>` · 切换项目  ·  `/close <名称>` · 关闭项目\n"
-        "`/status` · 查看所有引擎任务状态\n"
+        "`/status` · 工作区驾驶舱（工作区 / 编程通道 / Workflow·Deep·Spec / 锁）\n"
         "`/diff` · 查看最近两次版本变更"
     ),
     "system_help_section_workflow": "⚡ Workflow · 多 Agent 编排执行",
@@ -406,6 +403,9 @@ UI_TEXT = {
     "diag_step_completed": "完成",
     "diag_engine_deep": "Deep",
     "diag_engine_spec": "Spec",
+    "diag_engine_workflow": "Workflow",
+    "diag_cockpit_title": "🧭 工作区总览",
+    "diag_task_detail_workflow_title": "📊 Workflow 任务详情",
     "diag_label_origin_id": "**Origin ID**",
     "diag_label_request_id": "**Request ID**",
     "diag_label_project_id": "**Project ID**",

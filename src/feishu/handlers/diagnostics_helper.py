@@ -54,6 +54,42 @@ class DiagnosticsHelper:
                 started_at=p.started_at
             ))
 
+        # Workflow engines
+        wf_mgr = getattr(ctx, "workflow_engine_manager", None)
+        if wf_mgr is not None and callable(getattr(wf_mgr, "list_engines", None)):
+            wf_engines = wf_mgr.list_engines(chat_id)
+            if isinstance(wf_engines, (list, tuple)):
+                wf_label = UI_TEXT.get("diag_engine_workflow", "Workflow")
+                for engine in wf_engines:
+                    wp = getattr(engine, "workflow_project", None)
+                    if not wp:
+                        continue
+                    status_obj = getattr(wp, "status", None)
+                    status_val = getattr(status_obj, "value", str(status_obj or "idle"))
+                    if not include_done and status_val in ("completed", "failed", "cancelled", "idle"):
+                        continue
+                    tid = getattr(wp, "workflow_id", "") or ""
+                    phases = getattr(wp, "phases", ()) or ()
+                    done_phases = sum(
+                        1
+                        for ph in phases
+                        if getattr(getattr(ph, "status", None), "value", getattr(ph, "status", ""))
+                        == "completed"
+                    )
+                    parts = [status_val]
+                    if phases:
+                        parts.append(f"{done_phases}/{len(phases)} 阶段")
+                    entries.append(
+                        EngineStatusEntry(
+                            mode=wf_label,
+                            task_id=tid,
+                            name=getattr(wp, "name", "") or "Workflow",
+                            status=status_val,
+                            info=" · ".join(parts),
+                            started_at=getattr(wp, "started_at", None),
+                        )
+                    )
+
         # Sort: running first, then by start time descending
         def _sort_key(e: EngineStatusEntry):
             status_val = e.status

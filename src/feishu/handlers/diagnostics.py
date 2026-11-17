@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from ...card.backend_meta import get_backend_meta
 from ...card.builders.deep import DeepBuilder
 from ...card.builders.diagnostics import DiagnosticsBuilder
 from ...card.builders.project import ProjectBuilder
 from ...card.models import EngineCardState
 from ...card.ui_text import UI_TEXT
+from ...mode import PROGRAMMING_MODES
 from ...project import context_helper
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.errors import get_error_detail
@@ -210,12 +213,122 @@ class DiagnosticsHandler(BaseHandler):
             return ""
         return UI_TEXT["lock_status_section_header"] + "\n\n".join(parts) + _admin_suffix
 
-    def show_unified_status(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
-        """Show unified status across all engine types (Deep/Spec).
+    @staticmethod
+    def _read_git_branch(root_path: str) -> str:
+        """Read current git branch directly from .git/HEAD without subprocess overhead."""
+        if not root_path:
+            return ""
+        try:
+            root = Path(root_path)
+            git_entry = root / ".git"
+            if git_entry.is_file():
+                raw = git_entry.read_text(encoding="utf-8", errors="ignore").strip()
+                if raw.lower().startswith("gitdir:"):
+                    raw_dir = raw.split(":", 1)[1].strip()
+                    git_dir = Path(raw_dir)
+                    if not git_dir.is_absolute():
+                        git_dir = (root / git_dir).resolve()
+                else:
+                    return ""
+            elif git_entry.is_dir():
+                git_dir = git_entry
+            else:
+                return ""
+            head_file = git_dir / "HEAD"
+            if not head_file.is_file():
+                return ""
+            head_content = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if head_content.startswith("ref: refs/heads/"):
+                return head_content[len("ref: refs/heads/"):].strip()
+            if head_content.startswith("ref: "):
+                return head_content[5:].strip()
+            if len(head_content) >= 7:
+                return f"detached@{head_content[:7]}"
+        except OSError:
+            return ""
+        return ""
 
-        - /status          → list running/paused engine tasks for current chat
-        - /status all      → include completed tasks
-        - /status <task_id> → detailed status for a specific task
+    def _collect_direct_cockpit_info(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"],
+    ) -> dict:
+        """Collect non-blocking Direct programming lane summary for /status cockpit."""
+        pid = project.project_id if project else None
+        mode_key = ""
+        mode_display = "Smart 模式"
+        try:
+            mode = self.mode_manager.get_mode(chat_id, project_id=pid)
+            is_prog = self.mode_manager.is_programming_mode(chat_id, project_id=pid) is True
+            if mode in PROGRAMMING_MODES and is_prog:
+                mode_key = mode.value
+                meta = get_backend_meta(mode)
+                mode_display = meta.display_name if meta else mode.value
+        except Exception:
+            mode_key = ""
+
+        tool_name = mode_key or (getattr(project, "acp_tool_name", None) if project else "") or ""
+        model_name = (getattr(project, "acp_model_name", None) if project else None) or ""
+        session_id = ""
+        message_count = None
+        usage_text = ""
+        is_running = False
+        elapsed_s = None
+
+        if tool_name:
+            try:
+                handler = self.get_handler(tool_name)
+            except Exception:
+                handler = None
+            if handler is not None:
+                active_getter = getattr(handler, "_get_active_programming_run", None)
+                active_run = active_getter(chat_id, project) if callable(active_getter) else None
+                started_at = getattr(active_run, "started_at", None) if active_run is not None else None
+                if isinstance(started_at, (int, float)):
+                    is_running = True
+                    elapsed_s = max(0, int(time.monotonic() - float(started_at)))
+
+                mgr_getter = getattr(handler, "_get_session_manager", None)
+                mgr = mgr_getter() if callable(mgr_getter) else None
+                if mgr is not None and callable(getattr(mgr, "get_session", None)):
+                    live = mgr.get_session(chat_id, project_id=pid)
+                    live_sid = getattr(live, "session_id", None) if live is not None else None
+                    if isinstance(live_sid, str) and live_sid:
+                        session_id = live_sid
+                        raw_count = getattr(live, "message_count", None)
+                        if isinstance(raw_count, int):
+                            message_count = raw_count
+                        live_model = getattr(live, "_model_name", None)
+                        if isinstance(live_model, str) and live_model and not model_name:
+                            model_name = live_model
+                        usage_getter = getattr(live, "get_usage_info", None)
+                        usage = usage_getter() if callable(usage_getter) else None
+                        if usage is not None and (getattr(usage, "used", 0) > 0 or getattr(usage, "size", 0) > 0):
+                            used = int(getattr(usage, "used", 0) or 0)
+                            size = int(getattr(usage, "size", 0) or 0)
+                            if size > 0:
+                                pct = int(round((used / size) * 100))
+                                usage_text = f"{used:,}/{size:,} ({pct}%)"
+                            else:
+                                usage_text = f"{used:,} tokens"
+        return {
+            "mode_key": mode_key,
+            "mode_display": mode_display,
+            "tool_name": tool_name,
+            "model_name": model_name,
+            "session_id": session_id,
+            "message_count": message_count,
+            "usage_text": usage_text,
+            "is_running": is_running,
+            "elapsed_s": elapsed_s,
+        }
+
+    def show_unified_status(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+        """Show the unified Workspace Cockpit (/status) or inspect a specific task id.
+
+        - /status           → Workspace Cockpit (project, branch, direct lane, engines, locks)
+        - /status all       → include completed engine tasks
+        - /status <task_id> → detailed status for Deep / Spec / Workflow / scheduler task
         """
         arg = ""
         try:
@@ -232,11 +345,8 @@ class DiagnosticsHandler(BaseHandler):
 
         include_done = arg.lower() in ("all", "-a", "--all") if arg else False
 
-        # Collect engines across all three types
+        # Collect engines (Deep, Spec, Workflow)
         entries = DiagnosticsHelper.get_all_engine_statuses(self.ctx, chat_id, include_done=include_done)
-
-        project_name = project.project_name if project else ""
-        content = DiagnosticsBuilder.build_unified_status_content(entries, include_done, project_name)
 
         # Determine admin status for lock hints
         _is_admin = False
@@ -247,19 +357,21 @@ class DiagnosticsHandler(BaseHandler):
             if _sender:
                 _is_admin = _chat_lock_mgr.is_admin(_sender)
 
-        # Append lock status section
         lock_lines = self._build_lock_status_lines(chat_id, project, is_admin=_is_admin)
-        if lock_lines:
-            content += "\n\n" + lock_lines
+        working_dir = (project.root_path if project and getattr(project, "root_path", None) else None) or self.get_working_dir(chat_id)
+        git_branch = self._read_git_branch(working_dir)
+        direct_info = self._collect_direct_cockpit_info(chat_id, project)
 
-        msg_type, card_content = ProjectBuilder.build_smart_response_card(
+        msg_type, card_content = DiagnosticsBuilder.build_workspace_cockpit_card(
             project=project,
-            title=UI_TEXT["diag_unified_status_title"],
-            content=content,
-            working_dir=self.get_working_dir(chat_id),
-            show_buttons=True,
+            working_dir=working_dir,
+            git_branch=git_branch,
+            direct_info=direct_info,
+            entries=entries,
+            lock_lines=lock_lines,
+            include_done=include_done,
         )
-        self.reply_card(message_id, card_content)
+        self.reply_interactive_card(message_id, card_content, msg_type=msg_type)
 
     def _show_task_detail(
         self, message_id: str, chat_id: str, task_id: str, project: Optional["ProjectContext"] = None
@@ -307,6 +419,37 @@ class DiagnosticsHandler(BaseHandler):
                 )
                 self.reply_card(message_id, card_content)
                 return
+
+        wf_mgr = getattr(self.ctx, "workflow_engine_manager", None)
+        if wf_mgr is not None and callable(getattr(wf_mgr, "list_engines", None)):
+            wf_engines = wf_mgr.list_engines(chat_id)
+            if isinstance(wf_engines, (list, tuple)):
+                for engine in wf_engines:
+                    wp = getattr(engine, "workflow_project", None)
+                    wf_id = getattr(wp, "workflow_id", "") if wp else ""
+                    if wf_id and (wf_id == task_id or task_id in wf_id):
+                        wf_status = getattr(getattr(wp, "status", None), "value", "unknown")
+                        wf_name = getattr(wp, "name", "") or "Workflow"
+                        metrics = getattr(wp, "metrics", None)
+                        completed = int(getattr(metrics, "completed_agents", 0) or 0) if metrics else 0
+                        failed = int(getattr(metrics, "failed_agents", 0) or 0) if metrics else 0
+                        phases = getattr(wp, "phases", ()) or ()
+                        content_lines = [
+                            f"**Workflow**：`{wf_name}` (`{wf_id}`)",
+                            f"• 状态：`{wf_status}`",
+                            f"• 阶段数：{len(phases)} · Agent：完成 {completed} / 失败 {failed}",
+                        ]
+                        msg_type, card_content = DeepBuilder.build_info_card(
+                            project,
+                            EngineCardState(
+                                title=UI_TEXT.get("diag_task_detail_workflow_title", "📊 Workflow 任务详情"),
+                                content="\n".join(content_lines),
+                                engine_name=getattr(engine, "engine_name", "Workflow"),
+                                show_buttons=False,
+                            ),
+                        )
+                        self.reply_card(message_id, card_content)
+                        return
 
         # Also check scheduler by task_id
         state = self.scheduler.get_state_by_task_id(task_id, chat_id=chat_id)

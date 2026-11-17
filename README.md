@@ -160,12 +160,18 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | --- | --- |
 | `/help` | 查看完整帮助 |
 | `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex`、`/grok`、`/dsh`、`/agy` | 进入对应编程模式 |
-| `/coco_info`、`/claude_info`、`/aiden_info`、`/codex_info`、`/gemini_info`、`/traex_info`、`/grok_info`、`/dsh_info`、`/agy_info` | 查看对应编程会话与模型信息 |
-| `/model`、`/model list`、`/model <name>` | 自动适配并查看或切换当前 ACP 工具（Codex、Traex、DSH、AGY 等）的模型 |
-| `/acp` | 查看 ACP 工具选择入口 |
+| `/<工具> <需求或原生命令>` | 单句直达对应工具执行（如 `/agy /swarm 修复测试`、`/codex /review`） |
+| `/cmds [工具]` | 打开工具原生 `/` 命令与 Skills 卡片（并支持一键执行无参命令） |
+| `/coco_info`、…、`/agy_info`、`/info` | 查看当前或指定编程会话、模型与上下文用量 |
+| `/model`、`/model list`、`/model <name>` | 自动适配查看或热切换当前工具模型 |
+| `/acp [工具]` | 查看或热切换项目默认 ACP 工具 |
+| `/stop`、`/clear` | 立即停止运行中任务（不退出模式）/ 清空上下文并保留工具与模型 |
+| `/sh <命令>`、`/ask <工具> <问题>` | 任意模式执行 Shell / 一次性零副作用旁路咨询 |
 | `/exit` | 退出当前模式，回到 Smart |
 
-Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文本会进入宿主机
+工具原生 `/` 命令（如 AGY 的 `/swarm`、`/boost`、`/plan`、`/compact`，Codex/Traex/Coco 的 `/review`、`/review-branch`、`/mcp`、`/skills`）在对应编程模式下可直接发送透传；在 Smart 模式下发送专属原生命令（如 `/swarm ...`）也会自动路由到相应工具执行（`/logout` 等高危账号命令默认拦截）。
+
+Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文本（或任意模式下使用 `/sh <命令>`）会进入宿主机
 执行路径。命令会直接交给宿主 shell；GhostAP 仅保留超时、输出截断和日志脱敏，
 不再做黑白名单、风险分级或操作系统隔离。
 
@@ -177,7 +183,7 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | `/new <名称> [目录]` | 创建项目 |
 | `/switch <名称>` | 切换项目 |
 | `/close <名称>` | 关闭项目 |
-| `/status` | 查看当前项目、模式、锁和任务状态 |
+| `/status`、`/status <task_id>` | 打开工作区驾驶舱（工作区/Git分支/Direct/Workflow·Deep·Spec/锁）或查看任务详情 |
 
 ### 长任务引擎
 

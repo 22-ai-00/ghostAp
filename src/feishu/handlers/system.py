@@ -289,6 +289,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, t, p),
             "/cmds": lambda m, c, t, p: self.show_tool_commands(m, c, t, p),
+            "/info": lambda m, c, t, p: self.handle_info_command(m, c, p),
             "/stop": lambda m, c, t, p: self.stop_current_task(m, c, p),
             "/clear": lambda m, c, t, p: self.handle_clear_command(m, c, p),
             "/reset": lambda m, c, t, p: self.handle_clear_command(m, c, p),
@@ -853,6 +854,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/trace",
             "/acp",
             "/cmds",
+            "/info",
             "/stop",
             "/clear",
             "/reset",
@@ -896,6 +898,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/status",
             "/acp",
             "/cmds",
+            "/info",
             "/model",
             "/btw",
             "/setadmin",
@@ -1318,6 +1321,26 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             message_id,
             UI_TEXT["system_clear_done"].format(tool=target_tool, model=saved_model or "default"),
         )
+
+    def handle_info_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Universal /info command: show active tool session info or Workspace Cockpit."""
+        active_key = self._resolve_active_programming_mode_key(chat_id, project)
+        if active_key:
+            try:
+                handler = self.get_handler(active_key)
+            except Exception:
+                handler = None
+            if handler is not None and callable(getattr(handler, "show_info", None)):
+                handler.show_info(message_id, chat_id, project)
+                return
+        diag = self.get_handler("diagnostics")
+        if diag is not None and callable(getattr(diag, "show_unified_status", None)):
+            diag.show_unified_status(message_id, chat_id, "/status", project)
 
     def handle_sh_command(
         self,

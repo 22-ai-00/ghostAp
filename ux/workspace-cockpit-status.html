@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GhostAP 工作区驾驶舱 /status 预览</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #111318; color: #f3f4f6; }
+    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 460px)); gap: 24px; padding: 32px; justify-content: center; }
+    .card { border: 1px solid #343946; border-radius: 14px; overflow: hidden; background: #1b1f27; box-shadow: 0 18px 45px rgba(0,0,0,.28); }
+    .header { padding: 15px 18px; font-size: 16px; font-weight: 700; background: #1d3557; border-bottom: 1px solid #343946; }
+    .body { padding: 18px; font-size: 14px; line-height: 1.55; color: #d7dbe5; }
+    .kv { background: #242a34; border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+    .kv-title { font-weight: 700; color: #f3f4f6; margin-bottom: 6px; }
+    code { padding: 1px 6px; border-radius: 5px; background: #2c3442; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: #93c5fd; }
+    .hr { height: 1px; background: #303745; margin: 14px 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    button { padding: 8px 12px; border: 1px solid #4b5565; border-radius: 8px; color: #f3f4f6; background: #2a303b; font-size: 13px; font-weight: 600; cursor: pointer; }
+    button.primary { border-color: #3b82f6; background: #2563eb; }
+    button.danger { border-color: #ef6b73; background: #8c3038; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <div class="header">🧭 工作区总览 · ghostAp</div>
+      <div class="body">
+        <div class="kv">
+          <div class="kv-title">📂 工作区与分支</div>
+          <div>路径：<code>/data00/home/jiataorui/work/github/ghostAp</code></div>
+          <div>分支：<code>dev</code></div>
+        </div>
+
+        <div class="kv">
+          <div class="kv-title">💻 Direct 编程通道</div>
+          <div>当前模式：🪐 <strong>AGY</strong>（运行中 · 已运行 24s）</div>
+          <div>工具 / 模型：<code>agy</code> / <code>claude-sonnet-4</code></div>
+          <div>会话：<code>s-91ac...</code> · 消息数 4 · 上下文 <code>12,400 / 200,000 (6%)</code></div>
+        </div>
+
+        <div class="kv">
+          <div class="kv-title">⚙️ 长任务引擎（Workflow / Deep / Spec）</div>
+          <div>• 🔄 <strong>Workflow</strong> `build-api` (`wf_91a2c3`): running · 2/4 步</div>
+          <div>• 当前无活跃 Deep / Spec 任务</div>
+        </div>
+
+        <div class="hr"></div>
+        <div class="actions">
+          <button>切换模型</button>
+          <button>原生命令 /cmds</button>
+          <button class="danger">⏹️ 停止当前任务</button>
+          <button class="primary">项目看板</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

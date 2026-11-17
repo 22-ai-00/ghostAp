@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from src.card.actions import dispatch as action_ids
+from src.card.backend_meta import get_backend_meta
 from src.card.models import EngineStatusEntry
+from src.card.shared import build_responsive_layout
 from src.card.ui_text import UI_TEXT
 
+from .core import CoreBuilder
+
 if TYPE_CHECKING:
+    from src.project.context import ProjectContext
     from src.tasking.scheduler import TaskState
 
 logger = logging.getLogger(__name__)
@@ -158,6 +165,137 @@ class DiagnosticsBuilder:
             lines.append(UI_TEXT["diag_status_all_hint"])
 
         return "\n".join(lines)
+
+    @staticmethod
+    def build_workspace_cockpit_card(
+        project: Optional["ProjectContext"],
+        working_dir: str,
+        *,
+        git_branch: str = "",
+        direct_info: Optional[dict] = None,
+        entries: Optional[list[EngineStatusEntry]] = None,
+        lock_lines: str = "",
+        include_done: bool = False,
+    ) -> tuple[str, str]:
+        """Build the unified Workspace Cockpit (/status) Card JSON 2.0."""
+        d_info = direct_info or {}
+        entries = list(entries or [])
+        proj_name = getattr(project, "project_name", None) if project else None
+        proj_id = getattr(project, "project_id", None) if project else None
+        path_display = (getattr(project, "root_path", None) if project else None) or working_dir or "~"
+
+        # 1. Workspace & git branch
+        ws_lines = [
+            "**📂 工作区与分支**",
+            f"• 路径：`{path_display}`",
+        ]
+        if git_branch:
+            ws_lines.append(f"• 分支：`{git_branch}`")
+        elements: list[dict] = [{"tag": "markdown", "content": "\n".join(ws_lines)}]
+
+        # 2. Direct programming lane
+        mode_key = str(d_info.get("mode_key") or "").strip().lower()
+        tool_name = str(d_info.get("tool_name") or "").strip().lower()
+        meta = get_backend_meta(tool_name or mode_key)
+        is_running = bool(d_info.get("is_running"))
+        elapsed_s = d_info.get("elapsed_s")
+        if meta is not None and mode_key:
+            mode_label = f"{meta.emoji} **{meta.display_name}**"
+        else:
+            mode_label = f"🧠 **{d_info.get('mode_display') or 'Smart 模式'}**"
+        state_badge = (
+            f"（执行中 · 已运行 {int(elapsed_s)}s）"
+            if is_running and isinstance(elapsed_s, (int, float))
+            else ("（执行中）" if is_running else "（空闲）")
+        )
+        direct_lines = [
+            "**💻 Direct 编程通道**",
+            f"• 当前模式：{mode_label}{state_badge}",
+        ]
+        if tool_name:
+            model_display = str(d_info.get("model_name") or "").strip() or "default"
+            direct_lines.append(f"• 工具 / 模型：`{tool_name}` / `{model_display}`")
+        sid = str(d_info.get("session_id") or "").strip()
+        msg_count = d_info.get("message_count")
+        usage_text = str(d_info.get("usage_text") or "").strip()
+        session_bits: list[str] = []
+        if sid:
+            short_sid = f"{sid[:12]}…" if len(sid) > 12 else sid
+            count_part = f" · {int(msg_count)} 条消息" if msg_count is not None else ""
+            session_bits.append(f"会话 `{short_sid}`{count_part}")
+        if usage_text:
+            session_bits.append(f"上下文 `{usage_text}`")
+        if session_bits:
+            direct_lines.append("• " + " · ".join(session_bits))
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "\n".join(direct_lines)})
+
+        # 3. Engines lane (Workflow / Deep / Spec)
+        elements.append({"tag": "hr"})
+        if entries:
+            engine_md = DiagnosticsBuilder.build_unified_status_content(
+                entries,
+                include_done=include_done,
+                project_name=proj_name or "",
+            )
+        else:
+            engine_md = (
+                "**⚙️ 长任务引擎（Workflow / Deep / Spec）**\n"
+                "• 当前无活跃 Workflow / Deep / Spec 任务\n"
+                "<font color='grey'>发送 `/wf <需求>`、`/deep <需求>` 或 `/spec <需求>` 可随时启动</font>"
+            )
+        elements.append({"tag": "markdown", "content": engine_md})
+
+        # 4. Lock status section
+        if lock_lines:
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "markdown", "content": lock_lines})
+
+        # 5. Context-aware action buttons
+        def _cb_btn(label: str, payload: dict, *, btn_type: str = "default") -> dict:
+            val = dict(payload)
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": btn_type,
+                "value": val,
+                "behaviors": [{"type": "callback", "value": dict(val)}],
+            }
+
+        buttons: list[dict] = []
+        if tool_name:
+            picker_payload = {"action": action_ids.OPEN_ACP_MODEL_PICKER, "tool_name": tool_name}
+            cmds_payload = {"action": action_ids.SHOW_TOOL_COMMANDS, "tool_name": tool_name}
+            if proj_id:
+                picker_payload["project_id"] = proj_id
+                cmds_payload["project_id"] = proj_id
+            if d_info.get("model_name"):
+                picker_payload["current_model"] = d_info["model_name"]
+            buttons.append(_cb_btn(UI_TEXT["system_acp_switch_model_btn"], picker_payload))
+            buttons.append(_cb_btn(UI_TEXT["system_acp_native_cmds_btn"], cmds_payload))
+        if is_running:
+            stop_payload = {"action": action_ids.PROGRAMMING_STOP}
+            if tool_name:
+                stop_payload["tool_name"] = tool_name
+            if proj_id:
+                stop_payload["project_id"] = proj_id
+            buttons.append(_cb_btn("⏹️ 停止当前任务", stop_payload, btn_type="danger"))
+        buttons.append(
+            _cb_btn(
+                UI_TEXT["project_board_title"],
+                {"action": action_ids.SHOW_BOARD},
+                btn_type="default" if is_running else "primary",
+            )
+        )
+        elements.append({"tag": "hr"})
+        elements.extend(build_responsive_layout(buttons, layout="mobile"))
+
+        title_base = UI_TEXT.get("diag_cockpit_title", "🧭 工作区总览")
+        header_title = f"{title_base} · {proj_name}" if proj_name else title_base
+        header_color = meta.template_color if (meta is not None and mode_key) else "blue"
+        card = CoreBuilder._wrap_card(header_title, header_color, elements)
+        card["config"]["summary"] = {"content": header_title}
+        return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
     def build_task_detail_content(state: TaskState) -> str:

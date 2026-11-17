@@ -130,6 +130,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/agy", "进入 AGY 编程模式", aliases=("/enter_agy",), enters_programming_mode=True, programming_mode_id="agy", protects_from_auto_activation=True),
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
     _action("/cmds", "查看当前工具原生命令与 Skills", "/cmds [工具]", aliases=("/commands", "/tool_cmds"), protects_from_auto_activation=True),
+    _action("/info", "查看当前会话或工作区详情", protects_from_auto_activation=True, slash_discoverable=False),
     _action("/model", "自适应查看或设置当前编程工具模型", "/model [模型名|default]"),
     _action("/stop", "立即停止当前运行中的任务（保持当前模式）", protects_from_auto_activation=True),
     _action("/clear", "清空当前会话上下文（保留当前工具与模型）", aliases=("/reset",), protects_from_auto_activation=True),
@@ -201,7 +202,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
 # from Feishu automatically on the next startup.
 HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     # tool introspection / low-level ACP
-    "/tools", "/tools_status", "/acp", "/btw", "/sh", "/ask",
+    "/tools", "/tools_status", "/acp", "/btw", "/sh", "/ask", "/info",
     "/coco_status",
     "/coco_info", "/claude_info", "/aiden_info", "/codex_info",
     "/gemini_info", "/traex_info", "/grok_info", "/dsh_info", "/agy_info",
