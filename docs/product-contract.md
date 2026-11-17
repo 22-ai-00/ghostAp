@@ -19,10 +19,10 @@ engineering environment.
 - Direct, Deep and Spec automatically advance each accepted task to a successful
   or explicit failed terminal state. Missing ordinary choices use the saved or
   recommended default; bounded recovery does not add confirmation or resume gates.
-- Workflow accepts work through one owner-confirmed Agent Pool containing
-  1-8 `tool+model` Agents. After that single confirmation, the pool and
-  orchestrator are frozen and script generation, validation and execution advance
-  automatically without a later script-confirmation or continuation gate.
+- Workflow auto-binds an available recommended Agent Pool containing
+  1-8 `tool+model` Agents and freezes the pool and orchestrator immediately;
+  script generation, validation and execution advance automatically without any
+  confirmation or continuation gate.
 - Users retain explicit stop and configuration controls. Tool permissions and
   execution safety are delegated to the selected Agent backend.
 - `/hire <name>` creates a durable Employee Bot through the controlled

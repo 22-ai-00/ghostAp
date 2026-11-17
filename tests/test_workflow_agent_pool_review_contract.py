@@ -10,7 +10,6 @@ from src.workflow_engine.models import (
     AgentCallParams,
     AgentCallResult,
     AgentStatus,
-    ReviewAgentBinding,
     WorkflowProject,
     WorkflowStatus,
 )
@@ -21,42 +20,6 @@ from src.workflow_engine.script_gen import (
 )
 from src.workflow_engine.state_manager import WorkflowStateManager
 from tests.test_workflow_bridge_transport import _run_real_node_workflow
-
-
-def _review_binding(tool: str, model: str | None) -> ReviewAgentBinding:
-    return ReviewAgentBinding(
-        provider=tool,
-        tool_name=tool,
-        display_name=tool.title(),
-        agent_type=tool,
-        model_name=model,
-        model_display_name=model,
-        selection_key=f"{tool}:{model or 'default'}",
-        use_default_model=model is None,
-    )
-
-
-def _legacy_spec(
-    *,
-    allowed_tools: tuple[str, ...] = ("codex",),
-    tool_model_map: dict[str, str | None] | None = None,
-) -> WorkflowRunSpec:
-    return WorkflowRunSpec.from_legacy_replay(
-        orchestrator=_review_binding("codex", "frozen-model"),
-        reviewers=(),
-        tool_model_map=(
-            {"codex": "frozen-model"}
-            if tool_model_map is None
-            else tool_model_map
-        ),
-        task="legacy task",
-        chat_id="chat",
-        topic_id=None,
-        budget=10,
-        deadline=None,
-        auto_reviewer=True,
-        allowed_tools=allowed_tools,
-    )
 
 
 def _pool() -> tuple[WorkflowAgentBinding, ...]:
@@ -100,82 +63,34 @@ class _RecordingExecutor:
         return AgentCallResult(output="ok")
 
 
-def _legacy_engine(tmp_path, spec: WorkflowRunSpec) -> tuple[WorkflowEngine, _RecordingExecutor]:
-    engine = WorkflowEngine("chat", str(tmp_path), agent_type="codex")
-    project = WorkflowProject(name="legacy", status=WorkflowStatus.RUNNING)
-    engine._project = project
-    engine._state_manager = WorkflowStateManager(project)
-    engine._run_spec = spec
-    recorder = _RecordingExecutor()
-    engine._executor = recorder
-    return engine, recorder
-
-
-def test_legacy_replay_requires_an_exact_frozen_binding_for_every_allowed_tool() -> None:
-    with pytest.raises(ValueError, match="allowed|binding|model"):
-        _legacy_spec(
-            allowed_tools=("codex", "gemini"),
-            tool_model_map={"codex": "frozen-model"},
-        )
-
-    with pytest.raises(ValueError, match="allowed|binding|extra"):
-        _legacy_spec(
-            allowed_tools=("codex",),
-            tool_model_map={"codex": "frozen-model", "gemini": "other-model"},
-        )
-
-
-def test_legacy_replay_ignores_script_model_and_rejects_extra_tool(tmp_path) -> None:
-    engine, recorder = _legacy_engine(tmp_path, _legacy_spec())
-
-    result = engine._handle_agent_call(
-        AgentCallParams(
-            prompt="work",
-            tool="codex",
-            model="script-spoof",
-            label="worker",
-            phase="work",
-        ),
-        allow_cache=False,
-    )
-
-    assert result.error is None
-    assert recorder.calls[0].model == "frozen-model"
-
-    rejected = engine._handle_agent_call(
-        AgentCallParams(
-            prompt="work",
-            tool="gemini",
-            model="script-model",
-            label="extra",
-            phase="work",
-        ),
-        allow_cache=False,
-    )
-    assert rejected.error
-    assert len(recorder.calls) == 1
-
-
-def test_from_dict_distinguishes_missing_pool_from_explicit_empty_or_invalid() -> None:
-    old_payload = _legacy_spec().to_dict()
-    assert "agent_pool" not in old_payload
-    old_payload.pop("legacy_replay")
-    assert WorkflowRunSpec.from_dict(old_payload).legacy_replay is True
+def test_from_dict_rejects_missing_empty_or_invalid_pool() -> None:
+    strict_payload = WorkflowRunSpec(
+        reviewers=(),
+        tool_model_map={},
+        task="strict task",
+        chat_id="chat",
+        topic_id=None,
+        budget=4,
+        deadline=None,
+        auto_reviewer=True,
+        orchestrator="codex",
+        agent_pool=_pool(),
+        orchestrator_agent_id="codex-fast",
+    ).to_dict()
+    no_pool = dict(strict_payload)
+    no_pool.pop("agent_pool")
 
     with pytest.raises(ValueError, match="agent_pool"):
-        WorkflowRunSpec.from_dict(
-            {**old_payload, "agent_pool": [], "legacy_replay": True}
-        )
+        WorkflowRunSpec.from_dict(no_pool)
 
-    with pytest.raises(ValueError, match="legacy|agent_pool"):
-        WorkflowRunSpec.from_dict({**old_payload, "legacy_replay": False})
+    with pytest.raises(ValueError, match="agent_pool"):
+        WorkflowRunSpec.from_dict({**no_pool, "agent_pool": []})
 
     with pytest.raises((TypeError, ValueError), match="agent_pool|agent_id"):
         WorkflowRunSpec.from_dict(
             {
-                **old_payload,
+                **no_pool,
                 "agent_pool": [{"agent_id": "", "tool_name": "codex"}],
-                "legacy_replay": False,
             }
         )
 
@@ -344,15 +259,6 @@ def test_simple_script_strict_path_emits_agent_id_and_agent_plan() -> None:
     assert valid, errors
 
 
-def test_simple_script_requires_strict_pool_or_explicit_legacy_path() -> None:
-    with pytest.raises(ValueError, match="agent_pool|legacy"):
+def test_simple_script_requires_strict_pool() -> None:
+    with pytest.raises(ValueError, match="agent_pool|empty"):
         generate_simple_script("implement task")
-
-    legacy_script = generate_simple_script(
-        "implement task",
-        selected_tools=["codex"],
-        tool_model_map={"codex": "legacy-model"},
-        legacy_replay=True,
-    )
-    assert 'tool: "codex"' in legacy_script
-    assert 'model: "legacy-model"' in legacy_script

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_WORKFLOW_STORAGE_ROOT = "~/.ghostap/workflow"
 
@@ -53,3 +57,39 @@ def workflow_reports_dir(root_path: str, storage_root: str | None = None) -> str
         workflow_project_storage_root(root_path, storage_root),
         "reports",
     )
+
+
+def remove_owned_workflow_artifact(
+    path: str | None,
+    *,
+    root_path: str,
+    scripts_dir: str | None = None,
+    warn_on_refusal: bool = False,
+) -> None:
+    """Remove only disposable generated Workflow scripts or immutable execution copies."""
+    if not path:
+        return
+
+    candidate = os.path.realpath(os.path.abspath(path))
+    basename = os.path.basename(candidate)
+    resolved_scripts_dir = os.path.realpath(scripts_dir or workflow_scripts_dir(root_path))
+    temp_root = os.path.realpath(tempfile.gettempdir())
+
+    generated_source = (
+        os.path.dirname(candidate) == resolved_scripts_dir
+        and basename.endswith(".js")
+        and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
+    )
+    confirmed_copy = (
+        basename.startswith("ghostap-confirmed-")
+        and basename.endswith(".js")
+        and os.path.commonpath((candidate, temp_root)) == temp_root
+    )
+    if not (generated_source or confirmed_copy):
+        if warn_on_refusal:
+            logger.warning("[workflow] Refusing to remove non-owned workflow artifact: %s", basename)
+        return
+    try:
+        os.remove(candidate)
+    except OSError:
+        pass

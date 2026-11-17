@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.utils.text import format_duration
+
 from .models import AgentStatus, WorkflowProject
 from .storage import (
     DEFAULT_WORKFLOW_STORAGE_ROOT,
@@ -50,20 +52,6 @@ def _safe_slug(value: str, *, default: str = "workflow") -> str:
 
 def _status_text(value: Any) -> str:
     return getattr(value, "value", str(value or ""))
-
-
-def _format_duration(seconds: float) -> str:
-    if seconds < 1:
-        return "<1s"
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    if minutes < 60:
-        return f"{minutes}m{secs}s"
-    hours = int(minutes // 60)
-    mins = minutes % 60
-    return f"{hours}h{mins}m"
 
 
 def _pretty_json(value: Any) -> str:
@@ -137,7 +125,7 @@ def _workflow_summary(project: WorkflowProject) -> str:
         f"- 名称: {project.name or 'Workflow'}",
         f"- 状态: {_status_text(project.status)}",
         f"- Workflow ID: {project.workflow_id or '(none)'}",
-        f"- 耗时: {_format_duration(elapsed)}",
+        f"- 耗时: {format_duration(elapsed)}",
         f"- 阶段: {len(project.phases)}",
         f"- 代理: {completed_agents}/{total_agents} 完成，{failed_agents} 失败，{cached_agents} 缓存",
         f"- Token: {total_tokens}",
@@ -174,7 +162,7 @@ def _phase_process(project: WorkflowProject) -> str:
         cancelled = sum(1 for agent in agents if agent.status == AgentStatus.CANCELLED)
         duration = ""
         if phase.started_at and phase.finished_at:
-            duration = f"，耗时 {_format_duration(max(0.0, phase.finished_at - phase.started_at))}"
+            duration = f"，耗时 {format_duration(max(0.0, phase.finished_at - phase.started_at))}"
         lines.append(f"### 阶段 {idx}: {phase.title}")
         lines.append(f"- 汇总: {done}/{total} 完成，{failed} 失败，{cancelled} 已取消{duration}")
         for agent in agents:
@@ -188,7 +176,7 @@ def _phase_process(project: WorkflowProject) -> str:
             if agent.role:
                 agent_line += f" role={agent.role}"
             if agent.duration_s:
-                agent_line += f" duration={_format_duration(agent.duration_s)}"
+                agent_line += f" duration={format_duration(agent.duration_s)}"
             if agent.token_usage:
                 agent_line += f" tokens={agent.token_usage}"
             if agent.task_summary:
@@ -210,34 +198,6 @@ def _phase_process(project: WorkflowProject) -> str:
                         f"model={child.model or 'default'} latest={child_progress}"
                     )
             lines.append(agent_line)
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def _reviewer_evidence(project: WorkflowProject) -> str:
-    """Render only committed evidence; never infer a review from selection."""
-    run_spec = project.run_spec or {}
-    if run_spec.get("auto_reviewer"):
-        return "Auto 模式：未承诺、也未执行独立 Reviewer 调用。"
-    if not project.reviewer_evidence:
-        return "未记录独立 Reviewer 调用证据；本次运行不得视为已完成评审。"
-
-    lines: list[str] = []
-    for evidence in project.reviewer_evidence:
-        binding = f"{evidence.tool}/{evidence.model or 'default'}"
-        lines.append(
-            f"### Reviewer {evidence.reviewer_index}: {binding}\n"
-            f"- 状态: {evidence.status}\n"
-            f"- Selection key: {evidence.selection_key or '(none)'}\n"
-            f"- Fresh call: {'否' if evidence.cached else '是'}\n"
-            f"- Stop reason: {evidence.stop_reason or '(missing)'}\n"
-            f"- Token: {evidence.token_usage}\n"
-            f"- 耗时: {_format_duration(evidence.duration_s)}"
-        )
-        if evidence.error:
-            lines.append(f"- 错误: {evidence.error}")
-        if evidence.output:
-            lines.append(f"- 输出:\n{evidence.output}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -293,7 +253,6 @@ def _result_sections(project: WorkflowProject) -> list[_ReportSection]:
 def _report_sections(project: WorkflowProject) -> list[_ReportSection]:
     sections = [
         _ReportSection("运行摘要", _workflow_summary(project), expanded=True),
-        _ReportSection("独立评审证据", _reviewer_evidence(project), expanded=True),
         *_result_sections(project),
         _ReportSection("执行过程", _phase_process(project), expanded=False),
         _ReportSection("原始结果 JSON", project.result or "", expanded=False),
@@ -345,7 +304,7 @@ def _render_summary_stats_html(project: WorkflowProject) -> str:
     success_rate = int((completed_agents / max(total_agents, 1)) * 100)
 
     cards = [
-        (_format_duration(elapsed), "总耗时", "#3370ff"),
+        (format_duration(elapsed), "总耗时", "#3370ff"),
         (f"{completed_phases}/{total_phases}", "阶段完成", "#00b578"),
         (f"{completed_agents}/{total_agents}", "代理完成", "#722ed1"),
         (f"{success_rate}%", "成功率", "#00b578" if success_rate >= 80 else "#ff4d4f"),
@@ -378,7 +337,7 @@ def _render_phases_html(project: WorkflowProject) -> str:
         cancelled = sum(1 for agent in agents if agent.status == AgentStatus.CANCELLED)
         duration = ""
         if phase.started_at and phase.finished_at:
-            duration = _format_duration(max(0.0, phase.finished_at - phase.started_at))
+            duration = format_duration(max(0.0, phase.finished_at - phase.started_at))
 
         if failed:
             badge_cls = "badge-fail"
@@ -400,7 +359,7 @@ def _render_phases_html(project: WorkflowProject) -> str:
                 "done": "agent-ok", "cached": "agent-cached",
                 "failed": "agent-fail", "cancelled": "agent-cancel",
             }.get(a_status.lower(), "agent-pending")
-            a_dur = f' <span class="agent-meta">{_format_duration(agent.duration_s)}</span>' if agent.duration_s else ""
+            a_dur = f' <span class="agent-meta">{format_duration(agent.duration_s)}</span>' if agent.duration_s else ""
             a_tok = f' <span class="agent-meta">{agent.token_usage} tok</span>' if agent.token_usage else ""
             a_tool = f' <span class="agent-tool">{html.escape(agent.tool or "")}</span>' if agent.tool else ""
             a_model = f' <span class="agent-tool">{html.escape(agent.model or "")}</span>' if agent.model else ""

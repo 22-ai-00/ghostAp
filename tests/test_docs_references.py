@@ -196,22 +196,20 @@ def test_workflow_node_minimum_is_consistent_across_runtime_and_readme() -> None
     assert f"Node.js {NODE_MIN_VERSION[0]}+" in readme
 
 
-def test_readme_documents_workflow_single_pool_confirmation_gate() -> None:
+def test_readme_documents_workflow_auto_bound_agent_pool() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "`/workflow_help`" in readme
     assert "1–8 个 `tool+model` Agent" in readme
-    assert "`使用此池开始编排`" in readme
-    assert "单次确认后" in readme
-    assert "不以 Agent 选择" not in readme
+    assert "自动绑定" in readme
+    assert "使用此池开始编排" not in readme
 
 
-def test_product_contract_documents_workflow_single_pool_confirmation_gate() -> None:
+def test_product_contract_documents_workflow_auto_bound_agent_pool() -> None:
     contract = (ROOT / "docs" / "product-contract.md").read_text(
         encoding="utf-8"
     )
 
-    assert "owner-confirmed Agent Pool" in contract
+    assert "auto-binds an available recommended Agent Pool" in contract
     assert "1-8 `tool+model` Agents" in contract
-    assert "After that single confirmation" in contract
-    assert "never turns into a request for the user to select an Agent" not in contract
+    assert "owner-confirmed Agent Pool" not in contract

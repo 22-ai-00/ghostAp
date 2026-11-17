@@ -112,13 +112,13 @@ def test_same_tool_with_different_models_is_two_callable_agents() -> None:
     assert spec.agent_binding("codex-fast") == fast
 
 
-def test_new_run_spec_requires_pool_and_legacy_is_explicit() -> None:
+def test_run_spec_requires_strict_agent_pool() -> None:
     kwargs = dict(
         orchestrator=_legacy_binding(),
         reviewers=(),
         tool_model_map={"codex": "legacy-model"},
-        task="legacy replay",
-        chat_id="legacy-chat",
+        task="strict pool required",
+        chat_id="chat-strict",
         topic_id=None,
         budget=2,
         deadline=None,
@@ -129,28 +129,20 @@ def test_new_run_spec_requires_pool_and_legacy_is_explicit() -> None:
     with pytest.raises(ValueError, match="agent_pool"):
         WorkflowRunSpec(**kwargs)
 
-    legacy = WorkflowRunSpec.from_legacy_replay(**kwargs)
-    assert legacy.legacy_replay is True
-    assert legacy.agent_pool == ()
-
-    with pytest.raises(ValueError, match="unique tool"):
-        WorkflowRunSpec.from_legacy_replay(
-            **{
+    with pytest.raises(ValueError, match="agent_pool"):
+        WorkflowRunSpec.from_dict(
+            {
                 **kwargs,
-                "reviewers": (_legacy_binding("codex", "other-model"),),
-                "auto_reviewer": False,
+                "orchestrator": kwargs["orchestrator"].to_dict(),
+                "reviewers": [],
+                "allowed_tools": ["codex"],
             }
         )
 
-    replayed = WorkflowRunSpec.from_dict(
-        {
-            **kwargs,
-            "orchestrator": kwargs["orchestrator"].to_dict(),
-            "reviewers": [],
-            "allowed_tools": ["codex"],
-        }
-    )
-    assert replayed.legacy_replay is True
+    strict_spec = _strict_spec(_agent("A1", "codex", "gpt-high"))
+    reloaded = WorkflowRunSpec.from_dict(strict_spec.to_dict())
+    assert reloaded.agent_pool == strict_spec.agent_pool
+    assert reloaded.orchestrator_agent_id == "A1"
 
 
 def test_unknown_orchestrator_agent_id_is_rejected() -> None:

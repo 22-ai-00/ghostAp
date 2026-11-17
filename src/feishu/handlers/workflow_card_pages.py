@@ -10,7 +10,7 @@ from typing import Any
 
 _STOP_ACTION = "workflow_stop_running"
 _PAGE_KEY_FIELD = "_workflow_page_key"
-_PAGE_KEY_KINDS = frozenset({"status", "agent", "ledger"})
+_PAGE_KEY_KINDS = frozenset({"status", "agent"})
 _TERMINAL_STATUS_PAGE_CONTENT = (
     "📎 **运行进度已收起**\n"
     "任务已结束；本页仅用于运行期分页，最终状态请查看首张 Workflow 卡片。"
@@ -54,7 +54,6 @@ class WorkflowCardPageDelivery:
         if not page_message_ids:
             page_message_ids.append(None)
         self._page_message_ids = page_message_ids
-        self._last_pages: list[dict[str, Any]] = []
         self._key_to_message_id: dict[_PageKey, str | None] = {}
         self._last_pages_by_key: dict[_PageKey, dict[str, Any]] = {}
         self._delivered_wire_pages_by_key: dict[_PageKey, dict[str, Any]] = {}
@@ -76,83 +75,23 @@ class WorkflowCardPageDelivery:
         status_fallback_to_new: bool = True,
         terminal: bool = False,
     ) -> WorkflowPageDeliveryResult:
-        """Deliver renderer pages while preserving keyed or legacy bindings."""
+        """Deliver keyed Workflow renderer pages while keeping stable message bindings."""
         incoming_pages = _normalize_pages(card_data)
         with self._lock:
             page_keys = [_page_key(page) for page in incoming_pages]
-            keyed = any(key is not None for key in page_keys)
-            if keyed and any(key is None for key in page_keys):
-                raise ValueError("Workflow renderer pages must either all be keyed or all be unkeyed")
-            if keyed and len(set(page_keys)) != len(page_keys):
+            if any(key is None for key in page_keys):
+                raise ValueError("Workflow renderer pages must all include _workflow_page_key")
+            if len(set(page_keys)) != len(page_keys):
                 raise ValueError("Workflow renderer page keys must be unique")
 
-            if keyed:
-                return self._deliver_keyed(
-                    incoming_pages,
-                    tuple(key for key in page_keys if key is not None),
-                    replace_or_send=replace_or_send,
-                    chat_id=chat_id,
-                    origin_message_id=origin_message_id,
-                    status_fallback_to_new=status_fallback_to_new,
-                    terminal=terminal,
-                )
-
-            pages = self._pages_for_delivery(incoming_pages, terminal=terminal)
-            failed: list[int] = []
-            delivered: list[int] = []
-            status_delivered = False
-            creation_blocked = False
-
-            for page_index, page in enumerate(pages):
-                self._ensure_page_slot(page_index)
-                current_message_id = self._page_message_ids[page_index]
-
-                # Do not create later pages after an earlier create failed: that
-                # would reverse their visible message order. Existing pages are
-                # still patched, including during terminal delivery.
-                if current_message_id is None and creation_blocked:
-                    failed.append(page_index)
-                    continue
-
-                fallback_to_new = (
-                    status_fallback_to_new
-                    if page_index == 0
-                    else current_message_id is None
-                )
-                call_kwargs: dict[str, Any] = {
-                    "card_message_id": current_message_id,
-                    "chat_id": chat_id,
-                    "card_data": page,
-                }
-                if origin_message_id is not None:
-                    call_kwargs["origin_message_id"] = origin_message_id
-                call_kwargs["fallback_to_new"] = fallback_to_new
-
-                try:
-                    delivered_message_id = replace_or_send(**call_kwargs)
-                except Exception:
-                    failed.append(page_index)
-                    if current_message_id is None:
-                        creation_blocked = True
-                    continue
-
-                if not delivered_message_id:
-                    failed.append(page_index)
-                    if current_message_id is None:
-                        creation_blocked = True
-                    continue
-
-                self._page_message_ids[page_index] = delivered_message_id
-                delivered.append(page_index)
-                if page_index == 0:
-                    status_delivered = True
-
-            return WorkflowPageDeliveryResult(
-                status_message_id=self._page_message_ids[0],
-                status_delivered=status_delivered,
-                failed_page_indexes=tuple(failed),
-                delivered_page_indexes=tuple(delivered),
-                page_count=len(pages),
+            return self._deliver_keyed(
+                incoming_pages,
+                tuple(key for key in page_keys if key is not None),
+                replace_or_send=replace_or_send,
+                chat_id=chat_id,
+                origin_message_id=origin_message_id,
+                status_fallback_to_new=status_fallback_to_new,
+                terminal=terminal,
             )
 
     def _deliver_keyed(
@@ -286,49 +225,6 @@ class WorkflowCardPageDelivery:
                 self._last_pages_by_key[page_key] = copy.deepcopy(page)
             pages.append((page_key, page))
         return pages
-
-    def _pages_for_delivery(
-        self,
-        incoming_pages: list[dict[str, Any]],
-        *,
-        terminal: bool,
-    ) -> list[dict[str, Any]]:
-        for page_index, page in enumerate(incoming_pages):
-            if page_index < len(self._last_pages):
-                self._last_pages[page_index] = copy.deepcopy(page)
-            else:
-                self._last_pages.append(copy.deepcopy(page))
-
-        if not terminal:
-            return [copy.deepcopy(page) for page in incoming_pages]
-
-        # Result pages are append-only. If the terminal renderer returns fewer
-        # pages, patch every existing page with its last content after removing
-        # the now-invalid stop action instead of deleting it.
-        page_count = max(
-            len(incoming_pages),
-            len(self._last_pages),
-            len(self._page_message_ids),
-        )
-        terminal_pages: list[dict[str, Any]] = []
-        for page_index in range(page_count):
-            if page_index < len(incoming_pages):
-                source = incoming_pages[page_index]
-            elif page_index < len(self._last_pages):
-                source = self._last_pages[page_index]
-            else:
-                continue
-            cleaned = _without_stop_actions(source)
-            if page_index < len(self._last_pages):
-                self._last_pages[page_index] = copy.deepcopy(cleaned)
-            else:
-                self._last_pages.append(copy.deepcopy(cleaned))
-            terminal_pages.append(cleaned)
-        return terminal_pages
-
-    def _ensure_page_slot(self, page_index: int) -> None:
-        while len(self._page_message_ids) <= page_index:
-            self._page_message_ids.append(None)
 
 
 def _normalize_pages(

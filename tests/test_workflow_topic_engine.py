@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.feishu.handler_context import HandlerContext
@@ -151,8 +152,8 @@ class TestWorkflowCommandAliases(unittest.TestCase):
                 handler._reply_workflow_error.assert_not_called()
 
 
-def test_workflow_help_card_describes_confirmed_agent_pool_contract():
-    """完整帮助卡不得跳过 Workflow 唯一的用户确认门。"""
+def test_workflow_help_card_describes_auto_bound_agent_pool_contract():
+    """完整帮助卡应展示自动绑定 Agent Pool 契约且不保留旧确认门。"""
     handler = _make_workflow_handler()
     handler.reply_card = MagicMock()
 
@@ -163,9 +164,48 @@ def test_workflow_help_card_describes_confirmed_agent_pool_contract():
     assert "/workflow_help" in rendered
     assert "1–8" in rendered
     assert "Agent Pool" in rendered
-    assert "使用此池开始编排" in rendered
-    assert "确认后自动生成、验证并执行" in rendered
-    assert "自动编排** · 使用推荐可用工具和后端默认模型" not in rendered
+    assert "自动绑定" in rendered
+    assert "使用此池开始编排" not in rendered
+
+
+def test_start_workflow_auto_binds_pool_and_schedules_generation():
+    from src.workflow_engine.models import WorkflowStatus
+
+    handler = _make_workflow_handler()
+    handler._ensure_project = MagicMock(return_value=SimpleNamespace(project_id="p1", root_path="/tmp/repo"))
+    handler._supersede_incomplete_workflow = MagicMock(return_value=(True, None, None))
+    handler._ensure_topic_engine_context = MagicMock()
+    handler._replace_or_send_workflow_rendered_card = MagicMock(return_value="gen_card_1")
+    handler._schedule_generate_and_start_workflow = MagicMock()
+    engine = MagicMock()
+    engine._lock = __import__("threading").RLock()
+    engine.project = None
+    engine.is_running = False
+    handler.ctx.workflow_engine_manager.get.return_value = None
+    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
+
+    with (
+        patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True),
+        patch("src.workflow_engine.tool_registry.get_available_tools", return_value={"codex": "Codex", "claude": "Claude"}),
+    ):
+        handler.start_workflow("msg_1", "chat_1", "分析并重构工作流模块")
+
+    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+    assert len(engine.project.pending.agent_pool) == 2
+    assert engine.project.pending.orchestrator_was_auto is True
+    handler._replace_or_send_workflow_rendered_card.assert_called_once()
+    assert handler._replace_or_send_workflow_rendered_card.call_args.kwargs["card_message_id"] is None
+    assert handler._schedule_generate_and_start_workflow.call_args.kwargs["message_id"] == "gen_card_1"
+
+
+def test_handle_workflow_agent_action_rejects_retired_selector_card():
+    handler = _make_workflow_handler()
+    handler._reply_workflow_error = MagicMock()
+
+    handler.handle_workflow_agent_action("msg_1", "chat_1", None, {"action": "workflow_confirm_agents"})
+
+    handler._reply_workflow_error.assert_called_once()
+    assert handler._reply_workflow_error.call_args.args[:2] == ("msg_1", "session_expired")
 
 
 # ===========================================================================

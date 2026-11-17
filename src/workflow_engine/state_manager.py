@@ -23,7 +23,6 @@ from .models import (
     AgentProgress,
     AgentStatus,
     PhaseProgress,
-    ReviewerEvidence,
     SubagentProgress,
     SubagentStatus,
     WorkflowMetrics,
@@ -445,11 +444,6 @@ class WorkflowStateManager:
         with self._write_locked():
             self._delta_context_tokens += max(0, int(tokens))
 
-    def record_reviewer_evidence(self, evidence: ReviewerEvidence) -> None:
-        """Persist one immutable snapshot of an independent review call."""
-        with self._write_locked():
-            self._project.reviewer_evidence.append(evidence.model_copy(deep=True))
-
     @property
     def delta_context_tokens(self) -> int:
         """Observed main-context token delta for the current workflow run."""
@@ -536,10 +530,6 @@ class WorkflowStateManager:
                 ),
                 tool_model_map=dict(self._project.tool_model_map),
                 run_spec=copy.deepcopy(self._project.run_spec),
-                reviewer_evidence=[
-                    evidence.model_copy(deep=True)
-                    for evidence in self._project.reviewer_evidence
-                ],
             )
 
     @property

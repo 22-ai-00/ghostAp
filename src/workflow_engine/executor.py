@@ -26,7 +26,7 @@ from .constants import (
 )
 from .errors import _strip_internal_details, is_transient_error
 from .models import AgentCallParams, AgentCallResult
-from .roles import get_subagent_encouragement_prompt
+from .script_gen import get_subagent_encouragement
 
 if TYPE_CHECKING:
     from src.card.events import CardEvent
@@ -689,7 +689,7 @@ class AgentExecutor:
 
     def _build_prompt(self, params: AgentCallParams) -> str:
         parts = [f"Role: {params.role}\n\n" if params.role else "", params.prompt]
-        encouragement = get_subagent_encouragement_prompt()
+        encouragement = get_subagent_encouragement()
         if encouragement:
             parts.append(f"\n\n{encouragement}")
         return "".join(parts)

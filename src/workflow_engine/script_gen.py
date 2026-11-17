@@ -739,52 +739,31 @@ def generate_simple_script(
     | list[WorkflowAgentBinding]
     | None = None,
     orchestrator_agent_id: str | None = None,
-    legacy_replay: bool = False,
 ) -> str:
     """Return the one-Agent automatic path used by lightweight callers/tests."""
-    frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=False)
-    agent_plan = ""
-    if frozen_pool:
-        if legacy_replay:
-            raise ValueError("legacy_replay cannot be combined with agent_pool")
-        if selected_tools is not None or tool_model_map is not None:
-            raise ValueError(
-                "Strict simple scripts derive tool/model only from agent_pool"
-            )
-        selected_id = str(orchestrator_agent_id or "").strip() or frozen_pool[0].agent_id
-        binding = next(
-            (item for item in frozen_pool if item.agent_id == selected_id),
-            None,
+    frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=True)
+    if selected_tools is not None or tool_model_map is not None:
+        raise ValueError(
+            "Strict simple scripts derive tool/model only from agent_pool"
         )
-        if binding is None:
-            raise ValueError(
-                "orchestrator_agent_id is outside confirmed agent_pool: "
-                + selected_id
-            )
-        tools = [binding.tool_name]
-        binding_arguments = f"    agentId: {json.dumps(binding.agent_id)},\n"
-        agent_plan = f'''  agentPlan: [{{
+    selected_id = str(orchestrator_agent_id or "").strip() or frozen_pool[0].agent_id
+    binding = next(
+        (item for item in frozen_pool if item.agent_id == selected_id),
+        None,
+    )
+    if binding is None:
+        raise ValueError(
+            "orchestrator_agent_id is outside confirmed agent_pool: "
+            + selected_id
+        )
+    tools = [binding.tool_name]
+    binding_arguments = f"    agentId: {json.dumps(binding.agent_id)},\n"
+    agent_plan = f'''  agentPlan: [{{
     node: "execute-focused-task",
     role: "focused-executor",
     agentId: {json.dumps(binding.agent_id)},
   }}],
 '''
-    else:
-        if not legacy_replay:
-            raise ValueError(
-                "agent_pool is required; use legacy_replay=True only at replay boundaries"
-            )
-        if orchestrator_agent_id is not None:
-            raise ValueError(
-                "Legacy simple scripts cannot declare orchestrator_agent_id"
-            )
-        tools = [tool for tool in (selected_tools or ["coco"]) if tool] or ["coco"]
-        primary = tools[0]
-        model = (tool_model_map or {}).get(primary)
-        binding_arguments = (
-            f"    tool: {json.dumps(primary)},\n"
-            f"    model: {json.dumps(model)},\n"
-        )
     prompt = f"""Fulfill the user's request exactly and self-check the result before returning.
 
 Requirement:

@@ -217,9 +217,8 @@ def test_repeated_manager_cleanup_retains_preclaim_tombstone_until_done(
     """A cleanup timeout must remain observable on every subsequent retry."""
     manager = WorkflowEngineManager()
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    owner = _WorkflowLifecycleOwner("preclaim_session")
+    owner = _WorkflowLifecycleOwner("preclaim_session", worker_thread_id=-1)
     owner.worker_started_event.set()
-    object.__setattr__(owner, "worker_thread_id", -1)
     engine._workflow_start_owner = owner
 
     key = f"chat_1:{tmp_path}"

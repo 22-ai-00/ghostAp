@@ -892,7 +892,7 @@ class TestRunningAgentElapsed(unittest.TestCase):
 
         all_text = TestWorkflowProgressRenderer._extract_all_text(card.get("elements", []))
         self.assertIn("执行中 · Attempt 1", all_text)
-        self.assertIn("已运行 2m", all_text)
+        self.assertIn("已运行 2 分钟", all_text)
 
     def test_running_agent_without_started_at_does_not_crash(self):
         """A RUNNING agent without started_at renders without duration."""
@@ -913,7 +913,7 @@ class TestRunningAgentElapsed(unittest.TestCase):
         self.assertIsNotNone(summary)
         content = _markdown_content(summary) or ""
         self.assertIn("已运行", content)
-        self.assertIn("2m", content)
+        self.assertIn("2 分钟", content)
 
     def test_summary_no_running_elapsed_in_terminal_state(self):
         """Terminal workflows must NOT show the "已运行" line even if the last

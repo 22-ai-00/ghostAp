@@ -144,15 +144,15 @@ def test_programming_help_discovers_all_session_info_commands():
         assert f"`{command}`" in body
 
 
-def test_workflow_help_matches_single_agent_pool_confirmation_contract():
-    """快捷帮助必须展示现役 Agent Pool 单次确认门。"""
+def test_workflow_help_matches_auto_bound_agent_pool_contract():
+    """快捷帮助必须展示自动绑定 Agent Pool 契约，且不含旧版手动确认门。"""
     body = UI_TEXT["system_help_section_workflow_body"]
 
     assert "`/workflow_help`" in body
     assert "1–8" in body
     assert "Agent Pool" in body
-    assert "使用此池开始编排" in body
-    assert "确认后自动生成、验证并执行" in body
+    assert "自动绑定" in body
+    assert "使用此池开始编排" not in body
 
 
 # ---------------------------------------------------------------------------

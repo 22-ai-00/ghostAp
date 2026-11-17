@@ -46,7 +46,6 @@ class WorkflowRunSpec:
     enforce_tool_allowlist: bool = True
     agent_pool: tuple[WorkflowAgentBinding, ...] = ()
     orchestrator_agent_id: str | None = None
-    legacy_replay: bool = False
     _agent_by_id: Mapping[str, WorkflowAgentBinding] = field(
         init=False,
         repr=False,
@@ -71,10 +70,7 @@ class WorkflowRunSpec:
         if not self.auto_reviewer and not reviewers:
             raise ValueError("Explicit review mode requires at least one reviewer")
 
-        if self.legacy_replay:
-            self._initialize_legacy(reviewers)
-        else:
-            self._initialize_strict_pool(reviewers)
+        self._initialize_strict_pool(reviewers)
 
         object.__setattr__(self, "task", task)
         object.__setattr__(self, "chat_id", chat_id)
@@ -126,75 +122,10 @@ class WorkflowRunSpec:
         object.__setattr__(self, "tool_model_map", MappingProxyType(audit_map))
         object.__setattr__(self, "_agent_by_id", MappingProxyType(by_id))
 
-    def _initialize_legacy(self, reviewers: tuple[ReviewAgentBinding, ...]) -> None:
-        if self.agent_pool:
-            raise ValueError("Legacy Workflow replay cannot include agent_pool")
-        if self.orchestrator_agent_id:
-            raise ValueError("Legacy Workflow replay cannot include orchestrator_agent_id")
-        if not self.orchestrator.tool_name:
-            raise ValueError("Legacy Workflow orchestrator must name a tool")
-        bindings = (self.orchestrator, *reviewers)
-        binding_tools = [binding.tool_name for binding in bindings]
-        if len(binding_tools) != len(set(binding_tools)):
-            raise ValueError("Legacy Workflow replay requires a unique tool per binding")
-
-        normalized_map = {
-            str(tool or "").strip(): (str(model).strip() if model else None)
-            for tool, model in dict(self.tool_model_map or {}).items()
-            if str(tool or "").strip()
-        }
-        missing_tools = sorted(tool for tool in binding_tools if tool not in normalized_map)
-        if missing_tools:
-            raise ValueError(
-                "Workflow run tool-model map is missing confirmed bindings: "
-                + ", ".join(missing_tools)
-            )
-        mismatched_models = sorted(
-            binding.tool_name
-            for binding in bindings
-            if normalized_map.get(binding.tool_name) != _binding_model(binding)
-        )
-        if mismatched_models:
-            raise ValueError(
-                "Workflow tool-model map conflicts with confirmed bindings: "
-                + ", ".join(mismatched_models)
-            )
-        allowed_tools = tuple(
-            dict.fromkeys(
-                str(tool or "").strip()
-                for tool in (self.allowed_tools or tuple(normalized_map))
-                if str(tool or "").strip()
-            )
-        )
-        if any(tool not in allowed_tools for tool in binding_tools):
-            raise ValueError("Workflow run allowed tools must include every confirmed binding")
-        allowed_tool_set = set(allowed_tools)
-        frozen_tool_set = set(normalized_map)
-        if allowed_tool_set != frozen_tool_set:
-            missing = sorted(allowed_tool_set - frozen_tool_set)
-            extra = sorted(frozen_tool_set - allowed_tool_set)
-            details: list[str] = []
-            if missing:
-                details.append("missing bindings: " + ", ".join(missing))
-            if extra:
-                details.append("extra bindings: " + ", ".join(extra))
-            raise ValueError(
-                "Legacy replay allowed tools must exactly match frozen model "
-                "bindings (" + "; ".join(details) + ")"
-            )
-
-        object.__setattr__(self, "agent_pool", ())
-        object.__setattr__(self, "orchestrator_agent_id", None)
-        object.__setattr__(self, "allowed_tools", allowed_tools)
-        object.__setattr__(self, "tool_model_map", MappingProxyType(normalized_map))
-        object.__setattr__(self, "_agent_by_id", MappingProxyType({}))
-
     def agent_binding(self, agent_id: str | None) -> WorkflowAgentBinding:
         """Resolve one strict pool member or fail closed before backend dispatch."""
 
         normalized = str(agent_id or "").strip()
-        if self.legacy_replay:
-            raise ValueError("Legacy Workflow replay does not resolve agent_id")
         if not normalized:
             raise ValueError("Workflow agent_id is required")
         binding = self._agent_by_id.get(normalized)
@@ -202,14 +133,8 @@ class WorkflowRunSpec:
             raise ValueError(f"Workflow agent_id is outside confirmed agent_pool: {normalized}")
         return binding
 
-    @classmethod
-    def from_legacy_replay(cls, **kwargs: Any) -> "WorkflowRunSpec":
-        """Explicit boundary for restoring persisted pre-Agent-Pool runs."""
-
-        return cls(**kwargs, legacy_replay=True)
-
     def to_dict(self) -> dict[str, Any]:
-        data = {
+        return {
             "orchestrator": self.orchestrator.to_dict(),
             "reviewers": [reviewer.to_dict() for reviewer in self.reviewers],
             "tool_model_map": dict(self.tool_model_map),
@@ -223,62 +148,29 @@ class WorkflowRunSpec:
             "allowed_tools": list(self.allowed_tools),
             "enforce_tool_allowlist": self.enforce_tool_allowlist,
             "orchestrator_agent_id": self.orchestrator_agent_id,
-            "legacy_replay": self.legacy_replay,
+            "agent_pool": [binding.to_dict() for binding in self.agent_pool],
         }
-        if not self.legacy_replay:
-            data["agent_pool"] = [binding.to_dict() for binding in self.agent_pool]
-        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WorkflowRunSpec":
-        pool_was_provided = "agent_pool" in data
-        if pool_was_provided:
-            raw_pool_value = data.get("agent_pool")
-            if not isinstance(raw_pool_value, (list, tuple)) or not raw_pool_value:
-                raise ValueError(
-                    "Explicit agent_pool must be a non-empty list of bindings"
-                )
-        elif data.get("legacy_replay") is False:
-            raise ValueError(
-                "RunSpec without agent_pool cannot set legacy_replay=false"
-            )
+        raw_pool = data.get("agent_pool")
+        if not isinstance(raw_pool, (list, tuple)) or not raw_pool:
+            raise ValueError("Explicit agent_pool must be a non-empty list of bindings")
 
         reviewers = tuple(
             reviewer
             for item in (data.get("reviewers") or [])
             if (reviewer := ReviewAgentBinding.from_dict(item)) is not None
         )
-        raw_pool = data.get("agent_pool") or []
-        if raw_pool:
-            pool = freeze_agent_pool(raw_pool)
-            orchestrator_id = str(data.get("orchestrator_agent_id") or "").strip() or None
-            selected_id = orchestrator_id or pool[0].agent_id
-            selected = next(
-                (binding for binding in pool if binding.agent_id == selected_id),
-                pool[0],
-            )
-            return cls(
-                orchestrator=_review_binding(selected),
-                reviewers=reviewers,
-                tool_model_map=dict(data.get("tool_model_map") or {}),
-                task=str(data.get("task") or ""),
-                chat_id=str(data.get("chat_id") or ""),
-                topic_id=str(data.get("topic_id") or "").strip() or None,
-                budget=int(data.get("budget") or 0),
-                deadline=(float(data["deadline"]) if data.get("deadline") is not None else None),
-                auto_reviewer=bool(data.get("auto_reviewer")),
-                initiator_user_id=str(data.get("initiator_user_id") or "").strip() or None,
-                allowed_tools=tuple(data.get("allowed_tools") or ()),
-                enforce_tool_allowlist=bool(data.get("enforce_tool_allowlist", True)),
-                agent_pool=pool,
-                orchestrator_agent_id=orchestrator_id,
-            )
-
-        orchestrator = ReviewAgentBinding.from_dict(data.get("orchestrator"))
-        if orchestrator is None:
-            raise ValueError("Legacy Workflow replay has no valid orchestrator")
-        return cls.from_legacy_replay(
-            orchestrator=orchestrator,
+        pool = freeze_agent_pool(raw_pool)
+        orchestrator_id = str(data.get("orchestrator_agent_id") or "").strip() or None
+        selected_id = orchestrator_id or pool[0].agent_id
+        selected = next(
+            (binding for binding in pool if binding.agent_id == selected_id),
+            pool[0],
+        )
+        return cls(
+            orchestrator=_review_binding(selected),
             reviewers=reviewers,
             tool_model_map=dict(data.get("tool_model_map") or {}),
             task=str(data.get("task") or ""),
@@ -290,4 +182,6 @@ class WorkflowRunSpec:
             initiator_user_id=str(data.get("initiator_user_id") or "").strip() or None,
             allowed_tools=tuple(data.get("allowed_tools") or ()),
             enforce_tool_allowlist=bool(data.get("enforce_tool_allowlist", True)),
+            agent_pool=pool,
+            orchestrator_agent_id=orchestrator_id,
         )

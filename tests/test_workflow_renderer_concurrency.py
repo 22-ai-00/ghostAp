@@ -114,7 +114,7 @@ def test_shared_workflow_renderer_serializes_snapshot_rendering() -> None:
     assert renderer._project is base
 
 
-def test_running_renderer_defers_result_ledger_until_terminal() -> None:
+def test_progress_and_terminal_cards_never_emit_result_ledger() -> None:
     project = _project("ORDER")
     agent = project.phases[0].agents[0]
     agent.status = AgentStatus.DONE
@@ -135,4 +135,4 @@ def test_running_renderer_defers_result_ledger_until_terminal() -> None:
     kinds = [card["_workflow_page_key"][0] for card in terminal_cards]
     assert kinds[0] == "status"
     assert "agent" in kinds
-    assert kinds[-1] == "ledger"
+    assert "ledger" not in kinds

@@ -29,7 +29,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的直接宿主执行能力，不是 Agent provider |
 
-普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。普通编程、Deep 和 Spec 收到任务后会自动推进到成功或明确失败；Workflow 仅保留一次由发起者完成的 Agent Pool 选择确认，确认后自动生成、验证和执行脚本，不再要求脚本确认、继续批准或手动恢复。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
+普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。普通编程、Deep、Spec 和 Workflow 收到任务后均会自动推进到成功或明确失败；`/wf` 自动绑定可用推荐 Agent Pool 并开始编排，不要求手动确认或批准继续。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
 
 ## 快速开始
 
@@ -193,7 +193,7 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | `/deep_status`、`/stop_deep` | 查看或停止 Deep |
 | `/spec <需求>` | 按 Spec → Plan → Task → Build → Review 闭环推进 |
 | `/spec_status`、`/stop_spec` | 查看或停止 Spec |
-| `/wf <需求>` | 选择并单次确认 Agent Pool，随后自动生成、验证并执行 JS Workflow |
+| `/wf <需求>` | 自动绑定推荐 Agent Pool，随后生成、验证并执行 JS Workflow |
 | `/wf_status`、`/wf_help`、`/stop_wf` | 查看进度、帮助或停止 Workflow |
 | `/workflow`、`/workflow_status`、`/workflow_help`、`/stop_workflow` | Workflow 长命令别名 |
 
@@ -243,7 +243,7 @@ Spec 的阶段、任务进度、子代理输出和多角色审查结论汇总到
 
 ## 全自动执行
 
-普通编程、Deep 和 Spec 使用已保存配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。Workflow 发起后先显示仅发起者可修改的 Agent Pool：池中包含 1–8 个 `tool+model` Agent，并使用稳定的 `A1`、`A2` 等标识。用户点击 `使用此池开始编排` 完成单次确认后，池和主编排器冻结，脚本生成、验证与执行自动推进，不再出现脚本确认或继续批准门。
+普通编程、Deep、Spec 和 Workflow 使用已保存或自动绑定配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。`/wf <需求>` 自动绑定包含 1–8 个 `tool+model` Agent 的推荐 Agent Pool（`A1`、`A2` 等稳定标识）与自动选择的主编排器；池绑定后即冻结，脚本生成、验证与执行全自动推进，不要求确认或继续批准门。
 
 普通选择自动采用推荐项。GhostAP 不再对命令或 ACP 工具做二次风险判定；执行权限由 Codex、Claude 等后端自身负责。
 

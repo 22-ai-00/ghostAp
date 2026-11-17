@@ -26,7 +26,6 @@ class WorkflowStatus(str, Enum):
     """Lifecycle states of a WorkflowProject."""
 
     IDLE = "idle"
-    SELECTING_AGENTS = "selecting_agents"
     GENERATING_SCRIPT = "generating_script"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -199,25 +198,6 @@ class AgentProgress(BaseModel):
     execution_blocks: list[Any] = Field(default_factory=list)
 
 
-class ReviewerEvidence(BaseModel):
-    """Durable proof of one committed, independent reviewer invocation."""
-
-    reviewer_index: int
-    selection_key: str = ""
-    display_name: str = ""
-    tool: str
-    model: Optional[str] = None
-    status: str
-    output: Optional[str] = None
-    stop_reason: Optional[str] = None
-    error: Optional[str] = None
-    cached: bool = False
-    token_usage: int = 0
-    duration_s: float = 0.0
-    started_at: float = Field(default_factory=time.time)
-    finished_at: Optional[float] = None
-
-
 # ---------------------------------------------------------------------------
 # Workflow metrics
 # ---------------------------------------------------------------------------
@@ -258,15 +238,9 @@ class PendingWorkflow(BaseModel):
     agent_pool: tuple[WorkflowAgentBinding, ...] = ()
     orchestrator_agent_id: Optional[str] = None
     orchestrator_was_auto: bool = False
-    selection_session_key: Optional[str] = None
     project_id: Optional[str] = None
     next_agent_sequence: int = 1
     recommended_agents: list[dict[str, Any]] = Field(default_factory=list)
-    draft_tool_name: Optional[str] = None
-    draft_model_name: Optional[str] = None
-    draft_profile: Optional[str] = None
-    draft_effort: Optional[str] = None
-    selection_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +273,6 @@ class WorkflowProject(BaseModel):
     # Immutable WorkflowRunSpec is serialized here for state/history audit;
     # the live engine keeps the frozen object itself.
     run_spec: Optional[dict[str, Any]] = None
-    reviewer_evidence: list[ReviewerEvidence] = Field(default_factory=list)
     def start_execution(self) -> None:
         """Transition from generated state to execution.
 

@@ -8,7 +8,6 @@ from src.workflow_engine.models import (
     AgentProgress,
     AgentStatus,
     PhaseProgress,
-    ReviewerEvidence,
     WorkflowProject,
     WorkflowStatus,
 )
@@ -29,21 +28,16 @@ def _make_agent(
     current_activity: str = "",
     activity_updated_at: float | None = None,
 ) -> AgentProgress:
-    agent = AgentProgress(
+    return AgentProgress(
         label=label,
         tool=tool,
         status=status,
         duration_s=duration_s,
         error=error,
+        result=result,
         current_activity=current_activity,
+        activity_updated_at=activity_updated_at,
     )
-    # RED-contract fixture: production does not expose these result-ledger
-    # fields yet. Bypass Pydantic's unknown-field filtering so this test can
-    # describe the renderer's next public input contract without changing
-    # production code during the RED phase.
-    object.__setattr__(agent, "result", result)
-    object.__setattr__(agent, "activity_updated_at", activity_updated_at)
-    return agent
 
 
 def _make_project(phase_title: str, agents: list[AgentProgress]) -> WorkflowProject:
@@ -123,141 +117,6 @@ def test_phase_header_has_completed_summary_with_large_phase() -> None:
     assert "已完成 21/25" in text, f"Expected '已完成 21/25' in: {text[:800]}"
 
 
-def test_terminal_results_form_complete_ordered_ledger_across_cards() -> None:
-    """10+ terminal results remain reconstructable instead of being hidden."""
-    statuses = (AgentStatus.DONE, AgentStatus.CACHED, AgentStatus.FAILED)
-    markers = [f"RESULT{i:02d}SAFE" for i in range(15)]
-    agents = [
-        _make_agent(
-            f"agent-{i}",
-            statuses[i % len(statuses)],
-            error="agent failed" if statuses[i % len(statuses)] == AgentStatus.FAILED else None,
-            result=marker,
-        )
-        for i, marker in enumerate(markers)
-    ]
-    project = _make_project("Big Phase", agents)
-    project.status = WorkflowStatus.COMPLETED
-
-    cards = render_completion_cards(project)
-
-    assert len(cards) >= 2
-    assert all(isinstance(card, dict) and "header" in card and "elements" in card for card in cards)
-    status_text = _flatten_text(cards[0]["elements"])
-    ledger_texts = [_flatten_text(card["elements"]) for card in cards[1:]]
-    ledger_text = "\n".join(ledger_texts)
-
-    assert "执行过程" in status_text
-    assert all("进度 " not in text and "当前执行中" not in text for text in ledger_texts)
-    assert all(marker not in status_text for marker in markers)
-    assert all(ledger_text.count(marker) == 1 for marker in markers)
-    positions = [ledger_text.index(marker) for marker in markers]
-    assert positions == sorted(positions), "terminal results must retain agent call order"
-
-
-def test_single_oversized_result_splits_without_losing_content() -> None:
-    """One large terminal result spans result pages and every page stays bounded."""
-    chunks = [f"RESULTCHUNK{i:03d} " + ("x" * 700) for i in range(72)]
-    agent = _make_agent("large-result", AgentStatus.DONE, result="\n".join(chunks))
-    project = _make_project("Large Result", [agent])
-    project.status = WorkflowStatus.COMPLETED
-
-    cards = render_completion_cards(project)
-
-    assert len(cards[1:]) >= 2, "a single oversized result must span multiple ledger pages"
-    assert all(_card_size_bytes(card) <= 28_000 for card in cards)
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-    markers = [f"RESULTCHUNK{i:03d}" for i in range(72)]
-    assert all(ledger_text.count(marker) == 1 for marker in markers)
-    assert [ledger_text.index(marker) for marker in markers] == sorted(
-        ledger_text.index(marker) for marker in markers
-    )
-
-
-def test_workflow_result_envelope_renders_readable_sections_without_raw_json() -> None:
-    """Structured final output is unpacked instead of pretty-printed as JSON."""
-    result = {
-        "card_summary": {
-            "verdict": "passed",
-            "conclusion": "任务已完成，完整结果见报告。",
-            "findings": [],
-            "verification": [
-                {"status": "passed", "text": "执行 Agent 已完成自检。"},
-            ],
-            "deliverables": [],
-            "next_steps": [],
-        },
-        "result": (
-            "先完成现状分析。\n\n"
-            "## 架构结论\n\n"
-            "- ENTRY_MARKER：统一安装入口。\n"
-            "- API_MARKER：核心接口保持兼容。\n\n"
-            + ("完整架构分析与验证证据。" * 120)
-        ),
-        "verification": [
-            {"status": "passed", "text": "执行 Agent 已完成自检。"},
-        ],
-    }
-    project = _make_project("Readable Final", [])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = json.dumps(result, ensure_ascii=False)
-
-    cards = render_completion_cards(project)
-    ledger_cards = [
-        card for card in cards if card.get("_workflow_page_key", (None,))[0] == "ledger"
-    ]
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in ledger_cards)
-
-    assert "Workflow 最终结果" in ledger_text
-    assert "已完成 · 验证通过" in ledger_text
-    assert "**结论**" in ledger_text
-    assert "**验证**" in ledger_text
-    assert "## 架构结论" in ledger_text
-    assert ledger_text.count("ENTRY_MARKER") == 1
-    assert ledger_text.count("API_MARKER") == 1
-    assert '"card_summary"' not in ledger_text
-    assert '"verdict"' not in ledger_text
-    assert "\\n" not in ledger_text
-    assert "**关键发现**" not in ledger_text
-    assert "**交付物**" not in ledger_text
-    assert "**下一步**" not in ledger_text
-    assert any("collapsible_panel" in str(card) for card in ledger_cards)
-    assert all("down_outlined" in str(card) for card in ledger_cards)
-    assert all(_card_size_bytes(card) <= 28_000 for card in cards)
-
-
-def test_workflow_result_envelope_object_body_never_falls_back_to_raw_json() -> None:
-    """Object/list bodies remain readable without exposing serialization syntax."""
-    result = {
-        "card_summary": {
-            "verdict": "needs_attention",
-            "conclusion": "仍有一项需要处理。",
-        },
-        "result": {
-            "summary": "OBJECT_SUMMARY_MARKER",
-            "findings": [
-                {"severity": "high", "text": "OBJECT_FINDING_MARKER"},
-            ],
-            "next_steps": ["OBJECT_NEXT_MARKER"],
-        },
-    }
-    project = _make_project("Readable Object", [])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = json.dumps(result, ensure_ascii=False)
-
-    cards = render_completion_cards(project)
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-
-    assert "需处理" in ledger_text
-    assert "OBJECT_SUMMARY_MARKER" in ledger_text
-    assert "OBJECT_FINDING_MARKER" in ledger_text
-    assert "OBJECT_NEXT_MARKER" in ledger_text
-    assert '"summary"' not in ledger_text
-    assert '"findings"' not in ledger_text
-    assert "{" not in ledger_text
-    assert "}" not in ledger_text
-
-
 def test_double_encoded_workflow_envelope_keeps_brief_and_list_result() -> None:
     """Bridge-compatible nested JSON wrappers keep their structured summary."""
     envelope = {
@@ -282,59 +141,12 @@ def test_double_encoded_workflow_envelope_keeps_brief_and_list_result() -> None:
 
     cards = render_completion_cards(project)
     status_text = _flatten_text(cards[0]["elements"])
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
 
-    for marker in (
-        "DOUBLECONCLUSIONMARKER",
-        "DOUBLEVERIFYMARKER",
-        "LISTRESULTONE",
-        "LISTRESULTTWO",
-    ):
-        assert ledger_text.count(marker) == 1
     assert "DOUBLECONCLUSIONMARKER" in status_text
     assert "DOUBLEVERIFYMARKER" in status_text
     assert "待确认" not in status_text
-    assert "验证通过" in ledger_text
-    assert '"card_summary"' not in ledger_text
-    assert "\\n" not in ledger_text
-
-
-def test_agent_and_reviewer_envelopes_are_never_rendered_as_raw_json() -> None:
-    """Every terminal result surface shares the readable envelope projection."""
-    envelope = json.dumps(
-        {
-            "card_summary": {
-                "verdict": "passed",
-                "conclusion": "NESTEDRESULTCONCLUSION",
-            },
-            "result": "NESTEDRESULTBODY",
-        },
-        ensure_ascii=False,
-    )
-    agent = _make_agent("structured-agent", AgentStatus.DONE, result=envelope)
-    project = _make_project("Structured Results", [agent])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = envelope
-    project.reviewer_evidence = [
-        ReviewerEvidence(
-            reviewer_index=1,
-            display_name="Independent Review",
-            tool="claude",
-            status="passed",
-            output=envelope,
-        )
-    ]
-
-    cards = render_completion_cards(project)
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-
-    assert ledger_text.count("NESTEDRESULTCONCLUSION") == 3
-    assert ledger_text.count("NESTEDRESULTBODY") == 3
-    assert '"card_summary"' not in ledger_text
-    assert '"verdict"' not in ledger_text
-    assert '"result"' not in ledger_text
-    assert "\\n" not in ledger_text
-    assert "状态: 通过" in ledger_text
+    assert '"card_summary"' not in status_text
+    assert "\\n" not in status_text
 
 
 def test_fenced_result_envelope_is_unwrapped_and_redacted() -> None:
@@ -355,10 +167,9 @@ def test_fenced_result_envelope_is_unwrapped_and_redacted() -> None:
     )
 
     cards = render_completion_cards(project)
-    card_text = "\n".join(_flatten_text(card["elements"]) for card in cards)
+    card_text = _flatten_text(cards[0]["elements"])
 
-    assert card_text.count("FENCEDCONCLUSION") == 2
-    assert card_text.count("FENCEDBODYMARKER") == 1
+    assert "FENCEDCONCLUSION" in card_text
     assert secret not in card_text
     assert r"<redacted:api\_key>" in card_text
     assert '"card_summary"' not in card_text
@@ -388,10 +199,9 @@ def test_prefixed_and_long_fenced_envelopes_are_unwrapped() -> None:
         project.result = wrapper
 
         cards = render_completion_cards(project)
-        card_text = "\n".join(_flatten_text(card["elements"]) for card in cards)
+        card_text = _flatten_text(cards[0]["elements"])
 
-        assert card_text.count("WRAPPEDCONCLUSION") == 2
-        assert card_text.count("WRAPPEDBODY") == 1
+        assert "WRAPPEDCONCLUSION" in card_text
         assert '"card_summary"' not in card_text
         assert '"result"' not in card_text
 
@@ -406,114 +216,12 @@ def test_lone_surrogate_in_result_is_replaced_before_wire_serialization() -> Non
     )
 
     cards = render_completion_cards(project)
-    card_text = "\n".join(_flatten_text(card["elements"]) for card in cards)
+    card_text = _flatten_text(cards[0]["elements"])
 
     assert "SURROGATECONCLUSION" in card_text
-    assert "SURROGATEBODY" in card_text
     assert "\ud800" not in card_text
     assert "\udfff" not in card_text
     assert all(_card_size_bytes(card) <= 28_000 for card in cards)
-
-
-def test_readable_projection_preserves_zero_and_string_scalars() -> None:
-    project = _make_project("Scalar Result", [])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = json.dumps(
-        {
-            "count": 0,
-            "ratio": 0.0,
-            "flag": False,
-            "literal_null": "null",
-            "literal_zero": "0",
-            "items": [0, 1],
-        }
-    )
-
-    cards = render_completion_cards(project)
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-
-    assert "**count**\n0" in ledger_text
-    assert "**ratio**\n0.0" in ledger_text
-    assert "**flag**\n否" in ledger_text
-    assert "**literal null**\nnull" in ledger_text
-    assert "**literal zero**\n0" in ledger_text
-    assert "- 0" in ledger_text
-    assert "- 1" in ledger_text
-
-
-def test_card_summary_extension_fields_remain_readable() -> None:
-    project = _make_project("Legacy Summary", [])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = json.dumps(
-        {
-            "card_summary": {
-                "status": "success",
-                "message": "LEGACYMESSAGE",
-                "details": "LEGACYDETAIL",
-            },
-            "result": "LEGACYBODY",
-        }
-    )
-
-    cards = render_completion_cards(project)
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-
-    assert "摘要补充" in ledger_text
-    assert "LEGACYMESSAGE" in ledger_text
-    assert "LEGACYDETAIL" in ledger_text
-    assert "LEGACYBODY" in ledger_text
-    assert '"message"' not in ledger_text
-
-
-def test_long_workflow_markdown_result_keeps_fences_balanced_across_pages() -> None:
-    """Semantic pagination keeps every marker and repairs split code fences."""
-    markers = [f"FENCED_RESULT_{index:03d}" for index in range(48)]
-    result_body = (
-        "```text\n"
-        + "\n".join(f"{marker} " + ("x" * 900) for marker in markers)
-        + "\n```\n\nFINAL_FENCE_MARKER"
-    )
-    project = _make_project("Fenced Final", [])
-    project.status = WorkflowStatus.COMPLETED
-    project.result = json.dumps(
-        {
-            "card_summary": {
-                "verdict": "passed",
-                "conclusion": "长正文已完成。",
-            },
-            "result": result_body,
-        },
-        ensure_ascii=False,
-    )
-
-    cards = render_completion_cards(project)
-    ledger_cards = [
-        card for card in cards if card.get("_workflow_page_key", (None,))[0] == "ledger"
-    ]
-    ledger_texts = [_flatten_text(card["elements"]) for card in ledger_cards]
-    ledger_text = "\n".join(ledger_texts)
-
-    assert len(ledger_cards) >= 2
-    assert all(ledger_text.count(marker) == 1 for marker in markers)
-    assert ledger_text.count("FINAL_FENCE_MARKER") == 1
-    assert all(text.count("```") % 2 == 0 for text in ledger_texts)
-    assert all(_card_size_bytes(card) <= 28_000 for card in cards)
-
-
-def test_empty_workflow_results_use_one_clear_empty_state() -> None:
-    """Empty JSON shapes never leak syntax or imply that content exists."""
-    for raw_result in (None, "", "null", "[]", "{}"):
-        project = _make_project("Empty Final", [])
-        project.status = WorkflowStatus.COMPLETED
-        project.result = raw_result
-
-        cards = render_completion_cards(project)
-        ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
-
-        assert ledger_text.count("本次 Workflow 未返回可展示的最终内容") == 1
-        assert "[]" not in ledger_text
-        assert "{}" not in ledger_text
-        assert "null" not in ledger_text
 
 
 def test_failed_workflow_without_result_never_claims_completion() -> None:
@@ -524,14 +232,11 @@ def test_failed_workflow_without_result_never_claims_completion() -> None:
 
     cards = render_completion_cards(project)
     status_text = _flatten_text(cards[0]["elements"])
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
 
     assert cards[0]["header"]["template"] == "red"
     assert "任务未完成" in status_text
     assert "任务已完成" not in status_text
     assert "FAILUREDETAILMARKER" in status_text
-    assert "状态: 失败" in ledger_text
-    assert "FAILUREDETAILMARKER" in ledger_text
 
 
 def test_terminal_status_overrides_contradictory_result_verdicts() -> None:
@@ -577,15 +282,12 @@ def test_terminal_status_overrides_contradictory_result_verdicts() -> None:
 
         cards = render_completion_cards(project)
         status_text = _flatten_text(cards[0]["elements"])
-        ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
 
         assert cards[0]["header"]["template"] == template
         assert title in cards[0]["header"]["title"]["content"]
         assert expected in f"{cards[0]['header']['title']['content']}\n{status_text}"
-        assert expected in ledger_text
         if status in {WorkflowStatus.FAILED, WorkflowStatus.CANCELLED}:
             assert "ALL GOOD" not in status_text
-            assert "ALL GOOD" not in ledger_text
 
 
 def test_terminal_errors_are_redacted_and_cannot_inject_feishu_tags() -> None:
@@ -604,15 +306,6 @@ def test_terminal_errors_are_redacted_and_cannot_inject_feishu_tags() -> None:
     project = _make_project("Safe Errors", [agent])
     project.status = WorkflowStatus.FAILED
     project.error = injected
-    project.reviewer_evidence = [
-        ReviewerEvidence(
-            reviewer_index=1,
-            display_name="reviewer",
-            tool="codex",
-            status="failed",
-            error=injected,
-        )
-    ]
 
     cards = render_completion_cards(project)
     card_text = "\n".join(_flatten_text(card["elements"]) for card in cards)
@@ -621,8 +314,6 @@ def test_terminal_errors_are_redacted_and_cannot_inject_feishu_tags() -> None:
     assert "<at" not in card_text
     assert "id=all" in card_text
     assert "redacted" in card_text
-    assert '"message"' not in card_text
-    assert '"code"' not in card_text
 
 
 def test_deeply_nested_result_degrades_safely_instead_of_raising() -> None:
@@ -633,42 +324,9 @@ def test_deeply_nested_result_degrades_safely_instead_of_raising() -> None:
     project.result = raw
 
     cards = render_completion_cards(project)
-    card_text = "\n".join(_flatten_text(card["elements"]) for card in cards)
 
     assert cards
-    assert "Workflow 最终结果" in card_text
     assert all(_card_size_bytes(card) <= 28_000 for card in cards)
-
-
-def test_result_ledger_limits_collapsible_panels_per_card() -> None:
-    agents = [
-        _make_agent(
-            f"panel-agent-{index}",
-            AgentStatus.DONE,
-            result=json.dumps(
-                {
-                    "card_summary": {
-                        "verdict": "passed",
-                        "conclusion": f"PANELCONCLUSION{index:02d}",
-                    },
-                    "result": f"PANELBODY{index:02d} " + ("x" * 1_400),
-                }
-            ),
-        )
-        for index in range(12)
-    ]
-    project = _make_project("Panel Limit", agents)
-    project.status = WorkflowStatus.COMPLETED
-
-    cards = render_completion_cards(project)
-    ledger_cards = [
-        card for card in cards if card.get("_workflow_page_key", (None,))[0] == "ledger"
-    ]
-    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in ledger_cards)
-
-    assert len(ledger_cards) >= 3
-    assert all(str(card).count("'tag': 'collapsible_panel'") <= 5 for card in ledger_cards)
-    assert all(ledger_text.count(f"PANELBODY{index:02d}") == 1 for index in range(12))
 
 
 def test_current_step_uses_most_recent_running_activity() -> None:

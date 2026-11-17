@@ -629,10 +629,9 @@ def test_runtime_stop_timeout_never_claims_success_or_delivers_late_cancel(
         initiator_user_id="user_1",
     )
     engine._run_state = EngineRunState.RUNNING
-    owner = _WorkflowLifecycleOwner("runtime_session")
+    owner = _WorkflowLifecycleOwner("runtime_session", worker_thread_id=999999)
     owner.claimed_event.set()
     owner.worker_started_event.set()
-    object.__setattr__(owner, "worker_thread_id", 999999)
     engine._workflow_start_owner = owner
 
     handler = WorkflowHandler.__new__(WorkflowHandler)

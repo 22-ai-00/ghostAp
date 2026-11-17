@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 import uuid
@@ -15,7 +14,6 @@ from typing import Any, Callable, Optional
 from src.card.events import CardEvent, CardEventType
 
 from ..engine_base import BaseEngine, EngineRunState
-from ..spec_engine.models import ReviewAgentBinding
 from .bridge import RuntimeBridge
 from .constants import (
     DEFAULT_MAX_CONCURRENT,
@@ -32,7 +30,6 @@ from .models import (
     AgentCallParams,
     AgentCallResult,
     AgentStatus,
-    ReviewerEvidence,
     WorkflowMetrics,
     WorkflowProject,
     WorkflowStatus,
@@ -41,35 +38,22 @@ from .progress_coalescer import ProgressCoalescer
 from .renderer import WorkflowProgressRenderer
 from .run_spec import WorkflowRunSpec
 from .state_manager import WorkflowStateManager
-from .storage import workflow_project_storage_root, workflow_scripts_dir
+from .storage import (
+    remove_owned_workflow_artifact,
+    workflow_project_storage_root,
+    workflow_scripts_dir,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _remove_owned_script_artifact(path: str | None, root_path: str) -> None:
     """Remove only Workflow's generated source or immutable temp copy."""
-    if not path:
-        return
-    candidate = os.path.realpath(os.path.abspath(path))
-    basename = os.path.basename(candidate)
-    generated_dir = os.path.realpath(workflow_scripts_dir(root_path))
-    temp_root = os.path.realpath(tempfile.gettempdir())
-    generated_source = bool(
-        os.path.dirname(candidate) == generated_dir
-        and basename.endswith(".js")
-        and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
+    remove_owned_workflow_artifact(
+        path,
+        root_path=root_path,
+        scripts_dir=workflow_scripts_dir(root_path),
     )
-    execution_copy = bool(
-        basename.startswith("ghostap-confirmed-")
-        and basename.endswith(".js")
-        and os.path.commonpath((candidate, temp_root)) == temp_root
-    )
-    if not (generated_source or execution_copy):
-        return
-    try:
-        os.remove(candidate)
-    except OSError:
-        pass
 
 
 def _node_version_required_text() -> str:
@@ -255,7 +239,6 @@ class WorkflowEngine(BaseEngine):
         # Handler-owned lifecycle tokens. They make script generation and the
         # scheduler hand-off cancellable before execute_workflow() claims the
         # engine, without weakening the runtime cancel_event reuse contract.
-        self._workflow_selection_owner: Any = None
         self._script_generation_owner: Any = None
         self._workflow_start_owner: Any = None
         self._retired_lifecycle_owners: list[Any] = []
@@ -295,8 +278,6 @@ class WorkflowEngine(BaseEngine):
 
     def save_state(self, filepath: Optional[str] = None) -> str:
         """Persist state below ``~/.ghostap/workflow/projects``."""
-        import os
-
         if not filepath:
             state_dir = self._state_dir()
             os.makedirs(state_dir, exist_ok=True)
@@ -333,14 +314,11 @@ class WorkflowEngine(BaseEngine):
             tracked = any(
                 candidate is owner
                 for candidate in (
-                    self._workflow_selection_owner,
                     self._script_generation_owner,
                     self._workflow_start_owner,
                     *self._retired_lifecycle_owners,
                 )
             )
-            if self._workflow_selection_owner is owner:
-                self._workflow_selection_owner = None
             if self._script_generation_owner is owner:
                 self._script_generation_owner = None
             if self._workflow_start_owner is owner:
@@ -356,7 +334,6 @@ class WorkflowEngine(BaseEngine):
         """Return whether reuse could overlap an unconfirmed ACP session."""
         with self._lock:
             owners = (
-                self._workflow_selection_owner,
                 self._script_generation_owner,
                 self._workflow_start_owner,
                 *self._retired_lifecycle_owners,
@@ -381,7 +358,6 @@ class WorkflowEngine(BaseEngine):
             live_lifecycle_owners = tuple(
                 owner
                 for owner in (
-                    self._workflow_selection_owner,
                     self._script_generation_owner,
                     self._workflow_start_owner,
                 )
@@ -397,7 +373,6 @@ class WorkflowEngine(BaseEngine):
                 heartbeat_stop_event = getattr(owner, "heartbeat_stop_event", None)
                 if heartbeat_stop_event is not None:
                     heartbeat_stop_event.set()
-            self._workflow_selection_owner = None
             self._script_generation_owner = None
             self._workflow_start_owner = None
             project = self._project
@@ -831,8 +806,6 @@ class WorkflowEngine(BaseEngine):
             terminal_failure = _terminal_failure_from_result(result_text)
             if terminal_failure is None and self._state_manager is not None:
                 terminal_failure = _terminal_failure_from_project(self._state_manager.snapshot())
-            if terminal_failure is None:
-                terminal_failure = self._run_committed_reviewers(result_text)
 
             # The terminal state commit shares the same engine lock as
             # stop(). Exactly one side wins: a stopped owner cannot publish a
@@ -1120,69 +1093,6 @@ class WorkflowEngine(BaseEngine):
     # Bridge callbacks
     # ------------------------------------------------------------------
 
-    def _run_committed_reviewers(self, result_text: str) -> str | None:
-        """Invoke every explicitly confirmed reviewer and persist evidence.
-
-        Reviewer calls intentionally bypass the workflow journal cache. A
-        selected reviewer is a promise of an independent backend invocation
-        for this run; cached text is not proof that the promise was kept.
-        """
-        run_spec = getattr(self, "_run_spec", None)
-        if run_spec is None or run_spec.auto_reviewer:
-            return None
-
-        failures: list[str] = []
-        for index, reviewer in enumerate(run_spec.reviewers, start=1):
-            started_at = time.time()
-            params = AgentCallParams(
-                prompt=(
-                    "Independently review the completed Workflow deliverable below. "
-                    "Identify correctness gaps, unmet requirements, security or reliability "
-                    "risks, and give a clear verdict supported by evidence.\n\n"
-                    f"Original task:\n{run_spec.task}\n\n"
-                    f"Deliverable:\n{result_text}"
-                ),
-                tool=reviewer.tool_name,
-                model=None if reviewer.use_default_model else reviewer.model_name,
-                role="workflow_reviewer",
-                label=f"reviewer-{index}-{reviewer.tool_name}",
-                phase="Independent Review",
-            )
-            result = self._handle_agent_call(
-                params,
-                deadline_monotonic=run_spec.deadline,
-                forced_binding=reviewer,
-                allow_cache=False,
-            )
-            evidence = ReviewerEvidence(
-                reviewer_index=index,
-                selection_key=reviewer.selection_key,
-                display_name=reviewer.display_name,
-                tool=reviewer.tool_name,
-                model=None if reviewer.use_default_model else reviewer.model_name,
-                status="failed" if result.error else "completed",
-                output=result.output,
-                stop_reason=result.stop_reason,
-                error=result.error,
-                cached=bool(result.cached),
-                token_usage=result.token_usage,
-                duration_s=result.duration_s,
-                started_at=started_at,
-                finished_at=time.time(),
-            )
-            if self._state_manager is not None:
-                self._state_manager.record_reviewer_evidence(evidence)
-            elif self._project is not None:
-                self._project.reviewer_evidence.append(evidence)
-            if result.error:
-                failures.append(
-                    f"{reviewer.tool_name}/{reviewer.model_name or 'default'}: {result.error}"
-                )
-
-        if failures:
-            return "Independent review failed: " + "; ".join(failures)
-        return None
-
     def _handle_agent_call(
         self,
         params: AgentCallParams,
@@ -1190,14 +1100,13 @@ class WorkflowEngine(BaseEngine):
         cancel_event=None,
         request_id=None,
         deadline_monotonic: float | None = None,
-        forced_binding: ReviewAgentBinding | None = None,
         allow_cache: bool = True,
     ) -> AgentCallResult:
         """Handle an agent() call from the JS runtime.
 
         Flow:
             1. Safety fuse check (MAX_TOTAL_AGENTS)
-            2. Resolve missing model from user's tool-model bindings
+            2. Resolve bound agent identity from confirmed agent_pool
             3. Journal cache lookup
             4. Execute via AgentExecutor (creates one-shot session)
             5. Store result in journal
@@ -1211,64 +1120,19 @@ class WorkflowEngine(BaseEngine):
             count = self._agent_call_count
         label = params.label or f"agent-{count}"
         run_spec = getattr(self, "_run_spec", None)
-        if forced_binding is not None:
-            if run_spec is not None and not run_spec.legacy_replay:
-                forced_model = (
-                    None if forced_binding.use_default_model else forced_binding.model_name
+        if run_spec is not None:
+            try:
+                binding = run_spec.agent_binding(params.agent_id)
+            except ValueError as exc:
+                return AgentCallResult(
+                    error=str(exc),
+                    agent_id=params.agent_id,
+                    tool=params.tool,
+                    model=params.model,
                 )
-                matching = [
-                    binding
-                    for binding in run_spec.agent_pool
-                    if binding.tool_model_key
-                    == (forced_binding.tool_name, forced_model)
-                ]
-                if len(matching) != 1:
-                    return AgentCallResult(
-                        error="Workflow reviewer binding is outside confirmed agent_pool",
-                        tool=forced_binding.tool_name,
-                        model=forced_model,
-                    )
-                params.agent_id = matching[0].agent_id
-            params.tool = forced_binding.tool_name
-            if run_spec is not None and run_spec.legacy_replay:
-                if params.tool not in run_spec.tool_model_map:
-                    return AgentCallResult(
-                        error=(
-                            f"Tool '{params.tool}' is outside frozen legacy "
-                            "replay bindings"
-                        ),
-                        tool=params.tool,
-                    )
-                params.model = run_spec.tool_model_map[params.tool]
-            else:
-                params.model = (
-                    None if forced_binding.use_default_model else forced_binding.model_name
-                )
-        elif run_spec is not None:
-            if run_spec.legacy_replay:
-                params.tool = params.tool or run_spec.orchestrator.tool_name
-                if params.tool not in run_spec.tool_model_map:
-                    return AgentCallResult(
-                        error=(
-                            f"Tool '{params.tool}' is outside frozen legacy "
-                            "replay bindings"
-                        ),
-                        tool=params.tool,
-                    )
-                params.model = run_spec.tool_model_map[params.tool]
-            else:
-                try:
-                    binding = run_spec.agent_binding(params.agent_id)
-                except ValueError as exc:
-                    return AgentCallResult(
-                        error=str(exc),
-                        agent_id=params.agent_id,
-                        tool=params.tool,
-                        model=params.model,
-                    )
-                params.agent_id = binding.agent_id
-                params.tool = binding.tool_name
-                params.model = binding.model_name
+            params.agent_id = binding.agent_id
+            params.tool = binding.tool_name
+            params.model = binding.model_name
 
         effective_deadline = deadline_monotonic
         if run_spec is not None and run_spec.deadline is not None:
@@ -1419,25 +1283,6 @@ class WorkflowEngine(BaseEngine):
                 "model": params.model,
             }
         )
-
-        # A selected Reviewer is a completion promise, not merely a backend
-        # round-trip. Only an explicit end_turn with non-empty output proves
-        # that the independent review finished. Unknown/new stop reasons fail
-        # closed and are retained in durable Reviewer evidence.
-        if forced_binding is not None and result.error is None:
-            stop_reason = (result.stop_reason or "").strip().casefold()
-            if stop_reason != "end_turn":
-                reason = stop_reason or "missing_stop_reason"
-                result = result.model_copy(
-                    update={
-                        "error": (
-                            "Reviewer did not complete normally "
-                            f"(stop_reason={reason})"
-                        )
-                    }
-                )
-            elif not str(result.output or "").strip():
-                result = result.model_copy(update={"error": "Reviewer returned empty output"})
 
         # Store in journal (only on success)
         if allow_cache and result.error is None and self._journal:

@@ -6,6 +6,7 @@ Validates:
 
 import unittest
 
+from src.workflow_engine.agent_pool import WorkflowAgentBinding
 from src.workflow_engine.script_gen import (
     _get_agent_capability_note,
     build_script_gen_prompt,
@@ -127,13 +128,22 @@ class TestBuildScriptGenPromptInjection(unittest.TestCase):
         )
         self.assertNotIn("预算", prompt)
 
+def _binding(agent_id: str, tool_name: str) -> WorkflowAgentBinding:
+    return WorkflowAgentBinding(
+        agent_id=agent_id,
+        tool_name=tool_name,
+        model_name=None,
+        display_name=tool_name.title(),
+    )
+
+
 class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
     """Test that generate_simple_script includes SUBAGENT_ENCOURAGEMENT in agent prompts."""
 
     def test_generate_simple_script_returns_card_summary_envelope(self):
         script = generate_simple_script(
             "Implement and verify a focused change",
-            legacy_replay=True,
+            agent_pool=(_binding("A1", "coco"),),
         )
 
         self.assertIn("function completionEnvelope", script)
@@ -142,7 +152,10 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         self.assertIn("任务已完成，完整结果见报告。", script)
 
     def test_script_has_valid_structure(self):
-        script = generate_simple_script("Test requirement", legacy_replay=True)
+        script = generate_simple_script(
+            "Test requirement",
+            agent_pool=(_binding("A1", "coco"),),
+        )
         self.assertIn("export const meta", script)
         self.assertIn("export default async function", script)
         self.assertIn("agent(", script)
@@ -150,29 +163,36 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
     def test_script_avoids_slow_static_analysis_agent(self):
         script = generate_simple_script(
             "Fix workflow state mismatch",
-            legacy_replay=True,
+            agent_pool=(_binding("A1", "coco"),),
         )
         self.assertNotIn('label: "task-analysis"', script)
         self.assertNotIn("Analyze this task and determine the best execution strategy", script)
 
     def test_script_bounds_agent_calls_and_handles_errors(self):
+        pool = (
+            _binding("A1", "coco"),
+            _binding("A2", "codex"),
+        )
         script = generate_simple_script(
             "Fix workflow state mismatch",
-            selected_tools=["coco", "codex"],
-            legacy_replay=True,
+            agent_pool=pool,
         )
         self.assertIn("timeout:", script)
         self.assertIn(".error", script)
         self.assertIn("fallback", script.lower())
 
-        is_valid, messages = validate_generated_script(script)
+        is_valid, messages = validate_generated_script(script, agent_pool=pool)
         self.assertTrue(is_valid, f"Expected valid fallback script, got: {messages}")
 
     def test_simple_script_uses_one_backend_without_race_or_llm_routing(self):
+        pool = (
+            _binding("A1", "traex"),
+            _binding("A2", "codex"),
+            _binding("A3", "coco"),
+        )
         script = generate_simple_script(
             "分析 spec 模式目标完成度如何把控，先不要动手改代码",
-            selected_tools=["traex", "codex", "coco"],
-            legacy_replay=True,
+            agent_pool=pool,
         )
 
         self.assertNotIn("race(", script)
@@ -181,14 +201,17 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         self.assertNotIn('label: "route"', script)
         self.assertNotIn("route-classify", script)
 
-        is_valid, messages = validate_generated_script(script)
+        is_valid, messages = validate_generated_script(script, agent_pool=pool)
         self.assertTrue(is_valid, f"Expected valid fallback script, got: {messages}")
 
     def test_script_prompt_preserves_analysis_only_requests(self):
+        pool = (
+            _binding("A1", "traex"),
+            _binding("A2", "codex"),
+        )
         script = generate_simple_script(
             "分析 spec 模式目标完成度如何把控，先不要动手改代码",
-            selected_tools=["traex", "codex"],
-            legacy_replay=True,
+            agent_pool=pool,
         )
 
         self.assertIn("If the user asks for analysis only", script)

@@ -126,18 +126,15 @@ def _workflow_pending_statuses():
     from ...workflow_engine.models import WorkflowStatus
 
     return {
-        WorkflowStatus.SELECTING_AGENTS,
         WorkflowStatus.GENERATING_SCRIPT,
     }
 
 
 from .workflow_execution import WorkflowExecutionMixin  # noqa: E402
 from .workflow_script import WorkflowScriptMixin  # noqa: E402
-from .workflow_selection import WorkflowSelectionMixin  # noqa: E402
 
 
 class WorkflowHandler(
-    WorkflowSelectionMixin,
     WorkflowExecutionMixin,
     WorkflowScriptMixin,
     BaseEngineHandler,
@@ -330,13 +327,183 @@ class WorkflowHandler(
             project=project,
         )
 
-        self._start_workflow_agent_selection(
+        self._launch_auto_bound_workflow(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
             project=project,
             root_path=root_path,
+            engine=admission_engine,
             admission_owner=admission_owner,
+        )
+
+    def handle_workflow_agent_action(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: str | None,
+        value: dict[str, Any],
+    ) -> None:
+        """Reject legacy Agent Pool selection card callbacks cleanly."""
+        del chat_id, project_id, value
+        self._reply_workflow_error(
+            message_id,
+            "session_expired",
+            detail="旧版 Agent 选择卡已停用，请直接发送 `/wf <需求>` 自动启动。",
+        )
+
+    def _launch_auto_bound_workflow(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        requirement: str,
+        project: "ProjectContext" | None,
+        root_path: str,
+        engine: Any,
+        admission_owner: _WorkflowLifecycleOwner | None,
+    ) -> None:
+        """Auto-bind available recommended tools as the frozen pool and launch."""
+        from ...spec_engine.models import ReviewAgentBinding
+        from ...thread import get_current_sender_id
+        from ...workflow_engine.agent_pool import (
+            WorkflowAgentBinding,
+            freeze_agent_pool,
+            select_auto_orchestrator,
+        )
+        from ...workflow_engine.models import (
+            PendingWorkflow,
+            WorkflowProject,
+            WorkflowStatus,
+        )
+        from ...workflow_engine.tool_registry import get_available_tools
+
+        available_tools = get_available_tools(require_available=True)
+        preferred_order = (
+            "traex",
+            "claude",
+            "codex",
+            "grok",
+            "dsh",
+            "agy",
+            "aiden",
+            "gemini",
+            "coco",
+        )
+        selected_names = [t for t in preferred_order if t in available_tools][:3]
+        if not selected_names:
+            selected_names = list(available_tools)[:3]
+        if not selected_names:
+            if admission_owner is not None:
+                admission_owner.done_event.set()
+                release_owner = getattr(engine, "release_lifecycle_owner", None)
+                if callable(release_owner):
+                    release_owner(admission_owner)
+            self._reply_workflow_error(
+                message_id,
+                "invalid_state",
+                detail="当前环境未检测到可执行的 Workflow 工具。",
+            )
+            return
+
+        agent_pool = freeze_agent_pool(
+            WorkflowAgentBinding(
+                agent_id=f"A{idx}",
+                tool_name=name,
+                model_name=None,
+                display_name=str(available_tools[name] or name),
+            )
+            for idx, name in enumerate(selected_names, start=1)
+        )
+        orchestrator_binding = select_auto_orchestrator(agent_pool)
+        initiator_user_id = get_current_sender_id() or ""
+        workflow_project_id = uuid.uuid4().hex
+        selected_tools = [binding.tool_name for binding in agent_pool]
+
+        with engine._lock:
+            wf_project = engine.project
+            if not wf_project:
+                wf_project = WorkflowProject()
+                engine._project = wf_project
+                if getattr(engine, "project", None) is None:
+                    engine.project = wf_project
+            if admission_owner is not None:
+                admission_owner.stop_event.set()
+                admission_owner.heartbeat_stop_event.set()
+                admission_owner.done_event.set()
+                self._retire_workflow_owner(engine, admission_owner)
+            session_key = admission_owner.session_key if admission_owner is not None else uuid.uuid4().hex
+            generation_owner = _WorkflowLifecycleOwner(
+                session_key=session_key,
+                initiator_user_id=initiator_user_id,
+                chat_id=chat_id,
+                project_id=workflow_project_id,
+                root_path=root_path,
+            )
+            engine._script_generation_owner = generation_owner
+            wf_project.pending = PendingWorkflow(
+                requirement=requirement,
+                initiator_user_id=initiator_user_id,
+                engine_session_key=session_key,
+                selected_tools=selected_tools,
+                orchestrator_agent=orchestrator_binding.tool_name,
+                orchestrator_binding=ReviewAgentBinding(
+                    provider="workflow",
+                    tool_name=orchestrator_binding.tool_name,
+                    display_name=orchestrator_binding.display_name,
+                    agent_type=orchestrator_binding.tool_name,
+                    model_name=orchestrator_binding.model_name,
+                    model_display_name=orchestrator_binding.model_name,
+                    use_default_model=(orchestrator_binding.model_name is None),
+                ),
+                review_agents=[],
+                auto_reviewer=True,
+                agent_pool=agent_pool,
+                orchestrator_agent_id=orchestrator_binding.agent_id,
+                orchestrator_was_auto=True,
+                project_id=workflow_project_id,
+            )
+            wf_project.status = WorkflowStatus.GENERATING_SCRIPT
+
+        if admission_owner is not None:
+            release_owner = getattr(engine, "release_lifecycle_owner", None)
+            if callable(release_owner):
+                release_owner(admission_owner)
+
+        try:
+            origin_message_id = self._resolve_origin(message_id)
+        except Exception:
+            origin_message_id = message_id
+
+        generation_card_id: str | None = None
+        try:
+            card_data = self._workflow_generation_card_data(
+                requirement=requirement,
+                agent_pool=agent_pool,
+                orchestrator_agent_id=orchestrator_binding.agent_id,
+                orchestrator_was_auto=True,
+            )
+            with generation_owner.delivery_lock:
+                generation_card_id = self._replace_or_send_workflow_rendered_card(
+                    card_message_id=None,
+                    chat_id=chat_id,
+                    card_data=card_data,
+                    origin_message_id=origin_message_id,
+                )
+                if generation_card_id:
+                    object.__setattr__(generation_owner, "card_message_id", generation_card_id)
+        except Exception:
+            logger.debug("Failed to deliver initial workflow generation card", exc_info=True)
+
+        self._schedule_generate_and_start_workflow(
+            message_id=generation_card_id or message_id,
+            chat_id=chat_id,
+            requirement=requirement,
+            project=project,
+            root_path=root_path,
+            selected_tools=selected_tools,
+            expected_session_key=session_key,
+            engine=engine,
         )
 
     # ------------------------------------------------------------------
@@ -579,93 +746,6 @@ class WorkflowHandler(
         )
 
 
-    def _start_workflow_with_defaults(
-        self,
-        message_id: str,
-        chat_id: str,
-        requirement: str,
-        project: "ProjectContext" | None,
-        root_path: str,
-        admission_owner: _WorkflowLifecycleOwner | None,
-    ) -> None:
-        """Bind recommended defaults and immediately generate and execute."""
-        from ...spec_engine.models import ReviewAgentBinding
-        from ...thread import get_current_sender_id
-        from ...workflow_engine.constants import DEFAULT_ORCHESTRATOR_AGENT
-        from ...workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
-        from ...workflow_engine.tool_registry import get_available_tools
-
-        all_tools = get_available_tools(require_available=True)
-        if not all_tools:
-            self._reply_workflow_error(
-                message_id,
-                "invalid_state",
-                detail="当前环境未检测到可执行的 Workflow 工具。",
-            )
-            return
-
-        available = list(all_tools)
-        recommended_order = ["traex", "claude", "codex", "grok", "dsh", "agy", "aiden", "gemini", "coco"]
-        recommended = [tool for tool in recommended_order if tool in all_tools]
-        default_tools = recommended[:3] or available[:1]
-        orchestrator_tool = DEFAULT_ORCHESTRATOR_AGENT
-        if orchestrator_tool not in all_tools:
-            orchestrator_tool = default_tools[0]
-        if orchestrator_tool not in default_tools:
-            default_tools.append(orchestrator_tool)
-
-        engine = self.ctx.workflow_engine_manager.get_or_create(
-            chat_id,
-            root_path,
-            engine_name=self.get_engine_name(
-                chat_id,
-                project_id=(project.project_id if project else None),
-            ),
-        )
-        with engine._lock:
-            if not engine.project:
-                engine._project = WorkflowProject()
-            if admission_owner is not None and (
-                vars(engine).get("_workflow_selection_owner") is not admission_owner
-                or admission_owner.stop_event.is_set()
-            ):
-                return
-            session_key = admission_owner.session_key if admission_owner else uuid.uuid4().hex
-            engine.project.pending = PendingWorkflow(
-                requirement=requirement,
-                initiator_user_id=get_current_sender_id() or "",
-                engine_session_key=session_key,
-                selected_tools=list(dict.fromkeys(default_tools)),
-                orchestrator_agent=orchestrator_tool,
-                orchestrator_binding=ReviewAgentBinding(
-                    provider="workflow",
-                    tool_name=orchestrator_tool,
-                    display_name=orchestrator_tool,
-                    agent_type=orchestrator_tool,
-                    model_name=None,
-                    model_display_name=None,
-                    use_default_model=True,
-                ),
-                review_agents=[],
-                auto_reviewer=True,
-            )
-            engine.project.status = WorkflowStatus.GENERATING_SCRIPT
-
-        self._schedule_generate_and_start_workflow(
-            message_id=message_id,
-            chat_id=chat_id,
-            requirement=requirement,
-            project=project,
-            root_path=root_path,
-            selected_tools=list(default_tools),
-            expected_session_key=session_key,
-            engine=engine,
-        )
-
-
-
-
-
     def _resolve_project_from_id(self, project_id: str, chat_id: str) -> Optional["ProjectContext"]:
         """Resolve a ProjectContext from project_id, scoped to the chat.
 
@@ -735,18 +815,15 @@ class WorkflowHandler(
         sections = [
             (
                 "📚 命令列表",
-                "`/wf <需求描述>`（`/workflow`） · 打开 Agent Pool 选择卡\n"
+                "`/wf <需求描述>`（`/workflow`） · 自动绑定推荐 Agent Pool 并启动编排\n"
                 "`/wf_status`（`/workflow_status`） · 查看当前 Workflow 进度\n"
                 "`/wf_help`（`/workflow_help`） · 显示本帮助\n"
                 "`/stop_wf`（`/stop_workflow`） · 停止正在执行的 Workflow",
             ),
             (
                 "🧭 执行流程",
-                "**① 选择 Agent Pool** · 发起者选择 1–8 个 `tool+model` Agent，"
-                "也可采用推荐池\n"
-                "**② 单次确认** · 点击“使用此池开始编排”后，Agent Pool 与主编排器冻结\n"
-                "**③ 自动推进** · 确认后自动生成、验证并执行脚本，"
-                "无需再次确认脚本或批准继续",
+                "**① 自动绑定** · 自动选取可用推荐工具构建 1–8 个 `tool+model` Agent Pool 并锁定主编排器\n"
+                "**② 自动推进** · 绑定后全自动生成、验证并执行脚本，无需手动确认或批准继续",
             ),
             (
                 "✨ 核心能力",

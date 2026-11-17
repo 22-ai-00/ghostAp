@@ -164,7 +164,6 @@ def test_workflow_cot_replaces_detail_cards_and_preserves_report() -> None:
         return_value=[
             _page("status-terminal", "status"),
             _page("agent-terminal", "agent", "call-1"),
-            _page("ledger-terminal", "ledger"),
         ],
     ):
         callbacks.on_done(terminal)
@@ -278,14 +277,12 @@ def test_workflow_cot_terminal_without_report_falls_back_to_detail_cards() -> No
         return_value=[
             _page("status-terminal", "status"),
             _page("agent-terminal", "agent", "call-1"),
-            _page("ledger-terminal", "ledger"),
         ],
     ):
         callbacks.on_done(terminal)
 
     sent = "\n".join(str(call.args[1]) for call in handler.send_card_to_chat.call_args_list)
     assert "agent-terminal" in sent
-    assert "ledger-terminal" in sent
     handler._reply_workflow_completion_fallback.assert_not_called()
 
 

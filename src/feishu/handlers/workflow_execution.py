@@ -114,7 +114,6 @@ class WorkflowExecutionMixin:
                 source_script_path=self._new_workflow_script_path(root_path),
             )
             previous_owner: _WorkflowLifecycleOwner | None = None
-            selection_owner: _WorkflowLifecycleOwner | None = None
             generation_context: dict[str, Any] = {}
             with engine._lock:
                 if not self._is_current_generation_session(engine, expected_session_key):
@@ -129,29 +128,6 @@ class WorkflowExecutionMixin:
                         owner = current_owner
                     else:
                         previous_owner = current_owner
-                current_selection_owner = vars(engine).get("_workflow_selection_owner")
-                if isinstance(
-                    current_selection_owner,
-                    _workflow_module()._WorkflowLifecycleOwner,
-                ):
-                    if (
-                        current_selection_owner.session_key != expected_session_key
-                        or current_selection_owner.stop_event.is_set()
-                    ):
-                        logger.info(
-                            "[workflow] Dropping generation with stale selection owner (session=%s)",
-                            expected_session_key[:8],
-                        )
-                        return
-                    selection_owner = current_selection_owner
-                    current_selection_owner.stop_event.set()
-                    current_selection_owner.heartbeat_stop_event.set()
-                    current_selection_owner.done_event.set()
-                    self._retire_workflow_owner(
-                        engine,
-                        current_selection_owner,
-                    )
-                    engine._workflow_selection_owner = None
                 if previous_owner is not None:
                     self._retire_workflow_owner(engine, previous_owner)
                 owner.claimed_event.set()
@@ -203,11 +179,6 @@ class WorkflowExecutionMixin:
                         if existing_pending is not None
                         else False
                     ),
-                    "selection_session_key": (
-                        existing_pending.selection_session_key
-                        if existing_pending is not None
-                        else None
-                    ),
                     "project_id": (
                         existing_pending.project_id
                         if existing_pending is not None
@@ -225,12 +196,6 @@ class WorkflowExecutionMixin:
                 previous_owner.heartbeat_stop_event.set()
                 with previous_owner.delivery_lock:
                     pass
-            if selection_owner is not None:
-                with selection_owner.delivery_lock:
-                    pass
-                release_owner = getattr(engine, "release_lifecycle_owner", None)
-                if callable(release_owner):
-                    release_owner(selection_owner)
 
             heartbeat_thread: threading.Thread | None = None
             try:
@@ -376,7 +341,6 @@ class WorkflowExecutionMixin:
                     agent_pool=confirmed_pool,
                     orchestrator_agent_id=generation_context["orchestrator_agent_id"],
                     orchestrator_was_auto=generation_context["orchestrator_was_auto"],
-                    selection_session_key=generation_context["selection_session_key"],
                     project_id=generation_context["project_id"],
                     recommended_agents=generation_context["recommended_agents"],
                 )
@@ -928,14 +892,8 @@ class WorkflowExecutionMixin:
             stored_initiator = (
                 getattr(pending, "initiator_user_id", None) if pending_lifecycle and pending else None
             ) or getattr(wf_project, "initiator_user_id", None)
-            selection_owner = vars(engine).get("_workflow_selection_owner")
             generation_owner = vars(engine).get("_script_generation_owner")
             start_owner = vars(engine).get("_workflow_start_owner")
-            live_selection_owner = (
-                selection_owner
-                if isinstance(selection_owner, _workflow_module()._WorkflowLifecycleOwner) and not selection_owner.stop_event.is_set()
-                else None
-            )
             live_generation_owner = (
                 generation_owner
                 if isinstance(generation_owner, _workflow_module()._WorkflowLifecycleOwner) and not generation_owner.stop_event.is_set()
@@ -948,11 +906,6 @@ class WorkflowExecutionMixin:
             )
             stored_initiator = (
                 stored_initiator
-                or getattr(
-                    live_selection_owner,
-                    "initiator_user_id",
-                    None,
-                )
                 or getattr(
                     live_generation_owner,
                     "initiator_user_id",
@@ -974,7 +927,6 @@ class WorkflowExecutionMixin:
             runtime_active = bool(engine.is_running) and not terminal_committed
             lifecycle_active = bool(
                 runtime_active
-                or live_selection_owner is not None
                 or live_generation_owner is not None
                 or live_start_owner is not None
                 or status in _workflow_module()._workflow_pending_statuses()
@@ -991,7 +943,6 @@ class WorkflowExecutionMixin:
                 error = ("forbidden", "只有 Workflow 发起者或管理员才能停止此任务")
             else:
                 for lifecycle_owner in (
-                    live_selection_owner,
                     live_generation_owner,
                     live_start_owner,
                 ):
@@ -1025,8 +976,6 @@ class WorkflowExecutionMixin:
                     ):
                         if artifact:
                             artifacts_to_remove.append(artifact)
-                if live_selection_owner is not None:
-                    engine._workflow_selection_owner = None
                 if (
                     live_generation_owner is not None
                     and live_generation_owner.active_generation_session is None
@@ -1659,41 +1608,15 @@ class WorkflowExecutionMixin:
         *,
         root_path: str,
     ) -> None:
-        """Remove only files created as disposable Workflow artifacts.
+        """Remove only files created as disposable Workflow artifacts."""
+        from ...workflow_engine.storage import remove_owned_workflow_artifact
 
-        Only disposable generated scripts and immutable execution copies are owned here.
-        """
-        if not path:
-            return
-
-        import tempfile
-
-        candidate = os.path.realpath(os.path.abspath(path))
-        basename = os.path.basename(candidate)
-        script_dir = os.path.realpath(_workflow_module().workflow_scripts_dir(root_path))
-        temp_root = os.path.realpath(tempfile.gettempdir())
-        candidate_dir = os.path.dirname(candidate)
-
-        generated_source = (
-            candidate_dir == script_dir
-            and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
-            and basename.endswith(".js")
+        remove_owned_workflow_artifact(
+            path,
+            root_path=root_path,
+            scripts_dir=_workflow_module().workflow_scripts_dir(root_path),
+            warn_on_refusal=True,
         )
-        confirmed_copy = (
-            basename.startswith("ghostap-confirmed-")
-            and basename.endswith(".js")
-            and os.path.commonpath((candidate, temp_root)) == temp_root
-        )
-        if not (generated_source or confirmed_copy):
-            logger.warning(
-                "[workflow] Refusing to remove non-owned workflow artifact: %s",
-                basename,
-            )
-            return
-        try:
-            os.remove(candidate)
-        except OSError:
-            pass
 
     def _supersede_incomplete_workflow(
         self,
@@ -1734,12 +1657,10 @@ class WorkflowExecutionMixin:
             if wf_project.status == WorkflowStatus.GENERATING_SCRIPT:
                 return False, "invalid_state", None
             pending = wf_project.pending
-            selection_owner = vars(engine).get("_workflow_selection_owner")
             generation_owner = vars(engine).get("_script_generation_owner")
             start_owner = vars(engine).get("_workflow_start_owner")
             incomplete = bool(
                 wf_project.status in _workflow_module()._workflow_pending_statuses()
-                or isinstance(selection_owner, _workflow_module()._WorkflowLifecycleOwner)
                 or isinstance(generation_owner, _workflow_module()._WorkflowLifecycleOwner)
                 or isinstance(start_owner, _workflow_module()._WorkflowLifecycleOwner)
                 or wf_project.status == WorkflowStatus.RUNNING
@@ -1747,11 +1668,6 @@ class WorkflowExecutionMixin:
             if incomplete:
                 stored_initiator = (
                     (getattr(pending, "initiator_user_id", None) if pending is not None else None)
-                    or getattr(
-                        selection_owner,
-                        "initiator_user_id",
-                        None,
-                    )
                     or getattr(wf_project, "initiator_user_id", None)
                 )
                 admin_ids = set(getattr(self.ctx.settings, "admin_user_ids", []) or [])
@@ -1761,7 +1677,6 @@ class WorkflowExecutionMixin:
                     return False, "forbidden", None
 
                 for owner in (
-                    selection_owner,
                     generation_owner,
                     start_owner,
                 ):
@@ -1769,8 +1684,6 @@ class WorkflowExecutionMixin:
                         continue
                     owner.stop_event.set()
                     owner.heartbeat_stop_event.set()
-                    if owner is selection_owner:
-                        owner.done_event.set()
                     self._retire_workflow_owner(engine, owner)
                     owners.append(owner)
                     for artifact in (
@@ -1794,8 +1707,6 @@ class WorkflowExecutionMixin:
                 if wf_project.script_path:
                     artifacts.append(wf_project.script_path)
                 engine._project = WorkflowProject()
-
-            engine._workflow_selection_owner = admission_owner
 
         # An already-authorized card delivery may finish, but always before
         # the new request publishes its first card.
@@ -2735,10 +2646,7 @@ class WorkflowExecutionMixin:
                 process_complete = process_stream.complete(
                     self._workflow_process_terminal_event(wf_project)
                 )
-                if (
-                    process_complete
-                    and wf_project.status != WorkflowStatus.CANCELLED
-                ):
+                if wf_project.status != WorkflowStatus.CANCELLED:
                     report_status = self._send_workflow_completion_report(
                         wf_project=wf_project,
                         chat_id=chat_id,
