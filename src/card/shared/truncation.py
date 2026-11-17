@@ -364,29 +364,76 @@ def _safe_count_nodes(card_content: str) -> int | str:
         return "unknown"
 
 
+def advance_markdown_fence(open_fence: str, raw_line: str) -> str:
+    """Advance one CommonMark-style fenced-code delimiter state."""
+    match = _FENCE_LINE_RE.match(raw_line)
+    if not match:
+        return open_fence
+
+    fence = match.group("fence")
+    if not open_fence:
+        return fence
+
+    closes_current = (
+        fence[0] == open_fence[0]
+        and len(fence) >= len(open_fence)
+        and not match.group("tail").strip()
+    )
+    return "" if closes_current else open_fence
+
+
+def open_markdown_fence(content: str) -> str:
+    """Return the active unclosed CommonMark fence delimiter, or empty string."""
+    open_fence = ""
+    for raw_line in str(content).splitlines():
+        open_fence = advance_markdown_fence(open_fence, raw_line)
+    return open_fence
+
+
+def iter_unescaped_inline_backtick_runs(text: str):
+    """Yield unescaped 1- or 2-backtick inline code runs."""
+    i = 0
+    while i < len(text):
+        if text[i] != "`":
+            i += 1
+            continue
+        escaped = i > 0 and text[i - 1] == "\\"
+        j = i
+        while j < len(text) and text[j] == "`":
+            j += 1
+        run = text[i:j]
+        if not escaped and len(run) < 3:
+            yield run
+        i = j
+
+
+def last_unclosed_inline_code_tick(content: str) -> str:
+    """Return the unclosed inline code backtick delimiter outside fences."""
+    last_unclosed = ""
+    open_fence = ""
+    for raw_line in str(content).splitlines():
+        next_fence = advance_markdown_fence(open_fence, raw_line)
+        if next_fence != open_fence:
+            open_fence = next_fence
+            continue
+        if open_fence:
+            continue
+        for tick in iter_unescaped_inline_backtick_runs(raw_line):
+            if not last_unclosed:
+                last_unclosed = tick
+            elif last_unclosed == tick:
+                last_unclosed = ""
+    return last_unclosed
+
+
 def _truncate_markdown_text(text: str, limit: int, *, suffix: str) -> str:
     """Truncate markdown without leaving an open fenced code block."""
     truncated = text[:limit].rstrip()
-    closing = _open_fence_closer(truncated)
+    closing = open_markdown_fence(truncated)
     if closing:
         truncated = f"{truncated}\n{closing}"
     separator = "" if suffix.startswith("\n") else "\n"
     return truncated + separator + suffix
-
-
-def _open_fence_closer(text: str) -> str:
-    """Return the closing fence needed for text, or an empty string."""
-    open_fence = ""
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            fence = "```"
-        elif stripped.startswith("~~~"):
-            fence = "~~~"
-        else:
-            continue
-        open_fence = "" if open_fence == fence else fence
-    return open_fence
 
 
 def _build_limit_fallback_card(card: dict, *, engine_type: str | None = None) -> dict:

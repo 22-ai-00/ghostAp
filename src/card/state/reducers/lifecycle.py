@@ -174,7 +174,7 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
     """Handle lifecycle events: STARTED, COMPLETED, FAILED, CANCELLED, PAUSED, RESUMED."""
     payload = event.payload or {}
     now = payload.get("_now") if payload else None
-    allow_prog_stop = bool(state.metadata.allow_programming_stop and not state.metadata.is_subagent)
+    allow_prog_stop = bool(state.metadata.allow_programming_stop)
     match event.type:
         case CardEventType.STARTED:
             header = build_header(state.metadata, "running")
@@ -456,7 +456,7 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                 new_buttons = _running_buttons(
                     new_meta.engine_type,
                     compact,
-                    allow_programming_stop=bool(new_meta.allow_programming_stop and not new_meta.is_subagent),
+                    allow_programming_stop=bool(new_meta.allow_programming_stop),
                 )
             else:
                 new_buttons = state.buttons

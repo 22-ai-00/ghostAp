@@ -183,7 +183,7 @@ def build_force_release_confirm_card(
 
     Returns ``(markdown_content, buttons)`` with confirm/cancel buttons.
     The confirm button embeds ``repo_token`` and a ``timestamp`` for expiry
-    validation (same pattern as :func:`build_lock_confirm_card`).
+    validation.
 
     Parameters
     ----------

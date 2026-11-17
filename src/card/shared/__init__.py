@@ -135,70 +135,23 @@ def build_responsive_layout(
     return _build_button_grid(buttons)
 
 
-def resolve_title_and_template(
-    project_name: Optional[str],
-    mode: Optional[InteractionMode] = None,
-    theme_color: Optional[str] = None,
-) -> tuple[str, str]:
-    """Resolve card title and header template based on mode and project name."""
-    if mode == InteractionMode.CLAUDE:
-        mode_icon, header_template = "🔮", "purple"
-    elif mode == InteractionMode.COCO:
-        mode_icon, header_template = "🤖", "blue"
-    elif mode == InteractionMode.GEMINI:
-        mode_icon, header_template = "✨", "turquoise"
-    elif mode == InteractionMode.TRAEX:
-        mode_icon, header_template = "🚀", "blue"
-    elif mode == InteractionMode.GROK:
-        mode_icon, header_template = "🌌", "indigo"
-    elif mode == InteractionMode.DSH:
-        mode_icon, header_template = "🧭", "blue"
-    elif mode == InteractionMode.AGY:
-        mode_icon, header_template = "🪐", "wathet"
-    else:
-        mode_icon, header_template = "🧠", "turquoise"
-
-    # If a theme_color is provided (from project), use it for the template
-    if theme_color and mode not in [InteractionMode.CLAUDE, InteractionMode.COCO, InteractionMode.GEMINI, InteractionMode.TRAEX, InteractionMode.GROK, InteractionMode.DSH, InteractionMode.AGY]:
-        header_template = get_theme(theme_color).header_template
-
-    if project_name:
-        if mode == InteractionMode.CLAUDE:
-            title = f"🔮 {project_name} · Claude"
-        elif mode == InteractionMode.COCO:
-            title = f"🤖 {project_name} · Coco"
-        elif mode == InteractionMode.GEMINI:
-            title = f"✨ {project_name} · Gemini"
-        elif mode == InteractionMode.TRAEX:
-            title = f"🚀 {project_name} · Traex"
-        elif mode == InteractionMode.GROK:
-            title = f"🌌 {project_name} · Grok"
-        elif mode == InteractionMode.DSH:
-            title = f"🧭 {project_name} · DSH"
-        elif mode == InteractionMode.AGY:
-            title = f"🪐 {project_name} · AGY"
-        else:
-            title = f"🧠 {project_name}"
-    else:
-        if mode == InteractionMode.CLAUDE:
-            mode_name = UI_TEXT["mode_name_claude"]
-        elif mode == InteractionMode.COCO:
-            mode_name = UI_TEXT["mode_name_coco"]
-        elif mode == InteractionMode.GEMINI:
-            mode_name = UI_TEXT["mode_name_gemini"]
-        elif mode == InteractionMode.TRAEX:
-            mode_name = UI_TEXT["mode_name_traex"]
-        elif mode == InteractionMode.GROK:
-            mode_name = UI_TEXT["mode_name_grok"]
-        elif mode == InteractionMode.DSH:
-            mode_name = UI_TEXT["mode_name_dsh"]
-        elif mode == InteractionMode.AGY:
-            mode_name = UI_TEXT["mode_name_agy"]
-        else:
-            mode_name = UI_TEXT["mode_name_smart"]
-        title = f"{mode_icon} {mode_name}"
-
-    return title, header_template
+def build_callback_button(
+    text: str,
+    action: dict,
+    *,
+    button_type: str = "default",
+    compact: bool = False,
+) -> dict:
+    """Build a Feishu Schema 2.0 callback button with synced value and behavior."""
+    payload = dict(action)
+    button = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": button_type,
+        "value": payload,
+        "behaviors": [{"type": "callback", "value": dict(payload)}],
+    }
+    return apply_compact_style(button) if compact else button
 
 # ---- Internal helpers ----
 

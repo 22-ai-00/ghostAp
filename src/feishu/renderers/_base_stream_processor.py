@@ -1,7 +1,7 @@
 """BaseStreamProcessor — shared lifecycle logic for ACP-driven card stream processors.
 
 Extracts the common patterns from DeepStreamProcessor and SpecStreamProcessor:
-- ACPStreamBridge + ACPEventRenderer creation
+- ACPStreamBridge creation
 - _started_dispatched idempotent guard
 - Warning banner check + dispatch
 - Terminal lifecycle: completed / failed + renderer cleanup
@@ -16,7 +16,6 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from ...acp import ACPEventRenderer
 from ...card.events import CardEvent
 from ...card.stream_bridge import ACPStreamBridge
 
@@ -45,7 +44,6 @@ class BaseStreamProcessor:
         self._renderer = renderer
         self._message_id = message_id
         self._chat_id = chat_id
-        self._acp_renderer = ACPEventRenderer()
         image_uploader = getattr(renderer.handler, "upload_acp_image", None)
         self._image_uploader = image_uploader if callable(image_uploader) else None
         self._stream_bridge = ACPStreamBridge(

@@ -26,7 +26,6 @@ from ...card.backend_meta import VISIBLE_BACKEND_METAS, get_backend_meta
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
 from ...card.ui_text import UI_TEXT
-from ...coco_model import get_coco_model_manager
 from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.lock_order import LockLevel, ordered_rlock
@@ -70,18 +69,6 @@ class _ACPActivationEffect:
     changed: bool
 
 
-@dataclass(frozen=True)
-class _SystemSubcommands:
-    """Minimal delegator view for a SystemHandler responsibility group."""
-    _owner: "SystemHandler"
-    _method_names: tuple[str, ...]
-
-    def __getattr__(self, name: str):
-        if name in self._method_names:
-            return getattr(self._owner, name)
-        raise AttributeError(name)
-
-
 class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, BaseHandler):
     """Help, exit, shell, directory, and intercepted-command handling."""
 
@@ -92,28 +79,70 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()
     _DIRECT_TOOL_COMMAND_TO_MODE: dict[str, str] = {
         "/coco": "coco",
-        "/enter_coco": "coco",
         "/claude": "claude",
-        "/enter_claude": "claude",
         "/claude-w": "claude_w",
-        "/enter_claude_w": "claude_w",
         "/aiden": "aiden",
-        "/enter_aiden": "aiden",
         "/codex": "codex",
-        "/enter_codex": "codex",
         "/codex-w": "codex_w",
-        "/enter_codex_w": "codex_w",
         "/gemini": "gemini",
-        "/enter_gemini": "gemini",
         "/traex": "traex",
-        "/enter_traex": "traex",
         "/grok": "grok",
-        "/enter_grok": "grok",
         "/dsh": "dsh",
-        "/enter_dsh": "dsh",
         "/agy": "agy",
-        "/enter_agy": "agy",
     }
+    _INFO_COMMAND_MODES: tuple[str, ...] = (
+        "coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy",
+    )
+    _EXACT_ONLY_CONTROL_COMMANDS: frozenset[str] = frozenset(
+        {
+            "/help",
+            "/帮助",
+            "/menu",
+            "/tools",
+            "/tools_status",
+            "/projects",
+            "/project",
+            "/coco_status",
+            *(f"/{mode}_info" for mode in _INFO_COMMAND_MODES),
+            "/employees",
+            "/exit",
+            "/stop",
+            "/lock",
+            "/unlock",
+            "/goals",
+        }
+    )
+    _PREFIX_CONTROL_COMMANDS: frozenset[str] = frozenset(
+        {
+            "/switch",
+            "/new",
+            "/new-chat",
+            "/close",
+            "/sh",
+            "/ask",
+            "/clear",
+            "/tasks",
+            "/diff",
+            "/trace",
+            "/status",
+            "/acp",
+            "/cmds",
+            "/info",
+            "/model",
+            "/btw",
+            "/setadmin",
+            "/access",
+            "/employee-role",
+            "/hire",
+            "/fire",
+            "/history",
+            "/employee-memory",
+            "/goal",
+            "/approve",
+            "/runs",
+            *_DIRECT_TOOL_COMMAND_TO_MODE.keys(),
+        }
+    )
     _FAST_EXACT_CONTROL_COMMANDS: frozenset[str] = frozenset(
         {
             "/help",
@@ -124,36 +153,9 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/projects",
             "/project",
             "/coco_status",
-            "/coco_info",
-            "/claude_info",
-            "/aiden_info",
-            "/codex_info",
-            "/gemini_info",
-            "/traex_info",
-            "/grok_info",
-            "/dsh_info",
-            "/agy_info",
+            *(f"/{mode}_info" for mode in _INFO_COMMAND_MODES),
             "/employees",
             "/exit",
-            "/quit",
-            "/end_coco",
-            "/exit_coco",
-            "/end_claude",
-            "/exit_claude",
-            "/end_claude_w",
-            "/exit_claude_w",
-            "/end_aiden",
-            "/exit_aiden",
-            "/end_codex",
-            "/exit_codex",
-            "/end_codex_w",
-            "/exit_codex_w",
-            "/end_gemini",
-            "/exit_gemini",
-            "/end_traex",
-            "/exit_traex",
-            "/end_grok",
-            "/exit_grok",
             *_DIRECT_TOOL_COMMAND_TO_MODE.keys(),
         }
     )
@@ -207,9 +209,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             tuple[str, str, str], dict[int, _ACPActivationOwner]
         ] = {}
         self._init_command_registry()
-        self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
-        self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
-        self.lock_commands = _SystemSubcommands(self, ("handle_force_release_repo_lock", "handle_confirm_lock", "handle_cancel_lock", "handle_confirm_force_release", "handle_cancel_force_release"))
 
     @staticmethod
     def _project_id(project: Optional["ProjectContext"]) -> Optional[str]:
@@ -223,58 +222,16 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         self._exact_handlers = {
             "/help": lambda m, c, t, p: self.show_full_help(m, c, p),
             "/帮助": lambda m, c, t, p: self.show_full_help(m, c, p),
-            "/coco": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "coco", p),
-            "/enter_coco": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "coco", p),
-            "/claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
-            "/enter_claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
-            "/claude-w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude_w", p),
-            "/enter_claude_w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude_w", p),
-            "/aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
-            "/enter_aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
-            "/codex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex", p),
-            "/enter_codex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex", p),
-            "/codex-w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex_w", p),
-            "/enter_codex_w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex_w", p),
-            "/gemini": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "gemini", p),
-            "/enter_gemini": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "gemini", p),
-            "/traex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "traex", p),
-            "/enter_traex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "traex", p),
-            "/grok": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "grok", p),
-            "/enter_grok": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "grok", p),
-            "/dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
-            "/enter_dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
-            "/agy": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "agy", p),
-            "/enter_agy": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "agy", p),
+            **{
+                cmd: (lambda m, c, t, p, _mode=mode: self._handle_direct_mode_enter(m, c, _mode, p))
+                for cmd, mode in self._DIRECT_TOOL_COMMAND_TO_MODE.items()
+            },
             "/exit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/quit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_claude": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_claude": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_claude_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_claude_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_aiden": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_aiden": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_codex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_codex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_codex_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_codex_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_gemini": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_gemini": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/coco_status": lambda m, c, t, p: self.show_coco_status(m, c),
-            "/coco_info": lambda m, c, t, p: self.get_handler("coco").show_info(m, c, p),
-            "/claude_info": lambda m, c, t, p: self.get_handler("claude").show_info(m, c, p),
-            "/aiden_info": lambda m, c, t, p: self.get_handler("aiden").show_info(m, c, p),
-            "/codex_info": lambda m, c, t, p: self.get_handler("codex").show_info(m, c, p),
-            "/gemini_info": lambda m, c, t, p: self.get_handler("gemini").show_info(m, c, p),
-            "/traex_info": lambda m, c, t, p: self.get_handler("traex").show_info(m, c, p),
-            "/grok_info": lambda m, c, t, p: self.get_handler("grok").show_info(m, c, p),
-            "/dsh_info": lambda m, c, t, p: self.get_handler("dsh").show_info(m, c, p),
-            "/agy_info": lambda m, c, t, p: self.get_handler("agy").show_info(m, c, p),
+            **{
+                f"/{mode}_info": (lambda m, c, t, p, _mode=mode: self.get_handler(_mode).show_info(m, c, p))
+                for mode in self._INFO_COMMAND_MODES
+            },
             "/projects": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
@@ -284,9 +241,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/info": lambda m, c, t, p: self.handle_info_command(m, c, p),
             "/stop": lambda m, c, t, p: self.stop_current_task(m, c, p),
             "/clear": lambda m, c, t, p: self.handle_clear_command(m, c, p),
-            "/reset": lambda m, c, t, p: self.handle_clear_command(m, c, p),
             "/sh": lambda m, c, t, p: self.handle_sh_command(m, c, "", p),
-            "/shell": lambda m, c, t, p: self.handle_sh_command(m, c, "", p),
             "/ask": lambda m, c, t, p: self.handle_ask_command(m, c, "", p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
@@ -297,17 +252,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
             "/access": lambda m, c, t, p: self._handle_access_command(m, c, ""),
             "/employees": lambda m, c, t, p: self.employee.list_employees_roster(m, c),
-            "/employee-role": lambda m, c, t, p: self.employee.update_employee_role(
-                m, c, ""
-            ),
+            "/employee-role": lambda m, c, t, p: self.employee.update_employee_role(m, c, ""),
             "/hire": lambda m, c, t, p: self.employee.hire_employee(m, c, ""),
             "/fire": lambda m, c, t, p: self.employee.fire_employee(m, c, ""),
-            "/history": lambda m, c, t, p: self.employee.show_employee_history(
-                m, c, ""
-            ),
-            "/employee-memory": lambda m, c, t, p: self.employee.show_employee_memory(
-                m, c, ""
-            ),
+            "/history": lambda m, c, p: self.employee.show_employee_history(m, c, ""),
+            "/employee-memory": lambda m, c, t, p: self.employee.show_employee_memory(m, c, ""),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -770,8 +719,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
 
         return IntentRecognizer.looks_like_shell(text)
 
-    @staticmethod
-    def is_interceptable_command_match(command_match: CommandMatch | None) -> bool:
+    @classmethod
+    def is_interceptable_command_match(cls, command_match: CommandMatch | None) -> bool:
         """Return True when *command_match* should be routed to SystemHandler.
 
         NOTE: This is the request-scoped SSOT variant (no parsing).
@@ -780,133 +729,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         if not m:
             return False
         cmd = m.command
-
-        exact_commands = {
-            "/help",
-            "/帮助",
-            "/coco",
-            "/enter_coco",
-            "/claude",
-            "/enter_claude",
-            "/claude-w",
-            "/enter_claude_w",
-            "/aiden",
-            "/enter_aiden",
-            "/codex",
-            "/enter_codex",
-            "/codex-w",
-            "/enter_codex_w",
-            "/gemini",
-            "/enter_gemini",
-            "/traex",
-            "/enter_traex",
-            "/grok",
-            "/enter_grok",
-            "/dsh",
-            "/enter_dsh",
-            "/agy",
-            "/enter_agy",
-            "/exit",
-            "/quit",
-            "/end_coco",
-            "/exit_coco",
-            "/end_claude",
-            "/exit_claude",
-            "/end_claude_w",
-            "/exit_claude_w",
-            "/end_aiden",
-            "/exit_aiden",
-            "/end_codex",
-            "/exit_codex",
-            "/end_codex_w",
-            "/exit_codex_w",
-            "/end_gemini",
-            "/exit_gemini",
-            "/end_traex",
-            "/exit_traex",
-            "/end_grok",
-            "/exit_grok",
-            "/coco_status",
-            "/coco_info",
-            "/claude_info",
-            "/aiden_info",
-            "/codex_info",
-            "/gemini_info",
-            "/traex_info",
-            "/grok_info",
-            "/dsh_info",
-            "/agy_info",
-            "/projects",
-            "/status",
-            "/project",
-            "/switch",
-            "/new-chat",
-            "/tasks",
-            "/diff",
-            "/trace",
-            "/acp",
-            "/cmds",
-            "/info",
-            "/stop",
-            "/clear",
-            "/reset",
-            "/sh",
-            "/shell",
-            "/ask",
-            "/menu",
-            "/tools",
-            "/tools_status",
-            "/model",
-            "/lock",
-            "/unlock",
-            "/setadmin",
-            "/access",
-            "/employees",
-            "/employee-role",
-            "/hire",
-            "/fire",
-            "/history",
-            "/employee-memory",
-            "/btw",
-            "/goals",
-            "/runs",
-        }
-        exact_commands.update(SystemHandler._RETIRED_AUTONOMOUS_MANAGER_COMMANDS)
-        if not m.has_args and cmd in exact_commands:
+        if not m.has_args and cmd in cls._EXACT_ONLY_CONTROL_COMMANDS:
             return True
-        prefix_commands = {
-            "/switch",
-            "/new",
-            "/new-chat",
-            "/close",
-            "/sh",
-            "/shell",
-            "/ask",
-            "/clear",
-            "/reset",
-            "/tasks",
-            "/diff",
-            "/trace",
-            "/status",
-            "/acp",
-            "/cmds",
-            "/info",
-            "/model",
-            "/btw",
-            "/setadmin",
-            "/access",
-            "/employee-role",
-            "/hire",
-            "/fire",
-            "/history",
-            "/employee-memory",
-            "/goal",
-            "/approve",
-            "/runs",
-            *SystemHandler._DIRECT_TOOL_COMMAND_TO_MODE.keys(),
-        }
-        prefix_commands.update(SystemHandler._RETIRED_AUTONOMOUS_MANAGER_COMMANDS)
-        return cmd in prefix_commands
+        return (
+            cmd in cls._PREFIX_CONTROL_COMMANDS
+            or cmd in cls._RETIRED_AUTONOMOUS_MANAGER_COMMANDS
+        )
 
     @classmethod
     def is_ghostap_control_command(
@@ -1658,9 +1486,10 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         self.handle_help_category(message_id, chat_id, "main", project)
 
     def show_coco_status(self, message_id: str, chat_id: str):
-        manager = get_coco_model_manager()
-        current_model = manager.get_current_model()
-        models = manager.get_models().models
+        from ...acp.helper import fetch_acp_models
+
+        models = list(fetch_acp_models("coco", self.get_working_dir(chat_id)))
+        current_model = next((m.name for m in models if m.is_default), "")
 
         content = SystemBuilder.build_coco_status_content(current_model, models)
         self.reply_text(message_id, content)

@@ -285,3 +285,38 @@ def test_pending_revoke_fails_closed_across_restart_until_resolved(tmp_path):
     assert replayed.active_record("oc_managed") is None
     assert replayed.grant_for_chat("oc_managed") is None
     assert replayed.pending_revokes() == ("oc_managed",)
+
+
+def test_read_only_stat_cache_skips_reload_when_unchanged_and_reloads_on_change(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    _activate(registry, chat_id="oc_first")
+
+    load_calls = 0
+    orig_load = registry._load
+
+    def spy_load():
+        nonlocal load_calls
+        load_calls += 1
+        return orig_load()
+
+    monkeypatch.setattr(registry, "_load", spy_load)
+
+    # First read hits warm stat cache populated at _persist_locked
+    assert registry.revision == 1
+    rec, grant = registry.trust_snapshot("oc_first")
+    assert rec is not None and grant is not None
+    assert load_calls == 0
+
+    # External writer modifies the snapshot -> size changes -> cache invalidates -> reloads once
+    other = ManagedGroupRegistry(path)
+    _activate(other, chat_id="oc_second_external_group")
+    rec2, grant2 = registry.trust_snapshot("oc_second_external_group")
+    assert rec2 is not None and grant2 is not None
+    assert load_calls == 1
+
+    # Subsequent reads hit refreshed cache again without reloading
+    assert registry.active_record("oc_second_external_group") is not None
+    assert load_calls == 1

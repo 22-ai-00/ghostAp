@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 from src.card.actions import dispatch as action_ids
 from src.card.backend_meta import get_backend_meta
 from src.card.models import EngineStatusEntry
-from src.card.shared import build_responsive_layout
+from src.card.shared import build_callback_button, build_responsive_layout
 from src.card.ui_text import UI_TEXT
 
 from .core import CoreBuilder
@@ -252,16 +252,6 @@ class DiagnosticsBuilder:
             elements.append({"tag": "markdown", "content": lock_lines})
 
         # 5. Context-aware action buttons
-        def _cb_btn(label: str, payload: dict, *, btn_type: str = "default") -> dict:
-            val = dict(payload)
-            return {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": label},
-                "type": btn_type,
-                "value": val,
-                "behaviors": [{"type": "callback", "value": dict(val)}],
-            }
-
         buttons: list[dict] = []
         if tool_name:
             picker_payload = {"action": action_ids.OPEN_ACP_MODEL_PICKER, "tool_name": tool_name}
@@ -271,20 +261,20 @@ class DiagnosticsBuilder:
                 cmds_payload["project_id"] = proj_id
             if d_info.get("model_name"):
                 picker_payload["current_model"] = d_info["model_name"]
-            buttons.append(_cb_btn(UI_TEXT["system_acp_switch_model_btn"], picker_payload))
-            buttons.append(_cb_btn(UI_TEXT["system_acp_native_cmds_btn"], cmds_payload))
+            buttons.append(build_callback_button(UI_TEXT["system_acp_switch_model_btn"], picker_payload))
+            buttons.append(build_callback_button(UI_TEXT["system_acp_native_cmds_btn"], cmds_payload))
         if is_running:
             stop_payload = {"action": action_ids.PROGRAMMING_STOP}
             if tool_name:
                 stop_payload["tool_name"] = tool_name
             if proj_id:
                 stop_payload["project_id"] = proj_id
-            buttons.append(_cb_btn("⏹️ 停止当前任务", stop_payload, btn_type="danger"))
+            buttons.append(build_callback_button("⏹️ 停止当前任务", stop_payload, button_type="danger"))
         buttons.append(
-            _cb_btn(
+            build_callback_button(
                 UI_TEXT["project_board_title"],
                 {"action": action_ids.SHOW_BOARD},
-                btn_type="default" if is_running else "primary",
+                button_type="default" if is_running else "primary",
             )
         )
         elements.append({"tag": "hr"})

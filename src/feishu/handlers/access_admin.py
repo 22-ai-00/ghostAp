@@ -62,63 +62,73 @@ class AccessAdminMixin:
                 )
             return
 
-        if result.code == "missing_sender":
-            self.reply_error(message_id, _system_module().UI_TEXT["system_setadmin_missing_sender"])
-        elif result.code == "invalid_target":
-            self.reply_error(message_id, _system_module().UI_TEXT["system_setadmin_invalid_target"])
-        elif result.code == "bootstrap_requires_p2p":
-            self.reply_error(message_id, _system_module().UI_TEXT["system_setadmin_requires_p2p"])
-        elif result.code == "rate_limited":
-            self.reply_error(message_id, _system_module().UI_TEXT["system_setadmin_rate_limited"])
-        elif result.code == "persistence_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置持久化失败，在线访问策略未改变。",
-            )
-        elif result.code == "commit_uncertain":
-            self.reply_error(
-                message_id,
-                "管理员配置文件替换已发生，但目录耐久性确认失败；"
-                "在线策略已按磁盘现状重新对齐，并记录了安全阻断项。",
-            )
-        elif result.code == "commit_uncertain_unreconciled":
-            self.reply_error(
-                message_id,
-                "管理员配置替换状态不确定，且无法读取磁盘现状；"
-                "在线策略保持原快照，已记录安全阻断项。",
-            )
-        elif result.code == "commit_uncertain_refresh_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置替换状态不确定；已读取磁盘现状，但运行时刷新失败，"
-                "并已记录安全阻断项。",
-            )
-        elif result.code == "commit_cleanup_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置已持久化并在线生效，但事务资源清理失败；"
-                "已记录安全阻断项，请检查文件系统状态。",
-            )
-        elif result.code == "commit_cleanup_refresh_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置已持久化，但事务资源清理和运行时刷新均失败；"
-                "已记录安全阻断项，请修复后重启。",
-            )
-        elif result.code == "policy_refresh_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置已写入磁盘，但在线访问策略刷新失败；"
-                "当前进程仍使用旧策略，请修复配置后重启。",
-            )
-        elif result.code == "settings_mirror_failed":
-            self.reply_error(
-                message_id,
-                "管理员配置已写入磁盘，但运行时设置镜像失败；"
-                "在线策略保持旧快照并已记录安全阻断项。",
-            )
+        if self._reply_commit_outcome_error(
+            message_id,
+            result.code,
+            target_label="管理员配置",
+            policy_unchanged_msg="在线访问策略未改变。",
+            refresh_failed_msg="当前进程仍使用旧策略，请修复配置后重启。",
+            denied_msg=_system_module().UI_TEXT["system_setadmin_denied"],
+            prechecks={
+                "missing_sender": _system_module().UI_TEXT["system_setadmin_missing_sender"],
+                "invalid_target": _system_module().UI_TEXT["system_setadmin_invalid_target"],
+                "bootstrap_requires_p2p": _system_module().UI_TEXT["system_setadmin_requires_p2p"],
+                "rate_limited": _system_module().UI_TEXT["system_setadmin_rate_limited"],
+            },
+        ):
+            return
+
+    def _reply_commit_outcome_error(
+        self,
+        message_id: str,
+        code: str,
+        *,
+        target_label: str,
+        policy_unchanged_msg: str,
+        refresh_failed_msg: str,
+        denied_msg: str,
+        prechecks: dict[str, str],
+    ) -> bool:
+        if code in prechecks:
+            self.reply_error(message_id, prechecks[code])
+            return True
+        commit_errors = {
+            "persistence_failed": f"{target_label}持久化失败，{policy_unchanged_msg}",
+            "commit_uncertain": (
+                f"{target_label}文件替换已发生，但目录耐久性确认失败；"
+                "在线策略已按磁盘现状重新对齐，并记录了安全阻断项。"
+            ),
+            "commit_uncertain_unreconciled": (
+                f"{target_label}替换状态不确定，且无法读取磁盘现状；"
+                "在线策略保持原快照，已记录安全阻断项。"
+            ),
+            "commit_uncertain_refresh_failed": (
+                f"{target_label}替换状态不确定；已读取磁盘现状，但运行时刷新失败，"
+                "并已记录安全阻断项。"
+            ),
+            "commit_cleanup_failed": (
+                f"{target_label}已持久化并在线生效，但事务资源清理失败；"
+                "已记录安全阻断项，请检查文件系统状态。"
+            ),
+            "commit_cleanup_refresh_failed": (
+                f"{target_label}已持久化，但事务资源清理和运行时刷新均失败；"
+                "已记录安全阻断项，请修复后重启。"
+            ),
+            "policy_refresh_failed": (
+                f"{target_label}已写入磁盘，但在线访问策略刷新失败；"
+                f"{refresh_failed_msg}"
+            ),
+            "settings_mirror_failed": (
+                f"{target_label}已写入磁盘，但运行时设置镜像失败；"
+                "在线策略保持旧快照并已记录安全阻断项。"
+            ),
+        }
+        msg = commit_errors.get(code)
+        if msg is not None:
+            self.reply_error(message_id, msg)
         else:
-            self.reply_text(message_id, _system_module().UI_TEXT["system_setadmin_denied"])
+            self.reply_text(message_id, denied_msg)
+        return True
 
     def _handle_access_command(
         self,
@@ -222,60 +232,17 @@ class AccessAdminMixin:
         if result.success:
             self.reply_text(message_id, "✅ 当前群已加入访问白名单，立即生效。")
             return
-        if result.code == "access_requires_group":
-            self.reply_error(
-                message_id,
-                "请在需要授权的目标群内发送 `/access allow-chat`。",
-            )
-        elif result.code == "persistence_failed":
-            self.reply_error(
-                message_id,
-                "群授权持久化失败，在线访问策略未改变。",
-            )
-        elif result.code == "commit_uncertain":
-            self.reply_error(
-                message_id,
-                "群授权配置文件替换已发生，但目录耐久性确认失败；"
-                "在线策略已按磁盘现状重新对齐，并记录了安全阻断项。",
-            )
-        elif result.code == "commit_uncertain_unreconciled":
-            self.reply_error(
-                message_id,
-                "群授权配置替换状态不确定，且无法读取磁盘现状；"
-                "在线策略保持原快照，已记录安全阻断项。",
-            )
-        elif result.code == "commit_uncertain_refresh_failed":
-            self.reply_error(
-                message_id,
-                "群授权配置替换状态不确定；已读取磁盘现状，但运行时刷新失败，"
-                "并已记录安全阻断项。",
-            )
-        elif result.code == "commit_cleanup_failed":
-            self.reply_error(
-                message_id,
-                "群授权配置已持久化并在线生效，但事务资源清理失败；"
-                "已记录安全阻断项，请检查文件系统状态。",
-            )
-        elif result.code == "commit_cleanup_refresh_failed":
-            self.reply_error(
-                message_id,
-                "群授权配置已持久化，但事务资源清理和运行时刷新均失败；"
-                "已记录安全阻断项，请修复后重启。",
-            )
-        elif result.code == "policy_refresh_failed":
-            self.reply_error(
-                message_id,
-                "群授权已写入磁盘，但在线访问策略刷新失败；"
-                "当前进程仍拒绝该群，请修复配置后重启。",
-            )
-        elif result.code == "settings_mirror_failed":
-            self.reply_error(
-                message_id,
-                "群授权配置已写入磁盘，但运行时设置镜像失败；"
-                "在线策略保持旧快照并已记录安全阻断项。",
-            )
-        else:
-            self.reply_text(message_id, "当前账号无权授权此群。")
+        self._reply_commit_outcome_error(
+            message_id,
+            result.code,
+            target_label="群授权",
+            policy_unchanged_msg="在线访问策略未改变。",
+            refresh_failed_msg="当前进程仍拒绝该群，请修复配置后重启。",
+            denied_msg="当前账号无权授权此群。",
+            prechecks={
+                "access_requires_group": "请在需要授权的目标群内发送 `/access allow-chat`。",
+            },
+        )
 
     def _admin_bootstrap_service(self):
         """Construct the single-admin bootstrap service bound to .env storage."""

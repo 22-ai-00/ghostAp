@@ -17,7 +17,6 @@ from ...utils.errors import fmt_error, get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
 from ..slash_command_parser import SlashCommandParser
-from .base import CardActionContext
 from .engine_base import BaseEngineHandler
 
 if TYPE_CHECKING:
@@ -104,14 +103,6 @@ class SpecHandler(BaseEngineHandler):
         )
         self.send_card_to_chat(chat_id, err_card, origin_message_id=message_id, request_id=request_id)
 
-    def _refresh_card_view(self, message_id: str, chat_id: str, project=None):
-        self.show_spec_status(message_id, chat_id, project, origin_message_id=message_id)
-
-    def _get_ui_state(self, spec_project_id: str) -> dict:
-        """Deprecated: Delegate to renderer"""
-        return self.renderer.get_ui_state(spec_project_id)
-
-    # ------------------------------------------------------------------
     # Command router
     # ------------------------------------------------------------------
     def handle_spec_command(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
@@ -775,15 +766,5 @@ class SpecHandler(BaseEngineHandler):
             except Exception:
                 logger.debug("failed to get target_project", exc_info=True)
 
-        self._dispatch_standard_card_action(CardActionContext(
-            open_message_id=open_message_id,
-            open_chat_id=open_chat_id,
-            action_type=action_type,
-            value=value,
-            prefix="spec",
-            action_map={"spec_stop": self.stop_spec_engine},
-            toggle_log_method=self._toggle_log,
-            switch_mode_method=self._switch_card_mode,
-            toggle_ac_method=self._toggle_ac,
-            project=target_project,
-        ))
+        if action_type == "spec_stop":
+            self.stop_spec_engine(open_message_id, open_chat_id, project=target_project)

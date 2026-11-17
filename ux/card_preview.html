@@ -374,26 +374,6 @@ body {
   gap: 4px;
 }
 
-/* === Model Selection Preview === */
-.model-option-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  background: #fafbfc;
-  border: 1px solid #eef0f3;
-  border-radius: 6px;
-}
-.model-option-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-.model-option-desc {
-  font-size: 12px;
-  color: #646a73;
-}
-
 /* === Activity Summary === */
 .activity-item {
   font-size: 12px;
@@ -1384,38 +1364,8 @@ tests/test_tools.py::test_tool_history_fold PASSED
 </div>
 
 <!-- ==================== 2026-05-12 Mobile Acceptance ==================== -->
-<h2 class="section-title">2026-05-12 移动端验收：选择卡与错误卡</h2>
+<h2 class="section-title">2026-05-12 移动端验收：错误卡</h2>
 <div class="cards-grid mobile-acceptance-grid">
-  <div class="card-wrapper">
-    <div class="card-label">工具/模型选择卡 · 360px 移动端长标题/长描述</div>
-    <div class="feishu-card" style="max-width:360px;">
-      <div class="card-header header-blue">
-        <div class="title">🧰 选择工具与模型</div>
-        <div class="subtitle">长工具名不会挤压按钮区</div>
-      </div>
-      <div class="card-body">
-        <div class="model-option-row">
-          <div style="min-width:0;">
-            <div class="model-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Coco Enterprise Ultra Long Agent Name With Context Window 168k</div>
-            <div class="model-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">Context window: 168k, Max tool turns: 200, 适合大型代码库重构与多阶段任务；描述被两行截断，避免误导用户以为按钮不可点击。</div>
-          </div>
-          <button class="btn btn-primary" style="flex:0 0 auto;min-width:86px;">选择 Coco</button>
-        </div>
-        <div class="model-option-row">
-          <div style="min-width:0;">
-            <div class="model-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">claude-sonnet-4-20250514-super-long-model-id</div>
-            <div class="model-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">模型说明很长时保留关键 quota/能力摘要，完整值仍通过 callback payload 传递。</div>
-          </div>
-          <button class="btn btn-default" style="flex:0 0 auto;min-width:86px;">选择模型</button>
-        </div>
-        <div class="button-row">
-          <button class="btn btn-default">刷新</button>
-          <button class="btn btn-primary">确认</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <div class="card-wrapper">
     <div class="card-label">错误卡 · 致命错误（红色头部，重试降为次按钮）</div>
     <div class="feishu-card" style="max-width:360px;">

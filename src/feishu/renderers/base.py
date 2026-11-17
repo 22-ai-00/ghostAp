@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from src.card.render.throttle import StreamThrottle
 from src.card.shared.truncation import check_and_truncate_payload as _check_and_truncate
 from src.card.thresholds import THRESHOLDS
 
@@ -16,27 +15,6 @@ if TYPE_CHECKING:
     from ..handlers.base import BaseHandler
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Stream throttle (re-exported for backward compat; canonical at src.card.render.throttle)
-# ---------------------------------------------------------------------------
-
-_StreamThrottle = StreamThrottle
-
-
-class EngineRenderStrategy:
-    """Shared facade for engine renderer composition policies.
-
-    Keeps split/continuation wording and terminal dispatch helpers in one
-    place so Deep and Spec renderers use the same card composition semantics
-    without changing their public rendering behavior.
-    """
-
-    DEFAULT_BRIDGE_PHRASE = "续接："
-
-    def __init__(self, renderer: "BaseRenderer") -> None:
-        self.renderer = renderer
 
 
 def _dispatch_text_block(dispatchable, block_id: str, content: str) -> None:
@@ -81,7 +59,6 @@ class BaseRenderer:
         # project_id -> state dict
         self.ui_states: dict[str, dict[str, Any]] = {}
         self._session_factory = None
-        self.render_strategy = EngineRenderStrategy(self)
 
     def get_active_session(self) -> "Dispatchable | None":
         """Return the currently active session for this renderer, or None.
@@ -90,29 +67,6 @@ class BaseRenderer:
         Used by BaseEngineHandler._on_engine_error() to route error events
         through the session pipeline for full hook lifecycle support.
         """
-        return None
-
-    def _dispatch_card_split(
-        self,
-        session,
-        *,
-        reason: str,
-        hint: str | None = None,
-        bridge_phrase: str | None = None,
-    ) -> None:
-        """Dispatch a card_split event and wire completion callback.
-
-        Subclasses may override ``_on_card_split_completed`` to create a fresh
-        continuation session after the current card has closed successfully.
-        """
-        from ...card.events import CardEvent
-
-        normalized_hint = hint or ""
-        session.on_card_split_completed = self._on_card_split_completed
-        session.dispatch(CardEvent.card_split(reason=reason, hint=normalized_hint, bridge_phrase=bridge_phrase))
-
-    def _on_card_split_completed(self, reason: str, hint: str | None, bridge_phrase: str | None = None) -> None:
-        """Hook for subclasses to start a fresh continuation session."""
         return None
 
     def _build_hooks(

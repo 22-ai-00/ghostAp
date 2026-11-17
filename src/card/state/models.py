@@ -56,7 +56,6 @@ class CardMetadata:
     card_sequence: int | str = 1
     session_started_at: float | None = None
     working_dir: str | None = None
-    is_subagent: bool = False
     parent_card_seq: str | None = None
     final_state_for_freeze: "CardState | None" = None
     frozen: bool = False
@@ -234,19 +233,6 @@ class TaskListBlock:
 
 
 @dataclass(frozen=True)
-class SeparatorBlock:
-    """Section separator block — visual divider for overflow tasks merged into a card."""
-    _atom_kind: ClassVar[str] = "separator"
-    kind: Literal["separator"] = "separator"
-    block_id: str = ""
-    task_name: str = ""
-    is_first_overflow: bool = False
-    status_emoji: str = "⏳"
-    element_id: str | None = None
-    status: BlockStatus = "completed"
-
-
-@dataclass(frozen=True)
 class ReviewRoleBlock:
     """One Spec review role result rendered as its own collapsible panel."""
     _atom_kind: ClassVar[str] = "review_role"
@@ -294,7 +280,7 @@ class SpecTaskBlock:
 # Tagged-union type alias
 AnyContentBlock: TypeAlias = Union[
     TextBlock, ToolBlock, ReasoningBlock, ImageBlock, PlanBlock, PhaseBlock, CriteriaBlock,
-    TaskListBlock, SeparatorBlock,
+    TaskListBlock,
     ReviewRoleBlock, SpecPlanBlock, SpecTaskBlock,
 ]
 """Union of all content block types. Use isinstance() for type-safe dispatch."""
@@ -309,7 +295,6 @@ _BLOCK_KIND_MAP: dict[str, type] = {
     "phase": PhaseBlock,
     "criteria": CriteriaBlock,
     "task_list": TaskListBlock,
-    "separator": SeparatorBlock,
     "review_role": ReviewRoleBlock,
     "spec_plan": SpecPlanBlock,
     "spec_task": SpecTaskBlock,

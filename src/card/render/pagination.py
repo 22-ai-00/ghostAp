@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 
 from src.card.render.atoms import RenderAtom, estimate_atom_size
+from src.card.shared.truncation import (
+    last_unclosed_inline_code_tick,
+    open_markdown_fence,
+)
 from src.utils.text import utf8_replace_bytes
 
 # Approximate overhead for card config/header/footer skeleton
@@ -14,9 +17,6 @@ BASE_OVERHEAD = 500
 # Fixed node overhead for elements injected after pagination:
 # header/config(3) + banner(3) + footer(8) + buttons(6) = 20
 FIXED_NODE_OVERHEAD = 20
-_FENCE_LINE_RE = re.compile(
-    r"^\s{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$"
-)
 
 
 def split_atom(atom: RenderAtom, remaining_bytes: int) -> list[RenderAtom] | None:
@@ -158,76 +158,17 @@ def _make_split_atoms(
 
 def stabilize_markdown_split(first_content: str, rest_content: str) -> tuple[str, str]:
     """Close and reopen Markdown spans split across independently rendered pages."""
-    fence = _open_markdown_fence(first_content)
+    fence = open_markdown_fence(first_content)
     if fence:
         first_suffix = "" if first_content.endswith("\n") else "\n"
         rest_prefix = "" if rest_content.startswith("\n") else "\n"
         return f"{first_content}{first_suffix}{fence}", f"{fence}{rest_prefix}{rest_content}"
 
-    inline_tick = _last_unclosed_inline_code_tick(first_content)
+    inline_tick = last_unclosed_inline_code_tick(first_content)
     if inline_tick:
         return f"{first_content}{inline_tick}", f"{inline_tick}{rest_content}"
 
     return first_content, rest_content
-
-
-def _open_markdown_fence(content: str) -> str:
-    open_fence = ""
-    for raw_line in str(content).splitlines():
-        open_fence = _advance_markdown_fence(open_fence, raw_line)
-    return open_fence
-
-
-def _advance_markdown_fence(open_fence: str, raw_line: str) -> str:
-    """Advance one CommonMark-style fenced-code delimiter state."""
-    match = _FENCE_LINE_RE.match(raw_line)
-    if not match:
-        return open_fence
-
-    fence = match.group("fence")
-    if not open_fence:
-        return fence
-
-    closes_current = (
-        fence[0] == open_fence[0]
-        and len(fence) >= len(open_fence)
-        and not match.group("tail").strip()
-    )
-    return "" if closes_current else open_fence
-
-
-def _last_unclosed_inline_code_tick(content: str) -> str:
-    last_unclosed = ""
-    open_fence = ""
-    for raw_line in str(content).splitlines():
-        next_fence = _advance_markdown_fence(open_fence, raw_line)
-        if next_fence != open_fence:
-            open_fence = next_fence
-            continue
-        if open_fence:
-            continue
-        for tick in _iter_unescaped_inline_backtick_runs(raw_line):
-            if not last_unclosed:
-                last_unclosed = tick
-            elif last_unclosed == tick:
-                last_unclosed = ""
-    return last_unclosed
-
-
-def _iter_unescaped_inline_backtick_runs(text: str):
-    i = 0
-    while i < len(text):
-        if text[i] != "`":
-            i += 1
-            continue
-        escaped = i > 0 and text[i - 1] == "\\"
-        j = i
-        while j < len(text) and text[j] == "`":
-            j += 1
-        run = text[i:j]
-        if not escaped and len(run) < 3:
-            yield run
-        i = j
 
 
 def _estimate_content_bytes(atom: RenderAtom, content: str) -> int:

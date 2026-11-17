@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "build_chat_lock_card",
     "build_lock_success_card",
-    "build_lock_confirm_card",
     "build_lock_help_body",
 ]
 
@@ -240,19 +239,6 @@ def build_lock_success_card(
     if message:
         return UI_TEXT["lock_success_unlock_idempotent"].format(message=message)
     return UI_TEXT["lock_success_unlock_reply"]
-
-
-def build_lock_confirm_card(chat_id: str, *, confirm_timeout: Optional[int] = None) -> tuple[str, list[dict]]:
-    """Build a confirmation card for the /lock command.
-
-    .. deprecated::
-        The /lock command now executes directly without a two-step confirmation
-        flow.  This function now returns a single-line deprecation notice so
-        that historical ``confirm_lock`` / ``cancel_lock`` card actions still
-        get a graceful response instead of an error.
-    """
-    logger.warning("build_lock_confirm_card is deprecated — /lock now executes directly")
-    return "此功能已更新，请重新发送 /lock", []
 
 
 def build_lock_help_body(is_admin: bool = False, chat_id: str = "", *, chat_lock_manager=None, allowed_commands_display: Optional[str] = None, lock_undo_window_seconds: int = 300) -> str:

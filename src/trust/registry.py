@@ -274,21 +274,23 @@ class ManagedGroupRegistry:
         self._revokes: dict[str, dict[str, str]] = {}
         self._migration_dispositions: dict[str, dict[str, Any]] = {}
         self._commit_uncertain = False
+        self._has_loaded_snapshot = False
+        self._loaded_stat: tuple[int, int] | None = None
         self._validate_storage_path()
         with self._disk_transaction():
             pass
 
     @property
     def revision(self) -> int:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return self._revision
 
     def managed_groups(self) -> tuple[ManagedGroupRecord, ...]:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return tuple(self._records[key] for key in sorted(self._records))
 
     def project_grants(self) -> tuple[ProjectGrant, ...]:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             if self._commit_uncertain:
                 return ()
             active_ids = {
@@ -304,7 +306,7 @@ class ManagedGroupRegistry:
             )
 
     def record(self, chat_id: str) -> ManagedGroupRecord | None:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return self._records.get(chat_id)
 
     def _active_pair_locked(
@@ -318,11 +320,11 @@ class ManagedGroupRegistry:
         return record, self._grants.get(record.project_grant_id)
 
     def active_record(self, chat_id: str) -> ManagedGroupRecord | None:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return self._active_pair_locked(chat_id)[0]
 
     def grant_for_chat(self, chat_id: str) -> ProjectGrant | None:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return self._active_pair_locked(chat_id)[1]
 
     def trust_snapshot(
@@ -331,7 +333,7 @@ class ManagedGroupRegistry:
     ) -> tuple[ManagedGroupRecord | None, ProjectGrant | None]:
         """Read one current group/grant pair in a single disk transaction."""
 
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return self._active_pair_locked(chat_id)
 
     def begin_provision(
@@ -703,7 +705,7 @@ class ManagedGroupRegistry:
             return chat
 
     def pending_revokes(self) -> tuple[str, ...]:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return tuple(sorted(self._revokes))
 
     def record_migration_disposition(
@@ -729,7 +731,7 @@ class ManagedGroupRegistry:
             self._commit_locked(checkpoint)
 
     def migration_dispositions(self) -> tuple[tuple[str, str, str], ...]:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return tuple(
                 (
                     chat_id,
@@ -740,7 +742,7 @@ class ManagedGroupRegistry:
             )
 
     def unreported_migration_dispositions(self) -> tuple[tuple[str, str, str], ...]:
-        with self._disk_transaction():
+        with self._disk_transaction(read_only=True):
             return tuple(
                 (chat_id, value["project_id"], value["status"])
                 for chat_id, value in sorted(self._migration_dispositions.items())
@@ -851,9 +853,12 @@ class ManagedGroupRegistry:
             self._revokes = {}
             self._migration_dispositions = {}
             self._commit_uncertain = self._uncertain_path.exists()
+            self._loaded_stat = None
+            self._has_loaded_snapshot = True
             return
         try:
             with self._path.open("r", encoding="utf-8") as handle:
+                loaded_stat_raw = os.fstat(handle.fileno())
                 payload = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
             data = _require_dict(payload, _TOP_LEVEL_KEYS, "registry")
             if (
@@ -977,6 +982,8 @@ class ManagedGroupRegistry:
         self._revokes = revokes
         self._migration_dispositions = migrations
         self._commit_uncertain = self._uncertain_path.exists()
+        self._loaded_stat = (loaded_stat_raw.st_mtime_ns, loaded_stat_raw.st_size)
+        self._has_loaded_snapshot = True
 
     @staticmethod
     def _grant_matches_record(
@@ -1054,6 +1061,12 @@ class ManagedGroupRegistry:
                 "registry replace committed but durability is uncertain",
                 committed=True,
             ) from exc
+        try:
+            st = self._path.lstat()
+            self._loaded_stat = (st.st_mtime_ns, st.st_size)
+            self._has_loaded_snapshot = True
+        except OSError:
+            self._has_loaded_snapshot = False
 
     def _anchor_uncertain_locked(
         self,
@@ -1187,11 +1200,29 @@ class ManagedGroupRegistry:
             raise RegistryCorruptionError("registry path must not use symlinks")
 
     @contextmanager
-    def _disk_transaction(self):
+    def _disk_transaction(self, *, read_only: bool = False):
         """Reload state under a stable lock before each disk transaction."""
 
         with self._lock:
             self._validate_storage_path()
+            if (
+                read_only
+                and self._has_loaded_snapshot
+                and not self._commit_uncertain
+                and not self._uncertain_path.exists()
+            ):
+                try:
+                    st = self._path.lstat()
+                    current_stat: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+                    stat_ok = True
+                except FileNotFoundError:
+                    current_stat = None
+                    stat_ok = True
+                except OSError:
+                    stat_ok = False
+                if stat_ok and current_stat == self._loaded_stat:
+                    yield
+                    return
             parent = self._path.parent
             parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             flags = os.O_RDWR | os.O_CREAT

@@ -15,7 +15,6 @@ from ...utils.command_parser import CommandParser
 from ...utils.errors import get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
-from .base import CardActionContext
 from .engine_base import BaseEngineHandler
 
 if TYPE_CHECKING:
@@ -64,14 +63,6 @@ class DeepHandler(BaseEngineHandler):
             return project.acp_model_name
         return ""
 
-    def _refresh_card_view(self, message_id: str, chat_id: str, project=None):
-        self.show_deep_status(message_id, chat_id, project, origin_message_id=message_id)
-
-    def _get_ui_state(self, deep_project_id: str) -> dict:
-        """Deprecated: Delegate to renderer"""
-        return self.renderer.get_ui_state(deep_project_id)
-
-    # ------------------------------------------------------------------
     # Command router
     # ------------------------------------------------------------------
     def handle_deep_command(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
@@ -381,19 +372,5 @@ class DeepHandler(BaseEngineHandler):
                 logger.debug("resolve_deep_target_project失败: %s", get_error_detail(e))
                 target_project = None
 
-        deep_actions = {
-            "deep_stop": self.stop_deep_engine,
-        }
-
-        self._dispatch_standard_card_action(CardActionContext(
-            open_message_id=open_message_id,
-            open_chat_id=open_chat_id,
-            action_type=action_type,
-            value=value,
-            prefix="deep",
-            action_map=deep_actions,
-            toggle_log_method=self._toggle_log,
-            switch_mode_method=self._switch_card_mode,
-            toggle_ac_method=self._toggle_ac,
-            project=target_project,
-        ))
+        if action_type == "deep_stop":
+            self.stop_deep_engine(open_message_id, open_chat_id, project=target_project)

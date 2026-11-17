@@ -132,7 +132,6 @@ class DeepStreamProcessor(BaseStreamProcessor):
 
     def on_event(self, event: ACPEvent) -> None:
         """Process ACP events and dispatch Spec-style card events."""
-        self._acp_renderer.process_event(event)
         activity = (
             "tool_running"
             if event.event_type in {

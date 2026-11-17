@@ -17,7 +17,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from src.card.actions.router import ActionRouter
 from src.card.delivery.tracker import DeliveryTracker, PendingAction
 from src.card.dispatch_coordinator import DispatchDeliveryCoordinator
 from src.card.events import VALIDATE_PAYLOAD, CardEvent, CardEventType
@@ -70,9 +69,6 @@ _PENDING_ACTION_WARNING_MAP: dict[PendingAction, str] = {
 
 _ENGINE_CMD_MAP = ENGINE_CMD_MAP
 _ENGINE_NAME_MAP = ENGINE_NAME_MAP
-
-# Action ID for TTL keep-alive (avoids importing src.card.actions.dispatch)
-_TTL_KEEP_ALIVE = "ttl_keep_alive"
 
 
 def _pending_action_to_event(action: PendingAction, tracker, engine_cmd: str = "") -> CardEvent:
@@ -186,18 +182,12 @@ class CardSession:
         self._delivery_pending: _DeliverySnapshot | None = None
         self._delivery_highest_revision = -1
         self._delivery_owner_thread_id: int | None = None
-        self._first_deliver_fired: bool = False
         self._state: CardState | None = None
         self._ttl_warned = False
         self._terminal_reason: str | None = None
         self._last_dispatch_time = self._clock()
         self._ttl_seconds = config.ttl_seconds if config.ttl_seconds is not None else 1800.0
 
-        self._action_router = ActionRouter(
-            session_id=self._session_id,
-            engine_type=self._metadata.engine_type or "",
-            action_registry=self._action_registry,
-        )
         self._tracker = DeliveryTracker()
         self._hook_firer = HookFirer(self._hooks, self._session_id)
         self._timers = SessionTimerManager(
@@ -271,10 +261,6 @@ class CardSession:
     @property
     def session_started_at(self) -> float:
         return self._metadata.session_started_at or self._clock()
-
-    @property
-    def is_subagent(self) -> bool:
-        return self._metadata.is_subagent
 
     @property
     def parent_card_seq(self) -> str | None:
@@ -697,7 +683,6 @@ class CardSession:
 
     def _deliver_and_track(self, rendered: list, is_terminal: bool, *, event: CardEvent | None = None) -> None:
         """Deliver rendered cards via coordinator and handle outcomes."""
-        _fire_first_deliver_msg_id: str | None = None
         try:
             outcomes = self._coordinator.deliver(rendered, is_terminal=is_terminal)
             # Check for rejected outcomes (capacity exhausted or shutdown)
@@ -721,12 +706,6 @@ class CardSession:
             # Delivery succeeded — update tracker and close if terminal
             with self._lock:
                 self._coordinator.on_success(is_terminal)
-                # Snapshot first-deliver state inside lock, execute hooks outside.
-                if not self._first_deliver_fired:
-                    _candidate_msg_id = self.delivered_message_id
-                    if self._hook_firer.has_hooks and _candidate_msg_id:
-                        self._first_deliver_fired = True
-                        _fire_first_deliver_msg_id = _candidate_msg_id
                 # Update footer timestamp on successful delivery (non-terminal)
                 if not is_terminal and self._state and self._state.footer:
                     _now_hhmm = time.strftime("%m-%d %H:%M")
@@ -741,10 +720,6 @@ class CardSession:
         except Exception as exc:
             self._coordinator.on_failure(exc, rendered, is_terminal, engine_cmd=self.engine_cmd)
             return
-
-        # Fire first-delivered hooks OUTSIDE the lock to avoid lock nesting.
-        if _fire_first_deliver_msg_id:
-            self._hook_firer.fire_first_delivered(_fire_first_deliver_msg_id)
 
         # Finalize only on successful terminal delivery
         if is_terminal:
@@ -855,32 +830,3 @@ class CardSession:
             if rendered:
                 return ("interactive", json.dumps(rendered[0].to_feishu_json(), ensure_ascii=False))
             return None
-
-    def inbound_action(self, action_id: str, payload: dict | None = None) -> dict | None:
-        """Handle inbound user action (button click) → dispatch or toast.
-
-        Delegates to ActionRouter for action resolution and toast generation.
-        """
-        if self._closed.is_set():
-            logger.debug("CardSession %s: inbound_action after close, ignoring '%s'", self._session_id, action_id)
-            return self._action_router.route_closed(action_id, self._terminal_reason)
-
-        # Special handling: TTL keep-alive resets idle timer without dispatching
-        if action_id == _TTL_KEEP_ALIVE:
-            with self._lock:
-                self._last_dispatch_time = self._clock()
-                self._reset_ttl_timer()
-            return {"toast": {"type": "success", "content": UI_TEXT["ttl_keep_alive_toast"]}}
-
-        result = self._action_router.resolve(action_id, payload or {})
-        if isinstance(result, dict):
-            # Toast response (unknown action or factory error)
-            return result
-
-        # result is a CardEvent — dispatch it
-        try:
-            self.dispatch(result)
-        except Exception as exc:
-            logger.warning("CardSession %s: dispatch error for '%s': %s", self._session_id, action_id, repr(exc))
-            return {"toast": {"type": "error", "content": UI_TEXT["card_session_toast_dispatch_error"]}}
-        return {"toast": {"type": "info", "content": UI_TEXT.get("card_session_toast_action_ack", "操作已收到")}}

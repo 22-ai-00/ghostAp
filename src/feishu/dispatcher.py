@@ -160,18 +160,6 @@ class MessageDispatcher:
                 self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
                 return
 
-            if command_match is not None:
-                if not current_dispatch_allowed():
-                    return
-                self.system.handle_intercepted_command(
-                    message_id,
-                    chat_id,
-                    text,
-                    project,
-                    command_match=command_match,
-                )
-                return
-
             if parse_slash_command(text) is not None:
                 if not current_dispatch_allowed():
                     return
@@ -185,6 +173,18 @@ class MessageDispatcher:
                     is True
                 ):
                     return
+
+            if command_match is not None:
+                if not current_dispatch_allowed():
+                    return
+                self.system.handle_intercepted_command(
+                    message_id,
+                    chat_id,
+                    text,
+                    project,
+                    command_match=command_match,
+                )
+                return
 
         # Programming mode: exit or forward to active session
         if is_in_programming:
@@ -366,28 +366,9 @@ class MessageDispatcher:
         self.base.reply_text(message_id, "🤔 无法理解你的意图")
 
     def _handle_enter_coco(self, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
-        if pending_prompt is None:
-            self.system.show_explicit_acp_model_selection(
-                message_id,
-                chat_id,
-                "coco",
-                project,
-            )
-            return
-        _pid = project.project_id if project else None
-        if self.client._mode_manager.is_coco_mode(chat_id, project_id=_pid):
-            if pending_prompt:
-                handler = self.client._get_mode_handler(
-                    self.client._mode_manager.get_mode(chat_id, project_id=_pid)
-                )
-                if handler:
-                    handler.handle_message(message_id, chat_id, pending_prompt, project)
-            return
-        self.base.enter_mode(message_id, chat_id, project=project)
-        if pending_prompt:
-            self.base.handle_message(
-                message_id, chat_id, pending_prompt, project
-            )
+        return self._handle_enter_acp_mode(
+            "coco", message_id, chat_id, project, pending_prompt=pending_prompt
+        )
 
     def _handle_enter_acp_mode(self, mode: str, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
         if pending_prompt is None:

@@ -14,8 +14,7 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass as _dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ...acp.native_commands import is_pure_zero_arg_native_slash
 from ...card.ui_text import UI_TEXT
@@ -27,21 +26,6 @@ from ...utils.errors import (
 )
 from ..im_client import FeishuIMClient
 from ..ws_card_action_handler import bind_managed_trust_revisions
-
-
-@_dataclass
-class CardActionContext:
-    """Encapsulates the context needed for dispatching card actions."""
-    open_message_id: str
-    open_chat_id: str
-    action_type: str
-    value: dict
-    prefix: str
-    action_map: "dict[str, Callable]"
-    toggle_log_method: "Optional[Callable]" = None
-    toggle_ac_method: "Optional[Callable]" = None
-    switch_mode_method: "Optional[Callable]" = None
-    project: "Optional[Any]" = None
 
 if TYPE_CHECKING:
     from ...project import ContextSourceMode, ProjectContext
@@ -747,33 +731,6 @@ class BaseHandler:
                     return json.dumps(card, ensure_ascii=False)
             except Exception as e:
                 logger.warning("Failed to inject ref note into interactive card: %s", e, exc_info=True)
-        elif msg_type == "post" and isinstance(content_str, str):
-            try:
-                post = json.loads(content_str)
-                if isinstance(post, dict):
-                    lang = post.get("zh_cn")
-                    if isinstance(lang, dict) and isinstance(lang.get("content"), list):
-                        blocks = lang.get("content")
-                        injected = False
-                        for row in reversed(blocks):
-                            if not isinstance(row, list):
-                                continue
-                            for node in reversed(row):
-                                if (
-                                    isinstance(node, dict)
-                                    and node.get("tag") == "md"
-                                    and isinstance(node.get("text"), str)
-                                ):
-                                    node["text"] = f"{node['text']}\n\n---\n{ref_note}"
-                                    injected = True
-                                    break
-                            if injected:
-                                break
-                        if not injected:
-                            blocks.append([{"tag": "md", "text": f"---\n{ref_note}"}])
-                        return json.dumps(post, ensure_ascii=False)
-            except Exception as e:
-                logger.warning("Failed to inject ref note into post content: %s", e, exc_info=True)
 
         return content_str
 
@@ -790,46 +747,6 @@ class BaseHandler:
             self.im_client.add_reaction(message_id, emoji_type)
         except Exception as e:
             logger.warning("添加表情异常: %s", e, exc_info=True)
-
-    # ------------------------------------------------------------------
-    # Card Action Dispatcher (Template Method)
-    # ------------------------------------------------------------------
-    def _dispatch_standard_card_action(self, ctx: CardActionContext) -> bool:
-        """
-        Dispatch stop, detail, and view card actions.
-        Returns True if action was handled, False otherwise.
-        """
-        # 1. Explicit lifecycle actions (currently stop)
-        if ctx.action_type in ctx.action_map:
-            ctx.action_map[ctx.action_type](ctx.open_message_id, ctx.open_chat_id, project=ctx.project)
-            return True
-
-        # Common extraction for UI state actions
-        # Note: 'deep_project_id' is the convention used in card buttons for Deep/Spec engines
-        engine_project_id = ctx.value.get("deep_project_id", "")
-
-        # 2. Log expansion
-        if ctx.action_type in (f"{ctx.prefix}_expand", f"{ctx.prefix}_collapse"):
-            if ctx.toggle_log_method:
-                expanded = ctx.action_type == f"{ctx.prefix}_expand"
-                ctx.toggle_log_method(ctx.open_message_id, ctx.open_chat_id, ctx.project, engine_project_id, expanded)
-                return True
-
-        # 3. View mode
-        if ctx.action_type in (f"{ctx.prefix}_mode_full", f"{ctx.prefix}_mode_compact"):
-            if ctx.switch_mode_method:
-                compact = ctx.action_type == f"{ctx.prefix}_mode_compact"
-                ctx.switch_mode_method(ctx.open_message_id, ctx.open_chat_id, ctx.project, engine_project_id, compact)
-                return True
-
-        # 4. Acceptance-criteria expansion (AC)
-        if ctx.action_type in (f"{ctx.prefix}_expand_ac", f"{ctx.prefix}_collapse_ac"):
-            if ctx.toggle_ac_method:
-                expand_ac = ctx.action_type == f"{ctx.prefix}_expand_ac"
-                ctx.toggle_ac_method(ctx.open_message_id, ctx.open_chat_id, ctx.project, engine_project_id, expand_ac)
-                return True
-
-        return False
 
     # ------------------------------------------------------------------
     # Project ↔ message registration

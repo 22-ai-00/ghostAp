@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ...card.events import CardEvent
 from ...card.render.budget import RenderBudget
@@ -9,9 +9,8 @@ from ...card.state.models import CardMetadata
 from ...card.ui_text import UI_TEXT
 from ...spec_engine import SpecEngineCallbacks
 from ...spec_engine.review_display import build_review_role_payloads, format_review_overview
-from ._rotating_mixin import EngineView, RotatingRendererMixin
 from ._spec_stream_processor import SpecStreamProcessor
-from .base import BaseRenderer, EngineProfile, _StreamThrottle
+from .base import BaseRenderer, EngineProfile
 
 if TYPE_CHECKING:
     from ...card.protocols import Dispatchable
@@ -23,7 +22,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class SpecRenderer(RotatingRendererMixin, BaseRenderer):
+class EngineView:
+    """Lightweight wrapper around engine snapshot for view methods."""
+
+    __slots__ = ("engine_name", "project")
+
+    def __init__(self, snap: Any) -> None:
+        self.engine_name: str = snap.engine_name
+        self.project = snap.ext.get("project")
+
+
+class SpecRenderer(BaseRenderer):
     """
     Handles UI rendering and state management for Spec Engine interactions.
     """
@@ -35,7 +44,6 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
         engine_cmd="/spec",
     )
 
-    # Backward-compat aliases used by RotatingRendererMixin
     _engine_type = _PROFILE.engine_type
     _mode_prefix = _PROFILE.mode_name
     _mode_emoji = _PROFILE.mode_emoji
@@ -47,7 +55,6 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
         self._selection_sessions: dict[tuple[str, str, str], "CardSession"] = {}
         self._last_cycle: int | None = None
         self._last_perspective: str | None = None
-        self._pending_split_hint: str | None = None
 
     def get_active_session(self) -> "Dispatchable | None":
         """Return the currently active spec engine session (rotator)."""
@@ -63,11 +70,62 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
         self._last_cycle = current_cycle
         self._last_perspective = perspective
 
-    def _on_card_split_completed(self, reason: str, hint: str | None, bridge_phrase: str | None = None) -> None:
-        self._pending_split_hint = hint
-
     def _get_reporter(self):
         return self.ctx.spec_reporter
+
+    def _build_view_session(self, chat_id: str, message_id: str, engine_name: str, state: dict) -> "CardSession":
+        """Create a fresh CardSession for view rendering."""
+        metadata = CardMetadata(
+            engine_type=self._engine_type,
+            mode_name=self._mode_prefix,
+            mode_emoji=self._mode_emoji,
+            tool_name=engine_name,
+            compact=state.get("compact", False),
+            expanded=state.get("expanded", False),
+            expand_ac=state.get("expand_ac", False),
+        )
+        return self.create_session(chat_id, message_id, metadata, budget=RenderBudget(engine_cmd=self._engine_cmd))
+
+    def _render_error_view(self, message_id: str, chat_id: str, project, engine, state, error_msg: str):
+        """Render an error info card via CardSession."""
+        engine_name = engine.engine_name
+        session = self._build_view_session(chat_id, message_id, engine_name, state)
+        session.dispatch(CardEvent.started())
+        session.dispatch(CardEvent.failed(error_msg))
+
+    def _render_status_view(self, message_id: str, chat_id: str, project, engine, state):
+        """Render the standard status view with criteria, progress, and warning."""
+        reporter = self._get_reporter()
+        engine_name = engine.engine_name
+        engine_project = engine.project
+
+        session = self._build_view_session(chat_id, message_id, engine_name, state)
+        session.dispatch(CardEvent.started())
+
+        status_content = reporter.format_status(engine_project)
+        session.dispatch(CardEvent.text_delta("_status", status_content))
+
+        criteria_section = reporter.format_criteria_section(engine_project)
+        session.dispatch(CardEvent.criteria_updated(
+            criteria_section,
+            satisfied_count=engine_project.satisfied_count,
+            total_count=engine_project.total_criteria,
+        ))
+
+        progress_info = reporter.get_progress_info(engine_project)
+        if progress_info.get("is_running"):
+            session.dispatch(CardEvent.progress_updated(
+                current=engine_project.satisfied_count,
+                total=engine_project.total_criteria,
+                label="执行中",
+            ))
+
+        warning = self.check_warning_banner(engine_project.duration(), is_executing=progress_info.get("is_running", False))
+        if warning:
+            session.dispatch(CardEvent.warning_updated(warning))
+
+        if not progress_info.get("is_running"):
+            session.dispatch(CardEvent.completed())
 
     def get_default_ui_state(self) -> dict:
         return super().get_default_ui_state()
@@ -107,11 +165,6 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
         )
         self._current_session = rotator
 
-        _throttle = _StreamThrottle(
-            min_interval=self.settings.deep_stream_interval,
-            min_chars=self.settings.deep_stream_min_chars,
-        )
-
         processor = SpecStreamProcessor(
             rotator=rotator,
             reporter=reporter,
@@ -123,7 +176,6 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
             chat_id=chat_id,
             renderer=self,
             project_root_path=project.root_path if project else "",
-            throttle=_throttle,
         )
 
         return processor.build_callbacks()

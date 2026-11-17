@@ -13,7 +13,6 @@ from src.card.engine_meta import engine_type_to_cmd
 from src.card.render.atoms import AtomKind, RenderAtom, estimate_atom_size, flatten_to_atoms
 from src.card.render.budget import RenderBudget
 from src.card.render.buttons import render_buttons
-from src.card.render.error import render_collapsed_error_panel
 from src.card.render.footer import render_footer
 from src.card.render.header import render_header
 from src.card.render.layout import SectionLayout, paginate_layout
@@ -27,6 +26,10 @@ from src.card.render.review import render_review_role_panel
 from src.card.render.spec_artifacts import render_spec_plan_panel, render_spec_task_panel
 from src.card.render.sticky_head import build_sticky_head
 from src.card.render.tools import build_subagent_dispatch_atom, render_tool_panel
+from src.card.shared.truncation import (
+    last_unclosed_inline_code_tick,
+    open_markdown_fence,
+)
 from src.card.state.models import CardState, ContentBlock
 from src.card.text_stream import soft_join_text_fragments
 from src.card.themes import PANEL_STYLES
@@ -383,16 +386,6 @@ def compute_content_hash(state: CardState) -> str:
 # --- Individual atom renderer functions (signature: atom, state, budget, block_index → dict|None) ---
 
 def _render_atom_text(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict:
-    if (
-        atom.block_id == "_error"
-        and state.terminal == "failed"
-        and state.metadata.is_subagent
-    ):
-        block = block_index.get(atom.block_id)
-        return render_collapsed_error_panel(
-            detail_content=_normalize_text_markdown(atom.content),
-            full_content=str(getattr(block, "content", "") or atom.content),
-        )
     body = _render_text_element(atom, block_index)
     block = block_index.get(atom.block_id)
     if (
@@ -480,10 +473,7 @@ def _render_atom_task_list(atom: RenderAtom, state: CardState, budget: RenderBud
     block = block_index.get(atom.block_id)
     if block is None:
         return {"tag": "markdown", "content": atom.content}
-    return render_task_list_panel(
-        block,
-        compact=bool(state.metadata.is_subagent),
-    )
+    return render_task_list_panel(block)
 
 
 def _render_atom_review_role(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict | None:
@@ -875,67 +865,16 @@ def _stabilize_active_markdown(content: str) -> str:
     if not content:
         return content
 
-    fence = _open_markdown_fence(content)
+    fence = open_markdown_fence(content)
     if fence:
         suffix = "" if content.endswith("\n") else "\n"
         return f"{content}{suffix}{fence}"
 
-    inline_tick = _last_unclosed_inline_code_tick(content)
+    inline_tick = last_unclosed_inline_code_tick(content)
     if inline_tick:
         return f"{content}{inline_tick}"
 
     return content
-
-
-def _open_markdown_fence(content: str) -> str:
-    open_fence = ""
-    in_fence = False
-    for raw_line in str(content).splitlines():
-        line = raw_line.lstrip()
-        match = _FENCE_LINE_RE.match(line)
-        if not match:
-            continue
-        fence = match.group("fence")
-        if in_fence and open_fence and fence.startswith(open_fence[0] * min(len(open_fence), len(fence))):
-            in_fence = False
-            open_fence = ""
-            continue
-        if not in_fence:
-            in_fence = True
-            open_fence = fence[:3]
-    return open_fence if in_fence else ""
-
-
-def _last_unclosed_inline_code_tick(content: str) -> str:
-    last_unclosed = ""
-    in_fence = False
-    for raw_line in str(content).splitlines():
-        line = raw_line.lstrip()
-        match = _FENCE_LINE_RE.match(line)
-        if match:
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        for tick in _iter_unescaped_inline_backtick_runs(raw_line):
-            last_unclosed = "" if last_unclosed == tick else tick
-    return last_unclosed
-
-
-def _iter_unescaped_inline_backtick_runs(text: str):
-    i = 0
-    while i < len(text):
-        if text[i] != "`":
-            i += 1
-            continue
-        escaped = i > 0 and text[i - 1] == "\\"
-        j = i
-        while j < len(text) and text[j] == "`":
-            j += 1
-        run = text[i:j]
-        if not escaped and len(run) < 3:
-            yield run
-        i = j
 
 
 def _normalize_fence_line(line: str) -> str:

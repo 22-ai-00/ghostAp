@@ -3,23 +3,16 @@
 Provides a minimal protocol that CardSession, StaticCardSession, and
 SessionRotator all implement, enabling session registry / GC / monitoring
 to operate on a single type constraint.
-
-Also provides TTL management protocols: TTLDecider (read-only state query)
-and TTLActuator (combined mutation/delivery/timer/idle interface) for
-TTLHandler to interact with CardSession through semantic operations,
-fully decoupling TTL management from CardSession's internal attributes.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from src.acp.models import ACPEvent
     from src.card.events import CardEvent
     from src.card.state.models import CardState
-    from src.card.types import RenderedCard
 
 
 # ---------------------------------------------------------------------------
@@ -64,132 +57,6 @@ class TTLState(NamedTuple):
     ttl_seconds: float
     session_id: str
     state_snapshot: CardState | None
-
-
-class TTLDecider(Protocol):
-    """Session interface for TTL decisions and terminal resource cleanup.
-
-    TTLHandler uses this to inspect session state without modifying it.
-    """
-
-    def get_ttl_state(self) -> TTLState | None:
-        """Return a consistent snapshot of TTL-relevant session state.
-
-        Returns None if the internal lock cannot be acquired within a
-        reasonable timeout (e.g. 1s), signaling contention.
-        """
-        ...
-
-    @property
-    def engine_cmd(self) -> str:
-        """User-facing engine command (e.g. '/deep')."""
-        ...
-
-    @property
-    def engine_name(self) -> str:
-        """User-facing engine display name (e.g. 'Deep')."""
-        ...
-
-    def release_terminal_resources(self) -> None:
-        """Cancel timers and detach the completed session's GC finalizer."""
-        ...
-
-
-class TTLActuator(Protocol):
-    """Combined TTL actuator protocol for TTL lifecycle management.
-
-    Aggregates state mutation, delivery, timer/notification, and idle
-    extension methods into a single protocol. CardSession owns a
-    composition-based implementation of this protocol.
-    """
-
-    # --- State mutation ---
-
-    def mark_ttl_expired(self) -> None:
-        """Atomically set ttl_warned=True and terminal_reason='ttl_expired' (under lock)."""
-        ...
-
-    def rollback_ttl_warned(self) -> None:
-        """Reset ttl_warned=False (for error recovery, under lock)."""
-        ...
-
-    def mark_closed(self) -> None:
-        """Mark the session closed without waiting on the state lock."""
-        ...
-
-    def force_terminate(self, reason: str) -> None:
-        """Force-close the session (lock-timeout fallback path).
-
-        Handles try-acquire, stale-state rendering, delivery, notification,
-        and hook firing internally.
-        """
-        ...
-
-    def flag_retry_pending(self) -> None:
-        """Flag that a terminal retry is pending in the delivery tracker."""
-        ...
-
-    # --- Delivery ---
-
-    def reduce_and_render(self, events: "list[CardEvent]") -> "list[RenderedCard]":
-        """Apply events to state and render; returns rendered payload.
-
-        Holds internal lock during reduce+render. Raises on failure
-        (caller should handle rollback semantics).
-
-        Raises:
-            RuntimeError: If the internal state lock cannot be acquired.
-            ValueError: If an event has an invalid type or payload.
-        """
-        ...
-
-    def deliver_terminal(self, rendered: "list[RenderedCard]") -> None:
-        """Deliver rendered payload as a terminal event (with tracking)."""
-        ...
-
-    def deliver_update(self, rendered: "list[RenderedCard]") -> None:
-        """Deliver rendered payload as a non-terminal update (with tracking)."""
-        ...
-
-    def force_deliver(self, rendered: "list[RenderedCard]") -> None:
-        """Deliver rendered payload directly (no tracking, for force-close path)."""
-        ...
-
-    def close_delivery(self) -> None:
-        """Close the delivery channel for this session."""
-        ...
-
-    # --- Timer and notification ---
-
-    def notify_user(self, text: str) -> None:
-        """Send a notification to the user (notify_callback or reply_text fallback)."""
-        ...
-
-    def fire_terminal_hook(self, reason: str) -> None:
-        """Fire on_terminal lifecycle hooks."""
-        ...
-
-    def schedule_ttl_retry(self, callback: Callable[[], None]) -> bool:
-        """Handle a TTL retry; False only means an open session exhausted it."""
-        ...
-
-    def cancel_timers(self) -> None:
-        """Cancel all active timers for this session."""
-        ...
-
-    def schedule_retry(self, callback: Callable[[], None]) -> None:
-        """Schedule a terminal delivery retry timer."""
-        ...
-
-    # --- Idle extension ---
-
-    def defer_idle_timeout(
-        self,
-        on_expired: Callable[[], None],
-        on_prewarning: Callable[[], None],
-    ) -> None:
-        """Refresh idle activity and reschedule TTL timers."""
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -297,31 +164,6 @@ class CardAPIClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Session collaborator protocols (for CardSession decoupling)
-# ---------------------------------------------------------------------------
-
-
-class TTLManager(Protocol):
-    """Protocol for TTL expiration handler — manages idle timeout logic."""
-
-    def on_ttl_expired(self) -> None:
-        """Timer callback: check and handle idle timeout expiration."""
-        ...
-
-
-class ActionDispatcher(Protocol):
-    """Protocol for action routing — maps inbound button clicks to CardEvents or toasts."""
-
-    def route_closed(self, action_id: str, terminal_reason: str) -> dict:
-        """Generate toast response for actions on a closed/expired session."""
-        ...
-
-    def resolve(self, action_id: str, payload: dict) -> "CardEvent | dict":
-        """Resolve an action_id + payload into a CardEvent or toast dict."""
-        ...
-
-
-# ---------------------------------------------------------------------------
 # StreamBridge protocol (ACP event → CardEvent bridge)
 # ---------------------------------------------------------------------------
 
@@ -403,10 +245,6 @@ class ProcessSegmentRollover(NamedTuple):
 __all__ = [
     "Session",
     "TTLState",
-    "TTLDecider",
-    "TTLActuator",
-    "TTLManager",
-    "ActionDispatcher",
     "RendererProtocol",
     "Dispatchable",
     "ManagedDispatchable",

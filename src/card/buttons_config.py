@@ -10,11 +10,7 @@ from src.card.ui_text import UI_TEXT
 # Button Configuration
 BUTTON_CONFIG = {
     # Deep Engine Buttons
-    "pause": {"text": "⏸️ 暂停", "type": "default"},
     "stop": {"text": "⏹️ 停止", "type": "danger", "confirm": {"title": "确认停止", "text": "将中止当前运行的引擎任务，已产出内容将保留。"}},
-    "resume": {"text": "▶️ 继续", "type": "primary"},
-    "expand": {"text": "🔽 展开日志", "type": "default"},
-    "collapse": {"text": "🔼 收起日志", "type": "default"},
     "expand_ac": {"text": "🔽 展开验收标准", "type": "default"},
     "collapse_ac": {"text": "🔼 收起验收标准", "type": "default"},
     "mode_full": {"text": UI_TEXT["card_btn_mode_full"], "type": "default"},

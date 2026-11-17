@@ -17,7 +17,6 @@ from .reducers.phase import reduce_phase
 from .reducers.plan import reduce_plan
 from .reducers.reasoning import reduce_reasoning
 from .reducers.review import reduce_review_result
-from .reducers.separator import reduce_separator
 from .reducers.spec_artifacts import reduce_spec_artifacts
 from .reducers.task_list import reduce_task_list
 from .reducers.text import reduce_text
@@ -181,8 +180,6 @@ _REDUCER_DISPATCH: dict[CardEventType, Callable[[CardState, CardEvent], CardStat
     CardEventType.STOP_ESCALATED: reduce_lifecycle,
     # Task-level card management
     CardEventType.TASK_LIST_UPDATED: reduce_task_list,
-    # Section separator (overflow task divider)
-    CardEventType.SECTION_SEPARATOR: reduce_separator,
 }
 
 # Events that cause structural changes (block add/remove, terminal, header/buttons change)
@@ -224,8 +221,6 @@ _STRUCTURAL_EVENTS = frozenset({
     CardEventType.STOP_ESCALATED,
     # Task-level card management (block structure change)
     CardEventType.TASK_LIST_UPDATED,
-    # Section separator (adds new block)
-    CardEventType.SECTION_SEPARATOR,
     # A banner is inserted above the page body, so adding/removing one changes
     # the wire structure and must not be treated as an element-only text patch.
     CardEventType.WARNING_UPDATED,

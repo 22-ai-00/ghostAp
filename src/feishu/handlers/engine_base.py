@@ -241,63 +241,7 @@ class BaseEngineHandler(BaseHandler):
                 "%s Engine 发送错误消息失败: %s", self._get_engine_name_prefix(), send_err
             )
 
-    # ------------------------------------------------------------------
-    # UI toggle helpers (DRY for Deep/Spec toggle methods)
-    # ------------------------------------------------------------------
-
-    def _refresh_card_view(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None,
-    ):
-        """Refresh engine card after UI state change.  Subclasses may override."""
-        self._show_status(message_id, chat_id, project)
-
-    def _toggle_log(
-        self,
-        message_id: str,
-        chat_id: str,
-        project: Optional["ProjectContext"] = None,
-        engine_project_id: Optional[str] = None,
-        expanded: bool = False,
-    ):
-        """Toggle log expansion for an engine project."""
-        if engine_project_id:
-            self.renderer.update_ui_state(engine_project_id, expanded=expanded)
-            self._refresh_card_view(message_id, chat_id, project)
-
-    def _toggle_ac(
-        self,
-        message_id: str,
-        chat_id: str,
-        project: Optional["ProjectContext"] = None,
-        engine_project_id: Optional[str] = None,
-        expand_ac: bool = False,
-    ):
-        """Toggle acceptance-criteria expansion."""
-        if engine_project_id:
-            self.renderer.update_ui_state(engine_project_id, expand_ac=expand_ac)
-            self._refresh_card_view(message_id, chat_id, project)
-
-    def _switch_card_mode(
-        self,
-        message_id: str,
-        chat_id: str,
-        project: Optional["ProjectContext"] = None,
-        engine_project_id: Optional[str] = None,
-        compact: bool = False,
-    ):
-        """Switch card display mode (full / compact)."""
-        if engine_project_id:
-            self.renderer.update_ui_state(engine_project_id, compact=compact)
-            self._refresh_card_view(message_id, chat_id, project)
-        else:
-            # New CardSession path: buttons rendered by CardSession don't carry
-            # engine_project_id — dispatch MODE_TOGGLED directly to the active session.
-            session = self.renderer.get_active_session()
-            if session and not session.closed:
-                from src.card.events import CardEvent
-                session.dispatch(CardEvent.mode_toggled(compact=compact))
-
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
     # Project auto-creation helper
     # ------------------------------------------------------------------
 

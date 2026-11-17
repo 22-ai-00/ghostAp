@@ -18,12 +18,10 @@ import concurrent.futures
 import logging
 import threading
 import time
-import weakref
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from src.card.engine_meta import engine_type_to_cmd
 from src.card.events import CardEvent
-from src.card.nav_link import format_task_continuation_link
 from src.card.state.models import CardState, TerminalReason
 from src.card.ui_text import UI_TEXT
 
@@ -190,18 +188,6 @@ class SessionHook(Protocol):
         """
         ...
 
-    def on_first_delivered(self, session_id: str, msg_id: str) -> None:
-        """Called once after the first successful delivery, with the message_id.
-
-        Invoked outside the session lock to avoid lock nesting risks.
-        Used by orchestrator for deep-link backfill on archived cards.
-
-        Args:
-            session_id: The session that was delivered.
-            msg_id: The Feishu message_id of the first delivery.
-        """
-        ...
-
 
 # ---------------------------------------------------------------------------
 # Concrete hook implementations
@@ -259,9 +245,6 @@ class EmojiHook:
             logger.debug("EmojiHook: skipping reaction (no message_id, chat_id=%s)", self._chat_id)
             return
         if reason in ("completed", "completed_empty"):
-            if getattr(getattr(state, "metadata", None), "is_subagent", False) is True:
-                logger.debug("EmojiHook: skipping success reaction for subagent card")
-                return
             if not self._success_emoji:
                 return
             self._add_reaction(self._message_id, self._success_emoji)
@@ -562,100 +545,3 @@ class HookFirer:
             self._executor.record_timeout()
         elif done:
             self._executor.record_success()
-
-    def fire_first_delivered(self, msg_id: str) -> None:
-        """Fire on_first_delivered hooks with timeout protection.
-
-        Hooks are submitted to the shared executor with a 3s deadline.
-        Slow hooks are cancelled and logged at WARNING level.
-        """
-        if not self._hooks or not msg_id:
-            return
-        sid = self._session_id
-        futures: list[concurrent.futures.Future] = []
-        for hook in self._hooks:
-            fn = getattr(hook, "on_first_delivered", None)
-            if fn is None:
-                continue
-            fut = self._executor.submit(fn, sid, msg_id)
-            if fut is not None:
-                futures.append(fut)
-
-        if not futures:
-            return
-
-        # Wait with timeout (same as DISPATCHED_HOOK_TIMEOUT)
-        done, not_done = concurrent.futures.wait(futures, timeout=DISPATCHED_HOOK_TIMEOUT)
-        for fut in not_done:
-            fut.cancel()
-        if not_done:
-            logger.warning(
-                "HookFirer %s: %d on_first_delivered hook(s) timed out (%.1fs)",
-                sid, len(not_done), DISPATCHED_HOOK_TIMEOUT,
-            )
-            self._executor.record_timeout()
-        elif done:
-            self._executor.record_success()
-        # Log exceptions from completed hooks
-        for fut in done:
-            exc = fut.exception()
-            if exc:
-                logger.debug(
-                    "HookFirer %s: on_first_delivered hook failed: %s",
-                    sid, repr(exc),
-                )
-
-
-# ---------------------------------------------------------------------------
-# BackfillHook: patches old card with a deep-link after new card first delivers
-# ---------------------------------------------------------------------------
-
-
-class BackfillHook:
-    """SessionHook that backfills a deep-link on the old (archived) card.
-
-    When the new continuation session delivers its first card, this hook
-    patches the old session's content with a navigation link pointing to
-    the new message.
-
-    Implements SessionHook.on_first_delivered protocol.
-    """
-
-    __slots__ = ("_old_session_ref", "_task_name", "_rotation_count")
-
-    def __init__(
-        self,
-        old_session_ref: weakref.ref,
-        task_name: str,
-        rotation_count: int,
-    ) -> None:
-        self._old_session_ref = old_session_ref
-        self._task_name = task_name
-        self._rotation_count = rotation_count
-
-    def on_dispatched(self, event, state) -> None:  # noqa: ARG002
-        pass
-
-    def on_terminal(self, state, reason) -> None:  # noqa: ARG002
-        pass
-
-    def on_first_delivered(self, session_id: str, msg_id: str) -> None:
-        """Backfill the old card with a deep-link to the new message."""
-        if not msg_id:
-            return
-        old_sess = self._old_session_ref()
-        if old_sess is None:
-            return
-        if getattr(old_sess, "closed", False):
-            return
-        backfill_msg = format_task_continuation_link(
-            task_name=self._task_name,
-            rotation_count=self._rotation_count,
-            new_msg_id=msg_id,
-        )
-        try:
-            old_sess.dispatch(CardEvent.text_started("_continuation_backfill"))
-            old_sess.dispatch(CardEvent.text_delta("_continuation_backfill", backfill_msg))
-            old_sess.dispatch(CardEvent.text_done("_continuation_backfill"))
-        except Exception:
-            logger.debug("Deep-link backfill failed for task=%s", self._task_name)

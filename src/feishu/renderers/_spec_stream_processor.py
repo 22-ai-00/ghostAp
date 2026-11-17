@@ -14,7 +14,6 @@ from ...acp import ACPEventType
 from ...card.events import CardEvent
 from ...card.render.budget import RenderBudget
 from ...card.render.build_heartbeat import BuildHeartbeat
-from ...card.render.throttle import StreamThrottle
 from ...card.spec_adapter import SpecCardSession
 from ...card.state.models import CardMetadata
 from ...card.ui_text import UI_TEXT
@@ -86,10 +85,9 @@ class SpecStreamProcessor(BaseStreamProcessor):
         # Renderer/handler references (kept opaque to avoid circular import)
         renderer,  # SpecRenderer instance
         project_root_path: str,
-        throttle: StreamThrottle,
     ) -> None:
         # Base class handles: rotator, renderer, message_id, chat_id,
-        # _acp_renderer, _stream_bridge, _started_dispatched, _start_time
+        # _stream_bridge, _started_dispatched, _start_time
         super().__init__(rotator=rotator, renderer=renderer, message_id=message_id, chat_id=chat_id)
 
         # Immutable dependencies
@@ -109,7 +107,6 @@ class SpecStreamProcessor(BaseStreamProcessor):
 
         # Mutable state (previously closure-captured variables)
         self._max_cycles: int = 0
-        self._throttle: StreamThrottle = throttle
         self._footer_status: Optional[str] = None
         self._last_phase_content: str = ""
         self._current_cycle: int = 0
@@ -276,7 +273,6 @@ class SpecStreamProcessor(BaseStreamProcessor):
 
     def on_phase_start(self, cycle_num: int, phase: SpecPhase) -> None:
         self._rotator.begin_continuation_turn()
-        self._acp_renderer.reset()
         self._footer_status = "tool_running"
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         self._renderer.notify_cycle_change(current_cycle=cycle_num, perspective=phase_name)

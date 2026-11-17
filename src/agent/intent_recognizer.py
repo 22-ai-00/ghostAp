@@ -414,16 +414,19 @@ class IntentRecognizer:
     PROJECT_LIST_KEYWORDS = {"项目列表", "所有项目", "有哪些项目", "看看项目"}
     DIR_KEYWORDS = {"切换目录", "去目录", "进入目录", "当前目录", "上级目录", "cd "}
 
-    ENTER_COCO_KEYWORDS = {"进入编程模式", "编程模式", "开始编程", "进入coco", "coco模式"}
-    ENTER_CLAUDE_KEYWORDS = {"进入claude模式", "claude模式", "进入claude", "使用claude"}
-    ENTER_AIDEN_KEYWORDS = {"进入aiden模式", "aiden模式", "进入aiden", "使用aiden"}
-    ENTER_CODEX_KEYWORDS = {"进入codex模式", "codex模式", "进入codex", "使用codex"}
-    ENTER_GEMINI_KEYWORDS = {"进入gemini模式", "gemini模式", "进入gemini", "使用gemini"}
-    ENTER_TRAEX_KEYWORDS = {"进入traex模式", "traex模式", "进入traex", "使用traex"}
-    ENTER_GROK_KEYWORDS = {"进入grok模式", "grok模式", "进入grok", "使用grok"}
-    ENTER_DSH_KEYWORDS = {"进入dsh模式", "dsh模式", "进入dsh", "使用dsh"}
-    ENTER_AGY_KEYWORDS = {"进入agy模式", "agy模式", "进入agy", "使用agy"}
     EXIT_MODE_KEYWORDS = {"退出模式", "退出编程模式"}
+
+    _ENTER_TOOL_RULES: tuple[tuple[str, IntentType, str, tuple[str, ...]], ...] = (
+        ("coco", IntentType.ENTER_COCO, "Coco", ("进入编程模式", "编程模式", "开始编程", "进入coco", "coco模式")),
+        ("claude", IntentType.ENTER_CLAUDE, "Claude", ("进入claude模式", "claude模式", "进入claude", "使用claude")),
+        ("aiden", IntentType.ENTER_AIDEN, "Aiden", ("进入aiden模式", "aiden模式", "进入aiden", "使用aiden")),
+        ("codex", IntentType.ENTER_CODEX, "Codex", ("进入codex模式", "codex模式", "进入codex", "使用codex")),
+        ("gemini", IntentType.ENTER_GEMINI, "Gemini", ("进入gemini模式", "gemini模式", "进入gemini", "使用gemini")),
+        ("traex", IntentType.ENTER_TRAEX, "Traex", ("进入traex模式", "traex模式", "进入traex", "使用traex")),
+        ("grok", IntentType.ENTER_GROK, "Grok", ("进入grok模式", "grok模式", "进入grok", "使用grok")),
+        ("dsh", IntentType.ENTER_DSH, "DSH", ("进入dsh模式", "dsh模式", "进入dsh", "使用dsh")),
+        ("agy", IntentType.ENTER_AGY, "AGY", ("进入agy模式", "agy模式", "进入agy", "使用agy")),
+    )
 
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
 
@@ -476,16 +479,17 @@ class IntentRecognizer:
             ("spec_guide", IntentRecognizer._match_spec_guide_command),
             ("spec", IntentRecognizer._match_spec_command),
             ("exit_mode_keyword", IntentRecognizer._match_exit_mode_keyword),
-            ("enter_coco_keyword", IntentRecognizer._match_enter_coco_keyword),
-            ("enter_claude_keyword", IntentRecognizer._match_enter_claude_keyword),
             ("info_commands", IntentRecognizer._match_info_commands),
-            ("enter_aiden_keyword", IntentRecognizer._match_enter_aiden_keyword),
-            ("enter_codex_keyword", IntentRecognizer._match_enter_codex_keyword),
-            ("enter_gemini_keyword", IntentRecognizer._match_enter_gemini_keyword),
-            ("enter_traex_keyword", IntentRecognizer._match_enter_traex_keyword),
-            ("enter_grok_keyword", IntentRecognizer._match_enter_grok_keyword),
-            ("enter_dsh_keyword", IntentRecognizer._match_enter_dsh_keyword),
-            ("enter_agy_keyword", IntentRecognizer._match_enter_agy_keyword),
+        ):
+            matcher.register(name, rule)
+        for mode_name, intent, display, keywords in self._ENTER_TOOL_RULES:
+            matcher.register(
+                f"enter_{mode_name}_keyword",
+                lambda _rec, text, _mode, _i=intent, _d=display, _k=keywords: (
+                    _rec._match_enter_tool_keyword(text, _i, _d, _k)
+                ),
+            )
+        for name, rule in (
             ("programming_exit_keyword", IntentRecognizer._match_programming_exit_keyword),
             ("project_list_keyword", IntentRecognizer._match_project_list_keyword),
             ("cd_command", IntentRecognizer._match_cd_command),
@@ -718,27 +722,21 @@ class IntentRecognizer:
             )
         return None
 
-    def _match_enter_coco_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
+    def _match_enter_tool_keyword(
+        self,
+        text: str,
+        intent: IntentType,
+        display_name: str,
+        keywords: tuple[str, ...],
+    ) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_COCO_KEYWORDS):
+        if any(kw in text_lower for kw in keywords):
             return IntentResult.single(
-                intent=IntentType.ENTER_COCO,
+                intent=intent,
                 confidence=0.95,
                 original_text=text,
-                reasoning="检测到进入 Coco 编程模式关键词",
-                description="进入 Coco 编程模式",
-            )
-        return None
-
-    def _match_enter_claude_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_CLAUDE_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_CLAUDE,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Claude 编程模式关键词",
-                description="进入 Claude 编程模式",
+                reasoning=f"检测到进入 {display_name} 编程模式关键词",
+                description=f"进入 {display_name} 编程模式",
             )
         return None
 
@@ -763,90 +761,6 @@ class IntentRecognizer:
                 original_text=text,
                 reasoning=f"精确匹配: {text_lower}",
                 description=f"查看 {name} 会话信息",
-            )
-        return None
-
-    def _match_enter_aiden_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_AIDEN_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_AIDEN,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Aiden 编程模式关键词",
-                description="进入 Aiden 编程模式",
-            )
-        return None
-
-    def _match_enter_codex_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_CODEX_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_CODEX,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Codex 编程模式关键词",
-                description="进入 Codex 编程模式",
-            )
-        return None
-
-    def _match_enter_gemini_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_GEMINI_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_GEMINI,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Gemini 编程模式关键词",
-                description="进入 Gemini 编程模式",
-            )
-        return None
-
-    def _match_enter_traex_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_TRAEX_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_TRAEX,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Traex 编程模式关键词",
-                description="进入 Traex 编程模式",
-            )
-        return None
-
-    def _match_enter_grok_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_GROK_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_GROK,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 Grok 编程模式关键词",
-                description="进入 Grok 编程模式",
-            )
-        return None
-
-    def _match_enter_dsh_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_DSH_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_DSH,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 DSH 编程模式关键词",
-                description="进入 DSH 编程模式",
-            )
-        return None
-
-    def _match_enter_agy_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_AGY_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.ENTER_AGY,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到进入 AGY 编程模式关键词",
-                description="进入 AGY 编程模式",
             )
         return None
 

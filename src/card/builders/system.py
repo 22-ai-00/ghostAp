@@ -15,7 +15,8 @@ from src.card.error_diagnostics import register_error_diagnostic
 from src.utils.errors import GhostAPError, get_error_detail
 
 from ..actions import dispatch as action_ids
-from ..shared import build_responsive_layout
+from ..backend_meta import get_backend_meta
+from ..shared import build_callback_button, build_responsive_layout
 from ..themes import PANEL_STYLES
 from ..thresholds import THRESHOLDS
 from ..ui_text import UI_TEXT
@@ -51,17 +52,6 @@ class SystemBuilder:
     )
     _PATH_RE = re.compile(r"(?<![\w])(?:/[\w.\-]+){2,}")
 
-    @staticmethod
-    def _callback_button(*, text: str, action: dict, button_type: str = "default") -> dict:
-        """Build a Feishu callback button with value and behavior kept in sync."""
-        value = dict(action)
-        return {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": text},
-            "type": button_type,
-            "value": value,
-            "behaviors": [{"type": "callback", "value": value}],
-        }
 
     @staticmethod
     def _compact_help_path(path: object, *, limit: int = 42) -> str:
@@ -212,7 +202,7 @@ class SystemBuilder:
             elements.extend(
                 build_responsive_layout(
                     [
-                        SystemBuilder._callback_button(
+                        build_callback_button(
                             text=UI_TEXT["card_lifecycle_show_details"],
                             action=detail_payload,
                             button_type="default",
@@ -238,7 +228,7 @@ class SystemBuilder:
                     context=context,
                 )
                 buttons.append(
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["card_lifecycle_show_details"],
                         action=safe_detail_action,
                         button_type="default",
@@ -247,7 +237,7 @@ class SystemBuilder:
             if retry_action:
                 retry_button_text = UI_TEXT["card_lifecycle_restart"]
                 buttons.append(
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=retry_button_text,
                         action=SystemBuilder._safe_action_payload(retry_action),
                         button_type="primary" if severity == "recoverable" else "default",
@@ -343,18 +333,11 @@ class SystemBuilder:
 
     @staticmethod
     def _display_mode_label(mode: str) -> str:
-        labels = {
-            "coco": "Coco",
-            "claude": "Claude",
-            "claude_w": "Claude-W",
-            "claude cli": "Claude CLI",
-            "aiden": "Aiden",
-            "codex": "Codex",
-            "codex_w": "Codex-W",
-            "gemini": "Gemini",
-        }
         raw = str(mode or "").strip()
-        return labels.get(raw.lower(), raw)
+        meta = get_backend_meta(raw)
+        if meta is not None:
+            return meta.display_name
+        return "Claude CLI" if raw.lower() == "claude cli" else raw
 
     @staticmethod
     def _build_detail_action(
@@ -575,20 +558,12 @@ class SystemBuilder:
         if lock_undo_window_seconds is None:
             lock_undo_window_seconds = get_settings().lock_undo_window_seconds
 
-        mode_emoji = {
-            InteractionMode.SMART: UI_TEXT["system_mode_smart"],
-            InteractionMode.COCO: UI_TEXT["system_mode_coco"],
-            InteractionMode.CLAUDE: UI_TEXT["system_mode_claude"],
-            InteractionMode.AIDEN: UI_TEXT["system_mode_aiden"],
-            InteractionMode.CODEX: UI_TEXT["system_mode_codex"],
-            InteractionMode.GEMINI: UI_TEXT["system_mode_gemini"],
-            InteractionMode.TRAEX: UI_TEXT["system_mode_traex"],
-            InteractionMode.GROK: UI_TEXT["system_mode_grok"],
-            InteractionMode.DSH: UI_TEXT["system_mode_dsh"],
-            InteractionMode.AGY: UI_TEXT["system_mode_agy"],
-        }
-
-        current_mode_str = mode_emoji.get(current_mode, UI_TEXT["system_mode_smart"])
+        meta = get_backend_meta(current_mode) if current_mode != InteractionMode.SMART else None
+        current_mode_str = (
+            UI_TEXT.get(f"system_mode_{current_mode.value}")
+            or (f"{meta.emoji} {meta.display_name} 编程模式" if meta else None)
+            or UI_TEXT["system_mode_smart"]
+        )
 
         # Extract primitives for caching
         project_name = project.project_name if project else None
@@ -881,7 +856,7 @@ class SystemBuilder:
                     ]
                 )
 
-            default_button = SystemBuilder._callback_button(
+            default_button = build_callback_button(
                 text=UI_TEXT["system_acp_default_model_option"],
                 action=payload(
                     select_action,
@@ -889,7 +864,7 @@ class SystemBuilder:
                     use_default_model=True,
                 ),
             )
-            confirm_button = SystemBuilder._callback_button(
+            confirm_button = build_callback_button(
                 text=UI_TEXT["system_acp_confirm_model"].format(
                     model=state.selection,
                 ),
@@ -903,7 +878,7 @@ class SystemBuilder:
             elements.extend(build_responsive_layout([default_button, confirm_button], layout="mobile"))
         else:
             buttons = [
-                SystemBuilder._callback_button(
+                build_callback_button(
                     text=UI_TEXT["system_acp_default_model_option"],
                     action=payload(
                         select_action,
@@ -927,7 +902,7 @@ class SystemBuilder:
         elements.extend(
             build_responsive_layout(
                 [
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_refresh_models"],
                         action=payload(refresh_action),
                     )
@@ -936,7 +911,7 @@ class SystemBuilder:
             )
         )
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_select_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_model_select_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "blue",
             elements,
         )
@@ -952,7 +927,7 @@ class SystemBuilder:
         del project_id, thread_root_id
         tool = str(tool_name or "").strip().lower()
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_loading_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_model_loading_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "blue",
             [
                 {
@@ -986,7 +961,7 @@ class SystemBuilder:
             {"tag": "hr"},
             *build_responsive_layout(
                 [
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_refresh_models"],
                         action=retry_value,
                         button_type="primary",
@@ -996,7 +971,7 @@ class SystemBuilder:
             ),
         ]
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_error_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_model_error_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "red",
             elements,
         )
@@ -1014,7 +989,7 @@ class SystemBuilder:
         tool = str(tool_name or "").strip().lower()
         model = str(model_name or UI_TEXT["system_acp_default_model_option"])
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_initializing_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_programming_initializing_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "blue",
             [
                 {
@@ -1069,11 +1044,11 @@ class SystemBuilder:
             {"tag": "hr"},
             *build_responsive_layout(
                 [
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_switch_model_btn"],
                         action=switch_value,
                     ),
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_native_cmds_btn"],
                         action=cmds_value,
                         button_type="primary",
@@ -1083,7 +1058,7 @@ class SystemBuilder:
             ),
         ]
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_ready_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_programming_ready_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "green",
             elements,
         )
@@ -1133,7 +1108,7 @@ class SystemBuilder:
                     if thread_root_id:
                         payload["thread_root_id"] = thread_root_id
                     quick_buttons.append(
-                        SystemBuilder._callback_button(
+                        build_callback_button(
                             text=f"▶ /{cmd.name}",
                             action=payload,
                             button_type="primary" if idx == 0 else "default",
@@ -1159,12 +1134,12 @@ class SystemBuilder:
             )
 
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_tool_cmds_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_tool_cmds_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "blue",
             elements,
         )
         card["config"]["summary"] = {
-            "content": f"{tool.capitalize()} 原生命令与 Skills"
+            "content": f"{SystemBuilder._display_mode_label(tool)} 原生命令与 Skills"
         }
         return "interactive", json.dumps(card, ensure_ascii=False)
 
@@ -1215,12 +1190,12 @@ class SystemBuilder:
             {"tag": "hr"},
             *build_responsive_layout(
                 [
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_retry_activation_btn"],
                         action=retry_value,
                         button_type="primary",
                     ),
-                    SystemBuilder._callback_button(
+                    build_callback_button(
                         text=UI_TEXT["system_acp_back_to_models_btn"],
                         action=back_value,
                     ),
@@ -1229,7 +1204,7 @@ class SystemBuilder:
             ),
         ]
         card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_failed_title"].format(tool=tool.capitalize()),
+            UI_TEXT["system_acp_programming_failed_title"].format(tool=SystemBuilder._display_mode_label(tool)),
             "orange",
             elements,
         )
@@ -1253,7 +1228,7 @@ class SystemBuilder:
         )
         card = CoreBuilder._wrap_card(
             UI_TEXT["system_acp_programming_superseded_title"].format(
-                tool=tool.capitalize()
+                tool=SystemBuilder._display_mode_label(tool)
             ),
             "grey",
             [
@@ -1504,7 +1479,7 @@ class SystemBuilder:
             description = tool.get("description", "")
             is_available = tool.get("available", False)
 
-            btn_text = f"{emoji} {tool_name.capitalize()}"
+            btn_text = f"{emoji} {SystemBuilder._display_mode_label(tool_name)}"
             if description:
                 btn_text += f" ({description})"
             if not is_available:
@@ -1576,7 +1551,7 @@ class SystemBuilder:
                     "tag": "markdown",
                     "content": UI_TEXT["system_tools_status_item"].format(
                         emoji=emoji,
-                        name=tool_name.capitalize(),
+                        name=SystemBuilder._display_mode_label(tool_name),
                         status=status_text,
                         last_used=last_used,
                         active_info=active_info
@@ -1594,7 +1569,7 @@ class SystemBuilder:
                 action_buttons.append(
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_tools_status_btn_enter"].format(name=tool['name'].capitalize())},
+                        "text": {"tag": "plain_text", "content": UI_TEXT["system_tools_status_btn_enter"].format(name=SystemBuilder._display_mode_label(tool['name']))},
                         "type": "default",
                         "value": _status_btn_val,
                         "behaviors": [{"type": "callback", "value": dict(_status_btn_val)}],

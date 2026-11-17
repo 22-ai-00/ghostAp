@@ -93,9 +93,6 @@ class DeepRenderer(BaseRenderer):
             project=project,
         ).build_callbacks()
 
-    def _on_card_split_completed(self, reason: str, hint: str | None, bridge_phrase: str | None = None) -> None:
-        self._pending_split_hint = hint
-
     def _get_engine(self, chat_id: str, root_path: Optional[str], project: Optional["ProjectContext"]):
         """Helper to get the deep engine instance via snapshot interface."""
         rp = root_path or (project.root_path if project else "")

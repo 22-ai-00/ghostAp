@@ -488,20 +488,6 @@ def _block_to_spec_task_atom(block: ContentBlock) -> RenderAtom:
     return atom
 
 
-def _block_to_separator_atom(block: ContentBlock) -> RenderAtom:
-    task_name = getattr(block, "task_name", "")
-    is_first = getattr(block, "is_first_overflow", False)
-    status_emoji = getattr(block, "status_emoji", "⏳")
-    key = "orch_overflow_separator_first" if is_first else "orch_overflow_separator"
-    content = UI_TEXT[key].format(task_name=task_name, status_emoji=status_emoji)
-    atom = RenderAtom(
-        kind="text", block_id=block.block_id, content=content,
-        splittable=False, node_count=1,
-    )
-    atom.byte_size = estimate_atom_size(atom)
-    return atom
-
-
 # Registry: maps block.kind → handler function.
 # tool_call is handled separately due to lookahead grouping logic.
 # Lazy-initialized on first use to avoid import-time coupling with block_registry.
@@ -517,7 +503,6 @@ _ATOM_HANDLER_DISPATCH: dict[str, Callable[[ContentBlock], RenderAtom]] = {
     "review_role": _block_to_review_role_atom,
     "spec_plan": _block_to_spec_plan_atom,
     "spec_task": _block_to_spec_task_atom,
-    "separator": _block_to_separator_atom,
 }
 
 # Module-level lazy cache for block kind handlers (avoids @functools.cache semantics)

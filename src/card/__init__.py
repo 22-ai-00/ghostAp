@@ -5,7 +5,6 @@ from .shared import (
     build_mode_buttons,
     build_responsive_layout,
     get_theme,
-    resolve_title_and_template,
 )
 
 __all__ = [
@@ -16,5 +15,4 @@ __all__ = [
     "get_theme",
     "build_mode_buttons",
     "build_responsive_layout",
-    "resolve_title_and_template",
 ]

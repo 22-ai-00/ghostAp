@@ -35,12 +35,12 @@ def test_group_tasks_three_buckets_from_plan_entries():
     assert [task.title for task in pending] == ["c"]
 
 
-def test_three_groups_always_open_in_compact_mode():
+def test_three_groups_always_render():
     atom = render_task_list_panel(_block([
         ("t1", "探索代码", "completed"),
         ("t2", "修复路由", "in_progress"),
         ("t3", "补单测", "pending"),
-    ]), compact=True)
+    ]))
     md = atom["elements"][0]["content"]
 
     assert "进行中 (1)" in md
