@@ -934,22 +934,36 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         *,
         in_programming_mode: bool = False,
     ) -> bool:
-        """Classify lightweight GhostAP control commands vs task-bearing slash prompts.
+        """Classify GhostAP control/engine commands vs programming prompts.
 
-        Prompts starting with ``/<tool> <task>``, ``/wf``, ``/deep``, ``/spec``, or native tool
-        slash commands (``/swarm``, ``/compact``, ``/review``) belong on the normal ordered lane
-        instead of overtaking queued work in ``system_fast``.
+        Prompts starting with ``/<tool> <task>``, ``/ask <tool> <prompt>``, or native
+        tool slash commands (``/swarm``, ``/compact``, ``/review``) belong on the normal
+        ordered lane instead of overtaking queued work in ``system_fast``. Engine and
+        control commands (``/deep*``, ``/spec*``, ``/wf*``, ``/stop_wf``, etc.) retain
+        high priority while control-queue serialization continues to protect shared state.
         """
         raw = str(text or "").strip()
         if not raw:
             return False
         if cls.is_exit_command(raw):
             return True
+        if (
+            cls.is_deep_command(raw)
+            or cls.is_spec_command(raw)
+            or cls.is_workflow_command(raw)
+        ):
+            return True
         m = SlashCommandParser.parse(raw)
         if not m:
             return False
         if in_programming_mode and m.command == "/goal":
             return False
+        if m.command in cls._DIRECT_TOOL_COMMAND_TO_MODE and m.has_args:
+            return False
+        if m.command == "/ask":
+            return False
+        if cls.is_interceptable_command_match(m):
+            return True
         if m.command in cls._FAST_PREFIX_CONTROL_COMMANDS:
             return True
         if m.command in cls._FAST_EXACT_CONTROL_COMMANDS and not m.has_args:

@@ -2281,6 +2281,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         )
         project_id = managed_group.project_id if managed_group is not None else None
         thread_root_id = None
+        thread_ctx = None
         if (
             employee_candidate is None
             and ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
@@ -2289,7 +2290,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 parent_id = getattr(data.event.message, "parent_id", None)
                 root_id = getattr(data.event.message, "root_id", None)
                 thread_root_id = root_id
-                thread_ctx = None
 
                 if managed_group is None and root_id and self.settings.thread_programming_enabled:
                     thread_ctx = self._thread_manager.get(root_id)
@@ -2346,10 +2346,14 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             text and (text.lstrip().startswith("/") or SystemHandler.is_exit_command(text))
         )
         is_system = bool(
-            text
-            and SystemHandler.is_fast_lane_system_command(
-                text,
-                in_programming_mode=in_programming_mode,
+            has_leading_slash
+            if employee_candidate is not None
+            else (
+                text
+                and SystemHandler.is_fast_lane_system_command(
+                    text,
+                    in_programming_mode=in_programming_mode,
+                )
             )
         )
         is_shell_fast = (

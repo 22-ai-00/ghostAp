@@ -273,7 +273,9 @@ def test_system_handler_and_dispatcher_native_routing_and_fast_lane() -> None:
     assert SystemHandler.is_fast_lane_system_command("/codex fix auth") is False
     assert SystemHandler.is_fast_lane_system_command("/swarm fix") is False
     assert SystemHandler.is_fast_lane_system_command("/compact") is False
-    assert SystemHandler.is_fast_lane_system_command("/wf build it") is False
+    assert SystemHandler.is_fast_lane_system_command("/wf build it") is True
+    assert SystemHandler.is_fast_lane_system_command("/stop_wf") is True
+    assert SystemHandler.is_fast_lane_system_command("/review-branch main") is False
     assert SystemHandler.is_fast_lane_system_command("/goal run tests", in_programming_mode=True) is False
     assert SystemHandler.is_fast_lane_system_command("/goal run tests", in_programming_mode=False) is True
 
