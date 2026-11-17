@@ -136,7 +136,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/clear", "清空当前会话上下文（保留当前工具与模型）", aliases=("/reset",), protects_from_auto_activation=True),
     _action("/sh", "在当前项目目录直接执行 Shell 命令", "/sh <命令>", aliases=("/shell",), protects_from_auto_activation=True, slash_discoverable=False),
     _action("/ask", "向指定工具发起一次性零副作用咨询", "/ask <工具> <问题>", protects_from_auto_activation=True, slash_discoverable=False),
-    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_claude_w", "/exit_claude_w", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_codex_w", "/exit_codex_w", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok", "/end_dsh", "/exit_dsh", "/end_agy", "/exit_agy")),
+    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_claude_w", "/exit_claude_w", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_codex_w", "/exit_codex_w", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok")),
     _action("/btw", "在当前编程会话中提出旁路问题", "/btw <问题>"),
     _action("/coco_status", "查看 Coco 会话状态"),
     _action("/coco_info", "查看 Coco 会话与模型信息"),

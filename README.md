@@ -162,7 +162,7 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex`、`/grok`、`/dsh`、`/agy` | 进入对应编程模式 |
 | `/<工具> <需求或原生命令>` | 单句直达对应工具执行（如 `/agy /swarm 修复测试`、`/codex /review`） |
 | `/cmds [工具]` | 打开工具原生 `/` 命令与 Skills 卡片（并支持一键执行无参命令） |
-| `/coco_info`、…、`/agy_info`、`/info` | 查看当前或指定编程会话、模型与上下文用量 |
+| `/coco_info`、`/claude_info`、`/aiden_info`、`/codex_info`、`/gemini_info`、`/traex_info`、`/grok_info`、`/dsh_info`、`/agy_info`、`/info` | 查看当前或指定编程会话、模型与上下文用量 |
 | `/model`、`/model list`、`/model <name>` | 自动适配查看或热切换当前工具模型 |
 | `/acp [工具]` | 查看或热切换项目默认 ACP 工具 |
 | `/stop`、`/clear` | 立即停止运行中任务（不退出模式）/ 清空上下文并保留工具与模型 |
