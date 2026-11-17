@@ -16,7 +16,6 @@
 
 | ID | 日期 | Gap 描述 | Severity | 来源 | 状态 | 解决 Commit |
 |----|------|----------|----------|------|------|-------------|
-| B092 | 2026-10-26 | 主 Bot reply-chain readiness 目前只验证审计回调 callable，不反映运行期间的审计存储故障；磁盘恢复后的单帧补锚已修复，但持续故障时的健康观测仍不足。需区分消息写入可用性与 activation_fence_ready 的历史完整性，增加无业务外发的健康状态，避免将 audit incomplete 直接等同于整个进程不可用。 | Medium | 最近任务静默停滞诊断 | Open | — |
 | B091 | 2026-10-05 | 近期日志有 3682 条 card hook executor 背压警告（24 slots occupied），同期间任务仍成功完成，尚无任务失败因果证据。需定位具体慢 hook、等待持锁和线程资源生命周期，增加脱敏 hook 名称/耗时观测及持续运行验证，不把投递旁路拥塞误报为任务失败。 | Medium | 飞书任务中断诊断 | Open | — |
 | B090 | 2026-09-14 | 活跃 Spec 运行期间 SIGTERM，scheduler 十秒 drain 超时后仍有阶段回调，Python executor 已关闭而触发 cannot schedule new futures after shutdown；restart.sh 三十秒宽限后只能强停。需梳理引擎取消、状态保存、scheduler drain 和 callback executor 生命周期，补活跃 Spec 停机回归；本次新服务已正常就绪，不代表旧任务续跑。 | Medium | Spec 优化部署重启日志 | Open | — |
 | B049 | 2026-07-16 | Feishu API 硬超时后 daemon SDK worker 无法取消；本地删除 binding 后，迟到 PATCH 可能越过新代际远端写入。需设计 request generation/远端见证并做故障注入。 | Medium | Deep 卡片顺序分页审计 | Open | — |
@@ -24,7 +23,6 @@
 | B054 | 2026-07-22 | `lark-channel-sdk==1.2.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()`，产生上游 `DeprecationWarning`；关注 SDK 升级并在上游修复后移除兼容记录，不使用过滤器掩盖。 | Low | 普通编程 Channel 迁移 | Open | — |
 
 | B061 | 2026-08-07 | 单窗口耗尽后现已安全退休 transport、按原 provider session ID 自动恢复并续开新窗口，不再把一次 deadline 当作任务终态。仍需部署后采集真实租户 timeout → pause → retire → load_session → continue 的墙钟事件，校准 4 窗口默认值和 finalization reserve。 | Medium | 普通编程超时日志复盘 | Mitigated | — |
-| B062 | 2026-08-09 | Workflow 进度测试仍保留实现前的 RED 注释和 `object.__setattr__` 绕过，分页交付合同标题也仍标记为 RED；生产模型现已正式暴露对应字段。需在独立测试治理批次改用正常模型构造并校准文案，避免掩盖未来 schema 回归。 | Low | “继续执行”续接点调查 | Open | — |
 | B064 | 2026-08-11 | Workflow 的 `ACPStreamBridge` 尚未注入 handler 图片 uploader；Agent 截图/图片只会生成 `IMAGE_FAILED` 占位。需用窄 callback 接通上传，CardState 只保存 `image_key`，并补真实图片事件回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B065 | 2026-08-11 | ACP `ToolCallProgress.raw_output` 为快照语义，但 reducer 仍按 delta 拼接；连续 `A`/`AB` 会形成重复或无效内容并可能 O(n²) 膨胀。需为 full Workflow 投影使用 replace/去重语义并覆盖多 progress 回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B066 | 2026-08-11 | 完整 tool input/progress/output 固定使用三反引号；载荷自带 fenced Markdown 时会提前闭合并被当作卡片 Markdown 解释。需使用动态 fence 长度并让分页保持原 fence，覆盖跨页 fenced payload。 | Medium | Workflow 完整执行卡审查 | Open | — |
@@ -44,8 +42,6 @@
 | B083 | 2026-08-12 | `FeishuWSClient.close()` 已在 SDK handler 创建前安装 binding barrier，但忽略 `WSHealthMonitor.disconnect()` 的 `False`；当 SDK disconnect 五秒超时或无可观测连接时，关闭仍可继续并返回成功。新 handler 会被 fence 拒绝，已调度 handler 也由 barrier 保护，因此未证明数据丢失；但底层 WS 资源仍可能滞留。需将 disconnect 结果纳入关闭结果/可重试资源所有权，并区分“本来无连接”与“断开超时”。 | Medium | WS 关闭 barrier 复审 | Open | — |
 | B084 | 2026-08-12 | Scheduler completion callback 内若重入调用 `FeishuWSClient.close()`，`wait_for_completion_callbacks()` 会检测自身并返回未空，关闭随后进入 best-effort `scheduler.stop(wait=True)`；虽不会销毁 callback 依赖，但会经历自等待超时并返回 `False`。需显式拒绝 callback 内关闭或将关闭转移给独立 owner 线程，避免无效延迟与含糊返回值。 | Low | Scheduler completion 关闭复审 | Open | — |
 
-| B085 | 2026-08-13 | Workflow 完整结果正文目前按 27 KiB 无损分页，超大模型输出可能产生数十张账本消息；需为用户可见卡片建立总页数/总字节上限，超量部分自动改由已生成的 HTML/Markdown 报告附件交付，同时保留摘要和恢复指引。 | Medium | Workflow 结果账本可读化审计 | Open | — |
-| B086 | 2026-08-13 | Workflow 结果正文分页仍按 Unicode code point 选择切点，极窄边界可能把组合重音、肤色修饰符或 regional-indicator 字素拆到两页；需引入 grapheme-aware split boundary，并覆盖 emoji/组合字符/CJK wire 回归。 | Medium | Workflow 结果账本可读化审计 | Open | — |
 | B087 | 2026-08-13 | 完整工具载荷净化虽已有 64 层/10000 节点上限，但高基数 opaque ID × 文本叶仍可能形成二次复杂度，净化后 mapping key 碰撞也可能覆盖先前值；需增加总字节/opaque 基数预算、线性多模式替换及稳定碰撞后缀。非 full-content JSON 解析也应统一捕获深层递归失败。 | Medium | Workflow 结果账本可读化审计 | Open | — |
 | B088 | 2026-08-28 | `FeishuCOTStream.rollover()` 在旧 segment 已成功 seal、但新 segment 启动或 active-anchor 重放失败时仍返回 `sealed=False`。`ProgrammingCardSession` 因而会把包含已封存内容的完整 replay buffer 投影到主卡，造成过程重复展示。需区分 partial seal、只回放未封存尾部并补故障注入回归。 | Medium | COT 生命周期审计 | Open | — |
 | B089 | 2026-08-28 | 非 Codex final-phase 流中，handler 仍会在已有任意 streamed text 时忽略 `PromptResult.text`；而后者可能聚合多 source 和对账轮文本，二者都不能安全地单独作为结论。需在 ACP/会话层定义带 provenance 的公开 terminal-output 契约，再统一 fallback 优先级。 | Medium | COT 终答路由审计 | Open | — |

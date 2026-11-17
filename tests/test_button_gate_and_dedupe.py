@@ -237,11 +237,9 @@ def test_button_rapid_clicks_dedupe_same_state_and_accept_changed_state(tmp_path
         # selection state is a distinct intent and must still be submitted.
         assert client._scheduler.submit.call_count == 2
         assert reply_text.call_count == 0
-        assert first.toast.type == "info"
-        assert first.toast.content == "正在应用选择，卡片将自动更新"
+        assert first.toast is None
         assert duplicate.toast.type == "info"
         assert duplicate.toast.content == "操作正在处理中，请稍候"
-        assert changed_result.toast.type == "info"
-        assert changed_result.toast.content == "正在应用选择，卡片将自动更新"
+        assert changed_result.toast is None
 
         client.close()

@@ -414,7 +414,7 @@ def test_action_registry_and_empty_output_native_slash_completion() -> None:
     try:
         prog_mod.run_prompt_across_execution_windows = lambda *_a, **_kw: execution_res
         session = SimpleNamespace(session_id="s1", message_count=1, _force_dead=False)
-        project = SimpleNamespace(project_id="p1", root_path=".", add_conversation=MagicMock())
+        project = SimpleNamespace(project_id="p1", root_path=".")
         handler._execute_programming_response(
             message_id="m1",
             chat_id="c1",

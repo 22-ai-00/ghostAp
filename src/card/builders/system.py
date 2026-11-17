@@ -558,9 +558,14 @@ class SystemBuilder:
         if lock_undo_window_seconds is None:
             lock_undo_window_seconds = get_settings().lock_undo_window_seconds
 
-        meta = get_backend_meta(current_mode) if current_mode != InteractionMode.SMART else None
+        meta = (
+            get_backend_meta(current_mode)
+            if current_mode and current_mode != InteractionMode.SMART
+            else None
+        )
+        mode_value = getattr(current_mode, "value", current_mode)
         current_mode_str = (
-            UI_TEXT.get(f"system_mode_{current_mode.value}")
+            (UI_TEXT.get(f"system_mode_{mode_value}") if mode_value else None)
             or (f"{meta.emoji} {meta.display_name} 编程模式" if meta else None)
             or UI_TEXT["system_mode_smart"]
         )

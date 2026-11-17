@@ -2170,8 +2170,6 @@ class ProgrammingModeHandler(BaseHandler):
                         final_session.message_count,
                         final_session.session_id,
                     )
-                project.add_conversation("user", raw_user_text, message_id)
-                project.add_conversation("assistant", final_response)
                 source = (
                     self.context_source.value
                     if isinstance(self.context_source, ContextSourceMode)
@@ -2277,10 +2275,6 @@ class ProgrammingModeHandler(BaseHandler):
         if project is not None:
             if hasattr(project, "clear_session_state"):
                 project.clear_session_state(self.mode_key)
-            else:
-                history = getattr(project, "conversation_history", None)
-                if isinstance(history, list):
-                    history.clear()
             store = getattr(self.context_manager, "store", None)
             if store is not None and callable(getattr(store, "clear", None)):
                 try:

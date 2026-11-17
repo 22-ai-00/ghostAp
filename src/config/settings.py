@@ -533,10 +533,6 @@ class Settings(BaseSettings):
         le=3600,
         allow_inf_nan=False,
     )
-    autonomous_team_coordinator_tool: str = "coco"
-    autonomous_team_coordinator_model: str = ""
-    autonomous_team_coordinator_profile: str = ""
-    autonomous_team_coordinator_effort: str = ""
     autonomous_fire_grace_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -605,22 +601,6 @@ class Settings(BaseSettings):
     def _reject_boolean_context_settings(cls, value: object) -> object:
         if isinstance(value, bool):
             raise ValueError("employee context/ingress numeric settings reject booleans")
-        return value
-
-    @field_validator(
-        "autonomous_team_coordinator_tool",
-        "autonomous_team_coordinator_model",
-        "autonomous_team_coordinator_profile",
-        "autonomous_team_coordinator_effort",
-    )
-    @classmethod
-    def _validate_team_coordinator_identity(
-        cls, value: str, info: ValidationInfo
-    ) -> str:
-        if value != value.strip():
-            raise ValueError("team coordinator settings reject surrounding whitespace")
-        if info.field_name == "autonomous_team_coordinator_tool" and not value:
-            raise ValueError("team coordinator tool is required")
         return value
 
     @model_validator(mode="after")

@@ -178,7 +178,6 @@ def test_clear_and_sh_commands_keep_mode_and_execute_cleanly() -> None:
     project.set_programming_mode("codex", True, session_id="s-old", query_count=4)
     project.acp_tool_name = "codex"
     project.acp_model_name = "gpt-5.6-sol"
-    project.add_conversation("user", "old turn", "m0")
 
     mgr = MagicMock()
     store = MagicMock()
@@ -207,7 +206,6 @@ def test_clear_and_sh_commands_keep_mode_and_execute_cleanly() -> None:
     assert SystemHandler.is_ghostap_control_command(clear_match, in_programming_mode=True) is True
     system.handle_clear_command("m1", "chat-1", project)
     mgr.end_session.assert_called_once()
-    assert project.conversation_history == []
     assert project.codex_session_snapshot is None
     assert project.codex_mode is True
     assert project.acp_tool_name == "codex"
@@ -364,7 +362,6 @@ def test_unified_context_purity_raw_text_file_changes_and_no_self_transition() -
     finally:
         prog_mod.run_prompt_across_execution_windows = orig_runner
 
-    assert project.conversation_history[0].content == "请修复 bug"
     convs = uctx.get_entries_by_type(ContextEntryType.CONVERSATION)
     assert convs[0].content == "请修复 bug"
     changes = uctx.get_entries_by_type(ContextEntryType.FILE_CHANGE)

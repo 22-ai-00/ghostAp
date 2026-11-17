@@ -482,7 +482,6 @@ class MessageDispatcher:
         else:
             self.system.submit_shell_command(message_id, chat_id, cmd, working_dir, project)
         if project:
-            project.add_conversation("user", cmd, message_id)
             self.client._context_manager.update_context(
                 project.project_id,
                 conversation={"role": "user", "content": cmd, "source_mode": "shell", "message_id": message_id},

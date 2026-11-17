@@ -23,14 +23,6 @@ class ProjectStatus(Enum):
 
 
 @dataclass
-class ConversationItem:
-    role: str
-    content: str
-    timestamp: float = field(default_factory=time.time)
-    message_id: Optional[str] = None
-
-
-@dataclass
 class SessionSnapshot:
     session_id: str
     query_count: int
@@ -55,9 +47,6 @@ class ProjectContext:
 
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
-
-    conversation_history: list[ConversationItem] = field(default_factory=list)
-    max_history_size: int = 20
 
     theme_color: str = "green"
     emoji_prefix: str = "🟢"
@@ -200,17 +189,9 @@ class ProjectContext:
             self.allowed_chat_ids[chat_id] = now
             return evicted_chat_id
 
-    def add_conversation(self, role: str, content: str, message_id: Optional[str] = None):
-        item = ConversationItem(role=role, content=content, message_id=message_id)
-        self.conversation_history.append(item)
-        if len(self.conversation_history) > self.max_history_size:
-            self.conversation_history = self.conversation_history[-self.max_history_size :]
-        self.touch()
-
     def clear_session_state(self, mode_type: Optional[str] = None) -> None:
-        """Clear conversation history and active snapshot while keeping mode/tool/model config."""
+        """Clear active snapshot while keeping mode/tool/model config."""
         with self._chat_lock:
-            self.conversation_history.clear()
             if mode_type and mode_type in self._MODE_ATTRS:
                 _, snap_attr = self._MODE_ATTRS[mode_type]
                 setattr(self, snap_attr, None)
@@ -385,15 +366,6 @@ class ProjectContext:
             "bound_chat_name": self.bound_chat_name,
             "bound_chat_created_at": self.bound_chat_created_at,
             "managed_binding_generation": self.managed_binding_generation,
-            "conversation_history": [
-                {
-                    "role": item.role,
-                    "content": item.content,
-                    "timestamp": item.timestamp,
-                    "message_id": item.message_id,
-                }
-                for item in self.conversation_history
-            ],
         }
         with self._chat_lock:
             for mode_type, (mode_flag, snap_attr) in self._MODE_ATTRS.items():
@@ -464,15 +436,6 @@ class ProjectContext:
                     last_query=snap_data["last_query"],
                     is_resumable=snap_data.get("is_resumable", True),
                 ))
-        for item_data in data.get("conversation_history", []):
-            ctx.conversation_history.append(
-                ConversationItem(
-                    role=item_data["role"],
-                    content=item_data["content"],
-                    timestamp=item_data.get("timestamp", time.time()),
-                    message_id=item_data.get("message_id"),
-                )
-            )
         return ctx
 
 

@@ -242,7 +242,6 @@ def test_all_commands_and_card_actions_deliver_end_to_end(tmp_path: Path, monkey
                 _assert_deliveries_valid(f"SMART:{cmd}", deliveries)
 
             # Seed unified context & model selection, then verify /clear & /reset persist cleanly
-            project.add_conversation("user", "old turn", "m0")
             client._project_manager.commit_acp_configuration(
                 project,
                 tool_name="agy",
@@ -259,14 +258,12 @@ def test_all_commands_and_card_actions_deliver_end_to_end(tmp_path: Path, monkey
                 client._process_message_async(_make_message_event(cmd, idx))
                 _assert_deliveries_valid(f"AGY:{cmd}", deliveries)
             assert len(show_info_calls) == 1
-            assert project.conversation_history == []
 
             reloaded = client._project_manager.__class__(str(client._project_manager._storage_path))
             saved_proj = reloaded.get_project_for_chat(project.project_id, "oc_e2e")
             assert saved_proj is not None
             assert saved_proj.acp_tool_name == "agy"
             assert saved_proj.acp_model_name == "claude-sonnet-4"
-            assert saved_proj.conversation_history == []
 
             # Verify card callbacks via init_action_registry
             registry = init_action_registry(client)

@@ -774,12 +774,6 @@ def test_streaming_completion_persists_the_main_card_conclusion() -> None:
             "/tmp",
         )
 
-    assistant_conversation = next(
-        call.args[1]
-        for call in project.add_conversation.call_args_list
-        if call.args[0] == "assistant"
-    )
-    assert assistant_conversation == "主卡权威结论"
     assert _ConclusionProgrammingCardSession.last.on_text_calls == 0
     assistant_context = next(
         call.kwargs["conversation"]
@@ -1564,13 +1558,6 @@ def test_programming_terminal_delivery_failure_aborts_retry_and_replies_text():
     assert handler.reply_text.call_args.args[0] == "msg-1"
     assert "early-main-before-exception" in handler.reply_text.call_args.args[1]
     assert "terminal delivery test" in handler.reply_text.call_args.args[1]
-    assistant_conversation = next(
-        call
-        for call in project.add_conversation.call_args_list
-        if call.args[0] == "assistant"
-    )
-    assert "early-main-before-exception" in assistant_conversation.args[1]
-    assert "terminal delivery test" in assistant_conversation.args[1]
 
 
 def test_programming_timeout_fallback_keeps_earlier_main_transcript():

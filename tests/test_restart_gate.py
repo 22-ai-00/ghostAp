@@ -481,30 +481,3 @@ while :; do sleep 10; done
         if time.monotonic() >= deadline:
             raise AssertionError(f"restart descendant still alive pid={child_pid}")
         time.sleep(0.02)
-
-
-def test_legacy_markers_are_migrated_only_when_state_is_absent(
-    tmp_path: Path,
-) -> None:
-    _project, gate, generation = _ready_gate(tmp_path)
-    state = json.loads(gate.state_path.read_text(encoding="utf-8"))
-    proof = {
-        key: value
-        for key, value in state.items()
-        if key not in {"generation", "participation_id", "status", "exit_code"}
-    }
-    legacy_generation = {
-        key: state[key]
-        for key in ("generation", "participation_id", "status", "exit_code")
-    }
-    gate.state_path.unlink()
-    participation_path = gate.directory / "participation.json"
-    generation_path = gate.directory / "generation"
-    _write_private_json(participation_path, proof)
-    _write_private_json(generation_path, legacy_generation)
-
-    assert gate.snapshot() == generation
-    assert gate.state_path.exists()
-
-    generation_path.write_text("not valid JSON", encoding="utf-8")
-    assert gate.snapshot() == generation

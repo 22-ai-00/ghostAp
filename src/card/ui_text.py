@@ -553,7 +553,6 @@ UI_TEXT = {
     "card_session_max_failures_banner": "状态更新暂停，任务仍在运行。最后更新于 {timestamp}。请等待自动恢复，或发送 /status 查看",
     "card_session_max_failures_banner_no_ts": "状态更新暂停，任务仍在运行。请等待自动恢复，或发送 /status 查看最新状态",
     "card_session_toast_dedup": "操作正在处理中，请稍候",
-    "workflow_selection_toast_processing": "正在应用选择，卡片将自动更新",
     "card_session_terminal_retry_failed": "⚠️ 任务已结束（卡片未能刷新最终状态）。可发送状态命令查看结果；开始新任务请发送 {engine_cmd} <需求描述>",
     # TTL expiry messages — mutually exclusive triggers:
     # All engine-specific messages follow a consistent structure:
