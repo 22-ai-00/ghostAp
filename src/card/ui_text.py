@@ -399,7 +399,6 @@ UI_TEXT = {
     "project_board_current_marker": " (当前)",
     "project_board_claude_info": " | 🔮 Claude 模式中 (消息数: {count})",
     "project_board_coco_info": " | 🤖 Coco 模式中 (消息数: {count})",
-    "project_board_busy_info": " | ⏳ {task_type}",
     "project_board_page_info": "第 {page}/{total} 页",
     "project_board_btn_new": "➕ 新建项目",
     "project_new_usage_prompt": "📂 创建新项目请发送：`/new <项目名> <目录路径>`\n\n例如：`/new myapp ~/code/myapp`",

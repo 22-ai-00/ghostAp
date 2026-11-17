@@ -75,11 +75,7 @@ def _resolve_inputs(
     agent = (agent_type or "coco").strip().lower()
     normalized_cwd = normalize_session_cwd(cwd) or cwd
     model = (model_name or "").strip() or None
-    if model is None and agent == "coco":
-        from ..coco_model import get_coco_model_manager
-
-        model = get_coco_model_manager().get_current_model()
-    elif model is None and agent == "traex":
+    if model is None and agent == "traex":
         try:
             from ..acp.providers import get_providers, tool_registry
 

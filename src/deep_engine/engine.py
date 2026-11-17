@@ -22,17 +22,10 @@ from ..utils.errors import get_error_detail
 from ..utils.gc_monitor import get_gc_monitor
 from ..utils.retry import RetryPolicy
 from ..utils.trace import TraceContext
-from .models import (
-    DeepProject,
-    DeepProjectStatus,
-    EngineRunState,
-    ProgressUpdate,
-)
+from .models import DeepProject, DeepProjectStatus, EngineRunState
 from .progress import DeepProgress
 
 logger = logging.getLogger(__name__)
-
-_STATUS_ICONS = {"pending": "⏳", "in_progress": "🔄", "completed": "✅"}
 
 
 @dataclass
@@ -45,22 +38,6 @@ class DeepEngineCallbacks:
     on_text: Optional[Callable[[str], None]] = None
     on_project_done: Optional[Callable[[DeepProject], None]] = None
     on_error: Optional[Callable[[str], None]] = None
-
-    @property
-    def on_planning_start(self):
-        return self.on_analyzing_start
-
-    @on_planning_start.setter
-    def on_planning_start(self, value):
-        self.on_analyzing_start = value
-
-    @property
-    def on_planning_done(self):
-        return self.on_analyzing_done
-
-    @on_planning_done.setter
-    def on_planning_done(self, value):
-        self.on_analyzing_done = value
 
 
 class _RetryingPromptSession:
@@ -110,25 +87,11 @@ class DeepEngine(BaseEngine):
         self._progress = DeepProgress()
         self._pending_context: list[str] = []
         self._planning_done_fired: bool = False
-        self._last_mem_check: float = 0.0
         self._mem_snapshot = MemorySnapshot()
 
     @property
     def progress(self) -> DeepProgress:
         return self._progress
-
-    def _check_memory_and_gc(self) -> None:
-        """Backward-compatible memory check hook used by legacy tests/callers.
-
-        Delegates to the global GCMonitor which handles threshold-based gc.collect().
-        """
-        now = time.time()
-        if now - self._last_mem_check < 5.0:
-            return
-        self._last_mem_check = now
-
-        gc_monitor = get_gc_monitor(memory_threshold_percent=self.settings.deep_memory_threshold)
-        gc_monitor.check_and_collect(label="DeepEngine")
 
     def _make_on_event(self, callbacks: DeepEngineCallbacks) -> Callable[[ACPEvent], None]:
         """Create the event callback for autonomous execution."""
@@ -491,66 +454,6 @@ class DeepEngine(BaseEngine):
         logger.info("[Deep] 上下文已注入(待发送, 队列=%d): %s...", len(self._pending_context), message[:100])
 
     inject_context = inject_guidance
-
-    # Static status messages (no f-string allocation per call)
-    _STATUS_MESSAGES: dict[DeepProjectStatus, str] = {
-        DeepProjectStatus.IDLE: "等待开始",
-        DeepProjectStatus.PLANNING: "正在规划任务...",
-        DeepProjectStatus.CANCELLED: "已取消",
-        DeepProjectStatus.COMPLETED: "全部完成",
-    }
-
-    def get_progress(self) -> Optional[ProgressUpdate]:
-        with self._lock:
-            if not self._project:
-                return None
-
-            status = self._project.status
-            # Snapshot progress data under lock
-            tool_calls_count = len(self._progress.tool_calls)
-            completed = self._progress.completed_steps
-            total = self._progress.total_steps or 1
-            project_id = self._project.project_id
-            error = self._project.error
-
-        if status == DeepProjectStatus.EXECUTING:
-            message = f"执行中 (工具调用: {tool_calls_count})"
-        elif status == DeepProjectStatus.FAILED:
-            message = f"执行失败: {error or '未知错误'}"
-        else:
-            message = self._STATUS_MESSAGES.get(status, "未知状态")
-
-        return ProgressUpdate(
-            project_id=project_id,
-            completed_count=completed,
-            total_count=total,
-            status=status,
-            message=message,
-        )
-
-    def get_task_summary(self) -> str:
-        with self._lock:
-            if not self._project:
-                return "暂无任务"
-
-            lines = [f"📊 **{self._project.name}** 执行进度\n"]
-
-            if self._progress.plan_entries:
-                lines.append(self._progress.progress_bar)
-                lines.append("")
-                for entry in self._progress.plan_entries:
-                    icon = _STATUS_ICONS.get(entry["status"], "⬜")
-                    lines.append(f"{icon} {entry['content']}")
-            else:
-                lines.append(f"🔧 工具调用: {len(self._progress.tool_calls)} 次")
-
-            if self._progress.modified_files:
-                lines.append(f"\n📝 修改文件: {len(self._progress.modified_files)} 个")
-
-            if self._project.duration():
-                lines.append(f"\n⏱️ 总耗时: {self._project.duration():.1f}s")
-
-        return "\n".join(lines)
 
     def cleanup(self):
         super().cleanup()

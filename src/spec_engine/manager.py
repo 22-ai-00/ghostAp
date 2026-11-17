@@ -4,12 +4,15 @@ import os
 from typing import Optional
 
 from ..engine_base import BaseEngineManager
-from ..utils.engine_identity import resolve_engine_identity
 from .engine import SpecEngine
 from .models import SpecProject
 from .storage import state_path_candidates
 
 logger = logging.getLogger(__name__)
+
+_KNOWN_SPEC_BACKENDS = frozenset(
+    {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"}
+)
 
 
 class SpecEngineManager(BaseEngineManager["SpecEngine"]):
@@ -42,30 +45,18 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
         model_name: Optional[str] = None,
     ) -> tuple[str, str, Optional[str]]:
         normalized_agent = str(agent_type or "").strip().lower()
+        if normalized_agent:
+            if normalized_agent not in _KNOWN_SPEC_BACKENDS:
+                return SpecEngine._infer_engine_name(normalized_agent), normalized_agent, model_name
+            if normalized_agent == "claude":
+                return "Claude", "claude", None
+            resolved_name, resolved_agent, default_model = super()._resolve_identity(normalized_agent)
+            return resolved_name, resolved_agent, (model_name or default_model)
+
         normalized_name = str(engine_name or "").strip() or "Coco"
-        from ..mode import InteractionMode
-        mode_map = {
-            "coco": InteractionMode.COCO,
-            "claude": InteractionMode.CLAUDE,
-            "aiden": InteractionMode.AIDEN,
-            "codex": InteractionMode.CODEX,
-            "gemini": InteractionMode.GEMINI,
-            "traex": InteractionMode.TRAEX,
-            "grok": InteractionMode.GROK,
-            "dsh": InteractionMode.DSH,
-            "agy": InteractionMode.AGY,
-        }
-        backend = normalized_agent or next(
-            (name for name in mode_map if normalized_name.lower().startswith(name)),
-            "coco",
-        )
-        if backend not in mode_map:
-            return SpecEngine._infer_engine_name(backend), backend, model_name
-        if backend == "claude" and normalized_agent:
-            return "Claude", "claude", None
-        identity = resolve_engine_identity(mode=mode_map[backend])
-        resolved_model = identity.model_name if backend == "claude" else (model_name or identity.model_name)
-        return identity.engine_name, identity.agent_type, resolved_model
+        resolved_name, resolved_agent, default_model = super()._resolve_identity(normalized_name)
+        resolved_model = default_model if resolved_agent == "claude" else (model_name or default_model)
+        return resolved_name, resolved_agent, resolved_model
 
     def get_or_create(
         self,

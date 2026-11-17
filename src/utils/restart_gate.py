@@ -679,54 +679,13 @@ class RestartGate:
                 )
         return state
 
-    def _migrate_legacy_state(self) -> dict[str, object]:
-        """Atomically retire the former participation/generation split."""
-
-        proof = _read_private_json(
-            self.directory / "participation.json",
-            label="legacy restart participation proof",
-            allow_missing=True,
-        )
-        generation = _read_private_json(
-            self.directory / "generation",
-            label="legacy restart generation",
-            allow_missing=True,
-        )
-        if proof is None and generation is None:
-            raise RestartGateError("restart state is missing")
-        if proof is None or generation is None:
-            raise RestartGateError("legacy restart state is incomplete")
-        candidate = {
-            **proof,
-            "generation": generation.get("generation"),
-            "participation_id": generation.get("participation_id"),
-            "status": generation.get("status"),
-            "exit_code": generation.get("exit_code"),
-        }
-        candidate = self._validate_state(
-            candidate, require_live=True, check_pin=False
-        )
-        if _publish_private_json(
-            self.state_path,
-            candidate,
-            label="restart state",
-            create_only=True,
-        ):
-            return candidate
-        winner = _read_private_json(
-            self.state_path, label="restart state", allow_missing=False
-        )
-        assert winner is not None
-        return self._validate_state(winner, require_live=True, check_pin=False)
-
     def _read_state(
         self, *, require_live: bool = True, check_pin: bool = True
     ) -> dict[str, object]:
         value = _read_private_json(
-            self.state_path, label="restart state", allow_missing=True
+            self.state_path, label="restart state", allow_missing=False
         )
-        if value is None:
-            value = self._migrate_legacy_state()
+        assert value is not None
         return self._validate_state(
             value, require_live=require_live, check_pin=check_pin
         )

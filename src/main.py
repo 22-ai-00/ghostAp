@@ -247,11 +247,9 @@ class Application:
         try:
             if getattr(self.settings, "acp_model_preheat_on_startup", False):
                 from .acp.helper import kickoff_acp_model_preheat
-                from .coco_model import get_coco_model_manager
 
-                get_coco_model_manager().kickoff_preheat()
                 kickoff_acp_model_preheat(
-                    ["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"],
+                    ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"],
                     cwd=os.getcwd(),
                 )
         except Exception:

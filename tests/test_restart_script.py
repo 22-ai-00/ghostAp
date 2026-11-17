@@ -51,16 +51,11 @@ prepare_codex_acp_dependency
 
 def test_application_startup_defers_acp_connections_by_default(monkeypatch):
     import src.acp.helper as acp_helper
-    import src.coco_model as coco_model
     import src.main as main_module
     from src.config.settings import Settings
 
     events = []
     preheat_calls = []
-
-    class FakeCocoModelManager:
-        def kickoff_preheat(self):
-            preheat_calls.append("coco")
 
     class FakeFeishuClient:
         def __init__(self, *, message_callback):
@@ -77,11 +72,6 @@ def test_application_startup_defers_acp_connections_by_default(monkeypatch):
         preheat_calls.append("acp")
 
     monkeypatch.setattr(acp_helper, "kickoff_acp_model_preheat", fake_acp_preheat)
-    monkeypatch.setattr(
-        coco_model,
-        "get_coco_model_manager",
-        lambda: FakeCocoModelManager(),
-    )
     monkeypatch.setattr(main_module, "_load_feishu_runtime", lambda: (None, None, FakeFeishuClient))
     monkeypatch.setattr(main_module.Application, "_install_signal_handlers", lambda _self: None)
     monkeypatch.setattr(
@@ -173,7 +163,6 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     expected_shutdown_events,
 ):
     import src.acp.helper as acp_helper
-    import src.coco_model as coco_model
     import src.main as main_module
 
     events = []
@@ -182,10 +171,6 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     class ThreadMustNotBeJoined:
         def join(self, *_args, **_kwargs):
             raise AssertionError("application startup must not join ACP preheat")
-
-    class FakeCocoModelManager:
-        def kickoff_preheat(self):
-            events.append("coco-preheat")
 
     class FakeFeishuClient:
         def __init__(self, *, message_callback):
@@ -204,11 +189,6 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
         return ThreadMustNotBeJoined()
 
     monkeypatch.setattr(acp_helper, "kickoff_acp_model_preheat", fake_codex_preheat)
-    monkeypatch.setattr(
-        coco_model,
-        "get_coco_model_manager",
-        lambda: FakeCocoModelManager(),
-    )
     monkeypatch.setattr(main_module.os, "getcwd", lambda: "/repo")
     monkeypatch.setattr(
         main_module,
@@ -239,10 +219,9 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     app.run()
 
     assert preheat_calls == [
-        (["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"], "/repo")
+        (["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"], "/repo")
     ]
     assert events == [
-        "coco-preheat",
         "codex-preheat",
         "feishu-start",
         *expected_shutdown_events,

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote
 
 from src.mode.manager import InteractionMode
-from src.project.context import ProjectStatus
 
 from ..backend_meta import ALL_BACKEND_METAS, get_backend_meta, resolve_project_programming_mode
 from ..shared import (
@@ -338,8 +337,6 @@ class ProjectBuilder:
                     mode_info = UI_TEXT["project_board_coco_info"].format(count=query_count)
                 elif meta is not None:
                     mode_info = f" · {meta.emoji} {meta.display_name}({query_count})"
-            elif project.status == ProjectStatus.BUSY and project.current_task:
-                mode_info = UI_TEXT["project_board_busy_info"].format(task_type=project.current_task.task_type)
             else:
                 saved_tool = getattr(project, "acp_tool_name", None)
                 meta = get_backend_meta(saved_tool) if saved_tool else None

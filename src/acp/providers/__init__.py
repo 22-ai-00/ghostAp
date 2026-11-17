@@ -34,21 +34,6 @@ AvailabilityChecker = Callable[[], bool]
 HelpBlobLoader = Callable[[], str]
 
 
-def _find_lru_cached(*fns: object) -> Optional[Callable[[], None]]:
-    """Walk *fns* looking for the first ``lru_cache``-wrapped callable and
-    return its ``cache_clear`` handle.  Inspects both the function itself and
-    the cells of its ``__closure__`` (one level deep) so that it works for
-    both raw ``@lru_cache`` functions and closures that capture one."""
-    for fn in fns:
-        if hasattr(fn, "cache_clear"):
-            return fn.cache_clear  # type: ignore[union-attr]
-        for cell in (getattr(fn, "__closure__", None) or []):
-            obj = cell.cell_contents
-            if callable(obj) and hasattr(obj, "cache_clear"):
-                return obj.cache_clear
-    return None
-
-
 def _make_resolve_checker(tool_name: str) -> AvailabilityChecker:
     def _check() -> bool:
         from ..sync_adapter import _resolve_with_auto_update
@@ -56,14 +41,15 @@ def _make_resolve_checker(tool_name: str) -> AvailabilityChecker:
     return _check
 
 
-def _make_custom_help_checker(
+def _make_custom_help_checker_with_cache_handle(
     help_cmd: list[str],
     required_keywords: Sequence[str],
-) -> tuple[AvailabilityChecker, HelpBlobLoader]:
+) -> tuple[AvailabilityChecker, HelpBlobLoader, Callable[[], None]]:
     @functools.lru_cache(maxsize=1)
     def _get_help_blob() -> str:
         try:
             from ...utils.env import build_clean_env
+
             env = build_clean_env()
             p = subprocess.run(
                 help_cmd,
@@ -87,14 +73,17 @@ def _make_custom_help_checker(
         blob = _load_help_blob().lower()
         return bool(blob and all(kw in blob for kw in required_keywords))
 
-    return _check, _load_help_blob
+    return _check, _load_help_blob, _get_help_blob.cache_clear
 
 
-def _make_probe_checker(tool_name: str) -> tuple[AvailabilityChecker, HelpBlobLoader]:
+def _make_probe_checker_with_cache_handle(
+    tool_name: str,
+) -> tuple[AvailabilityChecker, HelpBlobLoader, Callable[[], None]]:
     @functools.lru_cache(maxsize=1)
     def _get_help_blob() -> str:
         try:
             from ..sync_adapter import _probe_acp_serve_help
+
             ok, _rc, out_snip, err_snip = _probe_acp_serve_help(tool_name)
             return (out_snip or "") + "\n" + (err_snip or "")
         except Exception:
@@ -103,12 +92,13 @@ def _make_probe_checker(tool_name: str) -> tuple[AvailabilityChecker, HelpBlobLo
     def _check() -> bool:
         try:
             from ..sync_adapter import _probe_acp_serve_help
+
             ok, _rc, _out, _err = _probe_acp_serve_help(tool_name)
             return bool(ok)
         except Exception:
             return False
 
-    return _check, _get_help_blob
+    return _check, _get_help_blob, _get_help_blob.cache_clear
 
 
 @dataclass(frozen=True)
@@ -328,33 +318,6 @@ class GrokACPProvider(GenericACPProvider):
         return self._config.tool_name, args
 
 
-def _make_custom_help_checker_with_cache_handle(
-    help_cmd: list[str],
-    required_keywords: Sequence[str],
-) -> tuple[AvailabilityChecker, HelpBlobLoader, Callable[[], None]]:
-    checker, loader = _make_custom_help_checker(help_cmd, required_keywords)
-    clear_fn = _find_lru_cached(checker, loader)
-
-    def _clear() -> None:
-        if clear_fn is not None:
-            clear_fn()
-
-    return checker, loader, _clear
-
-
-def _make_probe_checker_with_cache_handle(
-    tool_name: str,
-) -> tuple[AvailabilityChecker, HelpBlobLoader, Callable[[], None]]:
-    checker, loader = _make_probe_checker(tool_name)
-    clear_fn = _find_lru_cached(loader, checker)
-
-    def _clear() -> None:
-        if clear_fn is not None:
-            clear_fn()
-
-    return checker, loader, _clear
-
-
 _checkers: dict[str, tuple] | None = None
 _providers: dict[str, GenericACPProvider] | None = None
 _init_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -523,12 +486,6 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
     return _providers
 
 
-def _get_checker(name: str) -> tuple:
-    _ensure_providers()  # guarantees _checkers is populated
-    assert _checkers is not None
-    return _checkers[name]
-
-
 def get_providers() -> dict[str, GenericACPProvider]:
     """Public accessor — lazily builds and registers all providers on first call."""
     return _ensure_providers()
@@ -579,68 +536,6 @@ def _reset_providers_for_testing() -> None:
         _providers = None
 
 
-CocoProvider = type("CocoProvider", (), {"__new__": lambda cls: _ensure_providers()["coco"]})
-ClaudeProvider = type("ClaudeProvider", (), {"__new__": lambda cls: _ensure_providers()["claude"]})
-AidenProvider = type("AidenProvider", (), {"__new__": lambda cls: _ensure_providers()["aiden"]})
-CodexProvider = type("CodexProvider", (), {"__new__": lambda cls: _ensure_providers()["codex"]})
-GeminiProvider = type("GeminiProvider", (), {"__new__": lambda cls: _ensure_providers()["gemini"]})
-TraexProvider = type("TraexProvider", (), {"__new__": lambda cls: _ensure_providers()["traex"]})
-GrokProvider = type("GrokProvider", (), {"__new__": lambda cls: _ensure_providers()["grok"]})
-DSHProvider = type("DSHProvider", (), {"__new__": lambda cls: _ensure_providers()["dsh"]})
-AGYProvider = type("AGYProvider", (), {"__new__": lambda cls: _ensure_providers()["agy"]})
-
-
-def _get_aiden_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("aiden")
-    return loader()
-
-_get_aiden_acp_serve_help_blob.cache_clear = lambda: _get_checker("aiden")[2]()  # type: ignore[attr-defined]
-
-
-def _get_codex_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("codex")
-    return loader()
-
-_get_codex_acp_serve_help_blob.cache_clear = lambda: _get_checker("codex")[2]()  # type: ignore[attr-defined]
-
-
-def _get_gemini_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("gemini")
-    return loader()
-
-_get_gemini_acp_serve_help_blob.cache_clear = lambda: _get_checker("gemini")[2]()  # type: ignore[attr-defined]
-
-
-def _get_traex_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("traex")
-    return loader()
-
-_get_traex_acp_serve_help_blob.cache_clear = lambda: _get_checker("traex")[2]()  # type: ignore[attr-defined]
-
-
-def _get_grok_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("grok")
-    return loader()
-
-_get_grok_acp_serve_help_blob.cache_clear = lambda: _get_checker("grok")[2]()  # type: ignore[attr-defined]
-
-
-def _get_dsh_acp_profile_blob() -> str:
-    _, loader, _ = _get_checker("dsh")
-    return loader()
-
-
-_get_dsh_acp_profile_blob.cache_clear = lambda: _get_checker("dsh")[2]()  # type: ignore[attr-defined]
-
-
-def _get_agy_acp_serve_help_blob() -> str:
-    _, loader, _ = _get_checker("agy")
-    return loader()
-
-
-_get_agy_acp_serve_help_blob.cache_clear = lambda: _get_checker("agy")[2]()  # type: ignore[attr-defined]
-
-
 __all__ = [
     "ACPProvider",
     "ToolRegistry",
@@ -648,24 +543,8 @@ __all__ = [
     "get_providers",
     "normalize_acp_model_name",
     "_reset_providers_for_testing",
-    "CocoProvider",
-    "ClaudeProvider",
-    "AidenProvider",
-    "CodexProvider",
-    "GeminiProvider",
-    "TraexProvider",
-    "GrokProvider",
-    "DSHProvider",
-    "AGYProvider",
     "GenericACPProvider",
     "CodexACPProvider",
     "GrokACPProvider",
     "CODEX_ACP_NPM_PACKAGE",
-    "_get_aiden_acp_serve_help_blob",
-    "_get_codex_acp_serve_help_blob",
-    "_get_gemini_acp_serve_help_blob",
-    "_get_traex_acp_serve_help_blob",
-    "_get_grok_acp_serve_help_blob",
-    "_get_dsh_acp_profile_blob",
-    "_get_agy_acp_serve_help_blob",
 ]

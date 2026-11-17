@@ -8,15 +8,76 @@ from typing import TYPE_CHECKING, Optional
 
 from ..utils.errors import get_error_detail
 from .models import PlanArtifact, SpecArtifact, SpecTask
-from .utils import (
-    extract_json_blob,
-    normalize_list,
-    validate_plan_artifact_dict,
-    validate_spec_artifact_dict,
-)
 
 if TYPE_CHECKING:
     from .models import SpecProject
+
+CRITERIA_PATTERNS: list[re.Pattern] = [re.compile(rf"CRITERIA_{i}\s*:\s*(PASS|FAIL)") for i in range(1, 101)]
+
+
+def normalize_list(items) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for x in items:
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def extract_json_blob(text: str) -> Optional[str]:
+    """Extract a JSON object string from text (fenced ```json block first, then braces)."""
+    if not text:
+        return None
+    raw = text.strip()
+    if "```" in raw:
+        for part in raw.split("```"):
+            p = part.strip()
+            if p.lower().startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{") and p.endswith("}"):
+                return p
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return raw[start : end + 1]
+    return None
+
+
+def validate_spec_artifact_dict(data: dict) -> list[str]:
+    if not isinstance(data, dict):
+        return ["Spec JSON 不是对象"]
+    required = (
+        "goals",
+        "functional_spec",
+        "non_functional_requirements",
+        "acceptance_criteria",
+        "out_of_scope",
+        "risks",
+        "clarification_questions",
+        "decisions",
+    )
+    errors = [f"Spec 字段 `{k}` 不是数组" for k in required if not isinstance(data.get(k), list)]
+    ac = data.get("acceptance_criteria")
+    if isinstance(ac, list) and not any(str(x).strip() for x in ac):
+        errors.append("Spec 字段 `acceptance_criteria` 为空（应提供可验收条件）")
+    return errors
+
+
+def validate_plan_artifact_dict(data: dict) -> list[str]:
+    if not isinstance(data, dict):
+        return ["Plan JSON 不是对象"]
+    errors: list[str] = []
+    if not isinstance(data.get("architecture"), str):
+        errors.append("Plan 字段 `architecture` 不是字符串")
+    for k in ("tech_stack", "steps", "file_changes", "test_plan", "risks"):
+        if not isinstance(data.get(k), list):
+            errors.append(f"Plan 字段 `{k}` 不是数组")
+    steps = data.get("steps")
+    if isinstance(steps, list) and not any(str(x).strip() for x in steps):
+        errors.append("Plan 字段 `steps` 为空（应给出可执行步骤）")
+    return errors
 
 _TASK_LINE_PATTERN = re.compile(
     r"^\s*(\d+)\s*[.、)]\s*(.+?)(?:\s*\(\s*(?:依赖|depends?)\s*[:：]?\s*(.*?)\s*\))?\s*$",

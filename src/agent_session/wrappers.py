@@ -414,6 +414,29 @@ class ModelFailureAwareSession(_SessionWrapper):
             activity_predicate=activity_predicate,
         )
 
+        def _attempt_failover(failed_hint: object, reason: str, attempt_count: int) -> bool:
+            agent_args = list(
+                getattr(getattr(self._inner, "_inner", self._inner), "_agent_args", []) or []
+            )
+            failed = failed_hint or _extract_model_from_agent_args(agent_args)
+            fmap = self._parse_failover_map()
+            uses_config_c = any(
+                arg == "-c" or str(arg).startswith("model.name=") for arg in agent_args
+            )
+            target = fmap.get(str(failed or "").strip()) or (
+                fmap.get("gpt-5.2") if uses_config_c else ""
+            )
+            ok = self._do_failover(from_model=str(failed or ""), to_model=str(target or ""))
+            logger.warning(
+                "[ModelFailure] action=failover reason=%s fail_phase=model_loop failover=%s from_model=%s to_model=%s attempt_count=%d",
+                reason,
+                bool(ok),
+                failed or "",
+                target or "",
+                int(attempt_count or 0),
+            )
+            return ok
+
         while True:
             if self._cancel_event.is_set():
                 raise RuntimeError("ACP prompt cancelled before send")
@@ -425,40 +448,25 @@ class ModelFailureAwareSession(_SessionWrapper):
                 # 1) loop detected: attempt failover once
                 if info.get("reason") == "loop_detected" and not failover_tried:
                     failover_tried = True
-                    failed = info.get("failed_model") or _extract_model_from_agent_args(
-                        list(getattr(getattr(self._inner, "_inner", self._inner), "_agent_args", []) or [])
-                    )
-                    fmap = self._parse_failover_map()
-                    target = fmap.get(str(failed or "").strip()) or fmap.get("gpt-5.2")
-                    ok = self._do_failover(from_model=str(failed or ""), to_model=str(target or ""))
-                    logger.warning(
-                        "[ModelFailure] action=failover reason=loop_detected fail_phase=model_loop failover=%s from_model=%s to_model=%s attempt_count=%d",
-                        bool(ok),
-                        failed or "",
-                        target or "",
+                    if _attempt_failover(
+                        info.get("failed_model"),
+                        "loop_detected",
                         int(info.get("attempt_count") or 0),
-                    )
-                    if ok:
+                    ):
                         continue
                     raise
 
-                # 2) need compaction:
-                #    - 记录事件用于 loop 检测
-                #    - 首次命中：先 compaction，再同模型重试一次
-                #    - 若 compaction 后仍命中 need_compaction（或达到 loop 阈值）：触发 failover 一次
+                # 2) need compaction: compaction first, failover if loop or repeated
                 if info.get("reason") == "need_compaction":
-                    # loop detection (record every time)
                     is_loop, n = self._record_compaction_event_and_check_loop()
                     try:
                         info["attempt_count"] = int(n)
                     except Exception:
                         logger.debug("ModelFailureAwareSession.send_prompt: attempt_count assignment failed", exc_info=True)
 
-                    # feature flag: disabled => no auto-repair
                     if not bool(getattr(self._settings, "model_failure_compaction_enabled", True)):
                         raise
 
-                    # If loop detected: suppress compaction and attempt failover once.
                     if is_loop:
                         try:
                             window_s, max_count = self._loop_limits()
@@ -473,40 +481,13 @@ class ModelFailureAwareSession(_SessionWrapper):
                         )
                         if not failover_tried:
                             failover_tried = True
-                            failed = info.get("failed_model") or _extract_model_from_agent_args(
-                                list(getattr(getattr(self._inner, "_inner", self._inner), "_agent_args", []) or [])
-                            )
-                            fmap = self._parse_failover_map()
-                            target = fmap.get(str(failed or "").strip()) or fmap.get("gpt-5.2")
-                            ok = self._do_failover(from_model=str(failed or ""), to_model=str(target or ""))
-                            logger.warning(
-                                "[ModelFailure] action=failover reason=need_compaction fail_phase=model_loop failover=%s from_model=%s to_model=%s attempt_count=%d",
-                                bool(ok),
-                                failed or "",
-                                target or "",
-                                int(n),
-                            )
-                            if ok:
+                            if _attempt_failover(info.get("failed_model"), "need_compaction", n):
                                 continue
                         raise
 
-                    # Not loop: if compaction already tried once, attempt failover once.
-                    if compaction_tried and (not failover_tried):
+                    if compaction_tried and not failover_tried:
                         failover_tried = True
-                        failed = info.get("failed_model") or _extract_model_from_agent_args(
-                            list(getattr(getattr(self._inner, "_inner", self._inner), "_agent_args", []) or [])
-                        )
-                        fmap = self._parse_failover_map()
-                        target = fmap.get(str(failed or "").strip()) or fmap.get("gpt-5.2")
-                        ok = self._do_failover(from_model=str(failed or ""), to_model=str(target or ""))
-                        logger.warning(
-                            "[ModelFailure] action=failover reason=need_compaction fail_phase=model_loop failover=%s from_model=%s to_model=%s attempt_count=%d",
-                            bool(ok),
-                            failed or "",
-                            target or "",
-                            int(n),
-                        )
-                        if ok:
+                        if _attempt_failover(info.get("failed_model"), "need_compaction", n):
                             continue
 
                     # First time: do compaction once

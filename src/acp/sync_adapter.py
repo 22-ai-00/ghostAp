@@ -185,78 +185,37 @@ class AgentSpecResolveError(ACPStartupError):
 
 @lru_cache(maxsize=64)
 def _probe_acp_serve_help(command: str) -> tuple[bool, Optional[int], str, str]:
-    """探测 `<command> acp serve --help` 是否可用，并返回 (ok, rc, stdout_snip, stderr_snip)。
-
-    - ok=True 仅表示该命令支持 ACP server 启动（可用 `acp serve`）。
-    - 该探测避免对不支持 ACP 的工具进入 handshake 超时。
-    """
+    """探测 `<command> acp serve --help` 是否可用，并返回 (ok, rc, stdout_snip, stderr_snip)。"""
     cmd = (command or "").strip()
     if not cmd:
         return False, None, "", ""
     try:
-        # Claude Code 等可能因嵌套会话 guard 拒绝启动；探测时移除该 env，提升稳健性。
         from ..utils.env import build_clean_env
-        env = build_clean_env()
+
         p = subprocess.run(
             [cmd, "acp", "serve", "--help"],
             capture_output=True,
             text=True,
             timeout=5,
-            env=env,
+            env=build_clean_env(),
         )
-        out = p.stdout or ""
-        err = p.stderr or ""
+        out = getattr(p, "stdout", None) or ""
+        err = getattr(p, "stderr", None) or ""
         blob = (out + "\n" + err).lower()
+        rc = getattr(p, "returncode", 0)
         ok = bool(
-            p.returncode == 0
+            rc in (0, None)
             and (("acp serve" in blob and "usage" in blob) or ("acp" in blob and "server" in blob))
         )
-        # 片段截断，避免日志/异常过大
-        return ok, int(p.returncode), (out or "")[-200:], (err or "")[-200:]
+        return ok, (int(rc) if rc is not None else 0), out[-200:], err[-200:]
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         return False, None, "", (str(e) or type(e).__name__)[:200]
 
 
 @lru_cache(maxsize=32)
 def _supports_acp_serve(command: str) -> bool:
-    """Best-effort detection whether a binary supports `acp serve`.
-
-    We avoid hard-failing on environments where the agent CLI differs.
-
-    Note: Results are cached per command name. The cache is cleared after a
-    successful auto-update so upgraded binaries are detected without restart.
-    """
-    try:
-        # Some agent CLIs (notably Claude Code) refuse to launch when `CLAUDECODE`
-        # is set (nested-session guard). Since this probe is executed inside our
-        # service process, explicitly drop it to keep detection robust.
-        from ..utils.env import build_clean_env
-        env = build_clean_env()
-        p = subprocess.run(
-            [command, "acp", "serve", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=env,
-        )
-        out = (getattr(p, "stdout", "") or "") + "\n" + (getattr(p, "stderr", "") or "")
-        out_lower = out.lower()
-
-        # Some tests/fakes don't provide returncode; treat it as success.
-        rc = getattr(p, "returncode", 0)
-        if rc not in (0, None):
-            return False
-
-        # Preferred: explicit subcommand usage for `acp serve`.
-        if "acp serve" in out_lower and "usage:" in out_lower:
-            return True
-
-        # Backward-compatible heuristic: many CLIs print "Start the ACP server".
-        if "acp" in out_lower and "server" in out_lower:
-            return True
-        return False
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
+    """Cached boolean facade over :func:`_probe_acp_serve_help`."""
+    return _probe_acp_serve_help(command)[0]
 
 
 # Track which agent CLIs have already been auto-updated in this process
@@ -774,6 +733,21 @@ class SyncACPSession(PromptGenerationTracker):
         """Whether end_turn with in-progress outer tools represents a reactive background yield."""
         return self._uses_agy_acp()
 
+    async def _apply_two_step_config(
+        self,
+        primary_config_id: str,
+        primary_value: str,
+        secondary_config_id: str,
+        secondary_value: str | None,
+    ) -> bool:
+        if not self._acp_session:
+            return False
+        if not await self._acp_session.set_config_option(primary_config_id, primary_value):
+            return False
+        if secondary_value is None:
+            return True
+        return bool(await self._acp_session.set_config_option(secondary_config_id, secondary_value))
+
     async def _apply_official_codex_selection(self, selection: str) -> bool:
         """Apply a persisted Codex model/Effort selection over ACP config options."""
         if not self._acp_session:
@@ -785,14 +759,7 @@ class SyncACPSession(PromptGenerationTracker):
             return False
         if reasoning_effort is None:
             return bool(await self._acp_session.set_model(model_id))
-        if not await self._acp_session.set_config_option("model", model_id):
-            return False
-        return bool(
-            await self._acp_session.set_config_option(
-                "reasoning_effort",
-                reasoning_effort,
-            )
-        )
+        return await self._apply_two_step_config("model", model_id, "reasoning_effort", reasoning_effort)
 
     async def _apply_traex_selection(self, selection: str) -> bool:
         if not self._acp_session:
@@ -802,85 +769,38 @@ class SyncACPSession(PromptGenerationTracker):
         try:
             resolved = resolve_traex_runtime_selection(selection)
         except ValueError as exc:
-            logger.warning(
-                "[ACP:TRAEX] invalid model selection: %s",
-                get_error_detail(exc),
-            )
+            logger.warning("[ACP:TRAEX] invalid model selection: %s", get_error_detail(exc))
             return False
-        if not await self._acp_session.set_config_option(
-            "model",
-            resolved.backend_model_value,
-        ):
-            return False
-        if resolved.effort is None:
-            return True
-        return bool(
-            await self._acp_session.set_config_option(
-                "reasoning_effort",
-                resolved.effort,
-            )
+        return await self._apply_two_step_config(
+            "model", resolved.backend_model_value, "reasoning_effort", resolved.effort
         )
 
     async def _apply_dsh_selection(self, selection: str) -> bool:
         if not self._acp_session:
             return False
-        from .dsh_selection import (
-            DSH_MODEL_CONFIG_ID,
-            DSH_REASONING_CONFIG_ID,
-            split_dsh_model_selection,
-        )
+        from .dsh_selection import DSH_MODEL_CONFIG_ID, DSH_REASONING_CONFIG_ID, split_dsh_model_selection
 
         try:
             model_value, reasoning_value = split_dsh_model_selection(selection)
         except ValueError as exc:
-            logger.warning(
-                "[ACP:DSH] invalid model selection: %s",
-                get_error_detail(exc),
-            )
+            logger.warning("[ACP:DSH] invalid model selection: %s", get_error_detail(exc))
             return False
-        if not await self._acp_session.set_config_option(
-            DSH_MODEL_CONFIG_ID,
-            model_value,
-        ):
-            return False
-        if reasoning_value is None:
-            return True
-        return bool(
-            await self._acp_session.set_config_option(
-                DSH_REASONING_CONFIG_ID,
-                reasoning_value,
-            )
+        return await self._apply_two_step_config(
+            DSH_MODEL_CONFIG_ID, model_value, DSH_REASONING_CONFIG_ID, reasoning_value
         )
 
     async def _apply_agy_selection(self, selection: str) -> bool:
         if not self._acp_session:
             return False
-        from .agy_selection import (
-            AGY_MODEL_CONFIG_ID,
-            AGY_THOUGHT_LEVEL_CONFIG_ID,
-            split_agy_model_selection,
-        )
+        from .agy_selection import AGY_MODEL_CONFIG_ID, AGY_THOUGHT_LEVEL_CONFIG_ID, split_agy_model_selection
 
         try:
             model_id, thought_level = split_agy_model_selection(selection)
         except ValueError as exc:
-            logger.warning(
-                "[ACP:AGY] invalid model selection: %s",
-                get_error_detail(exc),
-            )
+            logger.warning("[ACP:AGY] invalid model selection: %s", get_error_detail(exc))
             return False
-        if not await self._acp_session.set_config_option(
-            AGY_MODEL_CONFIG_ID,
-            model_id,
-        ):
-            return False
-        if thought_level is None:
-            return True
-        return bool(
-            await self._acp_session.set_config_option(
-                AGY_THOUGHT_LEVEL_CONFIG_ID,
-                thought_level,
-            )
+        return await self._apply_two_step_config(
+            AGY_MODEL_CONFIG_ID, model_id, AGY_THOUGHT_LEVEL_CONFIG_ID, thought_level
         )
 
     async def _start_session(self) -> str:

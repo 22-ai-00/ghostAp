@@ -6,15 +6,9 @@ import src.spec_engine.persistence as persistence
 from src.spec_engine.models import SpecProject
 from src.spec_engine.persistence import artifact_root_dir, get_state_path, save_engine_state
 from src.spec_engine.storage import (
-    artifact_root_dir as storage_artifact_root_dir,
-)
-from src.spec_engine.storage import (
-    delete_spec_run,
-    list_spec_runs,
     project_cache_root,
     run_state_path,
     state_path_candidates,
-    state_path_for_run,
 )
 
 
@@ -76,56 +70,6 @@ def test_state_candidates_keep_legacy_project_path_as_fallback(tmp_path):
     assert candidates[1] == str(project_root / ".spec_engine_state.json")
 
 
-def test_list_spec_runs_reads_directory_state_files(tmp_path):
-    settings = _settings(str(tmp_path / "cache"))
-    project_root = tmp_path / "repo"
-    project = SpecProject.create(root_path=str(project_root))
-    project.requirement = "recover me"
-
-    save_engine_state(
-        project=project,
-        settings=settings,
-        root_path=str(project_root),
-        chat_id="chat-1",
-        build_runtime_context_fn=lambda: {},
-        project_to_compact_dict_fn=project.to_dict,
-    )
-
-    runs = list_spec_runs(str(project_root), settings)
-
-    assert [run.run_id for run in runs] == [project.project_id]
-    assert runs[0].requirement == "recover me"
-    assert runs[0].state_path.endswith("state.json")
-
-
-def test_list_spec_runs_uses_project_state_when_run_state_missing(tmp_path):
-    settings = _settings(str(tmp_path / "cache"))
-    project_root = tmp_path / "repo"
-    project = SpecProject.create(root_path=str(project_root))
-    project.requirement = "recover from project state"
-
-    save_engine_state(
-        project=project,
-        settings=settings,
-        root_path=str(project_root),
-        chat_id="chat-1",
-        build_runtime_context_fn=lambda: {},
-        project_to_compact_dict_fn=project.to_dict,
-    )
-    per_run_state = run_state_path(str(project_root), settings, project.project_id)
-    os.remove(per_run_state)
-    os.makedirs(storage_artifact_root_dir(str(project_root), settings, project.project_id), exist_ok=True)
-
-    runs = list_spec_runs(str(project_root), settings)
-
-    assert [run.run_id for run in runs] == [project.project_id]
-    repaired_state_path = run_state_path(str(project_root), settings, project.project_id)
-    assert runs[0].state_path == repaired_state_path
-    assert os.path.exists(repaired_state_path)
-    assert runs[0].requirement == "recover from project state"
-    assert state_path_for_run(str(project_root), settings, project.project_id) == repaired_state_path
-
-
 def test_save_engine_state_writes_run_state_before_project_state(monkeypatch, tmp_path):
     settings = _settings(str(tmp_path / "cache"))
     project_root = tmp_path / "repo"
@@ -150,28 +94,3 @@ def test_save_engine_state_writes_run_state_before_project_state(monkeypatch, tm
 
     assert writes[0] == run_state_path(str(project_root), settings, project.project_id)
     assert writes[1] == state_path
-
-
-def test_delete_spec_run_removes_run_dir_and_matching_project_state(tmp_path):
-    settings = _settings(str(tmp_path / "cache"))
-    project_root = tmp_path / "repo"
-    project = SpecProject.create(root_path=str(project_root))
-    project.requirement = "delete me"
-
-    state_path = save_engine_state(
-        project=project,
-        settings=settings,
-        root_path=str(project_root),
-        chat_id="chat-1",
-        build_runtime_context_fn=lambda: {},
-        project_to_compact_dict_fn=project.to_dict,
-    )
-    run_dir = storage_artifact_root_dir(str(project_root), settings, project.project_id)
-    assert os.path.isdir(run_dir)
-    assert os.path.exists(state_path)
-
-    assert delete_spec_run(str(project_root), settings, project.project_id) is True
-
-    assert not os.path.exists(run_dir)
-    assert not os.path.exists(state_path)
-    assert list_spec_runs(str(project_root), settings) == []

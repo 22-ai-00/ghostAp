@@ -3,12 +3,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import ClassVar, Optional
 
 from ..utils.lock_order import LockLevel, ordered_lock
-
-if TYPE_CHECKING:
-    pass
 
 # Sentinel returned by add_chat_id() when the chat cannot be added
 # (capacity full and all entries are owner).  Callers must check for
@@ -34,20 +31,6 @@ class ConversationItem:
 
 
 @dataclass
-class Task:
-    task_id: str
-    task_type: str
-    payload: dict
-    status: str = "pending"
-    progress: float = 0.0
-    created_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    result: Optional[Any] = None
-    error: Optional[str] = None
-
-
-@dataclass
 class SessionSnapshot:
     session_id: str
     query_count: int
@@ -67,44 +50,11 @@ class ProjectContext:
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
 
-    coco_session_snapshot: Optional[SessionSnapshot] = None
-    coco_mode: bool = False
-
-    claude_session_snapshot: Optional[SessionSnapshot] = None
-    claude_mode: bool = False
-
-    claude_w_session_snapshot: Optional[SessionSnapshot] = None
-    claude_w_mode: bool = False
-
-    aiden_session_snapshot: Optional[SessionSnapshot] = None
-    aiden_mode: bool = False
-
-    codex_session_snapshot: Optional[SessionSnapshot] = None
-    codex_mode: bool = False
-
-    codex_w_session_snapshot: Optional[SessionSnapshot] = None
-    codex_w_mode: bool = False
-
-    gemini_session_snapshot: Optional[SessionSnapshot] = None
-    gemini_mode: bool = False
-
-    traex_session_snapshot: Optional[SessionSnapshot] = None
-    traex_mode: bool = False
-
-    grok_session_snapshot: Optional[SessionSnapshot] = None
-    grok_mode: bool = False
-
-    dsh_session_snapshot: Optional[SessionSnapshot] = None
-    dsh_mode: bool = False
-
-    agy_session_snapshot: Optional[SessionSnapshot] = None
-    agy_mode: bool = False
+    _active_modes: set[str] = field(default_factory=set, repr=False)
+    session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict, repr=False)
 
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
-
-    task_queue: list[Task] = field(default_factory=list)
-    current_task: Optional[Task] = None
 
     conversation_history: list[ConversationItem] = field(default_factory=list)
     max_history_size: int = 20
@@ -394,26 +344,6 @@ class ProjectContext:
                 setattr(self, mode_flag, enabled)
                 setattr(self, snapshot_attr, snapshot)
 
-    # ── Backward-compatible delegates ──
-
-    def update_coco_snapshot(self, query: str, query_count: int):
-        self.update_programming_snapshot("coco", query, query_count)
-
-    def update_claude_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("claude", query, query_count, session_id)
-
-    def set_claude_w_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("claude_w", enabled, session_id, query_count)
-
-    def update_claude_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("claude_w", query, query_count, session_id)
-
-    def set_codex_w_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("codex_w", enabled, session_id, query_count)
-
-    def update_codex_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("codex_w", query, query_count, session_id)
-
     def get_status_emoji(self) -> str:
         status_map = {
             ProjectStatus.IDLE: "⚪",
@@ -511,17 +441,6 @@ class ProjectContext:
             status=ProjectStatus(data.get("status", "idle")),
             created_at=data.get("created_at", time.time()),
             last_active=data.get("last_active", time.time()),
-            coco_mode=data.get("coco_mode", False),
-            claude_mode=data.get("claude_mode", False),
-            claude_w_mode=data.get("claude_w_mode", False),
-            aiden_mode=data.get("aiden_mode", False),
-            codex_mode=data.get("codex_mode", False),
-            codex_w_mode=data.get("codex_w_mode", False),
-            gemini_mode=data.get("gemini_mode", False),
-            traex_mode=data.get("traex_mode", False),
-            grok_mode=data.get("grok_mode", False),
-            dsh_mode=data.get("dsh_mode", False),
-            agy_mode=data.get("agy_mode", False),
             acp_tool_name=acp_tool_name,
             acp_model_name=data.get("acp_model_name") if acp_tool_name else None,
             theme_color=data.get("theme_color", "green"),
@@ -534,18 +453,9 @@ class ProjectContext:
             bound_chat_created_at=data.get("bound_chat_created_at", 0.0),
             managed_binding_generation=data.get("managed_binding_generation", 0),
         )
-        if data.get("coco_session_snapshot"):
-            snap = data["coco_session_snapshot"]
-            ctx.coco_session_snapshot = SessionSnapshot(
-                session_id=snap["session_id"],
-                query_count=snap["query_count"],
-                last_query=snap["last_query"],
-                is_resumable=snap.get("is_resumable", True),
-            )
-        # Restore remaining mode snapshots via generic loop
-        for mode_type, (_, snap_attr) in cls._MODE_ATTRS.items():
-            if mode_type == "coco":
-                continue  # already handled above
+        for mode_flag, snap_attr in cls._MODE_ATTRS.values():
+            if data.get(mode_flag, False):
+                setattr(ctx, mode_flag, True)
             snap_data = data.get(snap_attr)
             if snap_data:
                 setattr(ctx, snap_attr, SessionSnapshot(
@@ -564,3 +474,33 @@ class ProjectContext:
                 )
             )
         return ctx
+
+
+def _attach_mode_descriptors() -> None:
+    """Attach property accessors for each programming mode flag and snapshot."""
+    for mode_name, (mode_flag, snap_attr) in ProjectContext._MODE_ATTRS.items():
+        setattr(
+            ProjectContext,
+            mode_flag,
+            property(
+                lambda self, m=mode_name: m in self._active_modes,
+                lambda self, enabled, m=mode_name: (
+                    self._active_modes.add(m) if enabled else self._active_modes.discard(m)
+                ),
+            ),
+        )
+        setattr(
+            ProjectContext,
+            snap_attr,
+            property(
+                lambda self, m=mode_name: self.session_snapshots.get(m),
+                lambda self, snap, m=mode_name: (
+                    self.session_snapshots.__setitem__(m, snap)
+                    if snap is not None
+                    else self.session_snapshots.pop(m, None)
+                ),
+            ),
+        )
+
+
+_attach_mode_descriptors()

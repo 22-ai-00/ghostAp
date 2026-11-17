@@ -294,8 +294,6 @@ class SpecStreamProcessor(BaseStreamProcessor):
 
     def on_phase_event(self, cycle_num: int, phase: SpecPhase, event) -> None:
         """Real-time ACP event processing."""
-        self._acp_renderer.process_event(event)
-
         # Track footer_status
         if event.event_type == ACPEventType.THOUGHT_CHUNK:
             self._footer_status = "thinking"

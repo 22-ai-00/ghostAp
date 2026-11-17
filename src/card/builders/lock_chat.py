@@ -13,7 +13,6 @@ from typing import Optional
 from ..ui_text import UI_TEXT
 from .lock_common import (
     _build_p2p_multi_url,
-    _compute_command_sig,
     format_undo_window,
     sign_command,
 )
@@ -115,7 +114,7 @@ def build_chat_lock_card(
         f"\n{UI_TEXT['chat_lock_p2p_guide']}"
     )
 
-    _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+    _status_sig = sign_command("/status", chat_id or "")
     _status_val = {
         "action": "retry_command",
         "_t": "/status",
@@ -175,7 +174,7 @@ def build_lock_success_card(
             by_line = UI_TEXT["lock_success_lock_broadcast_by"].format(name=locker_name) if locker_name else ""
             md = UI_TEXT["lock_success_lock_broadcast"].format(by_line=by_line)
             md += UI_TEXT["lock_success_lock_broadcast_hint"]
-            _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+            _status_sig = sign_command("/status", chat_id or "")
             _status_val = {"action": "retry_command", "_t": "/status", "_s": _status_sig}
             buttons: list[dict] = [{
                 "tag": "button",
@@ -198,8 +197,7 @@ def build_lock_success_card(
         _undo_display = format_undo_window(lock_undo_window_seconds)
         if _undo_display:
             md = UI_TEXT["lock_success_lock_reply"].format(lock_undo_window_display=_undo_display)
-            # Use v2 signing for /unlock when chat_id is available
-            _unlock_sig = sign_command("/unlock", chat_id) if chat_id else _compute_command_sig("/unlock")
+            _unlock_sig = sign_command("/unlock", chat_id or "")
             _undo_val = {
                 "action": "retry_command",
                 "_t": "/unlock",
@@ -226,7 +224,7 @@ def build_lock_success_card(
     if variant == "broadcast":
         by_line = UI_TEXT["lock_success_lock_broadcast_by"].format(name=locker_name) if locker_name else ""
         md = UI_TEXT["lock_success_unlock_broadcast"].format(by_line=by_line)
-        _status_sig = sign_command("/status", chat_id) if chat_id else _compute_command_sig("/status")
+        _status_sig = sign_command("/status", chat_id or "")
         _status_val = {"action": "retry_command", "_t": "/status", "_s": _status_sig}
         buttons: list[dict] = [{
             "tag": "button",

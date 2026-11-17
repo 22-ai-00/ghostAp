@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +20,6 @@ class StartupFatalError(RuntimeError):
     """Unexpected startup failure that must not be treated as operational."""
 
 
-# Startup crosses process, stdio and adapter boundaries.  Only explicitly
-# expected operational failures participate in retry/degrade semantics; ordinary
-# programming errors (TypeError/AssertionError) and unknown business exceptions
-# must fail fast so they are not disguised as recoverable startup failures.
 STARTUP_OPERATIONAL_EXCEPTIONS = (
     StartupOperationalError,
     TimeoutError,
@@ -40,24 +36,6 @@ class StartupBackend(str, Enum):
     CLI = "cli"
 
 
-class StartupErrorKind(str, Enum):
-    """User-visible startup failure category."""
-
-    RECOVERABLE = "recoverable"
-    DEGRADED = "degraded"
-    FATAL = "fatal"
-
-
-class StartupErrorAction(str, Enum):
-    """Next action associated with a classified startup failure."""
-
-    FALLBACK = "fallback"
-    RETRY = "retry"
-    FAIL_WITH_DIAGNOSTICS = "fail_with_diagnostics"
-    REQUIRES_USER_ACTION = "requires_user_action"
-    RAISE = "raise"
-
-
 @dataclass(frozen=True)
 class RetryPlan:
     """ACP/CLI startup retry plan with progressive timeout semantics."""
@@ -68,23 +46,6 @@ class RetryPlan:
     def timeout_for_attempt(self, attempt: int) -> float:
         safe_attempt = max(1, int(attempt or 1))
         return float(self.startup_timeout or 60) * (1.0 + 0.5 * (safe_attempt - 1))
-
-
-@dataclass(frozen=True)
-class StartupErrorClassification:
-    kind: StartupErrorKind
-    action: StartupErrorAction
-    phase: str
-    user_reachable: bool = True
-
-
-@dataclass(frozen=True)
-class AcpRetryStartResult:
-    session: Any | None
-    actual_id: str
-    last_spec: str
-    last_err: Exception | None
-    effective_timeout: float
 
 
 @dataclass(frozen=True)
@@ -111,161 +72,35 @@ class SessionStartupResult:
 def select_startup_backend(agent_type: str) -> StartupBackend:
     from ..agent_session.backend_resolver import is_cli_backend
 
-    if is_cli_backend(agent_type):
-        return StartupBackend.CLI
-    return StartupBackend.ACP
+    return StartupBackend.CLI if is_cli_backend(agent_type) else StartupBackend.ACP
 
 
-def should_try_injected_starter(agent_type: str, *, starter: object) -> bool:
-    return callable(starter) and select_startup_backend(agent_type) == StartupBackend.ACP
+def normalize_startup_cwd(cwd: str, *, normalize_fn: Callable[[str], str | None]) -> str:
+    raw_cwd = cwd or "."
+    try:
+        return normalize_fn(raw_cwd) or raw_cwd
+    except (OSError, RuntimeError, TypeError, ValueError):
+        logger.warning("Error while normalizing startup cwd", exc_info=True)
+        return raw_cwd
 
 
-class InjectedStarterFallback:
-    """Run the optional injected ACP starter and classify fallback failures."""
+def build_retry_plan(agent_type: str, *, retries: int, startup_timeout: float) -> RetryPlan:
+    attempts = 1 if select_startup_backend(agent_type) == StartupBackend.CLI else max(1, int(retries or 1))
+    return RetryPlan(attempts=attempts, startup_timeout=float(startup_timeout or 60))
 
-    def __init__(self, starter: object) -> None:
-        self._starter = starter
 
-    def should_try(self, agent_type: str) -> bool:
-        return should_try_injected_starter(agent_type, starter=self._starter)
-
-    def start(self, *, agent_type: str, retries: int, **kwargs: Any) -> tuple[Any, str, dict[str, Any] | None] | None:
-        if not self.should_try(agent_type):
-            return None
-        try:
-            session, actual_id, diagnostics = self._starter(agent_type=agent_type, **kwargs)  # type: ignore[misc]
-        except STARTUP_OPERATIONAL_EXCEPTIONS as exc:
-            classification = classify_startup_error(
-                exc,
-                phase="injected_starter",
-                attempt=1,
-                retries=retries,
-            )
-            if classification.action != StartupErrorAction.FALLBACK:
-                raise
-            return None
-        return session, actual_id, diagnostics
+def run_startup_operation(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Run an external startup adapter call with a narrow fail-fast boundary."""
+    try:
+        return fn(*args, **kwargs)
+    except (TypeError, AssertionError, *STARTUP_OPERATIONAL_EXCEPTIONS):
+        raise
+    except Exception as exc:
+        raise StartupFatalError(str(exc) or type(exc).__name__) from exc
 
 
 class AcpRetryStarter:
-    """Run ACP/CLI startup retries and diagnostics outside the coordinator."""
-
-    phase = "acp_retry"
-
-    def start(
-        self,
-        *,
-        backend: StartupBackend,
-        agent_type: str,
-        cwd: str,
-        model_name: Optional[str],
-        retry_plan: RetryPlan,
-        request_key: str,
-        acp_session_cls: Any,
-        cli_session_cls: Any,
-        start_operation: Callable[..., Any],
-        diagnostics_fn: Callable[..., dict[str, Any]],
-        format_log_line_fn: Callable[..., str],
-        get_settings_fn: Callable[[], Any],
-        sleep_fn: Callable[[float], None],
-        deadline_monotonic: float | None = None,
-        monotonic_fn: Callable[[], float] | None = None,
-    ) -> AcpRetryStartResult:
-        last_err: Exception | None = None
-        last_spec = ""
-        effective_timeout = float(retry_plan.startup_timeout or 60)
-        clock = monotonic_fn or time.monotonic
-
-        for attempt in range(1, int(retry_plan.attempts) + 1):
-            if deadline_monotonic is not None:
-                remaining = deadline_monotonic - clock()
-                if remaining <= 0:
-                    last_err = TimeoutError("ACP startup deadline exhausted")
-                    break
-            else:
-                remaining = float("inf")
-            session = self._build_session(
-                backend=backend,
-                agent_type=agent_type,
-                cwd=cwd,
-                model_name=model_name,
-                acp_session_cls=acp_session_cls,
-                cli_session_cls=cli_session_cls,
-            )
-            try:
-                last_spec = self._describe_session(session)
-                effective_timeout = min(
-                    retry_plan.timeout_for_attempt(attempt),
-                    remaining,
-                )
-                actual_id = start_operation(session.start, startup_timeout=effective_timeout)
-                if (
-                    deadline_monotonic is not None
-                    and clock() >= deadline_monotonic
-                ):
-                    last_err = TimeoutError("ACP startup deadline exhausted")
-                    self._close_session(session)
-                    break
-                return AcpRetryStartResult(
-                    session=session,
-                    actual_id=actual_id,
-                    last_spec=last_spec,
-                    last_err=None,
-                    effective_timeout=effective_timeout,
-                )
-            except STARTUP_OPERATIONAL_EXCEPTIONS as exc:
-                last_err = exc
-                classification = classify_startup_error(
-                    exc,
-                    phase=self.phase,
-                    attempt=int(attempt),
-                    retries=int(retry_plan.attempts),
-                )
-                diag = diagnostics_fn(
-                    agent_type=agent_type,
-                    cwd=cwd or ".",
-                    model_name=model_name,
-                    session=session,
-                    error=exc,
-                    attempt=int(attempt),
-                    retries=int(retry_plan.attempts),
-                    timeout_s=float(effective_timeout or 0),
-                )
-                if isinstance(diag, dict):
-                    error_text = str(diag.get("error_text") or "").strip()
-                    if error_text and ((not (str(exc) or "").strip()) or (str(exc) or "").strip() in ("(empty)", "None")):
-                        exc.args = (error_text,)
-                logger.warning(
-                    format_log_line_fn(
-                        agent_type=agent_type,
-                        event="Session start failed",
-                        attempt=int(attempt),
-                        retries=int(retry_plan.attempts),
-                        error=exc,
-                        diag=diag if isinstance(diag, dict) else None,
-                        attempts=(diag.get("attempts") if isinstance(diag, dict) else None),
-                        get_settings_fn=get_settings_fn,
-                    )
-                )
-                self._close_session(session)
-                if classification.action == StartupErrorAction.RETRY and attempt < int(retry_plan.attempts):
-                    retry_delay = min(2.0, 0.3 * attempt)
-                    if deadline_monotonic is not None:
-                        retry_delay = min(
-                            retry_delay,
-                            max(0.0, deadline_monotonic - clock()),
-                        )
-                    if retry_delay > 0:
-                        sleep_fn(retry_delay)
-                continue
-
-        return AcpRetryStartResult(
-            session=None,
-            actual_id="",
-            last_spec=last_spec,
-            last_err=last_err,
-            effective_timeout=effective_timeout,
-        )
+    """Session construction/closing helpers kept for bridge/startup call sites."""
 
     @staticmethod
     def _build_session(
@@ -278,24 +113,17 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
-            from ..agent_session.backend_resolver import (
-                cli_command_for_agent,
-                is_codex_cli_backend,
-            )
+            from ..agent_session.backend_resolver import cli_command_for_agent, is_codex_cli_backend
 
             command = cli_command_for_agent(agent_type)
             if is_codex_cli_backend(agent_type):
-                from ..agent_session.codex_cli import (
-                    CodexCLIConfig,
-                    SyncCodexCLISession,
-                )
+                from ..agent_session.codex_cli import CodexCLIConfig, SyncCodexCLISession
 
                 return SyncCodexCLISession(
                     cwd=cwd or ".",
                     config=CodexCLIConfig(command=command),
                     model_name=model_name,
                 )
-
             from ..agent_session.claude_cli import ClaudeCLIConfig
 
             return cli_session_cls(
@@ -327,31 +155,6 @@ class AcpRetryStarter:
             logger.warning("Error while closing session", exc_info=True)
 
 
-class StartupFailureReporter:
-    """Report startup failures to telemetry through a narrow collaborator."""
-
-    def __init__(self, *, telemetry: Any, manager_agent_type: str) -> None:
-        self._telemetry = telemetry
-        self._manager_agent_type = manager_agent_type
-
-    def record(
-        self,
-        *,
-        session_key: str,
-        backend_kind: str,
-        error: Exception,
-        diagnostics: Optional[dict[str, Any]],
-    ) -> None:
-        record_startup_failure(
-            telemetry=self._telemetry,
-            manager_agent_type=self._manager_agent_type,
-            session_key=session_key,
-            backend_kind=backend_kind,
-            error=error,
-            diagnostics=diagnostics,
-        )
-
-
 def _default_sync_acp_session_cls() -> Any:
     from .sync_adapter import SyncACPSession
 
@@ -359,165 +162,15 @@ def _default_sync_acp_session_cls() -> Any:
 
 
 def _default_sync_claude_cli_session_cls() -> Any:
-    from ..agent_session import SyncClaudeCLISession
+    from ..agent_session.claude_cli import SyncClaudeCLISession
 
     return SyncClaudeCLISession
 
 
-class StartupBackendStrategy(Protocol):
-    """Backend-specific startup strategy selected by the coordinator."""
+def _default_get_settings() -> Any:
+    from ..config import get_settings
 
-    backend: StartupBackend
-
-    def start(
-        self,
-        *,
-        request: SessionStartupRequest,
-        cwd: str,
-        model_name: Optional[str],
-        retry_plan: RetryPlan,
-    ) -> SessionStartupResult:
-        ...
-
-
-class AcpStartupBackendStrategy:
-    """Start ACP-direct sessions through retry/diagnostics collaborator."""
-
-    backend = StartupBackend.ACP
-
-
-    def __init__(
-        self,
-        *,
-        retry_starter: AcpRetryStarter,
-        failure_reporter: StartupFailureReporter,
-        sync_acp_session_cls: Any | None,
-        sync_claude_cli_session_cls: Any | None,
-        get_settings_fn: Callable[[], Any],
-        sleep_fn: Callable[[float], None],
-        monotonic_fn: Callable[[], float],
-    ) -> None:
-        self._retry_starter = retry_starter
-        self._failure_reporter = failure_reporter
-        self._sync_acp_session_cls = sync_acp_session_cls
-        self._sync_claude_cli_session_cls = sync_claude_cli_session_cls
-        self._get_settings = get_settings_fn
-        self._sleep = sleep_fn
-        self._monotonic = monotonic_fn
-
-    def start(
-        self,
-        *,
-        request: SessionStartupRequest,
-        cwd: str,
-        model_name: Optional[str],
-        retry_plan: RetryPlan,
-    ) -> SessionStartupResult:
-        started = self._start_with_retry(
-            request=request,
-            backend=self.backend,
-            cwd=cwd,
-            model_name=model_name,
-            retry_plan=retry_plan,
-        )
-        if started.session and started.actual_id:
-            return SessionStartupResult(
-                session=started.session,
-                actual_id=started.actual_id,
-                effective_agent_type=request.effective_agent_type,
-                model_name=model_name,
-            )
-        self._raise_startup_failure(
-            request=request,
-            retry_plan=retry_plan,
-            last_spec=started.last_spec,
-            last_err=started.last_err,
-        )
-
-    def _start_with_retry(
-        self,
-        *,
-        request: SessionStartupRequest,
-        backend: StartupBackend,
-        cwd: str,
-        model_name: Optional[str],
-        retry_plan: RetryPlan,
-    ) -> AcpRetryStartResult:
-        from .diagnostics import format_startup_failure_log_line
-        from .sync_adapter import build_startup_diagnostics
-
-        return self._retry_starter.start(
-            backend=backend,
-            agent_type=request.effective_agent_type,
-            cwd=cwd or ".",
-            model_name=model_name,
-            retry_plan=retry_plan,
-            request_key=request.key,
-            acp_session_cls=self._sync_acp_session_cls or _default_sync_acp_session_cls(),
-            cli_session_cls=self._sync_claude_cli_session_cls or _default_sync_claude_cli_session_cls(),
-            start_operation=run_startup_operation,
-            diagnostics_fn=lambda **kwargs: build_manager_startup_diagnostics(
-                diagnostics_fn=build_startup_diagnostics,
-                **kwargs,
-            ),
-            format_log_line_fn=format_startup_failure_log_line,
-            get_settings_fn=self._get_settings,
-            sleep_fn=self._sleep,
-            deadline_monotonic=request.deadline_monotonic,
-            monotonic_fn=self._monotonic,
-        )
-
-    def _raise_startup_failure(
-        self,
-        *,
-        request: SessionStartupRequest,
-        retry_plan: RetryPlan,
-        last_spec: str,
-        last_err: Exception | None,
-    ) -> None:
-        detail = str(last_err) if last_err else "unknown"
-        spec = f" ({last_spec})" if last_spec else ""
-        try:
-            self._failure_reporter.record(
-                session_key=request.key,
-                backend_kind="acp",
-                error=last_err or RuntimeError(detail),
-                diagnostics=None,
-            )
-        except (RuntimeError, OSError, TypeError, ValueError):
-            logger.debug("[ACP:%s] session telemetry on_session_start_failed error", request.effective_agent_type.upper(), exc_info=True)
-        raise RuntimeError(
-            f"启动 {request.effective_agent_type} ACP Server 失败{spec}（已重试 {int(retry_plan.attempts)} 次）: {detail}"
-        )
-
-
-class CliStartupBackendStrategy(AcpStartupBackendStrategy):
-    """Start shell CLI bridge sessions without ACP-specific branching in coordinator."""
-
-    backend = StartupBackend.CLI
-
-    def _raise_startup_failure(
-        self,
-        *,
-        request: SessionStartupRequest,
-        retry_plan: RetryPlan,
-        last_spec: str,
-        last_err: Exception | None,
-    ) -> None:
-        detail = str(last_err) if last_err else "unknown"
-        spec = f" ({last_spec})" if last_spec else ""
-        try:
-            self._failure_reporter.record(
-                session_key=request.key,
-                backend_kind="cli",
-                error=last_err or RuntimeError(detail),
-                diagnostics=None,
-            )
-        except (RuntimeError, OSError, TypeError, ValueError):
-            logger.debug("[ACP:%s] session telemetry on_session_start_failed error", request.effective_agent_type.upper(), exc_info=True)
-        raise RuntimeError(
-            f"启动 {request.effective_agent_type} 会话失败{spec}（已重试 {int(retry_plan.attempts)} 次）: {detail}"
-        )
+    return get_settings()
 
 
 class SessionStartupCoordinator:
@@ -538,49 +191,34 @@ class SessionStartupCoordinator:
         self._manager_agent_type = manager_agent_type
         self._session_starter = session_starter
         self._session_telemetry = session_telemetry
-        self._injected_starter = InjectedStarterFallback(session_starter)
-        self._acp_retry_starter = AcpRetryStarter()
-        self._failure_reporter = StartupFailureReporter(
-            telemetry=session_telemetry,
-            manager_agent_type=manager_agent_type,
-        )
         self._sync_acp_session_cls = sync_acp_session_cls
         self._sync_claude_cli_session_cls = sync_claude_cli_session_cls
-        self._get_settings = get_settings_fn or self._default_get_settings
-        self._sleep = sleep_fn or self._default_sleep
+        self._get_settings = get_settings_fn or _default_get_settings
+        self._sleep = sleep_fn or time.sleep
         self._monotonic = monotonic_fn or time.monotonic
-        self._backend_strategies: dict[StartupBackend, StartupBackendStrategy] = {
-            StartupBackend.ACP: AcpStartupBackendStrategy(
-                retry_starter=self._acp_retry_starter,
-                failure_reporter=self._failure_reporter,
-                sync_acp_session_cls=self._sync_acp_session_cls,
-                sync_claude_cli_session_cls=self._sync_claude_cli_session_cls,
-                get_settings_fn=self._get_settings,
-                sleep_fn=self._sleep,
-                monotonic_fn=self._monotonic,
-            ),
-            StartupBackend.CLI: CliStartupBackendStrategy(
-                retry_starter=self._acp_retry_starter,
-                failure_reporter=self._failure_reporter,
-                sync_acp_session_cls=self._sync_acp_session_cls,
-                sync_claude_cli_session_cls=self._sync_claude_cli_session_cls,
-                get_settings_fn=self._get_settings,
-                sleep_fn=self._sleep,
-                monotonic_fn=self._monotonic,
-            ),
-        }
 
-    @staticmethod
-    def _default_get_settings() -> Any:
-        from ..config import get_settings
-
-        return get_settings()
-
-    @staticmethod
-    def _default_sleep(seconds: float) -> None:
-        import time
-
-        time.sleep(seconds)
+    def _try_injected_starter(
+        self,
+        *,
+        request: SessionStartupRequest,
+        retries: int,
+        remaining: float,
+    ) -> tuple[Any, str, dict[str, Any] | None] | None:
+        agent_type = request.effective_agent_type
+        if not callable(self._session_starter) or select_startup_backend(agent_type) != StartupBackend.ACP:
+            return None
+        try:
+            return self._session_starter(
+                agent_type=agent_type,
+                retries=retries,
+                cwd=request.cwd or ".",
+                startup_timeout=remaining,
+                model_name=request.model_name,
+                session_id=request.session_id,
+                project_id=request.project_id,
+            )
+        except STARTUP_OPERATIONAL_EXCEPTIONS:
+            return None
 
     def _resume_requested_session(
         self,
@@ -592,9 +230,7 @@ class SessionStartupCoordinator:
         target_session_id = str(request.session_id or "").strip()
         if not target_session_id:
             return result
-        current_session_id = str(
-            getattr(result.session, "session_id", "") or ""
-        ).strip()
+        current_session_id = str(getattr(result.session, "session_id", "") or "").strip()
         if current_session_id == target_session_id:
             return replace(result, actual_id=target_session_id)
 
@@ -611,13 +247,111 @@ class SessionStartupCoordinator:
         except Exception:
             AcpRetryStarter._close_session(result.session)
             raise
-        loaded_session_id = str(
-            getattr(result.session, "session_id", "") or ""
-        ).strip()
-        if loaded_session_id != target_session_id:
+        if str(getattr(result.session, "session_id", "") or "").strip() != target_session_id:
             AcpRetryStarter._close_session(result.session)
             raise RuntimeError("ACP session resume returned a different session_id")
         return replace(result, actual_id=target_session_id)
+
+    def _start_backend_with_retry(
+        self,
+        *,
+        request: SessionStartupRequest,
+        backend: StartupBackend,
+        cwd: str,
+        retry_plan: RetryPlan,
+        deadline: float,
+    ) -> SessionStartupResult:
+        from .diagnostics import format_startup_failure_log_line
+        from .sync_adapter import build_startup_diagnostics
+
+        agent_type = request.effective_agent_type
+        model_name = request.model_name
+        last_err: Exception | None = None
+        last_spec = ""
+        acp_cls = self._sync_acp_session_cls or _default_sync_acp_session_cls()
+        cli_cls = self._sync_claude_cli_session_cls or _default_sync_claude_cli_session_cls()
+
+        for attempt in range(1, int(retry_plan.attempts) + 1):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                last_err = TimeoutError("ACP startup deadline exhausted")
+                break
+            session = AcpRetryStarter._build_session(
+                backend=backend,
+                agent_type=agent_type,
+                cwd=cwd or ".",
+                model_name=model_name,
+                acp_session_cls=acp_cls,
+                cli_session_cls=cli_cls,
+            )
+            try:
+                last_spec = AcpRetryStarter._describe_session(session)
+                effective_timeout = min(retry_plan.timeout_for_attempt(attempt), remaining)
+                actual_id = run_startup_operation(session.start, startup_timeout=effective_timeout)
+                if self._monotonic() >= deadline:
+                    last_err = TimeoutError("ACP startup deadline exhausted")
+                    AcpRetryStarter._close_session(session)
+                    break
+                logger.info(
+                    "[ACP:%s] Session started: key=%s, session=%s, agent=%s",
+                    agent_type.upper(),
+                    request.key[-16:],
+                    actual_id[:8],
+                    last_spec or agent_type,
+                )
+                return SessionStartupResult(
+                    session=session,
+                    actual_id=actual_id,
+                    effective_agent_type=agent_type,
+                    model_name=model_name,
+                )
+            except STARTUP_OPERATIONAL_EXCEPTIONS as exc:
+                last_err = exc
+                diag = build_startup_diagnostics(
+                    agent_type=agent_type,
+                    cwd=cwd or ".",
+                    model_name=model_name,
+                    session=session,
+                    error=exc,
+                    attempt=int(attempt),
+                    retries=int(retry_plan.attempts),
+                    timeout_s=float(min(retry_plan.timeout_for_attempt(attempt), remaining) or 0),
+                )
+                if isinstance(diag, dict):
+                    error_text = str(diag.get("error_text") or "").strip()
+                    if error_text and ((not (str(exc) or "").strip()) or (str(exc) or "").strip() in ("(empty)", "None")):
+                        exc.args = (error_text,)
+                logger.warning(
+                    format_startup_failure_log_line(
+                        agent_type=agent_type,
+                        event="Session start failed",
+                        attempt=int(attempt),
+                        retries=int(retry_plan.attempts),
+                        error=exc,
+                        diag=diag if isinstance(diag, dict) else None,
+                        get_settings_fn=self._get_settings,
+                    )
+                )
+                AcpRetryStarter._close_session(session)
+                if attempt < int(retry_plan.attempts):
+                    retry_delay = min(2.0, 0.3 * attempt, max(0.0, deadline - self._monotonic()))
+                    if retry_delay > 0:
+                        self._sleep(retry_delay)
+
+        detail = str(last_err) if last_err else "unknown"
+        spec = f" ({last_spec})" if last_spec else ""
+        try:
+            self._session_telemetry.on_session_start_failed(
+                manager_agent_type=self._manager_agent_type,
+                session_key=request.key,
+                backend_kind=backend.value,
+                error=last_err or RuntimeError(detail),
+                diagnostics=None,
+            )
+        except (RuntimeError, OSError, TypeError, ValueError):
+            logger.debug("[ACP:%s] session telemetry on_session_start_failed error", agent_type.upper(), exc_info=True)
+        label = f"{agent_type} 会话" if backend == StartupBackend.CLI else f"{agent_type} ACP Server "
+        raise RuntimeError(f"启动 {label}失败{spec}（已重试 {int(retry_plan.attempts)} 次）: {detail}".replace("  失败", " 失败"))
 
     def start(self, request: SessionStartupRequest) -> SessionStartupResult:
         deadline = request.deadline_monotonic
@@ -627,39 +361,26 @@ class SessionStartupCoordinator:
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TimeoutError("ACP startup deadline exhausted")
-        effective_agent_type = request.effective_agent_type
-        backend = select_startup_backend(effective_agent_type)
+
+        agent_type = request.effective_agent_type
+        backend = select_startup_backend(agent_type)
         retry_plan = build_retry_plan(
-            effective_agent_type,
+            agent_type,
             retries=int(request.retries or 1),
             startup_timeout=float(request.startup_timeout or 60),
         )
-        retries = int(retry_plan.attempts)
-        cwd = request.cwd
-        model_name = request.model_name
 
-        injected_result = self._injected_starter.start(
-            agent_type=effective_agent_type,
-            retries=retries,
-            cwd=cwd or ".",
-            startup_timeout=remaining,
-            model_name=model_name,
-            session_id=request.session_id,
-            project_id=request.project_id,
-        )
-        if injected_result is not None:
-            session, actual_id, _diag = injected_result
+        injected = self._try_injected_starter(request=request, retries=retry_plan.attempts, remaining=remaining)
+        if injected is not None:
+            session, actual_id, _diag = injected
             if session and actual_id:
                 if self._monotonic() >= deadline:
                     AcpRetryStarter._close_session(session)
                     raise TimeoutError("ACP startup deadline exhausted")
-                try:
-                    session.describe_agent()
-                except (AttributeError, TypeError):
-                    logger.warning("Error while describing agent", exc_info=True)
+                AcpRetryStarter._describe_session(session)
                 logger.info(
                     "[ACP:%s] Session started via injected starter: key=%s, session=%s",
-                    effective_agent_type.upper(),
+                    agent_type.upper(),
                     request.key[-16:],
                     actual_id[:8],
                 )
@@ -667,8 +388,8 @@ class SessionStartupCoordinator:
                     SessionStartupResult(
                         session=session,
                         actual_id=actual_id,
-                        effective_agent_type=effective_agent_type,
-                        model_name=model_name,
+                        effective_agent_type=agent_type,
+                        model_name=request.model_name,
                     ),
                     request=request,
                     deadline=deadline,
@@ -678,126 +399,17 @@ class SessionStartupCoordinator:
             raise TimeoutError("ACP startup deadline exhausted")
         from ..utils.path import normalize_session_cwd
 
-        cwd = normalize_startup_cwd(cwd, normalize_fn=normalize_session_cwd)
+        cwd = normalize_startup_cwd(request.cwd, normalize_fn=normalize_session_cwd)
         if self._monotonic() >= deadline:
             raise TimeoutError("ACP startup deadline exhausted")
-        result = self._backend_strategies[backend].start(
+        result = self._start_backend_with_retry(
             request=request,
+            backend=backend,
             cwd=cwd,
-            model_name=model_name,
             retry_plan=retry_plan,
-        )
-        return self._resume_requested_session(
-            result,
-            request=request,
             deadline=deadline,
         )
-
-
-def normalize_startup_cwd(cwd: str, *, normalize_fn: Callable[[str], str | None]) -> str:
-    raw_cwd = cwd or "."
-    try:
-        normalized = normalize_fn(raw_cwd)
-    except (OSError, RuntimeError, TypeError, ValueError):
-        logger.warning("Error while normalizing startup cwd", exc_info=True)
-        return raw_cwd
-    return normalized or raw_cwd
-
-
-def build_retry_plan(agent_type: str, *, retries: int, startup_timeout: float) -> RetryPlan:
-    attempts = 1 if select_startup_backend(agent_type) == StartupBackend.CLI else max(1, int(retries or 1))
-    return RetryPlan(attempts=attempts, startup_timeout=float(startup_timeout or 60))
-
-
-def classify_startup_error(
-    error: Exception,
-    *,
-    phase: str,
-    attempt: int,
-    retries: int,
-) -> StartupErrorClassification:
-    if phase == "injected_starter":
-        return StartupErrorClassification(
-            kind=StartupErrorKind.RECOVERABLE,
-            action=StartupErrorAction.FALLBACK,
-            phase=phase,
-        )
-    if phase == "acp_retry":
-        if int(attempt or 0) < int(retries or 1):
-            return StartupErrorClassification(
-                kind=StartupErrorKind.RECOVERABLE,
-                action=StartupErrorAction.RETRY,
-                phase=phase,
-            )
-        return StartupErrorClassification(
-            kind=StartupErrorKind.DEGRADED,
-            action=StartupErrorAction.REQUIRES_USER_ACTION,
-            phase=phase,
-        )
-    return StartupErrorClassification(
-        kind=StartupErrorKind.FATAL,
-        action=StartupErrorAction.RAISE,
-        phase=phase,
-    )
-
-
-def build_manager_startup_diagnostics(
-    *,
-    diagnostics_fn: Callable[..., dict[str, Any]],
-    agent_type: str,
-    cwd: str,
-    model_name: Optional[str],
-    session: Any,
-    error: Exception,
-    attempt: int,
-    retries: int,
-    timeout_s: float,
-) -> dict[str, Any]:
-    return diagnostics_fn(
-        agent_type=agent_type,
-        cwd=cwd or ".",
-        model_name=model_name,
-        session=session,
-        error=error,
-        attempt=int(attempt),
-        retries=int(retries),
-        timeout_s=float(timeout_s or 0),
-    )
-
-
-def record_startup_failure(
-    *,
-    telemetry: Any,
-    manager_agent_type: str,
-    session_key: str,
-    backend_kind: str,
-    error: Exception,
-    diagnostics: Optional[dict[str, Any]],
-) -> None:
-    telemetry.on_session_start_failed(
-        manager_agent_type=manager_agent_type,
-        session_key=session_key,
-        backend_kind=backend_kind,
-        error=error,
-        diagnostics=diagnostics,
-    )
-
-
-def run_startup_operation(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """Run an external startup adapter call with a narrow fail-fast boundary.
-
-    Adapter/test-double code may raise custom ``Exception`` subclasses for
-    process/handshake failures.  Programming errors remain fatal and propagate.
-    """
-
-    try:
-        return fn(*args, **kwargs)
-    except (TypeError, AssertionError):
-        raise
-    except STARTUP_OPERATIONAL_EXCEPTIONS:
-        raise
-    except Exception as exc:
-        raise StartupFatalError(str(exc) or type(exc).__name__) from exc
+        return self._resume_requested_session(result, request=request, deadline=deadline)
 
 
 def safe_float_or_none(value: object) -> Optional[float]:
@@ -805,16 +417,11 @@ def safe_float_or_none(value: object) -> Optional[float]:
     if value is None:
         return None
     try:
-        if isinstance(value, bool):
-            return float(value)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (bool, int, float)):
             return float(value)
         s = str(value).strip()
-        if not s:
-            return None
-        return float(s)
+        return float(s) if s else None
     except Exception:
-        logger.debug("safe_float_or_none: conversion failed for %r", value, exc_info=True)
         return None
 
 
@@ -829,6 +436,7 @@ def initial_startup_diagnostics(
     timeout_s: Optional[float],
 ) -> dict:
     """Create the stable startup diagnostics container before enrichment."""
+    err_name = type(error).__name__ if error is not None else ""
     return {
         "agent_type": (agent_type or ""),
         "cwd": (cwd or ""),
@@ -836,8 +444,8 @@ def initial_startup_diagnostics(
         "attempt": int(attempt) if isinstance(attempt, int) else attempt,
         "retries": int(retries) if isinstance(retries, int) else retries,
         "timeout_s": safe_float_or_none(timeout_s),
-        "error_type": type(error).__name__ if error is not None else "",
-        "exception_type": type(error).__name__ if error is not None else "",
+        "error_type": err_name,
+        "exception_type": err_name,
         "error_text": "",
         "error": "",
         "error_repr": "",

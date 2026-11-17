@@ -20,7 +20,6 @@ from src.acp.claude_capabilities import (
     with_1m_suffix,
 )
 from src.acp.providers import (
-    ClaudeProvider,
     _apply_model_args,
     _reset_providers_for_testing,
     get_providers,
@@ -235,12 +234,13 @@ class TestClaudeProviderConfig(unittest.TestCase):
     def test_claude_serve_command_passes_model_with_suffix(self):
         # Patch the availability checker so get_serve_command works without
         # an actual `claude` binary.
+        claude = get_providers()["claude"]
         with patch.object(
-            ClaudeProvider(),
+            claude,
             "check_availability",
             return_value=True,
         ):
-            cmd, args = ClaudeProvider().get_serve_command("claude-opus-4-8[1m]")
+            cmd, args = claude.get_serve_command("claude-opus-4-8[1m]")
         self.assertEqual(cmd, "claude")
         self.assertEqual(args, ["acp", "serve", "--model", "claude-opus-4-8[1m]"])
 

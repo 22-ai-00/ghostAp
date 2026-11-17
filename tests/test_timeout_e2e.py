@@ -426,27 +426,6 @@ class TestInternalDiagnosticsGuard:
         if resp and resp.field_meta and "error" in resp.field_meta:
             assert len(resp.field_meta["error"].strip()) > 0
 
-    def test_coco_model_manager_error_nonempty(self):
-        """manager.py: ModelListResult.error non-empty for bare Exception."""
-        from src.coco_model.manager import CocoModelManager
-
-        mgr = CocoModelManager.__new__(CocoModelManager)
-        mgr._cached_models = None
-        mgr._cache_time = 0.0
-        mgr._cache_ttl = 0.0
-        mgr._current_model = None
-        mgr._lock = __import__("threading").Lock()
-
-        # Force _load_models to raise bare Exception
-        mgr._load_models = MagicMock(side_effect=Exception())
-        mgr._ensure_initialized = lambda: None
-        mgr._is_cache_valid = lambda: False
-        result = mgr.get_models()
-
-        assert result.error is not None
-        assert len(result.error.strip()) > 0, "ModelListResult.error is empty for bare Exception"
-
-
 
 # ---------------------------------------------------------------------------
 # 6. User-facing empty-guard final: 6 residual f"{e}" sites

@@ -4,8 +4,8 @@ import logging
 from typing import Callable, Optional
 
 from ..acp import ACPEvent
+from ..acp.helper import fetch_acp_models
 from ..agent_session import create_engine_session
-from ..coco_model import get_coco_model_manager
 from ..engine_base import EngineRunState
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy
@@ -64,10 +64,18 @@ def try_switch_model(
     if agent_type == "claude":
         return False, current_model, None, models_tried, None
 
-    model_manager = get_coco_model_manager()
-    result = model_manager.get_models()
-    all_models = [m.name for m in result.models]
-    apply_switch = model_manager.set_model
+    try:
+        all_models = [
+            m.name
+            for m in fetch_acp_models(
+                agent_type,
+                root_path,
+                current_model=current_model or model_name,
+            )
+            if getattr(m, "name", None)
+        ]
+    except Exception:
+        all_models = []
 
     available = [m for m in all_models if m not in models_tried]
     if not available:
@@ -75,9 +83,6 @@ def try_switch_model(
 
     old_model = current_model or "(unknown)"
     new_model = available[0]
-
-    if not apply_switch(new_model):
-        return False, current_model, None, models_tried, None
 
     models_tried.append(new_model)
     new_current_model = new_model
@@ -122,14 +127,13 @@ def recreate_session_best_effort(
         return None
 
 
-def initialize_model_context(agent_type: str) -> tuple[Optional[str], list[str]]:
+def initialize_model_context(
+    agent_type: str, model_name: Optional[str] = None
+) -> tuple[Optional[str], list[str]]:
     agent_type = str(agent_type or "").strip().lower()
-
-    if agent_type == "claude":
+    if agent_type == "claude" or not model_name:
         return None, []
-
-    current_model = get_coco_model_manager().get_current_model()
-    return current_model, [current_model] if current_model else []
+    return model_name, [model_name]
 
 
 def build_runtime_context(

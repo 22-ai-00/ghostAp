@@ -72,30 +72,3 @@ class DeepProgress:
     @property
     def progress_bar(self) -> str:
         return make_progress_bar(self.completed_steps, self.total_steps)
-
-    def format_summary(self) -> str:
-        """Return human-readable progress summary."""
-        lines = []
-        if self.plan_entries:
-            lines.append(f"📋 计划进度: {self.completed_steps}/{self.total_steps}")
-            lines.append(self.progress_bar)
-        if self.modified_files:
-            lines.append(f"📝 修改文件: {len(self.modified_files)} 个")
-            for f in sorted(self.modified_files)[:10]:
-                lines.append(f"  • `{f}`")
-            if len(self.modified_files) > 10:
-                lines.append(f"  • ... 等 {len(self.modified_files) - 10} 个文件")
-        if self.tool_calls:
-            # Show total count with a breakdown by kind
-            kind_counts: dict[str, int] = {}
-            for tc in self.tool_calls:
-                kind = tc.kind or "other"
-                kind_counts[kind] = kind_counts.get(kind, 0) + 1
-            if kind_counts:
-                breakdown = " · ".join(
-                    f"{k}: {v}" for k, v in sorted(kind_counts.items(), key=lambda x: -x[1])
-                )
-                lines.append(f"🔧 工具调用: {len(self.tool_calls)} 次 ({breakdown})")
-            else:
-                lines.append(f"🔧 工具调用: {len(self.tool_calls)} 次")
-        return "\n".join(lines)

@@ -169,10 +169,6 @@ def invalidate_acp_model_cache(
         _probe_cache.pop(key, None)
         _negative_cache.pop(key, None)
         _cache_generation[key] = _cache_generation.get(key, 0) + 1
-    if key[0] == "coco":
-        from ..coco_model import get_coco_model_manager
-
-        get_coco_model_manager().invalidate_cache()
 
 
 def is_programming_tool_available(
@@ -370,34 +366,6 @@ def _codex_cli_fallback(current_model: str | None) -> list[ACPModelOption]:
     return options
 
 
-def _coco_models(current_model: str | None) -> list[ACPModelOption]:
-    try:
-        from ..coco_model import get_coco_model_manager
-
-        manager = get_coco_model_manager()
-        selected = str(current_model or manager.get_current_model() or "").strip()
-        models: list[ACPModelOption] = []
-        seen: set[str] = set()
-        for raw in manager.get_models().models or []:
-            name = str(getattr(raw, "name", "") or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            models.append(
-                ACPModelOption(
-                    name=name,
-                    description=str(getattr(raw, "description", "") or name),
-                    is_default=(name == selected)
-                    if selected
-                    else bool(getattr(raw, "is_default", False)),
-                )
-            )
-        return models
-    except Exception:
-        logger.debug("[ACP] coco model lookup failed")
-        return []
-
-
 def _config_models(response: object, selected: str) -> list[ACPModelOption]:
     """Read the standard model select option from a new-session response."""
     for wrapped in getattr(response, "config_options", None) or ():
@@ -465,6 +433,74 @@ def _reasoning_effort_capability(response: object) -> tuple[tuple[str, ...], str
     return tuple(values), current if current in values else None
 
 
+def _flatten_config_options(root: object) -> list[object]:
+    flattened: list[object] = []
+    for option in getattr(root, "options", None) or ():
+        nested = getattr(option, "options", None)
+        flattened.extend(list(nested) if nested is not None else [option])
+    return flattened
+
+
+async def _discover_effort_matrix_options(
+    connection: object,
+    response: object,
+    *,
+    config_id: str,
+    label: str,
+    current_value: str,
+    items: list[tuple[ACPModelOption, str]],
+    capability_fn,
+    compose_fn,
+    fallback_name_fn=lambda v: v,
+) -> list[ACPModelOption]:
+    session_id = str(getattr(response, "session_id", "") or "").strip()
+    discovered: list[ACPModelOption] = []
+    for live, probe_value in items:
+        authority = response if probe_value == current_value else None
+        if authority is None and session_id:
+            try:
+                authority = await connection.set_config_option(
+                    config_id=config_id,
+                    session_id=session_id,
+                    value=probe_value,
+                )
+            except Exception as exc:
+                from ..utils.errors import get_error_detail
+
+                logger.warning(
+                    "[ACP] %s model capability probe failed model=%s err=%s",
+                    label,
+                    probe_value,
+                    get_error_detail(exc),
+                )
+        efforts, default_effort = capability_fn(authority)
+        variants = tuple(
+            ACPModelSelectionVariant(
+                name=compose_fn(probe_value, effort),
+                model=live.name,
+                effort=effort,
+                is_default=effort == default_effort,
+            )
+            for effort in efforts
+        ) or (
+            ACPModelSelectionVariant(
+                name=fallback_name_fn(probe_value),
+                model=live.name,
+                is_default=True,
+            ),
+        )
+        discovered.append(
+            dataclasses.replace(
+                live,
+                is_default=probe_value == current_value,
+                selection_variants=variants,
+                reasoning_efforts=efforts,
+                default_reasoning_effort=default_effort,
+            )
+        )
+    return discovered
+
+
 async def discover_codex_model_options(
     connection: object,
     response: object,
@@ -479,53 +515,16 @@ async def discover_codex_model_options(
         current_model,
         value_field="value",
     )
-    session_id = str(getattr(response, "session_id", "") or "").strip()
-    discovered: list[ACPModelOption] = []
-    for live in live_models:
-        authority = response if live.name == current_model else None
-        if authority is None and session_id:
-            try:
-                authority = await connection.set_config_option(
-                    config_id="model",
-                    session_id=session_id,
-                    value=live.name,
-                )
-            except Exception as exc:
-                from ..utils.errors import get_error_detail
-
-                logger.warning(
-                    "[ACP] Codex model capability probe failed model=%s err=%s",
-                    live.name,
-                    get_error_detail(exc),
-                )
-        efforts, default_effort = _reasoning_effort_capability(authority)
-        variants = tuple(
-            ACPModelSelectionVariant(
-                name=compose_codex_model_selection(live.name, effort),
-                model=live.name,
-                effort=effort,
-                is_default=effort == default_effort,
-            )
-            for effort in efforts
-        )
-        if not variants:
-            variants = (
-                ACPModelSelectionVariant(
-                    name=live.name,
-                    model=live.name,
-                    is_default=True,
-                ),
-            )
-        discovered.append(
-            dataclasses.replace(
-                live,
-                is_default=live.name == current_model,
-                selection_variants=variants,
-                reasoning_efforts=efforts,
-                default_reasoning_effort=default_effort,
-            )
-        )
-    return discovered
+    return await _discover_effort_matrix_options(
+        connection,
+        response,
+        config_id="model",
+        label="Codex",
+        current_value=current_model,
+        items=[(live, live.name) for live in live_models],
+        capability_fn=_reasoning_effort_capability,
+        compose_fn=compose_codex_model_selection,
+    )
 
 
 def build_traex_model_options(
@@ -632,14 +631,8 @@ async def discover_dsh_model_options(
     if model_root is None:
         return []
     current_value = str(getattr(model_root, "current_value", "") or "").strip()
-    session_id = str(getattr(response, "session_id", "") or "").strip()
-    raw_options: list[object] = []
-    for option in getattr(model_root, "options", None) or ():
-        nested = getattr(option, "options", None)
-        raw_options.extend(list(nested) if nested is not None else [option])
-
-    discovered: list[ACPModelOption] = []
-    for option in raw_options:
+    items: list[tuple[ACPModelOption, str]] = []
+    for option in _flatten_config_options(model_root):
         raw_value = str(getattr(option, "value", "") or "").strip()
         if not raw_value:
             continue
@@ -647,55 +640,27 @@ async def discover_dsh_model_options(
             provider, model = decode_dsh_model_value(raw_value)
         except ValueError:
             continue
-        authority = response if raw_value == current_value else None
-        if authority is None and session_id:
-            try:
-                authority = await connection.set_config_option(
-                    config_id=DSH_MODEL_CONFIG_ID,
-                    session_id=session_id,
-                    value=raw_value,
-                )
-            except Exception as exc:
-                from ..utils.errors import get_error_detail
-
-                logger.warning(
-                    "[ACP] DSH model capability probe failed model=%s err=%s",
-                    raw_value,
-                    get_error_detail(exc),
-                )
-        efforts, default_effort = _dsh_reasoning_capability(authority)
-        variants = tuple(
-            ACPModelSelectionVariant(
-                name=compose_dsh_model_selection(raw_value, effort),
-                model=f"{provider}/{model}",
-                effort=effort,
-                is_default=effort == default_effort,
-            )
-            for effort in efforts
+        display_name = f"{provider}/{model}"
+        live = ACPModelOption(
+            name=display_name,
+            description=str(
+                getattr(option, "description", "")
+                or getattr(option, "name", "")
+                or display_name
+            ).strip(),
         )
-        if not variants:
-            variants = (
-                ACPModelSelectionVariant(
-                    name=compose_dsh_model_selection(raw_value),
-                    model=f"{provider}/{model}",
-                    is_default=True,
-                ),
-            )
-        discovered.append(
-            ACPModelOption(
-                name=f"{provider}/{model}",
-                description=str(
-                    getattr(option, "description", "")
-                    or getattr(option, "name", "")
-                    or f"{provider}/{model}"
-                ).strip(),
-                is_default=raw_value == current_value,
-                selection_variants=variants,
-                reasoning_efforts=efforts,
-                default_reasoning_effort=default_effort,
-            )
-        )
-    return discovered
+        items.append((live, raw_value))
+    return await _discover_effort_matrix_options(
+        connection,
+        response,
+        config_id=DSH_MODEL_CONFIG_ID,
+        label="DSH",
+        current_value=current_value,
+        items=items,
+        capability_fn=_dsh_reasoning_capability,
+        compose_fn=compose_dsh_model_selection,
+        fallback_name_fn=compose_dsh_model_selection,
+    )
 
 
 def _agy_thought_level_capability(response: object) -> tuple[tuple[str, ...], str | None]:
@@ -720,58 +685,21 @@ async def discover_agy_model_options(
     if model_root is None:
         return _response_models(response, None)
     current_model = str(getattr(model_root, "current_value", "") or "").strip()
-    raw_options: list[object] = []
-    for option in getattr(model_root, "options", None) or ():
-        nested = getattr(option, "options", None)
-        raw_options.extend(list(nested) if nested is not None else [option])
-    live_models = _options(raw_options, current_model, value_field="value")
-    session_id = str(getattr(response, "session_id", "") or "").strip()
-    discovered: list[ACPModelOption] = []
-    for live in live_models:
-        authority = response if live.name == current_model else None
-        if authority is None and session_id:
-            try:
-                authority = await connection.set_config_option(
-                    config_id=AGY_MODEL_CONFIG_ID,
-                    session_id=session_id,
-                    value=live.name,
-                )
-            except Exception as exc:
-                from ..utils.errors import get_error_detail
-
-                logger.warning(
-                    "[ACP] AGY model capability probe failed model=%s err=%s",
-                    live.name,
-                    get_error_detail(exc),
-                )
-        efforts, default_effort = _agy_thought_level_capability(authority)
-        variants = tuple(
-            ACPModelSelectionVariant(
-                name=compose_agy_model_selection(live.name, effort),
-                model=live.name,
-                effort=effort,
-                is_default=effort == default_effort,
-            )
-            for effort in efforts
-        )
-        if not variants:
-            variants = (
-                ACPModelSelectionVariant(
-                    name=live.name,
-                    model=live.name,
-                    is_default=True,
-                ),
-            )
-        discovered.append(
-            dataclasses.replace(
-                live,
-                is_default=live.name == current_model,
-                selection_variants=variants,
-                reasoning_efforts=efforts,
-                default_reasoning_effort=default_effort,
-            )
-        )
-    return discovered
+    live_models = _options(
+        _flatten_config_options(model_root),
+        current_model,
+        value_field="value",
+    )
+    return await _discover_effort_matrix_options(
+        connection,
+        response,
+        config_id=AGY_MODEL_CONFIG_ID,
+        label="AGY",
+        current_value=current_model,
+        items=[(live, live.name) for live in live_models],
+        capability_fn=_agy_thought_level_capability,
+        compose_fn=compose_agy_model_selection,
+    )
 
 
 async def _probe_acp_models(
@@ -871,10 +799,6 @@ def fetch_acp_models(
 ) -> list[ACPModelOption]:
     """Read backend-declared models with bounded, single-flight caching."""
     tool = str(tool_name or "").strip().lower()
-    if tool == "coco":
-        models = _coco_models(current_model)
-        if models:
-            return models
 
     # CLI backends do not expose an ACP session model catalog.  The Claude
     # Code CLI (and the claude-w sibling) accepts a static --effort set, so

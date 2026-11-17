@@ -86,7 +86,7 @@ _SAFE_MESSAGES: dict[str, str] = {
 
 _DEFAULT_SAFE_MESSAGE = "执行过程中出现异常，请稍后重试"
 
-# Patterns that indicate sensitive content
+# Patterns that indicate sensitive runtime internals (paths, frames, addresses)
 _SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"/[\w./]+\.py", re.IGNORECASE),  # File paths
     re.compile(r"line \d+", re.IGNORECASE),  # Line numbers
@@ -95,8 +95,7 @@ _SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\w+Error\(", re.IGNORECASE),  # Exception constructors
     re.compile(r"\w+Exception\(", re.IGNORECASE),  # Exception constructors
     re.compile(r"0x[0-9a-fA-F]+"),  # Memory addresses
-    re.compile(r"(password|secret|token|key|credential)s?\s*[=:]\s*[^\s,;]+", re.IGNORECASE),  # Credential values
-    re.compile(r"(password|secret|token|key|credential)s?\s*[=:]", re.IGNORECASE),  # Credentials
+    re.compile(r"(password|secret|token|key|credential)s?\s*[=:]", re.IGNORECASE),  # Bare credential labels
 )
 
 
@@ -319,19 +318,16 @@ def safe_error_message(exc: Union[BaseException, str, None]) -> str:
 def redact_sensitive(text: str) -> str:
     """Remove sensitive information from a text string.
 
-    Replaces file paths, line numbers, stack traces, memory addresses,
-    and credential patterns with '[redacted]'.
-
-    Args:
-        text: Raw text that may contain sensitive information.
-
-    Returns:
-        Text with sensitive patterns replaced by '[redacted]'.
+    Delegates credential redaction to :mod:`src.utils.redact` while masking
+    file paths, line numbers, stack traces, and memory addresses with '[redacted]'.
     """
     if not text:
         return text
 
-    result = text
+    from .redact import redact_sensitive as _redact_credentials
+
+    result = _redact_credentials(text)
+    result = re.sub(r"<redacted(?::[^>]*)?>", "[redacted]", result)
     for pattern in _SENSITIVE_PATTERNS:
         result = pattern.sub("[redacted]", result)
 

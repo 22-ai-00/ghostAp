@@ -15,7 +15,6 @@ import pytest
 
 from src.utils.signing import (
     VerifyResult,
-    _compute_command_sig,
     _get_signing_key,
     _is_v2_sig,
     _record_nonce,
@@ -59,34 +58,6 @@ class TestGetSigningKey:
     def test_fallback_empty_on_exception(self):
         with patch("src.config.get_settings", side_effect=RuntimeError("boom")):
             assert _get_signing_key() == ""
-
-
-# ---------------------------------------------------------------------------
-# _compute_command_sig (legacy v1)
-# ---------------------------------------------------------------------------
-
-
-class TestComputeCommandSig:
-
-    def test_produces_hmac_sha256(self):
-        with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):
-            sig = _compute_command_sig("hello")
-        expected = hmac.new(
-            _TEST_KEY.encode(), "hello".encode(), hashlib.sha256
-        ).hexdigest()
-        assert sig == expected
-
-    def test_different_keys_different_sigs(self):
-        with patch("src.utils.signing._get_signing_key", return_value="key_a"):
-            sig_a = _compute_command_sig("hello")
-        with patch("src.utils.signing._get_signing_key", return_value="key_b"):
-            sig_b = _compute_command_sig("hello")
-        assert sig_a != sig_b
-
-    def test_raises_on_empty_key(self):
-        with patch("src.utils.signing._get_signing_key", return_value=""):
-            with pytest.raises(ValueError, match="signing key is empty"):
-                _compute_command_sig("any")
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +110,6 @@ class TestIsV2Sig:
         with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):
             payload = sign_command("/cmd", "chat1")
         assert _is_v2_sig(payload) is True
-
-    def test_v1_format_not_v2(self):
-        with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):
-            sig = _compute_command_sig("/cmd")
-        assert _is_v2_sig(sig) is False
 
     def test_random_string_not_v2(self):
         assert _is_v2_sig("not_a_signature") is False
@@ -273,22 +239,14 @@ class TestVerifyCommandSigV2:
 # ---------------------------------------------------------------------------
 
 
-class TestVerifyCommandSigV1Compat:
+class TestVerifyCommandSigV1Rejected:
 
-    def test_v1_sig_accepted(self):
-        """Old HMAC-only format should still pass within compat window."""
+    def test_v1_hmac_sig_rejected(self):
+        """Legacy v1 HMAC-only hex digests are rejected with or without chat_id."""
+        v1_sig = hmac.new(_TEST_KEY.encode(), b"cmd", hashlib.sha256).hexdigest()
         with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):
-            sig = _compute_command_sig("cmd")
-            result = verify_command_sig("cmd", sig)
-            assert result is VerifyResult.OK
-            assert bool(result) is True
-
-    def test_v1_sig_rejected_when_callback_has_chat_id(self):
-        """Unbound legacy actions must not survive into real chat callbacks."""
-        with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):
-            sig = _compute_command_sig("cmd")
-            result = verify_command_sig("cmd", sig, chat_id="any_chat")
-            assert result is VerifyResult.MISMATCH
+            assert verify_command_sig("cmd", v1_sig) is VerifyResult.MISMATCH
+            assert verify_command_sig("cmd", v1_sig, chat_id="any_chat") is VerifyResult.MISMATCH
 
     def test_v1_wrong_sig_rejected(self):
         with patch("src.utils.signing._get_signing_key", return_value=_TEST_KEY):

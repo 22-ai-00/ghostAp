@@ -142,8 +142,8 @@ def test_intent_recognizer_routes_claude_w() -> None:
 
 def test_project_context_persists_claude_w_snapshot() -> None:
     ctx = ProjectContext(project_id="p1", project_name="n", root_path="/tmp")
-    ctx.set_claude_w_mode(True, session_id="sess-1", query_count=1)
-    ctx.update_claude_w_snapshot(query="hello", query_count=3, session_id="sess-1")
+    ctx.set_programming_mode("claude_w", True, session_id="sess-1", query_count=1)
+    ctx.update_programming_snapshot("claude_w", query="hello", query_count=3, session_id="sess-1")
 
     restored = ProjectContext.from_snapshot(ctx.to_snapshot())
     assert restored.claude_w_mode is True

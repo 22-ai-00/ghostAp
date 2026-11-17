@@ -134,14 +134,6 @@ class TestDeepEngine:
         engine._session = MagicMock()
         engine.inject_guidance("test context")
 
-    def test_get_progress_no_project(self):
-        engine = self._make_engine()
-        assert engine.get_progress() is None
-
-    def test_get_task_summary_no_project(self):
-        engine = self._make_engine()
-        assert engine.get_task_summary() == "暂无任务"
-
     def test_error_callback_observes_frozen_failed_project(self):
         engine = self._make_engine()
 

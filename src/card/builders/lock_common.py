@@ -10,7 +10,6 @@ import logging
 
 # -- Re-exported signing utilities (canonical implementation in src.utils.signing) --
 from src.utils.signing import (  # noqa: F401 — re-export for backward compatibility
-    _compute_command_sig,
     _get_signing_key,
     sign_command,
     verify_command_sig,
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_COMMAND_TEXT_LENGTH",
     "_build_p2p_multi_url",
-    "_compute_command_sig",
     "_get_signing_key",
     "sign_command",
     "verify_command_sig",

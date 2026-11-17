@@ -7,7 +7,7 @@ from typing import Callable
 from ..acp import ACPEvent, ACPEventType
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy
-from .utils import CRITERIA_PATTERNS as _CRITERIA_PATTERNS
+from .artifacts import CRITERIA_PATTERNS as _CRITERIA_PATTERNS
 
 logger = logging.getLogger(__name__)
 

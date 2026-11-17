@@ -27,9 +27,9 @@ async def _benchmark_provider_startup(provider_name: str, iterations: int = 10) 
         # Clear cache for testing
         tool_registry._availability_cache.clear()
         if provider_name == "aiden":
-            from src.acp.providers import _get_aiden_acp_serve_help_blob
+            from src.acp.providers import _reset_providers_for_testing
 
-            _get_aiden_acp_serve_help_blob.cache_clear()
+            _reset_providers_for_testing()
         elif provider_name == "coco":
             from src.acp.sync_adapter import _probe_acp_serve_help, _supports_acp_serve
 

@@ -4,25 +4,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 
-class TestCocoModelManagerReset:
-    def test_reset_produces_new_instance(self):
-        from src.coco_model.manager import (
-            _reset_coco_model_manager_for_testing,
-            get_coco_model_manager,
-        )
-
-        with patch("src.coco_model.manager.CocoModelManager") as MockCls:
-            MockCls.return_value = MagicMock(name="mgr_a")
-            a = get_coco_model_manager()
-            assert get_coco_model_manager() is a
-
-            _reset_coco_model_manager_for_testing()
-
-            MockCls.return_value = MagicMock(name="mgr_b")
-            b = get_coco_model_manager()
-            assert b is not a
-
-
 class TestChatLockManagerSingletonInterface:
     def test_set_chat_lock_manager_injects_test_instance_and_reset_clears_it(self):
         from src.chat_lock import (

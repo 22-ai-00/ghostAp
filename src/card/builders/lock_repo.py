@@ -15,7 +15,6 @@ from ..ui_text import UI_TEXT
 from .lock_common import (
     MAX_COMMAND_TEXT_LENGTH,
     _build_p2p_multi_url,
-    _compute_command_sig,
     format_elapsed_ago,
     sign_command,
 )
@@ -130,8 +129,7 @@ def build_repo_lock_card(
     if command_text and len(command_text) <= MAX_COMMAND_TEXT_LENGTH:
         _next_count = retry_count + 1
         _retry_label = UI_TEXT["repo_lock_btn_retry"]
-        # Use v2 signing (nonce+exp+chat_id) when chat_id is available
-        _sig = sign_command(command_text, chat_id) if chat_id else _compute_command_sig(command_text)
+        _sig = sign_command(command_text, chat_id or "")
         _retry_val = {
             "action": "retry_command",
             "_t": command_text,

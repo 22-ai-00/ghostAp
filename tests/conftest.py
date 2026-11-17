@@ -432,11 +432,6 @@ def _reset_all_singletons():
     """Reset all known global singletons after each test."""
     yield
     try:
-        from src.coco_model.manager import _reset_coco_model_manager_for_testing
-        _reset_coco_model_manager_for_testing()
-    except Exception:
-        pass
-    try:
         from src.thread import set_current_tenant_key, set_current_thread_id
         from src.thread.manager import _reset_thread_manager_for_testing
 

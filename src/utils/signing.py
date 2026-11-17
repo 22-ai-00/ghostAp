@@ -4,8 +4,7 @@ Provides tamper-detection signing and verification for Feishu card action
 payloads.  Extracted from ``card.builders.lock`` to keep cryptographic
 logic separate from UI card construction (Single Responsibility Principle).
 
-v2 adds nonce + expiry + chat_id binding to prevent replay attacks.
-The old keyed HMAC-only format remains supported for callers without chat context.
+v2 signing binds nonce + expiry + chat_id to prevent replay attacks.
 """
 
 from __future__ import annotations
@@ -69,29 +68,7 @@ def _get_signing_key() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Legacy (v1) signing — retained for backward compatibility
-# ---------------------------------------------------------------------------
-
-
-def _compute_command_sig(command_text: str) -> str:
-    """Return an HMAC-SHA256 hex digest of *command_text* for tamper detection.
-
-    Uses ``settings.app_secret`` as the HMAC key so that external
-    parties cannot forge a valid signature even though *command_text*
-    is visible in the card payload.
-
-    .. deprecated::
-        Use :func:`sign_command` for new code. This function is retained
-        for keyed legacy callers that genuinely lack chat context.
-    """
-    key = _get_signing_key()
-    if not key:
-        raise ValueError("signing key is empty")
-    return hmac.new(key.encode("utf-8"), command_text.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# New (v2) signing with nonce + expiry + chat_id binding
+# v2 signing with nonce + expiry + chat_id binding
 # ---------------------------------------------------------------------------
 
 
@@ -264,23 +241,18 @@ def _record_nonce(nonce: str, expires_at: int | None = None) -> bool:
         return False
 
 
-def _verify_v2_sig(command_text: str, chat_id: str, sig_payload: str) -> VerifyResult:
-    """Verify a v2 signature payload.
-
-    Checks:
-    1. Structural validity (4 dot-separated parts)
-    2. Expiry (exp >= now)
-    3. Nonce not reused (anti-replay)
-    4. HMAC recomputation
-    5. chat_id hash match
-    """
+def _verify_v2_sig(
+    command_text: str,
+    sig_payload: str,
+    *,
+    chat_id: str | None = None,
+) -> VerifyResult:
+    """Verify a v2 signature payload (expiry, optional chat_id binding, HMAC, nonce)."""
     parts = sig_payload.split(".")
     if len(parts) != 4:
         return VerifyResult.MISMATCH
 
     sig_hex, exp_str, nonce, payload_chat_hash = parts
-
-    # Validate expiry
     try:
         exp = int(exp_str)
     except ValueError:
@@ -289,24 +261,20 @@ def _verify_v2_sig(command_text: str, chat_id: str, sig_payload: str) -> VerifyR
     if time.time() > exp:
         return VerifyResult.EXPIRED
 
-    # Check chat_id hash matches
-    chat_hash = hashlib.sha256(chat_id.encode()).hexdigest()[:8]
-    if not hmac.compare_digest(payload_chat_hash, chat_hash):
-        return VerifyResult.CHAT_MISMATCH
+    if chat_id:
+        chat_hash = hashlib.sha256(chat_id.encode()).hexdigest()[:8]
+        if not hmac.compare_digest(payload_chat_hash, chat_hash):
+            return VerifyResult.CHAT_MISMATCH
 
-    # Recompute HMAC
     key = _get_signing_key()
     if not key:
         return VerifyResult.MISMATCH
 
     message = f"{command_text}|{payload_chat_hash}|{exp_str}|{nonce}"
     expected_sig = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-
     if not hmac.compare_digest(sig_hex, expected_sig):
         return VerifyResult.MISMATCH
 
-    # Check nonce not reused (do this AFTER sig verification to avoid
-    # poisoning the nonce store with forged payloads)
     try:
         if _record_nonce(nonce, exp):
             return VerifyResult.NONCE_REUSED
@@ -315,100 +283,11 @@ def _verify_v2_sig(command_text: str, chat_id: str, sig_payload: str) -> VerifyR
         return VerifyResult.MISMATCH
 
     return VerifyResult.OK
-
-
-# ---------------------------------------------------------------------------
-# Unified verification interface
-# ---------------------------------------------------------------------------
 
 
 def verify_command_sig(command_text: str, sig: str, *, chat_id: str = "") -> VerifyResult:
-    """Verify *sig* against the command text, with optional chat_id binding.
-
-    Supports v2 (nonce+exp+chat_id) and keyed v1 (HMAC-only) formats:
-
-    1. If *sig* is in v2 format and *chat_id* is provided, verify as v2.
-    2. If a callback supplies *chat_id*, reject every unbound legacy format.
-    3. Otherwise accept a matching keyed v1 HMAC-SHA256 signature.
-    4. Reject every unkeyed digest, including legacy plain SHA-256.
-
-    Returns :attr:`VerifyResult.OK` when valid.  ``VerifyResult`` implements
-    ``__bool__`` so that ``if verify_command_sig(...)`` continues to work
-    as a truthy/falsy check for backward compatibility.
-    """
-    if not sig:
+    """Verify a v2 command signature payload against *command_text* and optional *chat_id*."""
+    if not sig or not _is_v2_sig(sig):
         return VerifyResult.MISMATCH
-
-    # Try v2 format first
-    if _is_v2_sig(sig):
-        if chat_id:
-            return _verify_v2_sig(command_text, chat_id, sig)
-        # v2 sig but no chat_id provided — extract chat_hash from payload
-        # and skip chat_id check (caller doesn't have it)
-        # This shouldn't normally happen but handles edge cases gracefully
-        parts = sig.split(".")
-        if len(parts) == 4:
-            # Verify without chat_id constraint (still checks nonce+exp+hmac)
-            return _verify_v2_sig_without_chat_check(command_text, sig)
-        return VerifyResult.MISMATCH
-
-    # A real card callback always carries its chat id. Reject unbound legacy
-    # signatures there so old destructive buttons cannot be copied across
-    # chats or replayed indefinitely. Legacy verification remains available
-    # only to callers that genuinely lack chat context during migration.
-    if chat_id:
-        return VerifyResult.MISMATCH
-
-    # Try v1 HMAC-SHA256 format
-    try:
-        expected_hmac = _compute_command_sig(command_text)
-        if hmac.compare_digest(sig, expected_hmac):
-            return VerifyResult.OK
-    except ValueError:
-        pass  # empty key — skip HMAC check
-
-    return VerifyResult.MISMATCH
-
-
-def _verify_v2_sig_without_chat_check(command_text: str, sig_payload: str) -> VerifyResult:
-    """Verify a v2 signature without enforcing chat_id match.
-
-    Used when the verifier does not have access to chat_id (edge case).
-    Still checks expiry, nonce, and HMAC.
-    """
-    parts = sig_payload.split(".")
-    if len(parts) != 4:
-        return VerifyResult.MISMATCH
-
-    sig_hex, exp_str, nonce, payload_chat_hash = parts
-
-    # Validate expiry
-    try:
-        exp = int(exp_str)
-    except ValueError:
-        return VerifyResult.MISMATCH
-
-    if time.time() > exp:
-        return VerifyResult.EXPIRED
-
-    # Recompute HMAC using the chat_hash from the payload itself
-    key = _get_signing_key()
-    if not key:
-        return VerifyResult.MISMATCH
-
-    message = f"{command_text}|{payload_chat_hash}|{exp_str}|{nonce}"
-    expected_sig = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(sig_hex, expected_sig):
-        return VerifyResult.MISMATCH
-
-    # Check nonce not reused
-    try:
-        if _record_nonce(nonce, exp):
-            return VerifyResult.NONCE_REUSED
-    except Exception:
-        logger.error("Command nonce store failed closed", exc_info=True)
-        return VerifyResult.MISMATCH
-
-    return VerifyResult.OK
+    return _verify_v2_sig(command_text, sig, chat_id=chat_id or None)
 

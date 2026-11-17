@@ -104,13 +104,6 @@ def test_exact_invalidation_reprobes_only_the_requested_catalog(
     ]
 
 
-def test_coco_catalog_uses_the_same_long_cache_policy() -> None:
-    from src.coco_model import manager
-
-    assert manager.CACHE_TTL_SECONDS == 1_800
-    assert manager.FALLBACK_CACHE_TTL_SECONDS == 300
-
-
 def test_generic_model_probe_uses_late_frame_tolerant_queue(
     monkeypatch,
     tmp_path,
@@ -298,82 +291,6 @@ def test_model_probe_retry_is_bounded_and_only_for_traex_retired_metadata(
     assert probe.await_count == expected_attempts
     if expected_attempts == 2:
         assert probe.call_args.args == (tool, str(tmp_path), "available")
-
-
-def test_coco_model_probe_uses_late_frame_tolerant_queue(
-    monkeypatch,
-) -> None:
-    from src.coco_model import manager as coco_manager
-
-    captured: dict[str, object] = {}
-
-    class Connection:
-        async def initialize(self, protocol_version: int = 1) -> None:
-            assert protocol_version == 1
-
-        async def new_session(self, cwd: str):
-            return SimpleNamespace(models=None)
-
-    @asynccontextmanager
-    async def spawn(*_args, **kwargs):
-        captured.update(kwargs)
-        yield Connection(), object()
-
-    monkeypatch.setattr(coco_manager, "spawn_agent_process", spawn)
-
-    manager = coco_manager.CocoModelManager()
-    assert manager._load_models_via_acp(current_model=None) == []
-    assert isinstance(
-        captured.get("queue"),
-        LateFrameTolerantMessageQueue,
-    )
-
-
-def test_coco_real_catalog_and_fallback_obey_their_cache_windows(
-    monkeypatch,
-) -> None:
-    from src.coco_model import manager as coco_manager
-    from src.coco_model.models import CocoModel
-
-    now = [1_000.0]
-    monkeypatch.setattr(coco_manager.time, "time", lambda: now[0])
-    manager = coco_manager.CocoModelManager()
-    manager._initialized = True
-    real_probe = MagicMock(return_value=[CocoModel(name="real-model")])
-    monkeypatch.setattr(manager, "_load_models", real_probe)
-
-    assert manager.get_models().models[0].name == "real-model"
-    now[0] += 1_799.9
-    assert manager.get_models().cached is True
-    now[0] += 0.2
-    assert manager.get_models().cached is False
-    assert real_probe.call_count == 2
-
-    manager.invalidate_cache()
-    fallback_probe = MagicMock(return_value=list(coco_manager.DEFAULT_MODELS))
-    monkeypatch.setattr(manager, "_load_models", fallback_probe)
-    now[0] += 1.0
-    assert manager.get_models().cached is False
-    now[0] += 299.9
-    assert manager.get_models().cached is True
-    now[0] += 0.2
-    assert manager.get_models().cached is False
-    assert fallback_probe.call_count == 2
-
-
-def test_coco_invalidation_reaches_its_dedicated_manager(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    manager = MagicMock()
-    monkeypatch.setattr(
-        "src.coco_model.get_coco_model_manager",
-        lambda: manager,
-    )
-
-    helper.invalidate_acp_model_cache("coco", str(tmp_path))
-
-    manager.invalidate_cache.assert_called_once_with()
 
 
 def test_invalidation_fences_an_older_inflight_probe_result(

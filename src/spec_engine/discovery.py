@@ -7,9 +7,9 @@ from typing import Callable, Optional
 
 from ..acp import ACPEvent, ACPEventType
 from ..utils.errors import get_error_detail
+from .artifacts import extract_json_blob, validate_spec_artifact_dict
 from .models import SpecProject, SpecWorkItem, SpecWorkItemStatus
 from .persistence import persist_generated_spec_file, read_text_file_best_effort
-from .utils import extract_json_blob, validate_spec_artifact_dict
 
 logger = logging.getLogger(__name__)
 
