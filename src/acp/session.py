@@ -30,15 +30,17 @@ from .client import (
     emit_referenced_changed_local_image_events,
 )
 from .collaboration import merge_tool_call_sequence
-from .execution_instructions import AUTONOMOUS_EXECUTION_PROMPT
 from .models import (
+    ACPAvailableCommand,
     ACPEvent,
     ACPEventType,
     ACPGoalInfo,
     ACPSessionInfo,
     ACPSessionState,
+    ACPUsageInfo,
     PromptResult,
 )
+from .native_commands import build_acp_prompt_texts
 from .outcome import has_transient_child_lifecycle
 from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
 
@@ -433,6 +435,8 @@ class ACPSession:
         self._transport_epoch = 0
         self._load_epoch = 0
         self._attempted_load_targets: set[str] = set()
+        self._available_commands: tuple[ACPAvailableCommand, ...] = ()
+        self._last_usage: ACPUsageInfo | None = None
 
     def _uses_official_codex_acp(self) -> bool:
         return any(
@@ -514,6 +518,52 @@ class ACPSession:
             self._lifecycle_revision += 1
         self._wake_lifecycle_waiter()
 
+    def _on_available_commands(
+        self,
+        session_id: str,
+        commands: list[ACPAvailableCommand],
+        *,
+        transport_epoch: int | None = None,
+        load_epoch: int | None = None,
+    ) -> None:
+        with self._handler_lock:
+            if transport_epoch is not None and transport_epoch != self._transport_epoch:
+                return
+            if load_epoch is not None and load_epoch != self._load_epoch:
+                return
+            expected_sid = self._loading_session_id or self._session_id
+            if expected_sid and session_id and session_id != expected_sid:
+                return
+            self._available_commands = tuple(commands)
+
+    def _on_usage_update(
+        self,
+        session_id: str,
+        usage: ACPUsageInfo,
+        *,
+        transport_epoch: int | None = None,
+        load_epoch: int | None = None,
+    ) -> None:
+        with self._handler_lock:
+            if transport_epoch is not None and transport_epoch != self._transport_epoch:
+                return
+            if load_epoch is not None and load_epoch != self._load_epoch:
+                return
+            expected_sid = self._loading_session_id or self._session_id
+            if expected_sid and session_id and session_id != expected_sid:
+                return
+            self._last_usage = usage
+
+    def get_available_commands(self) -> list[ACPAvailableCommand]:
+        """Return latest live native slash commands advertised by this ACP session."""
+        with self._handler_lock:
+            return list(self._available_commands)
+
+    def get_usage_info(self) -> ACPUsageInfo | None:
+        """Return latest token/cost usage snapshot reported by this ACP session."""
+        with self._handler_lock:
+            return self._last_usage
+
     def _bind_session_info_callback(self) -> None:
         client = self._client
         if client is None:
@@ -524,6 +574,18 @@ class ACPSession:
         client._on_session_info = lambda session_id, info: self._on_session_info(
             session_id,
             info,
+            transport_epoch=transport_epoch,
+            load_epoch=load_epoch,
+        )
+        client._on_available_commands = lambda session_id, commands: self._on_available_commands(
+            session_id,
+            commands,
+            transport_epoch=transport_epoch,
+            load_epoch=load_epoch,
+        )
+        client._on_usage_update = lambda session_id, usage: self._on_usage_update(
+            session_id,
+            usage,
             transport_epoch=transport_epoch,
             load_epoch=load_epoch,
         )
@@ -1192,7 +1254,7 @@ class ACPSession:
 
             response: PromptResponse = await self._conn.prompt(
                 session_id=self._session_id,
-                prompt=[text_block(AUTONOMOUS_EXECUTION_PROMPT), text_block(text)],
+                prompt=[text_block(part) for part in build_acp_prompt_texts(text)],
             )
 
             while True:
@@ -1277,6 +1339,10 @@ class ACPSession:
             result.ingest_history(windowed)
         except Exception:
             logger.debug("failed to ingest history", exc_info=True)
+
+        with self._handler_lock:
+            if self._last_usage is not None:
+                result.usage = self._last_usage
 
         return result
 

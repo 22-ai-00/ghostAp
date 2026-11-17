@@ -33,7 +33,7 @@ from .diagnostics import (
 from .diagnostics import (
     format_startup_diagnostics_summary as format_startup_diagnostics,
 )
-from .models import ACPEvent, PromptResult
+from .models import ACPAvailableCommand, ACPEvent, ACPUsageInfo, PromptResult
 from .prompt_generation import PromptGenerationTracker
 from .session import ACPResumeRejected, ACPSession, ACPStartupError
 from .startup_utils import initial_startup_diagnostics
@@ -1591,18 +1591,56 @@ class SyncACPSession(PromptGenerationTracker):
             "is_resumed": self.is_resumed,
         }
 
+    def get_available_commands(self) -> list[ACPAvailableCommand]:
+        """Return live native slash commands reported by the underlying ACP session."""
+        acp_session = getattr(self, "_acp_session", None)
+        if acp_session is None or not hasattr(acp_session, "get_available_commands"):
+            return []
+        try:
+            return list(acp_session.get_available_commands())
+        except Exception:
+            return []
+
+    def get_usage_info(self) -> ACPUsageInfo | None:
+        """Return latest context window / cost snapshot reported by the ACP session."""
+        acp_session = getattr(self, "_acp_session", None)
+        if acp_session is None or not hasattr(acp_session, "get_usage_info"):
+            return None
+        try:
+            return acp_session.get_usage_info()
+        except Exception:
+            return None
+
     def get_session_info(self) -> str:
         """Return human-readable session info."""
         duration = int(time.time() - self.created_at)
         minutes, seconds = divmod(duration, 60)
         agent_name = self._agent_type.capitalize()
         resumed_info = " (已恢复)" if self.is_resumed else ""
-        return (
-            f"📊 {agent_name} 会话信息{resumed_info}:\n"
-            f"- 会话ID: {self.session_id}\n"
-            f"- 消息数: {self.message_count}\n"
-            f"- 持续时间: {minutes}分{seconds}秒"
-        )
+        lines = [
+            f"📊 {agent_name} 会话信息{resumed_info}:",
+            f"- 会话ID: {self.session_id}",
+            f"- 消息数: {self.message_count}",
+            f"- 持续时间: {minutes}分{seconds}秒",
+        ]
+        model_name = getattr(self, "_model_name", None)
+        if model_name:
+            lines.append(f"- 模型: {model_name}")
+        usage = self.get_usage_info()
+        if usage is not None and (usage.used > 0 or usage.size > 0):
+            if usage.size > 0:
+                pct = int(round((usage.used / usage.size) * 100))
+                usage_text = f"{usage.used:,} / {usage.size:,} ({pct}%)"
+            else:
+                usage_text = f"{usage.used:,} tokens"
+            if usage.cost_amount is not None:
+                currency = f" {usage.cost_currency}" if usage.cost_currency else ""
+                usage_text += f" · {usage.cost_amount:.4f}{currency}"
+            lines.append(f"- 上下文用量: {usage_text}")
+        live_cmds = self.get_available_commands()
+        if live_cmds:
+            lines.append(f"- 原生命令: {len(live_cmds)} 条（/cmds 查看）")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internal

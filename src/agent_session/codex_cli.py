@@ -17,12 +17,13 @@ from ..acp.client import (
     emit_referenced_changed_local_image_events,
     snapshot_local_image_artifacts,
 )
-from ..acp.execution_instructions import append_execution_instructions
+from ..acp.execution_instructions import AUTONOMOUS_EXECUTION_PROMPT, append_execution_instructions
 from ..acp.model_selection import (
     CODEX_DEFAULT_MODEL_TOKEN,
     split_codex_model_selection,
 )
 from ..acp.models import ACPEvent, ACPEventType, PromptResult
+from ..acp.native_commands import is_pure_zero_arg_native_slash, parse_slash_command
 from ..acp.prompt_generation import PromptGenerationTracker
 from ..utils.errors import get_error_detail
 from .process_cleanup import terminate_and_reap_process_tree
@@ -214,7 +215,13 @@ class SyncCodexCLISession(_PromptRetryMixin, PromptGenerationTracker):
             ]
             if resumed and self.session_id:
                 args += ["resume", self.session_id]
-            args.append(append_execution_instructions(text))
+            stripped = str(text or "").strip()
+            if is_pure_zero_arg_native_slash(stripped):
+                args.append(stripped)
+            elif parse_slash_command(stripped) is not None:
+                args.append(f"{stripped}\n\n{AUTONOMOUS_EXECUTION_PROMPT}")
+            else:
+                args.append(append_execution_instructions(text))
             return args
 
         def _run_once(resumed: bool) -> tuple[int, str, str, str, str]:

@@ -31,6 +31,7 @@ from acp.schema import (
     AgentPlanUpdate,
     AgentThoughtChunk,
     AllowedOutcome,
+    AvailableCommandsUpdate,
     BlobResourceContents,
     ContentToolCallContent,
     CreateTerminalResponse,
@@ -48,6 +49,7 @@ from acp.schema import (
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
+    UsageUpdate,
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
 )
@@ -56,15 +58,18 @@ from ..command_executor import CommandExecutor
 from ..utils.errors import get_error_detail
 from ..utils.text import sanitize_single_line_label
 from .models import (
+    ACPAvailableCommand,
     ACPEvent,
     ACPEventType,
     ACPGoalInfo,
     ACPImageInfo,
     ACPSessionInfo,
+    ACPUsageInfo,
     PlanEntryInfo,
     PlanInfo,
     ToolCallInfo,
 )
+from .native_commands import normalize_acp_available_commands
 
 logger = logging.getLogger(__name__)
 
@@ -1362,9 +1367,13 @@ class GhostAPClient(Client):
         root_dir: str = ".",
         capture_full_tool_content: bool = False,
         trust_codex_extensions: bool = False,
+        on_available_commands: Callable[[str, list[ACPAvailableCommand]], None] | None = None,
+        on_usage_update: Callable[[str, ACPUsageInfo], None] | None = None,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
+        self._on_available_commands = on_available_commands
+        self._on_usage_update = on_usage_update
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._capture_full_tool_content = bool(capture_full_tool_content)
         self._trust_codex_extensions = bool(trust_codex_extensions)
@@ -1427,6 +1436,47 @@ class GhostAPClient(Client):
                     )
                 ):
                     self._on_session_info(session_id, info)
+            elif isinstance(update, AvailableCommandsUpdate):
+                cmds = list(normalize_acp_available_commands(getattr(update, "available_commands", None)))
+                self._record(
+                    session_id,
+                    "available_commands",
+                    {"count": len(cmds), "names": [cmd.name for cmd in cmds[:20]]},
+                )
+                if self._on_available_commands is not None:
+                    self._on_available_commands(session_id, cmds)
+            elif isinstance(update, UsageUpdate):
+                cost = getattr(update, "cost", None)
+                cost_amount: float | None = None
+                cost_currency: str | None = None
+                if cost is not None:
+                    raw_amount = getattr(cost, "amount", None)
+                    if raw_amount is not None:
+                        try:
+                            cost_amount = float(raw_amount)
+                        except (TypeError, ValueError):
+                            cost_amount = None
+                    raw_currency = getattr(cost, "currency", None)
+                    if raw_currency is not None:
+                        cost_currency = str(raw_currency).strip() or None
+                usage = ACPUsageInfo(
+                    used=max(0, int(getattr(update, "used", 0) or 0)),
+                    size=max(0, int(getattr(update, "size", 0) or 0)),
+                    cost_amount=cost_amount,
+                    cost_currency=cost_currency,
+                )
+                self._record(
+                    session_id,
+                    "usage_update",
+                    {
+                        "used": usage.used,
+                        "size": usage.size,
+                        "cost_amount": usage.cost_amount,
+                        "cost_currency": usage.cost_currency,
+                    },
+                )
+                if self._on_usage_update is not None:
+                    self._on_usage_update(session_id, usage)
             elif isinstance(update, (AgentMessageChunk, AgentThoughtChunk)):
                 event_type = (
                     ACPEventType.TEXT_CHUNK

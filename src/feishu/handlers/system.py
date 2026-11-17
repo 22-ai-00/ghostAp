@@ -12,6 +12,15 @@ from ...acp.helper import (
     is_programming_tool_available,
     list_acp_tools,  # noqa: F401
 )
+from ...acp.native_commands import (
+    DEFAULT_TOOL_PRIORITY,
+    STATIC_TOOL_NATIVE_COMMANDS,
+    get_tool_native_commands,
+    is_blocked_native_command,
+    normalize_native_tool_key,
+    parse_slash_command,
+    resolve_smart_mode_native_command,
+)
 from ...acp.providers import get_providers  # noqa: F401
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
@@ -80,6 +89,106 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     # runtime. Keep its old spellings fail-closed with an explicit migration
     # message instead of reviving the obsolete process-local command surface.
     _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()
+    _DIRECT_TOOL_COMMAND_TO_MODE: dict[str, str] = {
+        "/coco": "coco",
+        "/enter_coco": "coco",
+        "/claude": "claude",
+        "/enter_claude": "claude",
+        "/claude-w": "claude_w",
+        "/enter_claude_w": "claude_w",
+        "/aiden": "aiden",
+        "/enter_aiden": "aiden",
+        "/codex": "codex",
+        "/enter_codex": "codex",
+        "/codex-w": "codex_w",
+        "/enter_codex_w": "codex_w",
+        "/gemini": "gemini",
+        "/enter_gemini": "gemini",
+        "/traex": "traex",
+        "/enter_traex": "traex",
+        "/grok": "grok",
+        "/enter_grok": "grok",
+        "/dsh": "dsh",
+        "/enter_dsh": "dsh",
+        "/agy": "agy",
+        "/enter_agy": "agy",
+    }
+    _FAST_EXACT_CONTROL_COMMANDS: frozenset[str] = frozenset(
+        {
+            "/help",
+            "/帮助",
+            "/menu",
+            "/tools",
+            "/tools_status",
+            "/projects",
+            "/project",
+            "/coco_status",
+            "/coco_info",
+            "/claude_info",
+            "/aiden_info",
+            "/codex_info",
+            "/gemini_info",
+            "/traex_info",
+            "/grok_info",
+            "/dsh_info",
+            "/agy_info",
+            "/employees",
+            "/exit",
+            "/quit",
+            "/end_coco",
+            "/exit_coco",
+            "/end_claude",
+            "/exit_claude",
+            "/end_claude_w",
+            "/exit_claude_w",
+            "/end_aiden",
+            "/exit_aiden",
+            "/end_codex",
+            "/exit_codex",
+            "/end_codex_w",
+            "/exit_codex_w",
+            "/end_gemini",
+            "/exit_gemini",
+            "/end_traex",
+            "/exit_traex",
+            "/end_grok",
+            "/exit_grok",
+            "/end_dsh",
+            "/exit_dsh",
+            "/end_agy",
+            "/exit_agy",
+            *_DIRECT_TOOL_COMMAND_TO_MODE.keys(),
+        }
+    )
+    _FAST_PREFIX_CONTROL_COMMANDS: frozenset[str] = frozenset(
+        {
+            "/cmds",
+            "/acp",
+            "/model",
+            "/status",
+            "/tasks",
+            "/diff",
+            "/trace",
+            "/switch",
+            "/new",
+            "/new-chat",
+            "/close",
+            "/lock",
+            "/unlock",
+            "/setadmin",
+            "/access",
+            "/employee-role",
+            "/hire",
+            "/fire",
+            "/history",
+            "/employee-memory",
+            "/btw",
+            "/info",
+            "/stop",
+            "/clear",
+            "/sh",
+        }
+    )
 
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
@@ -159,6 +268,10 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/exit_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/end_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/exit_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/end_agy": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/exit_agy": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/coco_status": lambda m, c, t, p: self.show_coco_status(m, c),
             "/coco_info": lambda m, c, t, p: self.get_handler("coco").show_info(m, c, p),
             "/claude_info": lambda m, c, t, p: self.get_handler("claude").show_info(m, c, p),
@@ -174,6 +287,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, t, p),
+            "/cmds": lambda m, c, t, p: self.show_tool_commands(m, c, t, p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
             "/tools_status": lambda m, c, t, p: self.show_tools_status(m, c, p),
@@ -204,6 +318,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             ("/diff", lambda m, c, t, p: self.get_handler("diagnostics").show_context_diff(m, c, t, p)),
             ("/trace", lambda m, c, t, p: self.get_handler("diagnostics").show_message_trace(m, c, t, p)),
             ("/acp", self.handle_acp_command),
+            ("/cmds", lambda m, c, t, p: self.show_tool_commands(m, c, t, p)),
             ("/model", self.handle_model_command),
             (
                 "/employee-role",
@@ -260,6 +375,261 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             mode_key,
             project,
         )
+
+    def _handle_direct_mode_enter_with_args(
+        self,
+        message_id: str,
+        chat_id: str,
+        mode_key: str,
+        args: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Execute ``/<tool> <task or /native_cmd>`` in one step without card friction."""
+        task_text = str(args or "").strip()
+        if not task_text:
+            self._handle_direct_mode_enter(message_id, chat_id, mode_key, project)
+            return
+        if is_blocked_native_command(task_text):
+            parsed = parse_slash_command(task_text)
+            blocked_name = parsed[0] if parsed else task_text.lstrip("/").split(maxsplit=1)[0].casefold()
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
+            )
+            return
+
+        active_mode_key = self._resolve_active_programming_mode_key(chat_id, project)
+        if active_mode_key == mode_key:
+            handler = self.get_handler(mode_key)
+            if handler is not None and hasattr(handler, "handle_message"):
+                self.add_reaction(message_id, EmojiReaction.on_processing())
+                handler.handle_message(message_id, chat_id, task_text, project)
+                return
+
+        self.add_reaction(message_id, EmojiReaction.on_processing())
+        self.handle_enter_acp_saved_selection(
+            message_id,
+            chat_id,
+            mode_key,
+            project,
+            pending_prompt=task_text,
+        )
+
+    def _resolve_live_commands_for_tool(
+        self,
+        chat_id: str,
+        tool_name: str,
+        project: Optional["ProjectContext"] = None,
+        *,
+        thread_root_id: Optional[str] = None,
+    ) -> Optional[list]:
+        try:
+            handler = self.get_handler(tool_name)
+        except Exception:
+            return None
+        manager_getter = getattr(handler, "_get_session_manager", None) if handler is not None else None
+        manager = manager_getter() if callable(manager_getter) else None
+        if manager is None or not hasattr(manager, "get_session"):
+            return None
+        try:
+            session = manager.get_session(
+                chat_id,
+                project_id=self._project_id(project),
+                thread_id=thread_root_id,
+            )
+        except Exception:
+            return None
+        getter = getattr(session, "get_available_commands", None) if session is not None else None
+        if not callable(getter):
+            return None
+        try:
+            cmds = getter()
+            return cmds if isinstance(cmds, (list, tuple)) else None
+        except Exception:
+            return None
+
+    def show_tool_commands(
+        self,
+        message_id: str,
+        chat_id: str,
+        text_or_tool: str = "",
+        project: Optional["ProjectContext"] = None,
+        *,
+        origin_message_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> None:
+        """Display the native slash commands and skills card for the active or requested tool."""
+        raw_input = str(text_or_tool or "").strip()
+        if raw_input.startswith("/"):
+            parsed = SlashCommandParser.parse(raw_input)
+            raw_arg = (parsed.args if parsed else "").strip()
+        else:
+            raw_arg = raw_input
+
+        if raw_arg:
+            token = raw_arg.split(maxsplit=1)[0]
+            tool_name = normalize_native_tool_key(token)
+            if tool_name not in STATIC_TOOL_NATIVE_COMMANDS and tool_name not in PROGRAMMING_MODE_VALUES:
+                self.reply_error(
+                    message_id,
+                    UI_TEXT["system_acp_unsupported_tool"].format(tool_name=token),
+                )
+                return
+        else:
+            tool_name = (
+                self._resolve_active_programming_mode_key(chat_id, project)
+                or self._resolve_current_acp_tool(chat_id, project)
+            )
+
+        live_cmds = self._resolve_live_commands_for_tool(
+            chat_id,
+            tool_name,
+            project,
+            thread_root_id=thread_root_id,
+        )
+        commands, source = get_tool_native_commands(tool_name, live_commands=live_cmds)
+        msg_type, card = SystemBuilder.build_tool_native_commands_card(
+            tool_name,
+            commands,
+            source=source,
+            project_id=self._project_id(project),
+            thread_root_id=thread_root_id,
+        )
+        self.reply_interactive_card(origin_message_id or message_id, card, msg_type=msg_type)
+
+    def handle_show_tool_commands(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: Optional[str],
+        value: dict,
+    ) -> None:
+        """Card callback opening the `/cmds` card for the specified tool."""
+        project = (self.project_manager.get_project(project_id) if project_id else None) or (
+            self.project_manager.get_active_project(chat_id)
+        )
+        tool_name = str((value or {}).get("tool_name") or "").strip()
+        thread_root_id = (value or {}).get("thread_root_id")
+        self.show_tool_commands(
+            message_id,
+            chat_id,
+            tool_name,
+            project,
+            thread_root_id=thread_root_id,
+        )
+
+    def handle_run_native_tool_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: Optional[str],
+        value: dict,
+    ) -> None:
+        """Card callback executing a zero-arg native slash command on the target tool."""
+        tool_name = normalize_native_tool_key(str((value or {}).get("tool_name") or ""))
+        command = str((value or {}).get("command") or "").strip()
+        if command and not command.startswith("/"):
+            command = f"/{command}"
+        if not tool_name or not command:
+            return
+        if is_blocked_native_command(command):
+            parsed = parse_slash_command(command)
+            blocked_name = parsed[0] if parsed else command.lstrip("/").split(maxsplit=1)[0].casefold()
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
+            )
+            return
+        project = (self.project_manager.get_project(project_id) if project_id else None) or (
+            self.project_manager.get_active_project(chat_id)
+        )
+        self._handle_direct_mode_enter_with_args(
+            message_id,
+            chat_id,
+            tool_name,
+            command,
+            project,
+        )
+
+    def try_dispatch_smart_native_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> bool:
+        """In SMART mode, auto-route unambiguous/preferred native slash commands to their tool."""
+        if parse_slash_command(text) is None:
+            return False
+
+        cfg_project = self._configuration_project(chat_id, project)
+        preferred_tool = getattr(cfg_project, "acp_tool_name", None) if cfg_project else None
+
+        available_tools = [
+            tool
+            for tool in DEFAULT_TOOL_PRIORITY
+            if is_programming_tool_available(
+                tool,
+                allow_sync_probe=False,
+                trigger_async_probe=True,
+            )
+        ]
+        live_map: dict[str, list] = {}
+        for tool in DEFAULT_TOOL_PRIORITY:
+            live_cmds = self._resolve_live_commands_for_tool(chat_id, tool, project)
+            if live_cmds:
+                live_map[tool] = live_cmds
+
+        result = resolve_smart_mode_native_command(
+            text,
+            preferred_tool=preferred_tool,
+            available_tools=available_tools,
+            live_commands_by_tool=live_map,
+        )
+        if result.status == "unavailable" and result.matched_tools:
+            # Retry sync probe only for matching candidates when cache was cold.
+            probed_available = set(available_tools)
+            for candidate in result.matched_tools:
+                if is_programming_tool_available(
+                    candidate,
+                    allow_sync_probe=True,
+                    trigger_async_probe=False,
+                ):
+                    probed_available.add(candidate)
+            result = resolve_smart_mode_native_command(
+                text,
+                preferred_tool=preferred_tool,
+                available_tools=probed_available,
+                live_commands_by_tool=live_map,
+            )
+
+        if result.status == "none":
+            return False
+        if result.status == "blocked":
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_blocked"].format(command=result.command_name),
+            )
+            return True
+        if result.status == "unavailable":
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_tool_unavailable"].format(
+                    command=result.command_name,
+                    tools=", ".join(result.matched_tools),
+                ),
+            )
+            return True
+
+        self.add_reaction(message_id, EmojiReaction.on_processing())
+        self.handle_enter_acp_saved_selection(
+            message_id,
+            chat_id,
+            result.tool_name,
+            project,
+            pending_prompt=text,
+        )
+        return True
 
     def _handle_switch_args(self, message_id: str, chat_id: str, args: str) -> None:
         name = (args or "").strip()
@@ -452,6 +822,10 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/exit_traex",
             "/end_grok",
             "/exit_grok",
+            "/end_dsh",
+            "/exit_dsh",
+            "/end_agy",
+            "/exit_agy",
             "/coco_status",
             "/coco_info",
             "/claude_info",
@@ -471,6 +845,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/diff",
             "/trace",
             "/acp",
+            "/cmds",
             "/menu",
             "/tools",
             "/tools_status",
@@ -501,6 +876,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/diff",
             "/trace",
             "/status",
+            "/acp",
+            "/cmds",
             "/model",
             "/btw",
             "/setadmin",
@@ -513,9 +890,55 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/goal",
             "/approve",
             "/runs",
+            *SystemHandler._DIRECT_TOOL_COMMAND_TO_MODE.keys(),
         }
         prefix_commands.update(SystemHandler._RETIRED_AUTONOMOUS_MANAGER_COMMANDS)
         return cmd in prefix_commands
+
+    @classmethod
+    def is_ghostap_control_command(
+        cls,
+        command_match: CommandMatch | None,
+        *,
+        in_programming_mode: bool = False,
+    ) -> bool:
+        """Return True when *command_match* is a GhostAP control command rather than a tool native command."""
+        if not command_match:
+            return False
+        if in_programming_mode and command_match.command == "/goal":
+            return False
+        return cls.is_interceptable_command_match(command_match)
+
+    @classmethod
+    def is_fast_lane_system_command(
+        cls,
+        text: str | None,
+        *,
+        in_programming_mode: bool = False,
+    ) -> bool:
+        """Classify lightweight GhostAP control commands vs task-bearing slash prompts.
+
+        Prompts starting with ``/<tool> <task>``, ``/wf``, ``/deep``, ``/spec``, or native tool
+        slash commands (``/swarm``, ``/compact``, ``/review``) belong on the normal ordered lane
+        instead of overtaking queued work in ``system_fast``.
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        if cls.is_exit_command(raw):
+            return True
+        m = SlashCommandParser.parse(raw)
+        if not m:
+            return False
+        if in_programming_mode and m.command == "/goal":
+            return False
+        if m.command in cls._FAST_PREFIX_CONTROL_COMMANDS:
+            return True
+        if m.command in cls._FAST_EXACT_CONTROL_COMMANDS and not m.has_args:
+            return True
+        if m.command in cls._RETIRED_AUTONOMOUS_MANAGER_COMMANDS:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Intercepted command router
@@ -567,6 +990,15 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             return
         if text_lower == "/close":
             self._handle_close_args(message_id, chat_id, m.args)
+            return
+        if text_lower in self._DIRECT_TOOL_COMMAND_TO_MODE:
+            self._handle_direct_mode_enter_with_args(
+                message_id,
+                chat_id,
+                self._DIRECT_TOOL_COMMAND_TO_MODE[text_lower],
+                m.args,
+                project,
+            )
             return
 
         # 2. Try prefix match

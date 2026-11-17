@@ -168,6 +168,8 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     ):
         actions[action] = system.handle_acp_model_cascade_select
     actions[action_ids.REFRESH_ACP_MODELS] = system.handle_refresh_acp_models
+    actions[action_ids.SHOW_TOOL_COMMANDS] = system.handle_show_tool_commands
+    actions[action_ids.RUN_NATIVE_TOOL_COMMAND] = system.handle_run_native_tool_command
 
     # Deep Engine
     actions[action_ids.SHOW_DEEP_STATUS] = (

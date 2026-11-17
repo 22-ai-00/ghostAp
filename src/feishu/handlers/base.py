@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass as _dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from ...acp.native_commands import is_pure_zero_arg_native_slash
 from ...card.ui_text import UI_TEXT
 from ...utils.engine_identity import resolve_engine_identity
 from ...utils.errors import (
@@ -932,6 +933,9 @@ class BaseHandler:
         """Consume and prepend bridge summary to the user prompt (one-shot)."""
         if not project:
             return text
+        stripped = str(text or "").strip()
+        if is_pure_zero_arg_native_slash(stripped):
+            return text
         ctx = self.ctx.context_manager.store.get(project.project_id, chat_id=chat_id)
         if not ctx:
             return text
@@ -948,6 +952,8 @@ class BaseHandler:
             bridge.to_mode.value,
             len(injection),
         )
+        if stripped.startswith("/") or stripped.startswith("$"):
+            return f"{stripped}\n\n{injection}"
         return f"{injection}\n\n{text}"
 
     # ------------------------------------------------------------------

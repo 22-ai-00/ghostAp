@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from ..trust.models import EffectiveTrust
 
 
+from ..acp.native_commands import is_blocked_native_command, parse_slash_command
 from ..agent.intent_recognizer import IntentType
 from ..card.ui_text import UI_TEXT
 from ..mode import PROGRAMMING_MODE_VALUES
@@ -125,25 +126,65 @@ class MessageDispatcher:
             self.system.exit_current_mode(message_id, chat_id, project=project)
             return
 
-        # Request-scoped slash parsing: direct system commands must not fall
-        # through to intent recognition, which can be slow or ambiguous.
-        if self.system.is_interceptable_command_match(command_match):
-            if not current_dispatch_allowed():
-                return
-            self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
-            return
-
-        if command_match is not None:
-            if not current_dispatch_allowed():
-                return
-            self.system.handle_intercepted_command(
-                message_id,
-                chat_id,
-                text,
-                project,
-                command_match=command_match,
+        # Request-scoped slash parsing:
+        # - In active programming mode, only GhostAP control commands are intercepted;
+        #   native tool slash commands (including `/goal` or `/swarm`, `/compact`, `/review`)
+        #   pass directly through to the active coding backend.
+        # - Outside programming mode, intercept catalog/compatibility commands first, then
+        #   check whether an unrecognized `/command` belongs uniquely/preferredly to a tool.
+        if is_in_programming:
+            is_control = (
+                command_match is not None
+                and hasattr(self.system, "is_ghostap_control_command")
+                and self.system.is_ghostap_control_command(command_match, in_programming_mode=True)
             )
-            return
+            if is_control:
+                if not current_dispatch_allowed():
+                    return
+                self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
+                return
+            if is_blocked_native_command(text):
+                if not current_dispatch_allowed():
+                    return
+                parsed_blocked = parse_slash_command(text)
+                blocked_name = parsed_blocked[0] if parsed_blocked else (text or "").lstrip("/").split(maxsplit=1)[0].casefold()
+                self.base.reply_error(
+                    message_id,
+                    UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
+                )
+                return
+        else:
+            if self.system.is_interceptable_command_match(command_match):
+                if not current_dispatch_allowed():
+                    return
+                self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
+                return
+
+            if command_match is not None:
+                if not current_dispatch_allowed():
+                    return
+                self.system.handle_intercepted_command(
+                    message_id,
+                    chat_id,
+                    text,
+                    project,
+                    command_match=command_match,
+                )
+                return
+
+            if parse_slash_command(text) is not None:
+                if not current_dispatch_allowed():
+                    return
+                if (
+                    self.system.try_dispatch_smart_native_command(
+                        message_id,
+                        chat_id,
+                        text,
+                        project,
+                    )
+                    is True
+                ):
+                    return
 
         # Programming mode: exit or forward to active session
         if is_in_programming:

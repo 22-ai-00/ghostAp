@@ -63,6 +63,8 @@ REFRESH_ACP_MODELS = "refresh_acp_models"
 SELECT_ACP_MODEL_GROUP = "select_acp_model_group"
 SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"
 SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"
+SHOW_TOOL_COMMANDS = "show_tool_commands"
+RUN_NATIVE_TOOL_COMMAND = "run_native_tool_command"
 
 # ---------------------------------------------------------------------------
 # Global / status actions

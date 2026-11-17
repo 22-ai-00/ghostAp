@@ -23,6 +23,7 @@ from ...acp import (
 )
 from ...acp.collaboration import AuthoritativeChildLifecycleProof
 from ...acp.manager import ACPSessionManager
+from ...acp.native_commands import parse_slash_command
 from ...acp.outcome import IncompleteToolTrace, PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
@@ -1936,20 +1937,39 @@ class ProgrammingModeHandler(BaseHandler):
                 else result_text or streamed_response
             )
             if prompt_outcome is PromptOutcome.COMPLETED:
+                parsed_native = parse_slash_command((text or "").splitlines()[0] if text else "")
+                native_summary = ""
+                if parsed_native is not None and not streamed_response and not result_text:
+                    native_cmd_name = f"/{parsed_native[0]}"
+                    tool_call_count = len(getattr(result, "tool_calls", None) or [])
+                    if tool_call_count > 0:
+                        native_summary = UI_TEXT["mode_native_cmd_complete_with_tools"].format(
+                            command=native_cmd_name,
+                            tool_count=tool_call_count,
+                        )
+                    else:
+                        native_summary = UI_TEXT["mode_native_cmd_complete"].format(
+                            command=native_cmd_name,
+                        )
+                    usage_info = getattr(result, "usage", None)
+                    if usage_info is not None and getattr(usage_info, "size", 0) > 0:
+                        pct = int(round((usage_info.used / usage_info.size) * 100))
+                        native_summary += f" · 上下文 {usage_info.used:,}/{usage_info.size:,} ({pct}%)"
+                summary_text = result_text or native_summary
                 if (
                     prog_session is not None
-                    and result_text
+                    and summary_text
                     and not streamed_response
                 ):
-                    prog_session.set_result_conclusion_fallback(result_text)
+                    prog_session.set_result_conclusion_fallback(summary_text)
                 if (
                     prog_session is not None
                     and not streamed_response
-                    and result_text
+                    and summary_text
                     and not prog_session.get_conclusion_text().strip()
                 ):
-                    prog_session.on_text(result_text)
-                final_response = response_text or UI_TEXT["mode_exec_complete"]
+                    prog_session.on_text(summary_text)
+                final_response = response_text or native_summary or UI_TEXT["mode_exec_complete"]
                 if prog_session is not None:
                     if reconciled_stale_children:
                         prog_session.finish(

@@ -293,7 +293,12 @@ def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> No
             "tool_name": "codex",
             "project_id": "project-3",
             "current_model": "gpt-5.6-sol/high",
-        }
+        },
+        {
+            "action": action_ids.SHOW_TOOL_COMMANDS,
+            "tool_name": "codex",
+            "project_id": "project-3",
+        },
     ]
 
     failed_card = _card(

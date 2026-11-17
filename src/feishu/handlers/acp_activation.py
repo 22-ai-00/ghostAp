@@ -1260,12 +1260,19 @@ class ACPActivationMixin:
                         session = effect_session
 
                     if explicit_card:
+                        live_cmds = None
+                        cmds_getter = getattr(session, "get_available_commands", None)
+                        if callable(cmds_getter):
+                            raw_live_cmds = cmds_getter()
+                            if isinstance(raw_live_cmds, (list, tuple)):
+                                live_cmds = raw_live_cmds
                         _msg_type, ready_content = (
                             _system_module().SystemBuilder.build_acp_programming_ready_card(
                                 tool,
                                 activation_model,
                                 project_id,
                                 thread_root_id,
+                                live_commands=live_cmds,
                             )
                         )
                         _replace_status_card(ready_content)

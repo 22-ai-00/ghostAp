@@ -6,6 +6,11 @@ import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
+from src.acp.native_commands import (
+    get_featured_native_commands,
+    get_zero_arg_quick_commands,
+    normalize_acp_available_commands,
+)
 from src.card.error_diagnostics import register_error_diagnostic
 from src.utils.errors import GhostAPError, get_error_detail
 
@@ -1029,6 +1034,8 @@ class SystemBuilder:
         model_name: Optional[str],
         project_id: Optional[str] = None,
         thread_root_id: Optional[str] = None,
+        *,
+        live_commands: Optional[Sequence] = None,
     ) -> tuple[str, str]:
         """Build the final frame after the selected ACP session is ready."""
         tool = str(tool_name or "").strip().lower()
@@ -1039,12 +1046,25 @@ class SystemBuilder:
             "project_id": project_id,
             "current_model": model_name,
         }
+        cmds_value = {
+            "action": action_ids.SHOW_TOOL_COMMANDS,
+            "tool_name": tool,
+            "project_id": project_id,
+        }
         if thread_root_id:
             switch_value["thread_root_id"] = thread_root_id
+            cmds_value["thread_root_id"] = thread_root_id
+
+        body_lines = [UI_TEXT["system_acp_programming_ready_body"].format(model=model)]
+        featured = get_featured_native_commands(tool, live_commands=live_commands, limit=4)
+        if featured:
+            examples = " · ".join(f"`/{cmd.name}`" for cmd in featured)
+            body_lines.append(UI_TEXT["system_acp_ready_native_hint"].format(examples=examples))
+
         elements = [
             {
                 "tag": "markdown",
-                "content": UI_TEXT["system_acp_programming_ready_body"].format(model=model),
+                "content": "\n".join(body_lines),
             },
             {"tag": "hr"},
             *build_responsive_layout(
@@ -1052,7 +1072,12 @@ class SystemBuilder:
                     SystemBuilder._callback_button(
                         text=UI_TEXT["system_acp_switch_model_btn"],
                         action=switch_value,
-                    )
+                    ),
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_native_cmds_btn"],
+                        action=cmds_value,
+                        button_type="primary",
+                    ),
                 ],
                 layout="mobile",
             ),
@@ -1064,6 +1089,82 @@ class SystemBuilder:
         )
         card["config"]["summary"] = {
             "content": "编程模式已就绪，打开卡片查看当前模型"
+        }
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_tool_native_commands_card(
+        tool_name: str,
+        commands: Sequence,
+        *,
+        source: str = "static",
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build a card showcasing native slash commands & skills for a coding tool."""
+        tool = str(tool_name or "").strip().lower() or "tool"
+        normalized = normalize_acp_available_commands(commands)
+        source_key = "system_tool_cmds_source_live" if source == "live" else "system_tool_cmds_source_static"
+        elements: list[dict] = [
+            {
+                "tag": "markdown",
+                "content": UI_TEXT[source_key].format(count=len(normalized)),
+            }
+        ]
+        if not normalized:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": UI_TEXT["system_tool_cmds_empty"].format(tool=tool),
+                }
+            )
+        else:
+            quick_cmds = get_zero_arg_quick_commands(normalized, limit=6)
+            if quick_cmds:
+                elements.append({"tag": "markdown", "content": UI_TEXT["system_tool_cmds_quick_header"]})
+                quick_buttons = []
+                for idx, cmd in enumerate(quick_cmds):
+                    payload = {
+                        "action": action_ids.RUN_NATIVE_TOOL_COMMAND,
+                        "tool_name": tool,
+                        "command": f"/{cmd.name}",
+                        "project_id": project_id,
+                    }
+                    if thread_root_id:
+                        payload["thread_root_id"] = thread_root_id
+                    quick_buttons.append(
+                        SystemBuilder._callback_button(
+                            text=f"▶ /{cmd.name}",
+                            action=payload,
+                            button_type="primary" if idx == 0 else "default",
+                        )
+                    )
+                elements.extend(build_responsive_layout(quick_buttons, layout="mobile"))
+
+            elements.append({"tag": "hr"})
+            list_lines = [UI_TEXT["system_tool_cmds_list_header"]]
+            display_limit = 14
+            for cmd in normalized[:display_limit]:
+                usage = f"/{cmd.name} {cmd.input_hint}".strip() if cmd.input_hint else f"/{cmd.name}"
+                desc = f" — {cmd.description}" if cmd.description else ""
+                list_lines.append(f"• `{usage}`{desc}")
+            if len(normalized) > display_limit:
+                list_lines.append(f"• …及另外 {len(normalized) - display_limit} 条原生命令")
+            elements.append({"tag": "markdown", "content": "\n".join(list_lines)})
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='grey'>{UI_TEXT['system_tool_cmds_footer_hint'].format(tool=tool)}</font>",
+                }
+            )
+
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_tool_cmds_title"].format(tool=tool.capitalize()),
+            "blue",
+            elements,
+        )
+        card["config"]["summary"] = {
+            "content": f"{tool.capitalize()} 原生命令与 Skills"
         }
         return "interactive", json.dumps(card, ensure_ascii=False)
 

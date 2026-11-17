@@ -2326,12 +2326,33 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             except (AttributeError, KeyError):
                 project_id = None
 
+        in_programming_mode = False
+        if managed_group is None:
+            if thread_ctx is not None and getattr(thread_ctx, "mode", None) in PROGRAMMING_MODE_VALUES:
+                in_programming_mode = True
+            else:
+                try:
+                    mode_check = self._mode_manager.is_programming_mode(
+                        chat_id,
+                        project_id=project_id,
+                    )
+                    in_programming_mode = mode_check is True
+                except (AttributeError, KeyError, TypeError):
+                    in_programming_mode = False
+
+        has_leading_slash = bool(
+            text and (text.lstrip().startswith("/") or SystemHandler.is_exit_command(text))
+        )
         is_system = bool(
-            text and (text.startswith("/") or SystemHandler.is_exit_command(text))
+            text
+            and SystemHandler.is_fast_lane_system_command(
+                text,
+                in_programming_mode=in_programming_mode,
+            )
         )
         is_shell_fast = (
             False
-            if is_system
+            if has_leading_slash
             else SystemHandler.is_likely_shell_command(text)
         )
         is_spec = SystemHandler.is_spec_command(text) if text else False

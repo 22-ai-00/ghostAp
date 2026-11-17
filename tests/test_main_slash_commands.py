@@ -23,6 +23,7 @@ EXPECTED_PANEL_COMMANDS = {
     "/dsh",
     "/agy",
     "/model",
+    "/cmds",
     "/exit",
     "/projects",
     "/new",
@@ -39,7 +40,7 @@ def test_slash_panel_is_trimmed_to_common_commands() -> None:
     discoverable = {action.command for action in get_slash_discoverable_actions()}
 
     assert discoverable == EXPECTED_PANEL_COMMANDS
-    assert len(discoverable) == 20
+    assert len(discoverable) == 21
     # MAIN_AGENT_COMMANDS is a pure projection of the discoverable set.
     assert registered == discoverable
 

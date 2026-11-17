@@ -179,6 +179,25 @@ class ACPSessionState:
             last_active=data.get("last_active", time.time()),
         )
 
+@dataclass(frozen=True)
+class ACPAvailableCommand:
+    """Slash command advertised by an ACP backend via AvailableCommandsUpdate."""
+
+    name: str
+    description: str = ""
+    input_hint: str = ""
+
+
+@dataclass(frozen=True)
+class ACPUsageInfo:
+    """Latest context window and cost snapshot reported via UsageUpdate."""
+
+    used: int = 0
+    size: int = 0
+    cost_amount: float | None = None
+    cost_currency: str | None = None
+
+
 @dataclass
 class PromptResult:
     """Result of a prompt sent via ACP."""
@@ -193,6 +212,7 @@ class PromptResult:
     output_tokens: Optional[int] = None  # Output token count for discussion budget tracking
     goal: ACPGoalInfo | None = None
     cancellation_source: str | None = None
+    usage: ACPUsageInfo | None = None
 
     # ---- aggregation helpers ----
     def add_text(self, chunk: str) -> None:
