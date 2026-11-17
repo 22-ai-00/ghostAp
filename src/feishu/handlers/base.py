@@ -579,6 +579,27 @@ class BaseHandler:
             logger.error("reply_card 异常: %s", e, exc_info=True)
             return None
 
+    def reply_interactive_card(
+        self,
+        message_id: str,
+        card_content,
+        *,
+        msg_type: str = "interactive",
+        reply_in_thread: Optional[bool] = None,
+    ) -> Optional[str]:
+        """Compatibility wrapper delivering interactive cards (or fallback text) via BaseHandler."""
+        if msg_type == "text":
+            return self.reply_text(
+                message_id,
+                str(card_content),
+                reply_in_thread=reply_in_thread,
+            )
+        return self.reply_card(
+            message_id,
+            card_content,
+            reply_in_thread=reply_in_thread,
+        )
+
     def update_card(self, message_id: str, card_content) -> bool:
         """Update an existing card message in-place.
 

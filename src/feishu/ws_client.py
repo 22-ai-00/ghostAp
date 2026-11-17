@@ -2973,16 +2973,16 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             logger.warning("处理消息超时: %s", get_error_detail(e))
             try:
                 self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_message_timeout"])
-            except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+            except (RuntimeError, OSError, TimeoutError, TypeError, ValueError, AttributeError, LookupError):
                 classify_ws_error(RuntimeError("reply timeout failed"), phase="dispatch")
                 logger.debug("failed to reply timeout message", exc_info=True)
-        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as e:
+        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError, AttributeError, LookupError) as e:
             classification = classify_ws_error(e, phase="dispatch")
             if classification.action == WSErrorAction.REPLY_INTERNAL_ERROR:
                 logger.error("处理消息异常: %s", get_error_detail(e), exc_info=True)
                 try:
                     self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_message_internal_error"])
-                except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+                except (RuntimeError, OSError, TimeoutError, TypeError, ValueError, AttributeError, LookupError):
                     classify_ws_error(RuntimeError("reply internal error failed"), phase="best_effort_notify")
                     logger.debug("failed to reply internal error message", exc_info=True)
             elif classification.action == WSErrorAction.LOG_AND_CONTINUE:

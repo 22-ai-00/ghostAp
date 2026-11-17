@@ -495,7 +495,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             project_id=self._project_id(project),
             thread_root_id=thread_root_id,
         )
-        self.reply_interactive_card(origin_message_id or message_id, card, msg_type=msg_type)
+        target_mid = origin_message_id or message_id
+        if msg_type == "text":
+            self.reply_text(target_mid, card)
+        else:
+            self.reply_card(target_mid, card)
 
     def handle_show_tool_commands(
         self,

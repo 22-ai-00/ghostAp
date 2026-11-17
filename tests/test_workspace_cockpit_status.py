@@ -60,6 +60,16 @@ def test_workspace_cockpit_status_and_git_branch_and_buttons(tmp_path) -> None:
         ),
     )
 
+    sent_replies: list[tuple[str, str, str]] = []
+    im_client = SimpleNamespace(
+        reply_message=lambda mid, content, msg_type="text", **_kw: (
+            sent_replies.append((mid, msg_type, content))
+            or SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id=f"om_reply_{len(sent_replies)}"),
+            )
+        )
+    )
     diag = object.__new__(DiagnosticsHandler)
     diag.ctx = SimpleNamespace(
         mode_manager=SimpleNamespace(
@@ -72,15 +82,26 @@ def test_workspace_cockpit_status_and_git_branch_and_buttons(tmp_path) -> None:
         workflow_engine_manager=SimpleNamespace(list_engines=lambda _c: [wf_engine]),
         chat_lock_manager=None,
         repo_lock_manager=None,
+        settings=SimpleNamespace(default_reply_mode="reply", ref_note_enabled=False),
+        im_client=im_client,
+        project_manager=SimpleNamespace(get_project_for_diagnostics=lambda _pid: project),
+        message_linker=SimpleNamespace(
+            resolve_origin=lambda mid: mid,
+            get_request_id=lambda _mid: "req_1",
+            ensure_request_id=lambda _mid, **_kw: "req_1",
+            register_origin=lambda *_a, **_kw: None,
+            get_binding=lambda _mid: None,
+            link_reply_message=lambda *_a, **_kw: None,
+            link_reply=lambda *_a, **_kw: None,
+        ),
     )
-    diag.reply_interactive_card = MagicMock()
-    diag.reply_card = MagicMock()
-    diag.reply_text = MagicMock()
+    diag.im_client = im_client
     diag.get_working_dir = lambda _c: str(repo)
 
     diag.show_unified_status("m1", "chat-1", "/status", project)
-    diag.reply_interactive_card.assert_called_once()
-    card = json.loads(diag.reply_interactive_card.call_args[0][1])
+    assert len(sent_replies) == 1
+    assert sent_replies[0][:2] == ("m1", "interactive")
+    card = json.loads(sent_replies[0][2])
     assert card["schema"] == "2.0"
     dump = json.dumps(card, ensure_ascii=False)
     assert "feat/cockpit" in dump
@@ -110,8 +131,9 @@ def test_workspace_cockpit_status_and_git_branch_and_buttons(tmp_path) -> None:
 
     # /status <wf_id> shows Workflow task detail card
     diag._show_task_detail("m2", "chat-1", "wf_91a2c3", project)
-    diag.reply_card.assert_called_once()
-    assert "build-api" in diag.reply_card.call_args[0][1]
+    assert len(sent_replies) == 2
+    assert sent_replies[1][:2] == ("m2", "interactive")
+    assert "build-api" in sent_replies[1][2]
 
 
 def test_universal_info_command_delegates_based_on_mode() -> None:
@@ -135,3 +157,81 @@ def test_universal_info_command_delegates_based_on_mode() -> None:
     system._resolve_active_programming_mode_key.return_value = None
     system.handle_info_command("m2", "chat-1", project)
     diag_handler.show_unified_status.assert_called_once_with("m2", "chat-1", "/status", project)
+
+
+def test_base_handler_reply_interactive_card_dispatches_card_and_text() -> None:
+    from src.feishu.handlers.base import BaseHandler
+
+    calls: list[tuple[str, str, object]] = []
+    handler = object.__new__(BaseHandler)
+    handler.reply_card = lambda mid, card, reply_in_thread=None: (
+        calls.append(("card", mid, card)) or "om_card"
+    )
+    handler.reply_text = lambda mid, txt, reply_in_thread=None: (
+        calls.append(("text", mid, txt)) or "om_text"
+    )
+
+    assert handler.reply_interactive_card("m1", '{"schema":"2.0"}') == "om_card"
+    assert handler.reply_interactive_card("m2", "plain fallback", msg_type="text") == "om_text"
+    assert calls == [
+        ("card", "m1", '{"schema":"2.0"}'),
+        ("text", "m2", "plain fallback"),
+    ]
+
+
+def test_ws_client_dispatch_surfaces_attribute_and_lookup_errors(monkeypatch) -> None:
+    from src.card.ui_text import UI_TEXT
+    from src.feishu.ws_client import FeishuWSClient
+
+    for err in (AttributeError("missing method"), KeyError("missing key")):
+        replies: list[tuple[str, str]] = []
+        ws = object.__new__(FeishuWSClient)
+        ws.settings = SimpleNamespace(thread_programming_enabled=False)
+        ws._extract_canonical_ingress_facts = lambda _d: ("m_err", "oc_err", "p2p", "ou_1")
+        ws._validate_message = lambda *_a, **_kw: True
+        ws._parse_message_content = lambda _m: ("/status", False)
+        ws._build_route_decision = lambda *_a, **_kw: SimpleNamespace(
+            trusted_project=None,
+            auto_enter_mode=None,
+            effective_trust=None,
+            command_match=None,
+        )
+        ws._project_manager = SimpleNamespace(
+            get_active_project=lambda _c: None,
+            get_project_for_chat=lambda *_a, **_kw: None,
+        )
+        ws._current_trust_can_dispatch = lambda *_a, **_kw: True
+        ws._pending_image_lock = __import__("threading").Lock()
+        ws._pending_image_only = set()
+        ws._pending_image_keys = {}
+        ws._handler_ctx = SimpleNamespace(
+            handlers={
+                "coco": SimpleNamespace(
+                    reply_text=lambda mid, txt: replies.append((mid, txt)),
+                    ensure_request_id=lambda mid, **_kw: f"req_{mid}",
+                )
+            }
+        )
+        ws._dispatch_message_logic = MagicMock(side_effect=err)
+        ws._message_ingress_guard = MagicMock()
+
+        event = SimpleNamespace(
+            event=SimpleNamespace(
+                sender=SimpleNamespace(
+                    sender_id=SimpleNamespace(open_id="ou_1", union_id="on_1", user_id="u_1"),
+                    sender_type="user",
+                ),
+                message=SimpleNamespace(
+                    message_id="m_err",
+                    chat_id="oc_err",
+                    chat_type="p2p",
+                    message_type="text",
+                    content='{"text":"/status"}',
+                    root_id=None,
+                    parent_id=None,
+                    mentions=[],
+                ),
+            )
+        )
+        ws._process_message_async(event)
+        assert replies == [("m_err", UI_TEXT["ws_message_internal_error"])]

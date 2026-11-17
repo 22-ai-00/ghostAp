@@ -371,7 +371,10 @@ class DiagnosticsHandler(BaseHandler):
             lock_lines=lock_lines,
             include_done=include_done,
         )
-        self.reply_interactive_card(message_id, card_content, msg_type=msg_type)
+        if msg_type == "text":
+            self.reply_text(message_id, card_content)
+        else:
+            self.reply_card(message_id, card_content)
 
     def _show_task_detail(
         self, message_id: str, chat_id: str, task_id: str, project: Optional["ProjectContext"] = None
