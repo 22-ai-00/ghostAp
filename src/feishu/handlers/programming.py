@@ -9,31 +9,16 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from ...acp import (
-    ACPEventRenderer,
-    run_prompt_across_execution_windows,
-    run_prompt_with_continuation,
-)
-from ...acp.collaboration import AuthoritativeChildLifecycleProof
 from ...acp.manager import ACPSessionManager
-from ...acp.native_commands import parse_slash_command
-from ...acp.outcome import IncompleteToolTrace, PromptAssessment, PromptOutcome
-from ...acp.providers import normalize_acp_model_name
-from ...acp.swarm_lifecycle import is_swarm_working_event
-from ...agent_session import SyncSession
 from ...card.actions import dispatch as card_action_ids
-from ...card.builders.core import CoreBuilder
-from ...card.builders.project import ProjectBuilder
-from ...card.builders.system import SystemBuilder
-from ...card.hooks import EmojiHook
-from ...card.session.config import SessionCallbacks
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, InteractionMode
 from ...project import ContextSourceMode
@@ -43,7 +28,29 @@ from ..message_formatter import FeishuMessageFormatter as fmt
 from .base import BaseHandler
 
 if TYPE_CHECKING:
+    from ...acp.collaboration import AuthoritativeChildLifecycleProof
+    from ...acp.outcome import PromptAssessment
+    from ...agent_session import SyncSession
+    from ...card.session.config import SessionCallbacks
     from ...project import ProjectContext
+
+
+def __getattr__(name: str) -> Any:
+    if name == "AuthoritativeChildLifecycleProof":
+        from ...acp.collaboration import AuthoritativeChildLifecycleProof
+
+        globals()["AuthoritativeChildLifecycleProof"] = AuthoritativeChildLifecycleProof
+        return AuthoritativeChildLifecycleProof
+    if name in ("run_prompt_across_execution_windows", "run_prompt_with_continuation"):
+        from ...acp import (
+            run_prompt_across_execution_windows,
+            run_prompt_with_continuation,
+        )
+
+        globals()["run_prompt_across_execution_windows"] = run_prompt_across_execution_windows
+        globals()["run_prompt_with_continuation"] = run_prompt_with_continuation
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 logger = logging.getLogger(__name__)
 _MODEL_OVERRIDE_UNSET = object()
@@ -273,6 +280,8 @@ def _log_final_unresolved_tool_trace(
     """Log Codex-only correlation data once the handler kept the failure."""
     if str(mode_name or "").strip().casefold() != "codex":
         return
+    from ...acp.outcome import IncompleteToolTrace
+
     trace = tuple(
         observation
         for observation in assessment.incomplete_tool_traces
@@ -338,6 +347,8 @@ def _has_reconciled_stale_child_history(
         return False
     if getattr(execution, "window_limit_reached", False):
         return False
+    from ...acp.outcome import PromptOutcome
+
     assessment = execution.assessment
     if (
         assessment.outcome is not PromptOutcome.INCOMPLETE
@@ -377,6 +388,9 @@ def build_programming_session_callbacks(
     chat_id: str,
 ) -> SessionCallbacks:
     """Build callbacks for normal programming CardSession lifecycle."""
+    from ...card.hooks import EmojiHook
+    from ...card.session.config import SessionCallbacks
+
     return SessionCallbacks(
         reply_text_fn=reply_text_fn,
         hooks=(
@@ -925,6 +939,9 @@ class ProgrammingModeHandler(BaseHandler):
                 self._deactivate_other_project_modes(project)
                 self._set_mode_on_project(project, True, session.session_id)
             if not silent:
+                from ...card.builders.core import CoreBuilder
+                from ...card.builders.project import ProjectBuilder
+
                 content = UI_TEXT["mode_enter_msg"].format(emoji=self.mode_emoji, name=self.mode_name)
 
                 banner = CoreBuilder._build_banner_element(UI_TEXT["mode_enter_banner"].format(name=self.mode_name), type="success")
@@ -980,11 +997,12 @@ class ProgrammingModeHandler(BaseHandler):
         """
         project_id = project.project_id if project else None
         mgr = self._get_session_manager()
-        backend_model_name = (
-            model_name
-            if self.mode_key == "traex"
-            else normalize_acp_model_name(self.mode_key, model_name)
-        )
+        if self.mode_key == "traex":
+            backend_model_name = model_name
+        else:
+            from ...acp.providers import normalize_acp_model_name
+
+            backend_model_name = normalize_acp_model_name(self.mode_key, model_name)
         if backend_model_name != model_name:
             logger.info(
                 "[%s] Normalized selected model for backend: selected=%s backend=%s",
@@ -1173,6 +1191,9 @@ class ProgrammingModeHandler(BaseHandler):
                         )
                         banner_type = "info"
                         card_title = UI_TEXT["mode_exit_card_title"]
+
+                    from ...card.builders.core import CoreBuilder
+                    from ...card.builders.project import ProjectBuilder
 
                     banner = CoreBuilder._build_banner_element(
                         banner_text,
@@ -1719,7 +1740,14 @@ class ProgrammingModeHandler(BaseHandler):
         _finalization_task_text: str | None = None,
     ) -> None:
         """Run one automatic ACP task, independent of its output transport."""
+        from ...acp import ACPEventRenderer
         from ...acp.models import ACPEventType
+        from ...acp.native_commands import parse_slash_command
+        from ...acp.outcome import PromptOutcome
+        from ...acp.swarm_lifecycle import is_swarm_working_event
+        from ...card.builders.project import ProjectBuilder
+        from ...card.builders.system import SystemBuilder
+        from ...card.hooks import EmojiHook
         from ...repo_lock import get_repo_lock_heartbeat_interval
         from ...tasking import get_current_task_run_id
         from ...thread import get_current_thread_id
@@ -1749,7 +1777,8 @@ class ProgrammingModeHandler(BaseHandler):
         image_keys: list[str] = []
         seen_image_ids: set[str] = set()
         image_failures = [0]
-        child_lifecycle_proof = AuthoritativeChildLifecycleProof()
+        mod = sys.modules[__name__]
+        child_lifecycle_proof = getattr(mod, "AuthoritativeChildLifecycleProof")()
         swarm_working_notified = [False]
         swarm_completed_flag = [False]
         active_run = self._get_active_programming_run(chat_id, project)
@@ -1854,7 +1883,7 @@ class ProgrammingModeHandler(BaseHandler):
             active_session[0] = window_session
             if active_run is not None:
                 active_run.session = window_session
-            return run_prompt_with_continuation(
+            return getattr(mod, "run_prompt_with_continuation")(
                 window_session,
                 window_prompt,
                 on_event=on_event,
@@ -1928,7 +1957,7 @@ class ProgrammingModeHandler(BaseHandler):
                 prog_session.begin_continuation_turn()
 
         try:
-            execution = run_prompt_across_execution_windows(
+            execution = getattr(mod, "run_prompt_across_execution_windows")(
                 session,
                 text,
                 task_scope=_finalization_task_text,
@@ -2359,6 +2388,8 @@ class ProgrammingModeHandler(BaseHandler):
         info = self._get_session_manager().get_session_info(chat_id, project_id=project_id, thread_id=thread_id)
         if info:
             if project:
+                from ...card.builders.project import ProjectBuilder
+
                 msg_type, card_content = ProjectBuilder.build_project_response_card(
                     project,
                     UI_TEXT["mode_session_info_title"].format(name=self.mode_name),

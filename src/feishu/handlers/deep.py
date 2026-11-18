@@ -7,11 +7,6 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from ...card.builders.deep import DeepBuilder
-from ...card.builders.project import ProjectBuilder
-from ...card.models import EngineCardState
-from ...deep_engine.models import DeepProjectStatus
-from ...utils.command_parser import CommandParser
 from ...utils.errors import get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
@@ -30,10 +25,19 @@ class DeepHandler(BaseEngineHandler):
 
     def __init__(self, ctx: "HandlerContext", renderer: "RendererProtocol | None" = None) -> None:
         super().__init__(ctx)
-        if renderer is None:
+        self._renderer: "RendererProtocol | None" = renderer
+
+    @property
+    def renderer(self) -> "RendererProtocol":
+        if self._renderer is None:
             from ..renderers import get_renderer
-            renderer = get_renderer("deep", self)
-        self.renderer = renderer
+
+            self._renderer = get_renderer("deep", self)
+        return self._renderer
+
+    @renderer.setter
+    def renderer(self, value: "RendererProtocol") -> None:
+        self._renderer = value
 
     def _get_engine_manager(self):
         return self.ctx.deep_engine_manager
@@ -66,6 +70,8 @@ class DeepHandler(BaseEngineHandler):
     # Command router
     # ------------------------------------------------------------------
     def handle_deep_command(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+        from ...utils.command_parser import CommandParser
+
         cmd = CommandParser.parse_basic(text)
         command = cmd.command
         arg = cmd.args
@@ -211,6 +217,11 @@ class DeepHandler(BaseEngineHandler):
         self.renderer.render_deep_status(message_id, chat_id, project, origin_message_id)
 
     def show_deep_board(self, message_id: str, chat_id: str):
+        from ...card.builders.deep import DeepBuilder
+        from ...card.builders.project import ProjectBuilder
+        from ...card.models import EngineCardState
+        from ...deep_engine.models import DeepProjectStatus
+
         engines = self.ctx.deep_engine_manager.list_engines(chat_id)
         candidates = []
         for e in engines:
@@ -339,6 +350,9 @@ class DeepHandler(BaseEngineHandler):
                 project = self.project_manager.find_project_by_path(engine.root_path, chat_id=chat_id)
             except Exception:
                 project = None
+
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
 
         _msg_type, card_content = DeepBuilder.build_info_card(
             project,

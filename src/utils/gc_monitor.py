@@ -3,16 +3,28 @@ import logging
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from .errors import get_error_detail
 
-try:
-    import psutil
-except Exception:  # pragma: no cover - exercised via monkeypatch in tests
-    psutil = None  # type: ignore[assignment]
-
 logger = logging.getLogger(__name__)
+
+
+def _get_psutil() -> Any:
+    if "psutil" in globals():
+        return globals()["psutil"]
+    try:
+        import psutil as _psutil
+    except Exception:  # pragma: no cover - exercised via monkeypatch in tests
+        _psutil = None  # type: ignore[assignment]
+    globals()["psutil"] = _psutil
+    return _psutil
+
+
+def __getattr__(name: str) -> Any:
+    if name == "psutil":
+        return _get_psutil()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class GCMonitor:
@@ -42,12 +54,13 @@ class GCMonitor:
                 return
             self._last_mem_check = now
 
-        if psutil is None:
+        psutil_mod = _get_psutil()
+        if psutil_mod is None:
             logger.debug("[%s] psutil unavailable, skip memory monitoring", label)
             return
 
         try:
-            process = psutil.Process(os.getpid())
+            process = psutil_mod.Process(os.getpid())
             mem_percent = process.memory_percent()
 
             if mem_percent > self._memory_threshold_percent:

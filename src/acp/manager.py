@@ -7,17 +7,19 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
-from ..agent_session import SyncClaudeCLISession, SyncSession
 from ..config import get_settings
 from ..utils.errors import get_error_detail
 from . import startup_utils as _startup_utils
-from .helper import SessionKeyCodec
+from .session_keys import SessionKeyCodec
 from .telemetry import (
     IdleHealthConfig,
     resolve_idle_health_collaborators_for_manager,
 )
+
+if TYPE_CHECKING:
+    from ..agent_session import SyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,12 @@ def __getattr__(name: str):
 
         globals()["SyncACPSession"] = SyncACPSession
         return SyncACPSession
+    if name in ("SyncClaudeCLISession", "SyncSession"):
+        from ..agent_session import SyncClaudeCLISession, SyncSession
+
+        globals()["SyncClaudeCLISession"] = SyncClaudeCLISession
+        globals()["SyncSession"] = SyncSession
+        return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 @dataclass(frozen=True)
 class SessionReplacementResult:
@@ -236,12 +244,13 @@ class ACPSessionManager:
                     self._closing_sessions.pop(key, None)
     def _build_startup_coordinator(self) -> _startup_utils.SessionStartupCoordinator:
         sync_acp_session_cls = getattr(sys.modules[__name__], "SyncACPSession")
+        sync_claude_cli_session_cls = getattr(sys.modules[__name__], "SyncClaudeCLISession")
         return _startup_utils.SessionStartupCoordinator(
             manager_agent_type=self._agent_type,
             session_starter=self._session_starter,
             session_telemetry=self._session_telemetry,
             sync_acp_session_cls=sync_acp_session_cls,
-            sync_claude_cli_session_cls=SyncClaudeCLISession,
+            sync_claude_cli_session_cls=sync_claude_cli_session_cls,
             get_settings_fn=get_settings,
         )
     def _ensure_keepalive_started_unlocked(self) -> None:

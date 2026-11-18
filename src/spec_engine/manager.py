@@ -4,8 +4,6 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from ..engine_base import BaseEngineManager
-from .models import SpecProject
-from .storage import state_path_candidates
 
 if TYPE_CHECKING:
     from .engine import SpecEngine
@@ -110,6 +108,8 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
         if not seed_engine.settings.spec_allow_resume_from_disk:
             return seed_engine
 
+        from .storage import state_path_candidates
+
         return self._load_or_create_from_state_paths(
             chat_id,
             root_path,
@@ -161,6 +161,8 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
 
         if persisted_project is not None and engine.project is None:
             try:
+                from .models import SpecProject
+
                 engine._project = SpecProject.from_dict(persisted_project)
                 engine._restore_runtime_context(runtime)
                 engine._resume_meta = {

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...card.text_stream import append_stream_text
 from ...utils.text import generate_task_id  # noqa: F401
-from ...workflow_engine.storage import workflow_scripts_dir  # noqa: F401
 from ..emoji import EmojiReaction
 from ..slash_command_parser import SlashCommandParser
 from .engine_base import BaseEngineHandler
@@ -20,6 +19,15 @@ from .engine_base import BaseEngineHandler
 if TYPE_CHECKING:
     from ...project import ProjectContext
     from ..handler_context import HandlerContext
+
+
+def __getattr__(name: str) -> Any:
+    if name == "workflow_scripts_dir":
+        from ...workflow_engine.storage import workflow_scripts_dir
+
+        globals()["workflow_scripts_dir"] = workflow_scripts_dir
+        return workflow_scripts_dir
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +157,6 @@ class WorkflowHandler(
 
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
-        # Workflow uses its own renderer (card JSON comes from WorkflowProgressRenderer)
-        from ...workflow_engine.renderer import WorkflowProgressRenderer  # noqa: F401
 
     # ------------------------------------------------------------------
     # Topic-engine free-text entry point

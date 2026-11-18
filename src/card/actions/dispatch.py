@@ -7,8 +7,10 @@ for CardSession injection.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from src.card.events import CardEvent, CardEventType
+if TYPE_CHECKING:
+    from src.card.events import CardEvent
 
 # ---------------------------------------------------------------------------
 # Spec engine actions
@@ -109,6 +111,8 @@ def build_common_action_registry() -> dict[str, Callable[[dict], CardEvent]]:
 
     Includes: mode toggle, generic engine stop.
     """
+    from src.card.events import CardEvent, CardEventType
+
     return {
         MODE_FULL: lambda p: CardEvent.mode_toggled(compact=False),
         MODE_COMPACT: lambda p: CardEvent.mode_toggled(compact=True),

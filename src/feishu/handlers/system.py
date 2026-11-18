@@ -3,28 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from ...acp.helper import (
-    invalidate_acp_model_cache,  # noqa: F401
-    is_programming_tool_available,
-    list_acp_tools,  # noqa: F401
-)
-from ...acp.native_commands import (
-    DEFAULT_TOOL_PRIORITY,
-    STATIC_TOOL_NATIVE_COMMANDS,
-    get_tool_native_commands,
-    is_blocked_native_command,
-    normalize_native_tool_key,
-    parse_slash_command,
-    resolve_smart_mode_native_command,
-)
-from ...acp.providers import get_providers  # noqa: F401
 from ...card.backend_meta import VISIBLE_BACKEND_METAS, get_backend_meta
-from ...card.builders.project import ProjectBuilder
-from ...card.builders.system import SystemBuilder
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
 from ...tasking import TaskPriority, TaskSpec
@@ -43,6 +27,35 @@ if TYPE_CHECKING:
     from ..handler_context import HandlerContext
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    if name in (
+        "invalidate_acp_model_cache",
+        "is_programming_tool_available",
+        "list_acp_tools",
+    ):
+        from ...acp import helper as _acp_helper
+
+        val = getattr(_acp_helper, name)
+        globals()[name] = val
+        return val
+    if name == "get_providers":
+        from ...acp.providers import get_providers
+
+        globals()["get_providers"] = get_providers
+        return get_providers
+    if name == "SystemBuilder":
+        from ...card.builders.system import SystemBuilder
+
+        globals()["SystemBuilder"] = SystemBuilder
+        return SystemBuilder
+    if name == "ProjectBuilder":
+        from ...card.builders.project import ProjectBuilder
+
+        globals()["ProjectBuilder"] = ProjectBuilder
+        return ProjectBuilder
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass
@@ -277,6 +290,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         if not task_text:
             self._handle_direct_mode_enter(message_id, chat_id, mode_key, project)
             return
+        from ...acp.native_commands import is_blocked_native_command, parse_slash_command
+
         if is_blocked_native_command(task_text):
             parsed = parse_slash_command(task_text)
             blocked_name = parsed[0] if parsed else task_text.lstrip("/").split(maxsplit=1)[0].casefold()
@@ -354,6 +369,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         else:
             raw_arg = raw_input
 
+        from ...acp.native_commands import (
+            STATIC_TOOL_NATIVE_COMMANDS,
+            get_tool_native_commands,
+            normalize_native_tool_key,
+        )
+
         if raw_arg:
             token = raw_arg.split(maxsplit=1)[0]
             tool_name = normalize_native_tool_key(token)
@@ -376,6 +397,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             thread_root_id=thread_root_id,
         )
         commands, source = get_tool_native_commands(tool_name, live_commands=live_cmds)
+        from ...card.builders.system import SystemBuilder
+
         msg_type, card = SystemBuilder.build_tool_native_commands_card(
             tool_name,
             commands,
@@ -418,6 +441,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         value: dict,
     ) -> None:
         """Card callback executing a zero-arg native slash command on the target tool."""
+        from ...acp.native_commands import (
+            is_blocked_native_command,
+            normalize_native_tool_key,
+            parse_slash_command,
+        )
+
         tool_name = normalize_native_tool_key(str((value or {}).get("tool_name") or ""))
         command = str((value or {}).get("command") or "").strip()
         if command and not command.startswith("/"):
@@ -451,16 +480,23 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         project: Optional["ProjectContext"] = None,
     ) -> bool:
         """In SMART mode, auto-route unambiguous/preferred native slash commands to their tool."""
+        from ...acp.native_commands import (
+            DEFAULT_TOOL_PRIORITY,
+            parse_slash_command,
+            resolve_smart_mode_native_command,
+        )
+
         if parse_slash_command(text) is None:
             return False
 
+        is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
         cfg_project = self._configuration_project(chat_id, project)
         preferred_tool = getattr(cfg_project, "acp_tool_name", None) if cfg_project else None
 
         available_tools = [
             tool
             for tool in DEFAULT_TOOL_PRIORITY
-            if is_programming_tool_available(
+            if is_tool_available(
                 tool,
                 allow_sync_probe=False,
                 trigger_async_probe=True,
@@ -482,7 +518,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             # Retry sync probe only for matching candidates when cache was cold.
             probed_available = set(available_tools)
             for candidate in result.matched_tools:
-                if is_programming_tool_available(
+                if is_tool_available(
                     candidate,
                     allow_sync_probe=True,
                     trigger_async_probe=False,
@@ -884,6 +920,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         return None
 
     def handle_menu_command(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
+        from ...card.builders.system import SystemBuilder
+
         msg_type, card_content = SystemBuilder.build_command_menu_card(project)
         self.reply_card(message_id, card_content)
 
@@ -917,6 +955,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         except Exception:
             logger.debug("failed to check admin config", exc_info=True)
             _settings = None
+
+        from ...card.builders.system import SystemBuilder
 
         msg_type, card_content = SystemBuilder.build_help_card(
             project, category, current_dir, current_mode,
@@ -1138,6 +1178,13 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             self.reply_text(message_id, UI_TEXT["system_ask_usage"])
             return
 
+        from ...acp.native_commands import (
+            STATIC_TOOL_NATIVE_COMMANDS,
+            is_blocked_native_command,
+            normalize_native_tool_key,
+            parse_slash_command,
+        )
+
         token, question = parts[0].strip(), parts[1].strip()
         tool_name = normalize_native_tool_key(token)
         if tool_name not in STATIC_TOOL_NATIVE_COMMANDS and tool_name not in PROGRAMMING_MODE_VALUES:
@@ -1156,7 +1203,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             )
             return
 
-        if not is_programming_tool_available(
+        is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
+        if not is_tool_available(
             tool_name,
             allow_sync_probe=True,
             trigger_async_probe=False,
@@ -1206,6 +1254,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             answer = (getattr(result, "text", None) or "").strip() or UI_TEXT["mode_exec_complete"]
             meta = get_backend_meta(tool_name)
             tool_display = meta.display_name if meta else tool_name.capitalize()
+            from ...card.builders.project import ProjectBuilder
+
             _, card_content = ProjectBuilder.build_smart_response_card(
                 project=target_project,
                 title=UI_TEXT["system_ask_title"].format(tool=tool_display),
@@ -1304,6 +1354,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             lock_root_path = self.lock_helper.resolve_git_lock_root(working_dir)
 
         def _run_shell():
+            from ...card.builders.system import SystemBuilder
+
             executor = CommandExecutor()
             # Smart mode shell execution: disable interactive mode to avoid .bashrc noise and job control errors
             result = executor.execute(cmd, cwd=working_dir, interactive=False, chat_id=chat_id)
@@ -1380,6 +1432,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         if not path:
             self.add_reaction(message_id, EmojiReaction.on_dir_changed())
             if project:
+                from ...card.builders.project import ProjectBuilder
+
                 content = ProjectBuilder.build_project_info_content(project, current_dir)
                 msg_type, card_content = ProjectBuilder.build_project_response_card(
                     project,
@@ -1393,6 +1447,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             else:
                 self.reply_text(message_id, fmt.format_current_dir(current_dir))
             return
+
+        from ...card.builders.system import SystemBuilder
 
         success, result = self.set_working_dir(chat_id, path)
         if success:
@@ -1430,17 +1486,22 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         models = list(fetch_acp_models("coco", self.get_working_dir(chat_id)))
         current_model = next((m.name for m in models if m.is_default), "")
 
+        from ...card.builders.system import SystemBuilder
+
         content = SystemBuilder.build_coco_status_content(current_model, models)
         self.reply_text(message_id, content)
 
     def show_tools_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show a list of all available ACP tools with quick access buttons."""
+        from ...card.builders.system import SystemBuilder
+
+        is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
         # Only user-visible programming tools; hidden bridges (e.g. claude-w)
         # stay out of the discovery surfaces even though they are full modes.
         tools = []
         for meta in VISIBLE_BACKEND_METAS:
             name = meta.mode_key
-            is_available = is_programming_tool_available(
+            is_available = is_tool_available(
                 name,
                 allow_sync_probe=False,
                 trigger_async_probe=True,
@@ -1512,13 +1573,16 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             h, m = divmod(total_minutes, 60)
             return UI_TEXT["time_hours_mins_ago"].format(hours=h, minutes=m)
 
+        from ...card.builders.system import SystemBuilder
+
+        is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
         # Gather availability + real session activity from ACP managers.
         tools = []
         active_sessions: dict[str, dict] = {}
         for meta in tool_defs:
             name = meta["name"]
             manager = meta["manager"]
-            is_available = is_programming_tool_available(
+            is_available = is_tool_available(
                 name,
                 allow_sync_probe=False,
                 trigger_async_probe=True,

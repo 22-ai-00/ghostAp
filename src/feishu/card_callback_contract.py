@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from lark_channel.event.callback.model.p2_card_action_trigger import (
-    P2CardActionTriggerResponse,
-)
-
-from src.card.schema import require_card_json_2
+if TYPE_CHECKING:
+    from lark_channel.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTriggerResponse,
+    )
 
 CARD_CALLBACK_SCHEMA = "2.0"
 CARD_CALLBACK_EVENT_TYPE = "card.action.trigger"
@@ -57,6 +56,9 @@ def build_card_action_response(
     card: dict[str, Any] | None = None,
 ) -> P2CardActionTriggerResponse:
     """Build the official latest callback response envelope."""
+    from lark_channel.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTriggerResponse,
+    )
 
     payload: dict[str, Any] = {}
     if toast_type is not None or toast_content is not None:
@@ -69,6 +71,8 @@ def build_card_action_response(
             "content": toast_content,
         }
     if card is not None:
+        from src.card.schema import require_card_json_2
+
         payload["card"] = {
             "type": "raw",
             "data": require_card_json_2(card),

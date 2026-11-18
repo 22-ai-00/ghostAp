@@ -8,11 +8,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from ...card.backend_meta import get_backend_meta
-from ...card.builders.deep import DeepBuilder
-from ...card.builders.diagnostics import DiagnosticsBuilder
-from ...card.builders.project import ProjectBuilder
-from ...card.models import EngineCardState
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODES
 from ...project import context_helper
@@ -35,6 +30,9 @@ class DiagnosticsHandler(BaseHandler):
     # ------------------------------------------------------------------
 
     def show_task_board(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+        from ...card.builders.project import ProjectBuilder
+
         arg = ""
         try:
             parts = (text or "").strip().split(None, 1)
@@ -261,6 +259,8 @@ class DiagnosticsHandler(BaseHandler):
             mode = self.mode_manager.get_mode(chat_id, project_id=pid)
             is_prog = self.mode_manager.is_programming_mode(chat_id, project_id=pid) is True
             if mode in PROGRAMMING_MODES and is_prog:
+                from ...card.backend_meta import get_backend_meta
+
                 mode_key = mode.value
                 meta = get_backend_meta(mode)
                 mode_display = meta.display_name if meta else mode.value
@@ -362,6 +362,8 @@ class DiagnosticsHandler(BaseHandler):
         git_branch = self._read_git_branch(working_dir)
         direct_info = self._collect_direct_cockpit_info(chat_id, project)
 
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+
         msg_type, card_content = DiagnosticsBuilder.build_workspace_cockpit_card(
             project=project,
             working_dir=working_dir,
@@ -380,6 +382,11 @@ class DiagnosticsHandler(BaseHandler):
         self, message_id: str, chat_id: str, task_id: str, project: Optional["ProjectContext"] = None
     ):
         """Show detailed status for a specific task by task_id."""
+        from ...card.builders.deep import DeepBuilder
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+        from ...card.builders.project import ProjectBuilder
+        from ...card.models import EngineCardState
+
         # Search across all engine managers
         for engine in self.ctx.deep_engine_manager.list_engines(chat_id):
             if (
@@ -524,6 +531,8 @@ class DiagnosticsHandler(BaseHandler):
                 ),
             )
 
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+
         content = DiagnosticsBuilder.build_diff_report_content(project, from_v, to_v, entries, show_current)
         return True, content, None
 
@@ -543,6 +552,8 @@ class DiagnosticsHandler(BaseHandler):
         banner_tpl = UI_TEXT["diag_diff_generating_banner"]
         initial = f"{banner_tpl}\n\n{ref_note}" if ref_note else banner_tpl
         title = UI_TEXT["diag_diff_report_title"]
+
+        from ...card.builders.project import ProjectBuilder
 
         _msg_type, card_content = ProjectBuilder.build_project_response_card(
             project, title, initial, show_buttons=False,
@@ -726,6 +737,9 @@ class DiagnosticsHandler(BaseHandler):
                 project = self.project_manager.get_project_for_chat(proj_id, chat_id)
             except Exception:
                 project = None
+
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+        from ...card.builders.project import ProjectBuilder
 
         content = DiagnosticsBuilder.build_message_trace_content(data)
         title = UI_TEXT["diag_trace_title"]

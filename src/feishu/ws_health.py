@@ -4,8 +4,6 @@ import threading
 import time
 from typing import Optional
 
-from lark_channel.ws import client as lark_ws_client_impl
-
 from ..utils.errors import get_error_detail
 
 logger = logging.getLogger(__name__)
@@ -86,6 +84,8 @@ class WSHealthMonitor:
             return False
 
         try:
+            from lark_channel.ws import client as lark_ws_client_impl
+
             fut = asyncio.run_coroutine_threadsafe(client._disconnect(), lark_ws_client_impl.loop)
             fut.result(timeout=5)
             logger.warning("飞书长连接 watchdog 已触发重连: %s", reason)

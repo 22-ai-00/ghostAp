@@ -5,23 +5,6 @@ import os
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from lark_oapi.api.im.v1 import (
-    CreateFileRequest,
-    CreateFileRequestBody,
-    CreateImageRequest,
-    CreateImageRequestBody,
-    CreateMessageReactionRequest,
-    CreateMessageReactionRequestBody,
-    CreateMessageRequest,
-    CreateMessageRequestBody,
-    Emoji,
-    GetMessageResourceRequest,
-    PatchMessageRequest,
-    PatchMessageRequestBody,
-    ReplyMessageRequest,
-    ReplyMessageRequestBody,
-)
-
 from ..utils.errors import LARK_CODE_MESSAGE_NOT_FOUND, LARK_CODE_MESSAGE_RECALLED, get_error_detail
 from .emoji import EmojiReaction
 
@@ -146,6 +129,8 @@ class FeishuIMClient:
         """Send a message."""
         content = _sanitize_content(content)
         self._audit_outbound("create", receive_id)
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
         client = self.api_client_factory()
         request = (
             CreateMessageRequest.builder()
@@ -193,6 +178,8 @@ class FeishuIMClient:
                     target,
                     tenant_key=audit_tenant_key,
                 )
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+
         client = self.api_client_factory()
         body = (
             ReplyMessageRequestBody.builder()
@@ -220,6 +207,8 @@ class FeishuIMClient:
         max_retries: Optional[int] = None,
     ) -> Optional[str]:
         """Upload a local file to Feishu IM and return its file_key."""
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
         client = self.api_client_factory()
         resolved_name = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as file_obj:
@@ -252,6 +241,8 @@ class FeishuIMClient:
         """Upload in-memory image bytes to Feishu IM and return image_key."""
         if not isinstance(image_bytes, bytes) or not image_bytes:
             raise ValueError("image_bytes must be non-empty bytes")
+        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+
         client = self.api_client_factory()
 
         def _upload_once():
@@ -304,6 +295,8 @@ class FeishuIMClient:
                 raise RuntimeError("main Bot reply recipient scope is unavailable")
             for target in dict.fromkeys((message_id, *audit_aliases)):
                 self._audit_outbound("reply", target)
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+
         client = self.api_client_factory()
         request = (
             ReplyMessageRequest.builder()
@@ -342,6 +335,8 @@ class FeishuIMClient:
                 raise RuntimeError("main Bot patch recipient scope is unavailable")
             for target in dict.fromkeys((message_id, *audit_aliases)):
                 self._audit_outbound("patch", target)
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
         client = self.api_client_factory()
         request = (
             PatchMessageRequest.builder()
@@ -357,6 +352,12 @@ class FeishuIMClient:
         if not EmojiReaction.should_send(emoji_type):
             logger.debug("跳过非保留自动表情: %s", emoji_type)
             return
+
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+            Emoji,
+        )
 
         client = self.api_client_factory()
         request = (
@@ -376,6 +377,8 @@ class FeishuIMClient:
         self, message_id: str, file_key: str, resource_type: str, max_retries: Optional[int] = None
     ) -> Optional[Any]:
         """Download a resource (image, file, etc.)."""
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
         client = self.api_client_factory()
         request = (
             GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type(resource_type).build()

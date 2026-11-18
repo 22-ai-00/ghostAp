@@ -9,7 +9,6 @@ if TYPE_CHECKING:
     from ..trust.models import EffectiveTrust
 
 
-from ..acp.native_commands import is_blocked_native_command, parse_slash_command
 from ..agent.intent_recognizer import IntentType
 from ..card.ui_text import UI_TEXT
 from ..mode import PROGRAMMING_MODE_VALUES
@@ -143,6 +142,8 @@ class MessageDispatcher:
                     return
                 self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
                 return
+            from ..acp.native_commands import is_blocked_native_command, parse_slash_command
+
             if is_blocked_native_command(text):
                 if not current_dispatch_allowed():
                     return
@@ -159,6 +160,8 @@ class MessageDispatcher:
                     return
                 self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
                 return
+
+            from ..acp.native_commands import parse_slash_command
 
             if parse_slash_command(text) is not None:
                 if not current_dispatch_allowed():

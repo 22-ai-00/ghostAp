@@ -3,17 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import sys
+from typing import TYPE_CHECKING, Any, Optional
 
-from ...acp.claude_capabilities import (
-    is_1m_variant,
-    model_supports_1m,
-    strip_1m_suffix,
-)
-from ...acp.claude_selection import split_claude_model_selection
-from ...acp.helper import fetch_acp_models
-from ...acp.providers import normalize_acp_model_name
-from ...card.render.model_cascade import compose_model_selection, parse_model_selection
 from ...tasking import TaskStatus
 from ...utils.errors import safe_error_message
 
@@ -22,6 +14,15 @@ if TYPE_CHECKING:
     from .system import _ACPActivationEffect, _ACPActivationOwner
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "fetch_acp_models":
+        from ...acp.helper import fetch_acp_models
+
+        globals()["fetch_acp_models"] = fetch_acp_models
+        return fetch_acp_models
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _system_module():
@@ -373,11 +374,12 @@ class ACPActivationMixin:
                 live_session is not None
                 and model_name is not None
             ):
-                backend_model_name = (
-                    model_name
-                    if _tool == "traex"
-                    else normalize_acp_model_name(_tool, model_name)
-                )
+                if _tool == "traex":
+                    backend_model_name = model_name
+                else:
+                    from ...acp.providers import normalize_acp_model_name
+
+                    backend_model_name = normalize_acp_model_name(_tool, model_name)
                 active_model_name = str(
                     getattr(live_session, "_model_name", "") or ""
                 ).strip()
@@ -621,7 +623,9 @@ class ACPActivationMixin:
         current_model: Optional[str] = None,
     ) -> list:
         """Fetch the compact model catalog used by the text command."""
-        return fetch_acp_models(tool_name, cwd=cwd, current_model=current_model)
+        return getattr(sys.modules[__name__], "fetch_acp_models")(
+            tool_name, cwd=cwd, current_model=current_model
+        )
 
     @staticmethod
     def _selected_option(value: dict) -> Optional[str]:
@@ -871,6 +875,8 @@ class ACPActivationMixin:
             model_profile = None
             model_effort = None
         else:
+            from ...card.render.model_cascade import compose_model_selection, parse_model_selection
+
             group = str(value.get("model_group") or "").strip()
             model_name = compose_model_selection(
                 models,
@@ -963,6 +969,13 @@ class ACPActivationMixin:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_model_prompt"])
             return
         if tool in {"claude", "claude_w"} and model:
+            from ...acp.claude_capabilities import (
+                is_1m_variant,
+                model_supports_1m,
+                strip_1m_suffix,
+            )
+            from ...acp.claude_selection import split_claude_model_selection
+
             model_base, _effort = split_claude_model_selection(model)
             if (
                 model_base
@@ -1543,6 +1556,13 @@ class ACPActivationMixin:
             )
             return
         if tool_name in {"claude", "claude_w"} and model_name:
+            from ...acp.claude_capabilities import (
+                is_1m_variant,
+                model_supports_1m,
+                strip_1m_suffix,
+            )
+            from ...acp.claude_selection import split_claude_model_selection
+
             model_base, _effort = split_claude_model_selection(model_name)
             if (
                 model_base

@@ -21,7 +21,7 @@ class BaseEngineHandler(BaseHandler):
     Provides common lifecycle management logic.
     """
 
-    renderer: RendererProtocol  # Subclasses MUST assign in __init__
+    renderer: RendererProtocol  # Subclasses provide lazily or assign in __init__
 
     # ------------------------------------------------------------------
     # Repo-lock + conflict-card helper (DRY for scheduled closures)

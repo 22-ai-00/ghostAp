@@ -1,16 +1,20 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
-from ...card.builders.diagnostics import DiagnosticsBuilder
-from ...card.models import EngineStatusEntry
 from ...card.ui_text import UI_TEXT
 
 if TYPE_CHECKING:
+    from ...card.models import EngineStatusEntry
     from ..handler_context import HandlerContext
 
 class DiagnosticsHelper:
     @staticmethod
     def get_all_engine_statuses(ctx: "HandlerContext", chat_id: str, include_done: bool = False) -> list[EngineStatusEntry]:
         """Collect and aggregate status entries from all engines (Deep, Spec)."""
+        from ...card.builders.diagnostics import DiagnosticsBuilder
+        from ...card.models import EngineStatusEntry
+
         entries: list[EngineStatusEntry] = []
 
         deep_label = UI_TEXT["diag_engine_deep"]

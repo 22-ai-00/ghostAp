@@ -16,7 +16,6 @@ import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
-from ...acp.native_commands import is_pure_zero_arg_native_slash
 from ...card.ui_text import UI_TEXT
 from ...utils.engine_identity import resolve_engine_identity
 from ...utils.errors import (
@@ -880,6 +879,8 @@ class BaseHandler:
         if not project:
             return text
         stripped = str(text or "").strip()
+        from ...acp.native_commands import is_pure_zero_arg_native_slash
+
         if is_pure_zero_arg_native_slash(stripped):
             return text
         ctx = self.ctx.context_manager.store.get(project.project_id, chat_id=chat_id)

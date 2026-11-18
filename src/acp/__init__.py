@@ -4,32 +4,72 @@ Provides structured communication with AI agents (Coco/Claude) via JSON-RPC 2.0
 over stdio, replacing the previous subprocess-based CLI interaction.
 """
 
-from .continuation import (
-    PromptContinuationResult,
-    run_prompt_with_continuation,
-)
-from .execution_windows import run_prompt_across_execution_windows
-from .finalization import run_prompt_with_finalization
-from .models import (
-    ACPEvent,
-    ACPEventType,
-    ACPImageInfo,
-    ACPSessionState,
-    PlanEntryInfo,
-    PlanInfo,
-    PromptResult,
-    ToolCallInfo,
-)
-from .renderer import ACPEventRenderer
+from __future__ import annotations
 
-# NOTE: .client, .session, .sync_adapter, and .manager imports are deferred via
-# __getattr__ (PEP 562).  .client/.session/.sync_adapter pull in the external
-# `acp` (agent-client-protocol) SDK (~9 MB USS), which is only needed when an
-# ACP session or probe actually starts; deferring .manager also breaks the
-# circular dependency with the agent_session package.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .client import GhostAPClient
+    from .continuation import PromptContinuationResult, run_prompt_with_continuation
+    from .execution_windows import run_prompt_across_execution_windows
+    from .finalization import run_prompt_with_finalization
+    from .manager import ACPSessionManager, AgentSessionManager
+    from .models import (
+        ACPEvent,
+        ACPEventType,
+        ACPImageInfo,
+        ACPSessionState,
+        PlanEntryInfo,
+        PlanInfo,
+        PromptResult,
+        ToolCallInfo,
+    )
+    from .renderer import ACPEventRenderer
+    from .session import ACPResumeRejected, ACPSession
+    from .sync_adapter import SyncACPSession, start_session_with_retry
+
+_MODEL_EXPORTS = frozenset(
+    {
+        "ACPEvent",
+        "ACPEventType",
+        "ACPImageInfo",
+        "ACPSessionState",
+        "PlanEntryInfo",
+        "PlanInfo",
+        "PromptResult",
+        "ToolCallInfo",
+    }
+)
 
 
 def __getattr__(name: str):
+    if name in _MODEL_EXPORTS:
+        from . import models as _models
+
+        for attr in _MODEL_EXPORTS:
+            globals()[attr] = getattr(_models, attr)
+        return globals()[name]
+    if name in ("PromptContinuationResult", "run_prompt_with_continuation"):
+        from .continuation import PromptContinuationResult, run_prompt_with_continuation
+
+        globals()["PromptContinuationResult"] = PromptContinuationResult
+        globals()["run_prompt_with_continuation"] = run_prompt_with_continuation
+        return globals()[name]
+    if name == "run_prompt_across_execution_windows":
+        from .execution_windows import run_prompt_across_execution_windows
+
+        globals()["run_prompt_across_execution_windows"] = run_prompt_across_execution_windows
+        return run_prompt_across_execution_windows
+    if name == "run_prompt_with_finalization":
+        from .finalization import run_prompt_with_finalization
+
+        globals()["run_prompt_with_finalization"] = run_prompt_with_finalization
+        return run_prompt_with_finalization
+    if name == "ACPEventRenderer":
+        from .renderer import ACPEventRenderer
+
+        globals()["ACPEventRenderer"] = ACPEventRenderer
+        return ACPEventRenderer
     if name == "GhostAPClient":
         from .client import GhostAPClient
 

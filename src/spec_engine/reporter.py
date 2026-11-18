@@ -1,18 +1,20 @@
 """Spec Engine 进度报告器 — 格式化进度信息供 Feishu 卡片展示。"""
 
-import re
+from __future__ import annotations
 
-from ..engine_base import PerspectiveReview
+import re
+from typing import TYPE_CHECKING
+
 from ..utils.text import format_duration, make_progress_bar
-from .models import (
-    ReviewResult,
-    SpecCycle,
-    SpecPhase,
-    SpecProject,
-    SpecProjectStatus,
-    SpecTaskStatus,
-    SpecWorkItemStatus,
-)
+
+if TYPE_CHECKING:
+    from ..engine_base import PerspectiveReview
+    from .models import (
+        ReviewResult,
+        SpecCycle,
+        SpecPhase,
+        SpecProject,
+    )
 
 
 class SpecReporter:
@@ -49,6 +51,8 @@ class SpecReporter:
         return "\n".join(lines)
 
     def format_phase_progress(self, current_phase: SpecPhase, completed: bool = False) -> str:
+        from .models import SpecPhase
+
         phases = list(SpecPhase)
         parts: list[str] = []
         current_idx = phases.index(current_phase) if current_phase in phases else -1
@@ -69,6 +73,8 @@ class SpecReporter:
 
         Example: "Cycle 1/3 · Spec ✅ Plan ✅ Task ✅ Build ▶️ Review ⬜"
         """
+        from .models import SpecPhase
+
         phases = list(SpecPhase)
         current_idx = phases.index(current_phase) if current_phase in phases else -1
         parts: list[str] = []
@@ -102,6 +108,8 @@ class SpecReporter:
     def _extract_phase_summary(self, phase: SpecPhase, output: str) -> str:
         if not output:
             return ""
+        from .models import SpecPhase
+
         if phase == SpecPhase.SPEC:
             goals_count = output.count('"goals"')
             criteria_count = output.count('"acceptance_criteria"')
@@ -157,6 +165,8 @@ class SpecReporter:
             parts.append("🏗️ **方案规划**: 已规划")
 
         if cycle.tasks:
+            from .models import SpecTaskStatus
+
             completed = sum(1 for t in cycle.tasks if t.status == SpecTaskStatus.COMPLETED)
             total = len(cycle.tasks)
             parts.append(f"📝 **任务分解**: {completed}/{total} 完成")
@@ -178,6 +188,8 @@ class SpecReporter:
         return "\n".join(parts)
 
     def format_cycle_done(self, cycle_number: int, cycle: SpecCycle) -> str:
+        from .models import SpecPhase
+
         status_emoji = "✅" if cycle.status == "completed" else "❌"
         status_text = "完成" if cycle.status == "completed" else "失败"
 
@@ -275,6 +287,8 @@ class SpecReporter:
         return "\n".join(lines)
 
     def format_project_done(self, project: SpecProject) -> str:
+        from .models import SpecProjectStatus
+
         if project.status == SpecProjectStatus.COMPLETED:
             lines = [
                 "🎉 **Spec 模式完成！**\n",
@@ -443,6 +457,8 @@ class SpecReporter:
 {advice}"""
 
     def format_status(self, project: SpecProject) -> str:
+        from .models import SpecProjectStatus, SpecWorkItemStatus
+
         status_text = {
             SpecProjectStatus.IDLE: "⏳ 等待开始",
             SpecProjectStatus.ANALYZING: "🧠 正在分析需求",
@@ -632,6 +648,8 @@ class SpecReporter:
         return make_progress_bar(completed, total)
 
     def get_progress_info(self, project: SpecProject) -> dict:
+        from .models import SpecProjectStatus, SpecWorkItemStatus
+
         done_work_items = sum(1 for w in getattr(project, "work_items", []) if w.status == SpecWorkItemStatus.DONE)
         total_work_items = getattr(project, "work_items_total", 0)
 

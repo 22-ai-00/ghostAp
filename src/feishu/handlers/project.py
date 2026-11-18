@@ -6,7 +6,6 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
-from ...card.builders.project import ProjectBuilder
 from ...card.ui_text import UI_TEXT
 from ...project import ContextEntryType, ContextSourceMode
 from .base import BaseHandler
@@ -29,6 +28,8 @@ class ProjectHandler(BaseHandler):
         )
 
         if success and project:
+            from ...card.builders.project import ProjectBuilder
+
             msg_type, card_content = ProjectBuilder.build_project_created_card(project)
             response_id = self.reply_card(message_id, card_content)
             if response_id:
@@ -37,6 +38,8 @@ class ProjectHandler(BaseHandler):
             self.reply_error(message_id, UI_TEXT["project_create_error"].format(error=msg))
 
     def show_project_board(self, message_id: str, chat_id: str, origin_message_id: Optional[str] = None, page: int = 1):
+        from ...card.builders.project import ProjectBuilder
+
         projects = self.project_manager.get_all_projects(chat_id=chat_id)
         active_project = self.project_manager.get_active_project(chat_id)
         current_id = active_project.project_id if active_project else None
@@ -64,6 +67,8 @@ class ProjectHandler(BaseHandler):
         if not project:
             self.show_project_board(message_id, chat_id)
             return
+
+        from ...card.builders.project import ProjectBuilder
 
         global_working_dir = self.get_working_dir(chat_id)
         msg_type, card_content = ProjectBuilder.build_project_status_report_card(project, global_working_dir)
@@ -169,6 +174,8 @@ class ProjectHandler(BaseHandler):
             if hint:
                 self.reply_error(message_id, hint)
                 return
+            from ...card.builders.project import ProjectBuilder
+
             results = self.project_manager.search_projects(name, chat_id=chat_id)
             content = ProjectBuilder.build_project_not_found_content(name, results)
             self.reply_error(message_id, content, title=UI_TEXT["project_not_found_title"])
@@ -261,6 +268,8 @@ class ProjectHandler(BaseHandler):
             elif getattr(project, "coco_mode", False) is True and coco_handler:
                 coco_handler.enter_mode(message_id, chat_id, project=project)
                 return
+
+        from ...card.builders.project import ProjectBuilder
 
         msg_type, card_content = ProjectBuilder.build_project_switch_notification_card(project, restore_info)
 

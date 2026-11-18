@@ -465,3 +465,128 @@ assert "Crypto" in sys.modules
         check=False,
     )
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_feishu_ws_client_startup_and_cold_hydration_dispatch(tmp_path):
+    """Startup keeps heavy subtrees unloaded and cold hydration works cleanly on demand."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = f"""
+import sys
+from unittest.mock import MagicMock, patch
+
+import src.main as main_mod
+
+main_mod._activate_lark_import_cache()
+main_mod._load_feishu_runtime()
+from src.feishu.ws_client import FeishuWSClient
+
+client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+
+# 1. Verify heavy modules remain unloaded after cold startup init
+for forbidden in (
+    "acp",
+    "src.acp.client",
+    "src.acp.session",
+    "src.acp.sync_adapter",
+    "src.acp.helper",
+    "src.acp.continuation",
+    "src.agent_session.claude_cli",
+    "src.agent_session.factory",
+    "src.card.session",
+    "src.card.session.core",
+    "src.card.render",
+    "src.card.delivery",
+    "src.card.events",
+    "src.card.builders",
+    "src.card.models",
+    "src.deep_engine.engine",
+    "src.spec_engine.engine",
+    "src.spec_engine.models",
+    "src.workflow_engine.engine",
+    "src.workflow_engine.renderer",
+    "lark_channel",
+    "lark_channel.ws",
+    "lark_channel.channel",
+    "psutil",
+    "requests",
+    "requests_toolbelt",
+    "urllib3",
+    "Crypto",
+    "click",
+    "pygments",
+    "rich",
+    "websockets",
+):
+    assert forbidden not in sys.modules, f"{{forbidden}} unexpectedly loaded at startup"
+
+assert len(sys.modules) < 520, f"too many startup modules: {{len(sys.modules)}}"
+src_mods = [m for m in sys.modules if m == "src" or m.startswith("src.")]
+assert len(src_mods) <= 130, f"too many src modules at startup: {{len(src_mods)}}"
+
+# 2. Hydrate lazy handlers, renderers, engines, IM client, card callback, and GCMonitor
+handlers = client._handler_ctx.handlers
+for h in handlers.values():
+    h.reply_card = MagicMock(return_value="om_mock_reply")
+    h.reply_interactive_card = MagicMock(return_value="om_mock_reply")
+    h.reply_text = MagicMock(return_value="om_mock_text")
+    h.reply_error = MagicMock(return_value="om_mock_err")
+
+# Deep & Spec lazy renderers + engine creation
+deep_renderer = handlers["deep"].renderer
+spec_renderer = handlers["spec"].renderer
+assert deep_renderer is not None
+assert spec_renderer is not None
+assert "src.deep_engine.engine" in sys.modules
+
+# SpecReporter lazy models hydration + SpecEngineManager cold engine creation
+spec_eng = client._spec_engine_manager.get_or_create("oc_cold", {str(tmp_path)!r})
+assert spec_eng is not None
+assert "src.spec_engine.engine" in sys.modules
+spec_status = client._spec_reporter.format_phase_progress(
+    __import__("src.spec_engine.models", fromlist=["SpecPhase"]).SpecPhase.SPEC
+)
+assert spec_status
+
+# Workflow lazy storage helper + engine manager
+from src.feishu.handlers.workflow_execution import _workflow_module
+assert isinstance(_workflow_module().workflow_scripts_dir({str(tmp_path)!r}), str)
+
+# System, Project, Diagnostics lazy card builder hydration
+handlers["system"].handle_menu_command("om_1", "oc_cold")
+handlers["system"].show_full_help("om_2", "oc_cold")
+handlers["project"].show_project_board("om_3", "oc_cold")
+handlers["diagnostics"].show_task_board("om_4", "oc_cold", "/tasks")
+assert handlers["system"].reply_card.called
+assert handlers["project"].reply_card.called
+
+# Card callback 2.0 response hydration
+from src.feishu.card_callback_contract import build_card_action_response
+resp = build_card_action_response(
+    toast_type="info",
+    toast_content="hydrated",
+    card={{"schema": "2.0", "body": {{"elements": [{{"tag": "markdown", "content": "ok"}}]}}}},
+)
+assert resp is not None
+
+# FeishuIMClient lazy im.v1 model hydration
+from src.feishu.im_client import FeishuIMClient
+mock_api = MagicMock()
+mock_api.im.v1.message.reply.return_value = MagicMock(success=lambda: True)
+im_client = FeishuIMClient(lambda: mock_api, client.settings)
+assert im_client.reply_message("om_1", '{{"text":"hi"}}', msg_type="text") is not None
+
+# GCMonitor lazy psutil hydration
+from src.utils.gc_monitor import GCMonitor
+with patch("gc.collect"):
+    GCMonitor(memory_threshold_percent=99.9, check_interval_seconds=0.0).check_and_collect("Test")
+assert "psutil" in sys.modules
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"

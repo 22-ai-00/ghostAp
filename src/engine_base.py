@@ -1,20 +1,43 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Generic, Optional, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Generic, Optional, Protocol, TypeVar, runtime_checkable
 
-from .acp import ACPEventRenderer
-from .agent_session import SyncSession, close_session_safely
 from .config import get_settings
 from .utils.engine_identity import resolve_engine_identity
 from .utils.errors import get_error_detail
-from .utils.gc_monitor import get_gc_monitor
 from .utils.lock_order import LockLevel, ordered_lock, ordered_rlock
 
+if TYPE_CHECKING:
+    from .agent_session import SyncSession
+
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    if name == "ACPEventRenderer":
+        from .acp import ACPEventRenderer
+
+        globals()["ACPEventRenderer"] = ACPEventRenderer
+        return ACPEventRenderer
+    if name in ("SyncSession", "close_session_safely"):
+        from .agent_session import SyncSession, close_session_safely
+
+        globals()["SyncSession"] = SyncSession
+        globals()["close_session_safely"] = close_session_safely
+        return globals()[name]
+    if name == "get_gc_monitor":
+        from .utils.gc_monitor import get_gc_monitor
+
+        globals()["get_gc_monitor"] = get_gc_monitor
+        return get_gc_monitor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class EngineRunState(Enum):
@@ -194,7 +217,7 @@ class BaseEngine:
 
         self._session: Optional[SyncSession] = None
         self._project = None
-        self._renderer = ACPEventRenderer()
+        self._renderer = getattr(sys.modules[__name__], "ACPEventRenderer")()
         self._run_state = EngineRunState.IDLE
         self._lock = ordered_rlock(LockLevel.ENGINE_INSTANCE, name="BaseEngine._lock")
 
@@ -214,7 +237,7 @@ class BaseEngine:
             return self._run_state != EngineRunState.IDLE
 
     def _close_session_safely(self) -> None:
-        close_session_safely(self._session)
+        getattr(sys.modules[__name__], "close_session_safely")(self._session)
         self._session = None
 
     def _on_stop(self) -> None:
@@ -266,7 +289,7 @@ class BaseEngine:
         gc_kwargs: dict = {"label": self._gc_label}
         if mem_snapshot is not None:
             gc_kwargs["mem_snapshot"] = mem_snapshot
-        get_gc_monitor(
+        getattr(sys.modules[__name__], "get_gc_monitor")(
             memory_threshold_percent=self._gc_threshold_default,
         ).check_and_collect(**gc_kwargs)
         try:

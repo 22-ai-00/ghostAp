@@ -211,7 +211,7 @@ class _IdleHealthService:
         idle_bucket = compute_time_ago_bucket(idle_seconds)
 
         try:
-            from .helper import SessionKeyCodec
+            from .session_keys import SessionKeyCodec
 
             chat_id, project_id, thread_id = SessionKeyCodec.decode(session_key or "")
         except Exception:

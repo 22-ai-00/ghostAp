@@ -7,12 +7,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Optional
 
-from ...card.builders.deep import DeepBuilder
-from ...card.models import EngineCardState
 from ...card.ui_text import UI_TEXT
-from ...spec_engine.models import SpecProjectStatus
-from ...spec_engine.persistence import load_engine_state
-from ...spec_engine.recovery_lock import try_acquire_recovery_lease
 from ...utils.errors import fmt_error, get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
@@ -32,10 +27,19 @@ class SpecHandler(BaseEngineHandler):
 
     def __init__(self, ctx: "HandlerContext", renderer: "RendererProtocol | None" = None) -> None:
         super().__init__(ctx)
-        if renderer is None:
+        self._renderer: "RendererProtocol | None" = renderer
+
+    @property
+    def renderer(self) -> "RendererProtocol":
+        if self._renderer is None:
             from ..renderers import get_renderer
-            renderer = get_renderer("spec", self)
-        self.renderer = renderer
+
+            self._renderer = get_renderer("spec", self)
+        return self._renderer
+
+    @renderer.setter
+    def renderer(self, value: "RendererProtocol") -> None:
+        self._renderer = value
 
     def _get_engine_manager(self):
         return self.ctx.spec_engine_manager
@@ -263,14 +267,15 @@ class SpecHandler(BaseEngineHandler):
             except Exception:
                 logger.debug("failed to load canonical Spec run-state", exc_info=True)
 
-        if (
-            engine
-            and engine.project
-            and engine.project.status in (SpecProjectStatus.ANALYZING, SpecProjectStatus.RUNNING)
-            and not engine.is_running
-            and getattr(engine, "_resume_meta", None)
-        ):
-            self._schedule_automatic_recovery(message_id, chat_id, project, engine)
+        if engine and engine.project:
+            from ...spec_engine.models import SpecProjectStatus
+
+            if (
+                engine.project.status in (SpecProjectStatus.ANALYZING, SpecProjectStatus.RUNNING)
+                and not engine.is_running
+                and getattr(engine, "_resume_meta", None)
+            ):
+                self._schedule_automatic_recovery(message_id, chat_id, project, engine)
 
         self.renderer.render_current_view(message_id, chat_id, project, origin_message_id)
 
@@ -281,6 +286,10 @@ class SpecHandler(BaseEngineHandler):
         project: Optional["ProjectContext"],
         engine,
     ) -> None:
+        from ...spec_engine.models import SpecProjectStatus
+        from ...spec_engine.persistence import load_engine_state
+        from ...spec_engine.recovery_lock import try_acquire_recovery_lease
+
         with engine._lock:
             if engine.is_running or getattr(engine, "_auto_recovery_claimed", False):
                 return
@@ -410,6 +419,9 @@ class SpecHandler(BaseEngineHandler):
 
 
     def show_spec_history(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
+
         if project is None:
             project = self.project_manager.get_active_project(chat_id)
         root_path = project.root_path if project else self.get_working_dir(chat_id)
@@ -451,6 +463,9 @@ class SpecHandler(BaseEngineHandler):
         self.reply_card(message_id, card_content)
 
     def show_spec_metrics(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
+
         if project is None:
             project = self.project_manager.get_active_project(chat_id)
         root_path = project.root_path if project else self.get_working_dir(chat_id)
@@ -492,6 +507,9 @@ class SpecHandler(BaseEngineHandler):
         self.reply_card(message_id, card_content)
 
     def show_spec_config(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
+
         if project is None:
             project = self.project_manager.get_active_project(chat_id)
         s = self.settings
@@ -691,6 +709,8 @@ class SpecHandler(BaseEngineHandler):
             engine = self.ctx.spec_engine_manager.get(chat_id, project.root_path)
 
         if not engine:
+            from ...spec_engine.models import SpecProjectStatus
+
             # Fallback: if there's exactly one runnable engine in the chat
             candidates = [
                 e
@@ -708,6 +728,8 @@ class SpecHandler(BaseEngineHandler):
                 "请先使用 `/spec <需求>` 启动，或发送 `/spec_status` 查看当前任务",
             )
             return
+
+        from ...spec_engine.models import SpecProjectStatus
 
         if engine.project.status != SpecProjectStatus.RUNNING:
             self.reply_text(
@@ -730,6 +752,9 @@ class SpecHandler(BaseEngineHandler):
             engine.inject_guidance(guide_message)
             content = reporter.format_guidance_injected(guide_message)
             title = reporter.get_guidance_injected_title()
+
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
 
         msg_type, card_content = DeepBuilder.build_info_card(
             project,

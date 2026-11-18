@@ -9,6 +9,8 @@
 - 兼容性：部分 lark-oapi 版本不包含完整的 callback model 类型；这里对仅用于类型标注的符号做了降级处理。
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextvars
 import gc
@@ -27,21 +29,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import lark_oapi as lark
-from lark_channel.event.callback.model.p2_card_action_trigger import (
-    P2CardActionTrigger,
-    P2CardActionTriggerResponse,
-)
-from lark_oapi.api.im.v1 import GetChatRequest
 
 if TYPE_CHECKING:
     from lark_channel import FeishuChannel
+    from lark_channel.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTrigger,
+        P2CardActionTriggerResponse,
+    )
 
-# NOTE: lark-oapi 的 event callback models 在不同版本中并不完整。
-# 本项目仅将 P2ImMessageReceiveV1 用于类型标注；运行时缺失不应导致 import 失败。
-try:  # pragma: no cover
-    from lark_channel.event.callback.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1  # type: ignore
-except (ImportError, AttributeError):  # pragma: no cover
-    P2ImMessageReceiveV1 = Any  # type: ignore
+    from .ws_lifecycle import ObservedLarkWSClient
+
+    try:  # pragma: no cover
+        from lark_channel.event.callback.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1  # type: ignore
+    except (ImportError, AttributeError):  # pragma: no cover
+        P2ImMessageReceiveV1 = Any  # type: ignore
 
 from ..access_control import (
     AccessDecision,
@@ -119,10 +120,7 @@ from .handlers import (
     WorkflowHandler,
 )
 from .image_handler import FeishuImageHandler
-from .main_slash_commands import reconcile_main_agent_slash_commands
 from .message_cache import MessageCache
-from .renderers.deep_renderer import DeepRenderer
-from .renderers.spec_renderer import SpecRenderer
 from .slash_command_parser import CommandMatch, SlashCommandParser
 from .slash_commands import SlashPermissionRequired
 from .ws_card_action_handler import (
@@ -133,7 +131,6 @@ from .ws_card_action_handler import (
 )
 from .ws_event_router import MessageIngressGuard, WSErrorAction, classify_ws_error
 from .ws_health import WSHealthMonitor
-from .ws_lifecycle import ObservedLarkWSClient
 from .ws_managed_groups import WSManagedGroupsMixin
 from .ws_resource_manager import EngineResourceGroup
 
@@ -647,8 +644,6 @@ class FeishuWSClient(WSManagedGroupsMixin):
             "workflow": WorkflowHandler,
         }
         handlers = {name: cls(self._handler_ctx) for name, cls in handler_types.items()}
-        handlers["deep"].renderer = DeepRenderer(handlers["deep"])
-        handlers["spec"].renderer = SpecRenderer(handlers["spec"])
         self._handler_ctx.managers.update(acp_managers)
         self._handler_ctx.handlers.update(handlers)
         system_handler = handlers["system"]
@@ -1186,8 +1181,9 @@ class FeishuWSClient(WSManagedGroupsMixin):
         while not self._closed:
             self._sync_main_bot_identity()
             try:
+                reconcile_fn = getattr(sys.modules[__name__], "reconcile_main_agent_slash_commands")
                 verified = asyncio.run(
-                    reconcile_main_agent_slash_commands(
+                    reconcile_fn(
                         self._get_api_client(),
                         app_id=self.settings.app_id,
                     )
@@ -3390,6 +3386,8 @@ class FeishuWSClient(WSManagedGroupsMixin):
         if not chat_id or chat_id == "unknown":
             return None
         try:
+            from lark_oapi.api.im.v1 import GetChatRequest
+
             request = GetChatRequest.builder().chat_id(chat_id).build()
             response = self._get_api_client().im.v1.chat.get(request)
             if not response or not response.success() or not response.data:
@@ -3792,7 +3790,8 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 time.sleep(reconnect_delay)
                 continue
             log_level_cls = getattr(sys.modules[__name__], "ChannelLogLevel")
-            self._client = ObservedLarkWSClient(
+            observed_cls = getattr(sys.modules[__name__], "ObservedLarkWSClient")
+            self._client = observed_cls(
                 self.settings.app_id,
                 self.settings.app_secret,
                 event_handler=event_handler,
@@ -3833,6 +3832,16 @@ _LAZY_CHANNEL_ATTRS = frozenset(
 
 
 def __getattr__(name: str) -> Any:
+    if name == "ObservedLarkWSClient":
+        from .ws_lifecycle import ObservedLarkWSClient
+
+        globals()["ObservedLarkWSClient"] = ObservedLarkWSClient
+        return ObservedLarkWSClient
+    if name == "reconcile_main_agent_slash_commands":
+        from .main_slash_commands import reconcile_main_agent_slash_commands
+
+        globals()["reconcile_main_agent_slash_commands"] = reconcile_main_agent_slash_commands
+        return reconcile_main_agent_slash_commands
     if name not in _LAZY_CHANNEL_ATTRS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from lark_channel import EventDispatcherHandler as ChannelEventDispatcherHandler
