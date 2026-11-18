@@ -4,6 +4,9 @@ if _os.environ.get("GHOSTAP_DISABLE_LAZY_LARK", "").strip().lower() not in {"1",
     try:
         if __package__ == "feishu":
             from utils.lark_lazy import (
+                install_lazy_httpx_guard as _install_lazy_httpx_guard,
+            )
+            from utils.lark_lazy import (
                 install_lazy_lark_channel as _install_lazy_lark_channel,
             )
             from utils.lark_lazy import (
@@ -11,11 +14,15 @@ if _os.environ.get("GHOSTAP_DISABLE_LAZY_LARK", "").strip().lower() not in {"1",
             )
         else:
             from ..utils.lark_lazy import (
+                install_lazy_httpx_guard as _install_lazy_httpx_guard,
+            )
+            from ..utils.lark_lazy import (
                 install_lazy_lark_channel as _install_lazy_lark_channel,
             )
             from ..utils.lark_lazy import (
                 install_lazy_lark_oapi as _install_lazy_lark_oapi,
             )
+        _install_lazy_httpx_guard()
         _install_lazy_lark_oapi()
         _install_lazy_lark_channel()
     except Exception:

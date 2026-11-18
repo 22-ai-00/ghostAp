@@ -19,10 +19,14 @@ a ``MetaPathFinder`` that:
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
+import inspect
+import json
+import logging
 import re
 import sys
 import threading
@@ -32,6 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 _INSTALL_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+_BLOCKED_HTTPX_SUBMODULES = frozenset({"httpx._main"})
 
 _TOP_LEVEL_SUBMODULES = frozenset(
     {"api", "card", "channel", "client", "core", "event", "scene", "ws"}
@@ -777,6 +782,454 @@ def _build_lazy_client_module(
     return mod
 
 
+def _build_lazy_decryptor_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi") -> types.ModuleType:
+    """Construct a lazy ``<pkg_prefix>.core.utils.decryptor`` deferring ``Crypto``."""
+    const_mod = importlib.import_module(f"{pkg_prefix}.core.const")
+    UTF_8 = const_mod.UTF_8
+
+    class AESCipher(object):
+        def __init__(self, key: Any) -> None:
+            import hashlib
+
+            if isinstance(key, str):
+                key = key.encode(UTF_8)
+            self.digest = hashlib.sha256(key).digest()
+
+        def decrypt(self, enc: bytes) -> bytes:
+            from Crypto.Cipher import AES
+
+            if len(enc) < AES.block_size * 2 or len(enc) % AES.block_size != 0:
+                raise ValueError("invalid ciphertext length")
+            iv = enc[: AES.block_size]
+            cipher = AES.new(self.digest, AES.MODE_CBC, iv)
+            s = cipher.decrypt(enc[AES.block_size :])
+            if not s:
+                raise ValueError("invalid ciphertext: empty plaintext")
+            pad = s[-1]
+            if pad < 1 or pad > AES.block_size or pad > len(s):
+                raise ValueError("invalid PKCS7 padding")
+            if s[-pad:] != bytes([pad]) * pad:
+                raise ValueError("invalid PKCS7 padding")
+            return s[:-pad]
+
+        def decrypt_str(self, enc: str) -> str:
+            import base64
+
+            raw = base64.b64decode(enc)
+            return self.decrypt(raw).decode(UTF_8)
+
+    mod = types.ModuleType(f"{pkg_prefix}.core.utils.decryptor")
+    mod.__file__ = str(pkg_root / "core" / "utils" / "decryptor.py")
+    mod.__package__ = f"{pkg_prefix}.core.utils"
+    mod.AESCipher = AESCipher
+    mod.__all__ = ["AESCipher"]
+    return mod
+
+
+def _httpx_client_kwargs_for(conf: Any, client_cls: Any) -> dict[str, Any]:
+    proxy_url = getattr(conf, "proxy_url", None)
+    trust_env = getattr(conf, "trust_env_proxy", None)
+    kwargs: dict[str, Any] = {}
+    if proxy_url:
+        params = inspect.signature(client_cls).parameters
+        if "proxy" in params:
+            kwargs["proxy"] = proxy_url
+        elif "proxies" in params:
+            kwargs["proxies"] = proxy_url
+        else:
+            raise RuntimeError("installed httpx does not support explicit proxy configuration")
+    if trust_env is not None:
+        kwargs["trust_env"] = trust_env
+    return kwargs
+
+
+def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi") -> types.ModuleType:
+    """Construct an ``httpx``-unified ``<pkg_prefix>.core.http.transport`` module."""
+    const_mod = importlib.import_module(f"{pkg_prefix}.core.const")
+    UTF_8 = const_mod.UTF_8
+    USER_AGENT = const_mod.USER_AGENT
+    AUTHORIZATION = const_mod.AUTHORIZATION
+    enum_mod = importlib.import_module(f"{pkg_prefix}.core.enum")
+    AccessTokenType = enum_mod.AccessTokenType
+    JSON = importlib.import_module(f"{pkg_prefix}.core.json").JSON
+    log_mod = importlib.import_module(f"{pkg_prefix}.core.log")
+    sdk_logger = log_mod.logger
+    redact_for_log = getattr(log_mod, "redact_for_log", None)
+    redact_files_for_log = getattr(log_mod, "redact_files_for_log", None)
+    redact_query_params_for_log = getattr(log_mod, "redact_query_params_for_log", None)
+    model_mod = importlib.import_module(f"{pkg_prefix}.core.model")
+    Config = model_mod.Config
+    BaseRequest = model_mod.BaseRequest
+    RawResponse = model_mod.RawResponse
+    RequestOption = model_mod.RequestOption
+    build_user_agent = importlib.import_module(
+        f"{pkg_prefix}.core.utils.user_agent"
+    ).build_user_agent
+
+    def _build_url(domain: str, uri: str, paths: dict[str, str]) -> str:
+        if paths is None:
+            paths = {}
+        for key in paths:
+            value = paths[key]
+            if value is None:
+                value = ""
+            encoded = urllib.parse.quote(str(value), safe="")
+            uri = uri.replace(":" + key, encoded)
+        if uri.startswith("http://") or uri.startswith("https://"):
+            return uri
+        return domain + uri
+
+    def _build_header(
+        request: Any, option: Any, conf: Optional[Any] = None
+    ) -> dict[str, str]:
+        headers = request.headers
+        source = getattr(conf, "source", None) if conf is not None else None
+        extra_tags = getattr(conf, "extra_ua_tags", None) if conf is not None else None
+        headers[USER_AGENT] = build_user_agent(source=source, extra_tags=extra_tags)
+        if option.headers is not None:
+            for key in option.headers:
+                headers[key] = option.headers[key]
+        for token_type in request.token_types:
+            if AccessTokenType.TENANT == token_type:
+                headers[AUTHORIZATION] = f"Bearer {option.tenant_access_token}"
+            elif AccessTokenType.APP == token_type:
+                headers[AUTHORIZATION] = f"Bearer {option.app_access_token}"
+            elif AccessTokenType.USER == token_type:
+                headers[AUTHORIZATION] = f"Bearer {option.user_access_token}"
+        return headers
+
+    def _merge_dicts(*dicts: Any) -> dict[str, Any]:
+        res: dict[str, Any] = {}
+        for d in dicts:
+            if d is not None:
+                res.update(d)
+        return res
+
+    def _redact_body_for_log(json_: Any, files: Any, data: Any) -> dict[str, Any]:
+        if callable(redact_for_log) and callable(redact_files_for_log):
+            return _merge_dicts(
+                redact_for_log(json_),
+                redact_files_for_log(files),
+                redact_for_log(data),
+            )
+        return {}
+
+    class Transport(object):
+        @staticmethod
+        def execute(
+            conf: Any, req: Any, option: Optional[Any] = None
+        ) -> Any:
+            import httpx
+
+            if option is None:
+                option = RequestOption()
+            url = _build_url(conf.domain, req.uri, req.paths)
+            headers = _build_header(req, option, conf)
+
+            data = req.body
+            content: Optional[bytes] = None
+            if data is not None:
+                to_string = getattr(data, "to_string", None)
+                if callable(to_string):
+                    content = to_string()
+                elif isinstance(data, (bytes, bytearray)):
+                    content = bytes(data)
+                else:
+                    content = JSON.marshal(req.body).encode(UTF_8)
+
+            client_kwargs = _httpx_client_kwargs_for(conf, httpx.Client)
+            with httpx.Client(**client_kwargs) as client:
+                response = client.request(
+                    str(req.http_method.name),
+                    url,
+                    headers=req.headers,
+                    params=req.queries,
+                    content=content,
+                    timeout=conf.timeout,
+                )
+
+            if sdk_logger.isEnabledFor(logging.DEBUG):
+                if callable(redact_for_log) and callable(redact_query_params_for_log):
+                    sdk_logger.debug(
+                        f"{str(req.http_method.name)} {url} {response.status_code}, "
+                        f"headers: {JSON.marshal(redact_for_log(headers))}, "
+                        f"params: {JSON.marshal(redact_query_params_for_log(req.queries))}, "
+                        f"body: {JSON.marshal(redact_for_log(content))}"
+                    )
+                else:
+                    sdk_logger.debug(
+                        f"{str(req.http_method.name)} request completed with status {response.status_code}, "
+                        f"headers_count: {len(headers)}, "
+                        f"params_count: {len(req.queries)}, "
+                        f"body_present: {content is not None}"
+                    )
+
+            resp = RawResponse()
+            resp.status_code = response.status_code
+            resp.headers = dict(response.headers)
+            resp.content = response.content
+            return resp
+
+        @staticmethod
+        async def aexecute(
+            conf: Any, req: Any, option: Optional[Any] = None
+        ) -> Any:
+            import httpx
+
+            if option is None:
+                option = RequestOption()
+            url = _build_url(conf.domain, req.uri, req.paths)
+            headers = _build_header(req, option, conf)
+
+            json_, files, data = None, None, None
+            if req.files:
+                files = req.files
+                if req.body is not None:
+                    data = json.loads(JSON.marshal(req.body))
+            elif req.body is not None:
+                json_ = json.loads(JSON.marshal(req.body))
+
+            client_kwargs = _httpx_client_kwargs_for(conf, httpx.AsyncClient)
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                response = await client.request(
+                    str(req.http_method.name),
+                    url,
+                    headers=req.headers,
+                    params=req.queries,
+                    json=json_,
+                    data=data,
+                    files=files,
+                    timeout=conf.timeout,
+                )
+
+                if sdk_logger.isEnabledFor(logging.DEBUG):
+                    if callable(redact_for_log) and callable(redact_query_params_for_log):
+                        sdk_logger.debug(
+                            f"{str(req.http_method.name)} {url} {response.status_code}"
+                            f"{f', headers: {JSON.marshal(redact_for_log(headers))}' if headers else ''}"
+                            f"{f', params: {JSON.marshal(redact_query_params_for_log(req.queries))}' if req.queries else ''}"
+                            f"{f', body: {JSON.marshal(_redact_body_for_log(json_, files, data))}' if json_ or files or data else ''}"
+                        )
+                    else:
+                        sdk_logger.debug(
+                            f"{str(req.http_method.name)} request completed with status {response.status_code}, "
+                            f"headers_count: {len(headers)}, "
+                            f"params_count: {len(req.queries)}, "
+                            f"body_present: {json_ is not None or files is not None or data is not None}"
+                        )
+
+                resp = RawResponse()
+                resp.status_code = response.status_code
+                resp.headers = dict(response.headers)
+                resp.content = response.content
+                return resp
+
+    mod = types.ModuleType(f"{pkg_prefix}.core.http.transport")
+    mod.__file__ = str(pkg_root / "core" / "http" / "transport.py")
+    mod.__package__ = f"{pkg_prefix}.core.http"
+    mod.Transport = Transport
+    mod.Config = Config
+    mod.BaseRequest = BaseRequest
+    mod.RawResponse = RawResponse
+    mod.RequestOption = RequestOption
+    mod._build_url = _build_url
+    mod._build_header = _build_header
+    mod._merge_dicts = _merge_dicts
+    mod._redact_body_for_log = _redact_body_for_log
+    return mod
+
+
+class _LazyHttpPackage(_LazyLarkPackage):
+    """Lazy package for ``<pkg_prefix>.core.http`` deferring HTTP stack imports."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_") and name not in (
+            "_build_url",
+            "_build_header",
+            "_merge_dicts",
+            "_redact_body_for_log",
+        ):
+            raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+        with self._lazy_lock:
+            if name in self.__dict__:
+                return self.__dict__[name]
+
+            if name in ("handler", "transport"):
+                mod = importlib.import_module(f"{self.__name__}.{name}")
+                self.__dict__[name] = mod
+                return mod
+
+            if name == "HttpHandler":
+                handler_mod = importlib.import_module(f"{self.__name__}.handler")
+                val = getattr(handler_mod, name)
+                self.__dict__[name] = val
+                return val
+
+            if name in (
+                "Transport",
+                "_build_url",
+                "_build_header",
+                "_merge_dicts",
+                "_redact_body_for_log",
+            ):
+                transport_mod = importlib.import_module(f"{self.__name__}.transport")
+                val = getattr(transport_mod, name)
+                self.__dict__[name] = val
+                return val
+
+            _exec_real_init(self, self._lazy_pkg_dir / "__init__.py")
+            if name in self.__dict__:
+                return self.__dict__[name]
+
+        raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+
+class _HttpxRequestsCompat:
+    """Minimal ``requests``-compatible facade backed by lazy ``httpx`` for WS endpoint POST."""
+
+    @staticmethod
+    def _extract_proxy_url(proxies: Any) -> Optional[str]:
+        if isinstance(proxies, str):
+            return proxies
+        if isinstance(proxies, dict):
+            return proxies.get("https") or proxies.get("http")
+        return None
+
+    class Session:
+        def __init__(self) -> None:
+            self.trust_env: bool = True
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Any = None,
+            json: Any = None,
+            proxies: Any = None,
+            timeout: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            import httpx
+
+            client_kwargs: dict[str, Any] = {"trust_env": self.trust_env}
+            proxy_url = _HttpxRequestsCompat._extract_proxy_url(proxies)
+            if proxy_url:
+                params = inspect.signature(httpx.Client).parameters
+                if "proxy" in params:
+                    client_kwargs["proxy"] = proxy_url
+                elif "proxies" in params:
+                    client_kwargs["proxies"] = proxy_url
+                else:
+                    raise RuntimeError(
+                        "installed httpx does not support explicit proxy configuration"
+                    )
+            with httpx.Client(**client_kwargs) as client:
+                return client.post(
+                    url,
+                    headers=headers,
+                    json=json,
+                    timeout=timeout,
+                    **kwargs,
+                )
+
+    @classmethod
+    def post(
+        cls,
+        url: str,
+        *,
+        headers: Any = None,
+        json: Any = None,
+        proxies: Any = None,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        return cls.Session().post(
+            url,
+            headers=headers,
+            json=json,
+            proxies=proxies,
+            timeout=timeout,
+            **kwargs,
+        )
+
+
+class _LazyChannelWSClientLoader(importlib.abc.Loader):
+    """Execute ``lark_channel/ws/client.py`` without loading duplicate ``requests`` stack."""
+
+    def __init__(self, client_file: Path) -> None:
+        self._client_file = client_file
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        source = self._client_file.read_text(encoding="utf-8")
+        if "requests" not in sys.modules:
+            try:
+                tree = ast.parse(source, str(self._client_file))
+                replaced = False
+                new_body: list[ast.stmt] = []
+                for stmt in tree.body:
+                    if (
+                        not replaced
+                        and isinstance(stmt, ast.Import)
+                        and len(stmt.names) == 1
+                        and stmt.names[0].name == "requests"
+                        and stmt.names[0].asname is None
+                    ):
+                        assign = ast.Assign(
+                            targets=[ast.Name(id="requests", ctx=ast.Store())],
+                            value=ast.Name(id="_ghostap_requests", ctx=ast.Load()),
+                        )
+                        ast.copy_location(assign, stmt)
+                        ast.fix_missing_locations(assign)
+                        new_body.append(assign)
+                        replaced = True
+                    else:
+                        new_body.append(stmt)
+                if replaced:
+                    tree.body = new_body
+                    module.__dict__["_ghostap_requests"] = _HttpxRequestsCompat
+                    code = compile(tree, str(self._client_file), "exec")
+                    exec(code, module.__dict__)
+                    return
+            except Exception:
+                pass
+        code = compile(source, str(self._client_file), "exec")
+        exec(code, module.__dict__)
+
+
+class _BlockedSubmoduleLoader(importlib.abc.Loader):
+    """Raise ``ImportError`` for unused CLI helper submodules like ``httpx._main``."""
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        raise ImportError(f"{module.__name__} CLI helper disabled in GhostAP runtime")
+
+
+class _BlockedSubmoduleFinder(importlib.abc.MetaPathFinder):
+    """Block optional CLI submodules that pull heavy formatting dependencies (click/pygments)."""
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Any = None,
+        target: Any = None,
+    ) -> Optional[importlib.machinery.ModuleSpec]:
+        del path, target
+        if fullname not in _BLOCKED_HTTPX_SUBMODULES:
+            return None
+        main_mod = sys.modules.get("__main__")
+        if getattr(main_mod, "__package__", None) == "httpx":
+            return None
+        return importlib.util.spec_from_loader(
+            fullname, _BlockedSubmoduleLoader(), is_package=False
+        )
+
+
 class _LazyLarkLoader(importlib.abc.Loader):
     """Loader creating lazy ``lark_oapi`` / ``lark_channel`` package or ``client`` modules."""
 
@@ -799,8 +1252,14 @@ class _LazyLarkLoader(importlib.abc.Loader):
             return _LazyLarkRootModule(fullname, self._pkg_root)
         if fullname == f"{self._pkg_prefix}.client":
             return _build_lazy_client_module(self._pkg_root, pkg_prefix=self._pkg_prefix)
+        if fullname == f"{self._pkg_prefix}.core.utils.decryptor":
+            return _build_lazy_decryptor_module(self._pkg_root, pkg_prefix=self._pkg_prefix)
+        if fullname == f"{self._pkg_prefix}.core.http.transport":
+            return _build_lazy_transport_module(self._pkg_root, pkg_prefix=self._pkg_prefix)
         parts = fullname.split(".")
         assert self._pkg_dir is not None
+        if fullname == f"{self._pkg_prefix}.core.http":
+            return _LazyHttpPackage(fullname, self._pkg_dir)
         if self._pkg_prefix == "lark_channel" and len(parts) == 2 and parts[1] == "channel":
             return _LazyChannelSubpackage(fullname, self._pkg_dir)
         if len(parts) == 2 and parts[1] == "api":
@@ -863,6 +1322,40 @@ class _LazyLarkFinder(importlib.abc.MetaPathFinder):
         if fullname == f"{self._pkg_prefix}.client":
             loader = _LazyLarkLoader(self._pkg_root, pkg_prefix=self._pkg_prefix)
             return importlib.util.spec_from_loader(fullname, loader, is_package=False)
+
+        if fullname == f"{self._pkg_prefix}.core.utils.decryptor":
+            decryptor_file = self._pkg_root / "core" / "utils" / "decryptor.py"
+            if decryptor_file.is_file():
+                loader = _LazyLarkLoader(self._pkg_root, pkg_prefix=self._pkg_prefix)
+                return importlib.util.spec_from_loader(
+                    fullname, loader, origin=str(decryptor_file), is_package=False
+                )
+
+        if fullname == f"{self._pkg_prefix}.core.http":
+            http_dir = self._pkg_root / "core" / "http"
+            if http_dir.is_dir():
+                loader = _LazyLarkLoader(
+                    self._pkg_root, http_dir, pkg_prefix=self._pkg_prefix
+                )
+                return importlib.util.spec_from_loader(fullname, loader, is_package=True)
+
+        if fullname == f"{self._pkg_prefix}.core.http.transport":
+            transport_file = self._pkg_root / "core" / "http" / "transport.py"
+            if transport_file.is_file():
+                loader = _LazyLarkLoader(self._pkg_root, pkg_prefix=self._pkg_prefix)
+                return importlib.util.spec_from_loader(
+                    fullname, loader, origin=str(transport_file), is_package=False
+                )
+
+        if fullname == "lark_channel.ws.client":
+            ws_client_file = self._pkg_root / "ws" / "client.py"
+            if ws_client_file.is_file():
+                return importlib.util.spec_from_loader(
+                    fullname,
+                    _LazyChannelWSClientLoader(ws_client_file),
+                    origin=str(ws_client_file),
+                    is_package=False,
+                )
 
         parts = fullname.split(".")
         if self._pkg_prefix == "lark_channel" and len(parts) == 2 and parts[1] == "channel":
@@ -964,4 +1457,19 @@ def install_lazy_lark_channel() -> bool:
     return _install_lazy_sdk("lark_channel", "_IS_LAZY_LARK_CHANNEL_ROOT")
 
 
-__all__ = ["install_lazy_lark_channel", "install_lazy_lark_oapi"]
+def install_lazy_httpx_guard() -> bool:
+    """Prevent ``import httpx`` from eagerly loading optional CLI deps (click/pygments/rich)."""
+    with _INSTALL_LOCK:
+        if "httpx._main" in sys.modules:
+            return False
+        if any(isinstance(f, _BlockedSubmoduleFinder) for f in sys.meta_path):
+            return True
+        sys.meta_path.insert(0, _BlockedSubmoduleFinder())
+        return True
+
+
+__all__ = [
+    "install_lazy_httpx_guard",
+    "install_lazy_lark_channel",
+    "install_lazy_lark_oapi",
+]

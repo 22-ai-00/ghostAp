@@ -367,3 +367,101 @@ assert len([m for m in sys.modules if m.startswith("lark_oapi")]) < 150
         check=False,
     )
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_lazy_httpx_guard_crypto_and_unified_transport():
+    """HTTPX CLI deps, Crypto, requests, and requests_toolbelt stay unloaded until needed."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import asyncio
+import base64
+import hashlib
+import sys
+from unittest.mock import patch
+
+from src.utils.lark_lazy import (
+    install_lazy_httpx_guard,
+    install_lazy_lark_channel,
+    install_lazy_lark_oapi,
+)
+
+assert install_lazy_httpx_guard()
+assert install_lazy_lark_oapi()
+assert install_lazy_lark_channel()
+
+import httpx
+import httpx as httpx_mod
+import lark_oapi
+import lark_channel
+import lark_channel.ws.client as lark_ws_impl
+from lark_oapi.core.utils.decryptor import AESCipher as OapiAESCipher
+from lark_channel.core.http import Transport as ChannelTransport
+from lark_oapi.core.http import Transport as OapiTransport
+
+assert httpx_mod.Client is not None
+assert lark_ws_impl.Client is not None
+
+for forbidden in (
+    "httpx._main",
+    "click",
+    "pygments",
+    "rich",
+    "requests",
+    "requests_toolbelt",
+    "urllib3",
+    "Crypto",
+):
+    assert forbidden not in sys.modules, f"{forbidden} should not be loaded eagerly"
+
+from lark_oapi.core.enum import HttpMethod as OapiHttpMethod
+from lark_oapi.core.model import BaseRequest as OapiBaseRequest, Config as OapiConfig
+from lark_channel.core.enum import HttpMethod as ChHttpMethod
+from lark_channel.core.model import BaseRequest as ChBaseRequest, Config as ChConfig
+
+# Verify unified httpx Transport.execute & Transport.aexecute without importing requests
+req_oapi = OapiBaseRequest.builder().uri("/open-apis/test/:id").paths({"id": "42"}).http_method(OapiHttpMethod.POST).body({"ok": True}).build()
+conf_oapi = OapiConfig()
+conf_oapi.domain = "https://open.feishu.cn"
+conf_oapi.timeout = 5
+
+mock_transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"url": str(request.url)}))
+orig_client = httpx.Client
+orig_async_client = httpx.AsyncClient
+
+with patch.object(httpx, "Client", lambda **kw: orig_client(transport=mock_transport, **kw)):
+    raw = OapiTransport.execute(conf_oapi, req_oapi)
+    assert raw.status_code == 200
+    assert b"42" in raw.content
+assert "requests" not in sys.modules
+
+req_ch = ChBaseRequest.builder().uri("/open-apis/ch").http_method(ChHttpMethod.POST).body({"hello": "world"}).build()
+conf_ch = ChConfig()
+conf_ch.domain = "https://open.feishu.cn"
+conf_ch.timeout = 5
+with patch.object(httpx, "AsyncClient", lambda **kw: orig_async_client(transport=mock_transport, **kw)):
+    raw_async = asyncio.run(ChannelTransport.aexecute(conf_ch, req_ch))
+    assert raw_async.status_code == 200
+assert "requests" not in sys.modules
+assert "Crypto" not in sys.modules
+
+# Verify lazy decryptor still hydrates Crypto on first decrypt_str call
+from Crypto.Cipher import AES
+key = "secret-key"
+digest = hashlib.sha256(key.encode("utf-8")).digest()
+iv = b"0123456789abcdef"
+plaintext = b"ghostap-secret"
+pad = 16 - (len(plaintext) % 16)
+ct = iv + AES.new(digest, AES.MODE_CBC, iv).encrypt(plaintext + bytes([pad]) * pad)
+enc = base64.b64encode(ct).decode("ascii")
+assert OapiAESCipher(key).decrypt_str(enc) == "ghostap-secret"
+assert "Crypto" in sys.modules
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"

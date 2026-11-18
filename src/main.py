@@ -31,11 +31,13 @@ def _activate_lark_import_cache():
         try:
             try:
                 from utils.lark_lazy import (
+                    install_lazy_httpx_guard,
                     install_lazy_lark_channel,
                     install_lazy_lark_oapi,
                 )
             except ImportError:
                 from .utils.lark_lazy import (
+                    install_lazy_httpx_guard,
                     install_lazy_lark_channel,
                     install_lazy_lark_oapi,
                 )
@@ -46,6 +48,7 @@ def _activate_lark_import_cache():
             channel_already_lazy = getattr(
                 sys.modules.get("lark_channel"), "_IS_LAZY_LARK_CHANNEL_ROOT", False
             )
+            install_lazy_httpx_guard()
             oapi_ok = install_lazy_lark_oapi()
             channel_ok = install_lazy_lark_channel()
             if oapi_ok or channel_ok:
