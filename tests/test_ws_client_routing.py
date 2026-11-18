@@ -2030,6 +2030,7 @@ def test_ready_employee_target_snapshot_untyped_runtime_error_propagates() -> No
 
 
 def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -> None:
+    from src.autonomous.provisioning import composition as employee_composition
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
     ingress = SimpleNamespace(
@@ -2039,8 +2040,13 @@ def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -
     )
     runtime = object.__new__(EmployeeDepartmentRuntime)
     runtime._ingress = ingress
+    runtime._router = object()
+    runtime._closing = False
+    runtime._employee_handoff_projection_result = MagicMock(
+        return_value=employee_composition._EmployeeHandoffProjection.OWNED
+    )
 
-    accepted = runtime.wait_for_employee_message_acceptance(
+    accepted = runtime.wait_for_employee_message_handoff(
         tenant_key="tenant_test",
         agent_id="agt_alpha",
         bot_principal_id="bot_alpha",
@@ -2053,18 +2059,21 @@ def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -
     )
 
     assert accepted is True
-    ingress.wait_for_anchored_message_acceptance.assert_called_once_with(
-        tenant_key="tenant_test",
-        agent_id="agt_alpha",
-        bot_principal_id="bot_alpha",
-        app_id="cli_alpha",
-        event_type="im.message.receive_v1",
-        chat_id="oc_" + hashlib.sha256(b"oc_raw_cross_app").hexdigest(),
-        message_id="om_" + hashlib.sha256(b"om_raw_cross_app").hexdigest(),
-        channel_generation=3,
-        connection_id="conn_alpha",
-        timeout=1.75,
-    )
+    ingress.wait_for_anchored_message_acceptance.assert_called_once()
+    call_kwargs = ingress.wait_for_anchored_message_acceptance.call_args.kwargs
+    assert call_kwargs == {
+        "tenant_key": "tenant_test",
+        "agent_id": "agt_alpha",
+        "bot_principal_id": "bot_alpha",
+        "app_id": "cli_alpha",
+        "event_type": "im.message.receive_v1",
+        "chat_id": "oc_" + hashlib.sha256(b"oc_raw_cross_app").hexdigest(),
+        "message_id": "om_" + hashlib.sha256(b"om_raw_cross_app").hexdigest(),
+        "channel_generation": 3,
+        "connection_id": "conn_alpha",
+        "timeout": call_kwargs["timeout"],
+    }
+    assert 0.0 < call_kwargs["timeout"] <= 1.5
 
 
 @pytest.mark.parametrize(
