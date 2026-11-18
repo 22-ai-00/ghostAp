@@ -31,7 +31,7 @@ _GLIBC_M_ARENA_MAX = -8
 _STATE_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 _LIBC_HANDLE: Any = None
 _LIBC_PROBED = False
-_LAST_PERIODIC_TRIM_AT = 0.0
+_LAST_PERIODIC_TRIM_AT: Optional[float] = None
 
 
 def _parse_int_env(name: str, default: int, *, minimum: int) -> int:
@@ -141,7 +141,11 @@ def maybe_trim_process_heap(*, min_interval_s: float = 60.0) -> bool:
     global _LAST_PERIODIC_TRIM_AT
     now = time.monotonic()
     with _STATE_LOCK:
-        if min_interval_s > 0 and (now - _LAST_PERIODIC_TRIM_AT) < min_interval_s:
+        if (
+            min_interval_s > 0
+            and _LAST_PERIODIC_TRIM_AT is not None
+            and (now - _LAST_PERIODIC_TRIM_AT) < min_interval_s
+        ):
             return False
         _LAST_PERIODIC_TRIM_AT = now
     return trim_process_heap()

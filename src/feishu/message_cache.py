@@ -47,10 +47,17 @@ class MessageCache:
                 has_entries = bool(self._cache)
                 if not has_entries:
                     self._wakeup.clear()
+                    wait_timeout = None
+                elif self._ttl > 0:
+                    oldest_ts = next(iter(self._cache.values()))
+                    remaining = (oldest_ts + self._ttl) - time.time()
+                    wait_timeout = min(max(0.05, remaining), max(float(self._ttl), 1.0))
+                else:
+                    wait_timeout = max(0.05, float(self._cleanup_interval or 1))
             if not has_entries:
                 self._wakeup.wait()
                 continue
-            if self._stop_event.wait(timeout=self._cleanup_interval):
+            if self._stop_event.wait(timeout=wait_timeout):
                 return
             if self._running:
                 self._do_cleanup()
@@ -91,8 +98,10 @@ class MessageCache:
                 # into the cleanup interval (30 seconds in production).
                 del self._cache[message_id]
 
+            was_empty = not self._cache
             self._cache[message_id] = current_time
-            self._wakeup.set()
+            if was_empty or self._ttl <= 0:
+                self._wakeup.set()
 
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
@@ -135,7 +144,9 @@ class MessageCache:
         current_time = time.time()
         with self._lock:
             self._cache.pop(message_id, None)
+            was_empty = not self._cache
             self._cache[message_id] = current_time
-            self._wakeup.set()
+            if was_empty or self._ttl <= 0:
+                self._wakeup.set()
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)

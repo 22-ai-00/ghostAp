@@ -118,9 +118,21 @@ class WSHealthMonitor:
 
         return self._trigger_disconnect(reason=f"idle_for={idle_for:.1f}s > timeout={stale_timeout:.1f}s")
 
-    def _watchdog_loop(self) -> None:
+    def _next_watchdog_wait_seconds(self) -> float:
         interval = self._get_watchdog_interval()
-        while not self._watchdog_stop.wait(interval):
+        client = getattr(self._client_instance, "_client", None)
+        if client is None or getattr(client, "_conn", None) is None:
+            return interval
+        stale_timeout = self._get_stale_timeout()
+        with self._health_lock:
+            last_seen = max(self._last_pong_at, self._last_frame_at, self._last_connect_at)
+        if last_seen <= 0.0:
+            return interval
+        remaining = (last_seen + stale_timeout) - time.time()
+        return max(interval, remaining)
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(self._next_watchdog_wait_seconds()):
             try:
                 self.check_health_once()
             except Exception as e:

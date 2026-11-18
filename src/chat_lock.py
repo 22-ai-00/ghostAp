@@ -345,6 +345,13 @@ class ChatLockManager:
                 self._cleanup_expired()
             except Exception:
                 logger.exception("ChatLockCleanup: unexpected error in cleanup cycle")
+                continue
+            with self._mu:
+                if not self._locks:
+                    with self._thread_mu:
+                        if self._cleanup_thread is threading.current_thread():
+                            self._cleanup_thread = None
+                            return
 
     def _cleanup_expired(self) -> None:
         """Remove chat locks that have exceeded max_duration."""

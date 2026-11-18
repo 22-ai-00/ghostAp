@@ -271,3 +271,192 @@ def test_acp_history_store_load_streams_large_files(tmp_path):
 
     all_items = store.load(session_id, limit=0)
     assert len(all_items) == 50
+
+
+def test_maybe_trim_process_heap_succeeds_during_early_uptime(monkeypatch):
+    """Initial maybe_trim_process_heap succeeds even when time.monotonic() < min_interval_s."""
+    monkeypatch.setattr(memory_tuning, "_LAST_PERIODIC_TRIM_AT", None)
+    clock = iter([5.0, 10.0, 70.0])
+    monkeypatch.setattr(memory_tuning.time, "monotonic", lambda: next(clock))
+    trims: list[int] = []
+    monkeypatch.setattr(
+        memory_tuning,
+        "trim_process_heap",
+        lambda: trims.append(1) or True,
+    )
+
+    assert memory_tuning.maybe_trim_process_heap(min_interval_s=60.0) is True
+    assert memory_tuning.maybe_trim_process_heap(min_interval_s=60.0) is False
+    assert memory_tuning.maybe_trim_process_heap(min_interval_s=60.0) is True
+    assert len(trims) == 2
+
+
+def test_control_plane_deferred_exit_race_and_chat_prefix_wakeup():
+    """Deferred exit completes promptly if task already finished and wakes on chat-scoped events."""
+    from src.tasking import TaskStatus
+
+    scheduler = MagicMock()
+    scheduler.list_tasks.return_value = []
+    project_mgr = MagicMock()
+    project_mgr.get_project_for_chat.return_value = None
+    project_mgr.get_active_project.return_value = None
+    submitted: list[tuple] = []
+    scheduler.submit.side_effect = lambda spec, fn: submitted.append((spec, fn))
+
+    cp = ControlPlane(scheduler, project_mgr, lambda *_a, **_kw: None)
+    try:
+        # Case 1: task already finished before request_deferred_exit() -> no spin, completes immediately
+        cp.request_deferred_exit(message_id="m-done", chat_id="c1", project_id="p1")
+        deadline = time.monotonic() + 1.0
+        while not submitted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(submitted) == 1
+
+        # Case 2: active task finishes with chat-scoped event (project_id=None) -> prefix match wakes "c1:p1"
+        submitted.clear()
+        running_task = SimpleNamespace(status=TaskStatus.RUNNING)
+        scheduler.list_tasks.return_value = [running_task]
+        cp.request_deferred_exit(message_id="m-wait", chat_id="c1", project_id="p1")
+        time.sleep(0.05)
+        assert len(submitted) == 0
+
+        scheduler.list_tasks.return_value = []
+        cp.on_scheduler_event(
+            SimpleNamespace(
+                chat_id="c1",
+                project_id=None,
+                run_id="r-chat",
+                task_type="coding",
+                status=TaskStatus.SUCCEEDED,
+            )
+        )
+        deadline = time.monotonic() + 1.0
+        while not submitted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(submitted) == 1
+    finally:
+        cp.stop()
+
+
+def test_task_scheduler_next_reap_delay_exact_remaining_and_no_active_poll():
+    """TaskScheduler sleeps until exact terminal reap age rather than fixed 15s/0.2s polling."""
+    scheduler = TaskScheduler(max_concurrent=1)
+    try:
+        with scheduler._cv:
+            assert scheduler._next_reap_delay_unlocked() is None
+
+        spec = TaskSpec(
+            chat_id="c-reap",
+            project_id="p-reap",
+            name="reap-check",
+            task_type="coding",
+            priority=TaskPriority.NORMAL,
+        )
+        done = threading.Event()
+        handle = scheduler.submit(spec, lambda _ctx: "ok")
+        handle.add_done_callback(lambda _ev: done.set())
+        assert done.wait(timeout=2.0)
+
+        deadline = time.monotonic() + 2.0
+        state = scheduler.get_state(handle.run_id)
+        while state is not None and state.status == TaskStatus.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            state = scheduler.get_state(handle.run_id)
+        assert state is not None and state.status == TaskStatus.SUCCEEDED
+
+        with scheduler._cv:
+            delay = scheduler._next_reap_delay_unlocked()
+            assert delay is not None
+            assert 0.05 <= delay <= scheduler._REAP_DEFAULT_MAX_AGE + 1.0
+    finally:
+        scheduler.stop()
+
+
+def test_message_cache_adaptive_ttl_wait_only_wakes_on_empty_transition():
+    """MessageCache sets _wakeup only when transitioning from empty (or ttl<=0)."""
+    cache = MessageCache(ttl=10, max_size=100, cleanup_interval=60)
+    assert not cache._wakeup.is_set()
+    assert cache.is_duplicate("msg-1") is False
+    assert cache._wakeup.is_set()
+    cache._wakeup.clear()
+
+    # Subsequent inserts while cache is non-empty do not repeatedly wake the reaper
+    assert cache.is_duplicate("msg-2") is False
+    assert not cache._wakeup.is_set()
+
+
+def test_ws_health_monitor_next_watchdog_wait_adapts_to_stale_timeout(monkeypatch):
+    """WSHealthMonitor sleeps up to remaining stale timeout when connected and healthy."""
+    from src.feishu.ws_health import WSHealthMonitor
+
+    fake_client = SimpleNamespace(_client=None)
+    settings = SimpleNamespace(feishu_ws_watchdog_interval=15.0, feishu_ws_stale_timeout=300.0)
+    monitor = WSHealthMonitor(fake_client, settings)
+
+    # Disconnected -> uses base watchdog interval (15s)
+    assert monitor._next_watchdog_wait_seconds() == 15.0
+
+    # Connected & recently active -> sleeps remaining stale window (~295s)
+    monkeypatch.setattr("src.feishu.ws_health.time.time", lambda: 1005.0)
+    with monitor._health_lock:
+        monitor._last_connect_at = 1000.0
+        monitor._last_frame_at = 1000.0
+        monitor._last_pong_at = 1000.0
+    fake_client._client = SimpleNamespace(_conn=object())
+    assert monitor._next_watchdog_wait_seconds() == 295.0
+
+    # Near/past stale deadline -> floored at watchdog interval (15s)
+    monkeypatch.setattr("src.feishu.ws_health.time.time", lambda: 1295.0)
+    assert monitor._next_watchdog_wait_seconds() == 15.0
+
+
+def test_chat_lock_and_repo_lock_cleanup_threads_retire_and_restart(monkeypatch):
+    """ChatLockManager and RepoLockManager retire empty cleanup threads and restart on re-lock."""
+    from src.chat_lock import ChatLockManager
+    from src.repo_lock import RepoLockManager
+
+    monkeypatch.setattr(
+        "src.chat_lock.get_settings",
+        lambda: SimpleNamespace(
+            admin_user_ids=("admin-1",),
+            chat_lock_max_duration=60.0,
+            chat_lock_cleanup_interval=0.02,
+        ),
+    )
+    chat_mgr = ChatLockManager(max_duration=60.0, cleanup_interval=0.02)
+    try:
+        assert chat_mgr._cleanup_thread is None
+        res = chat_mgr.lock_chat("chat-1", "admin-1")
+        assert res.success is True
+        assert chat_mgr._cleanup_thread is not None and chat_mgr._cleanup_thread.is_alive()
+
+        assert chat_mgr.unlock_chat("chat-1", "admin-1").success is True
+        deadline = time.monotonic() + 1.5
+        while chat_mgr._cleanup_thread is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert chat_mgr._cleanup_thread is None
+
+        # Re-locking cleanly spawns a fresh thread
+        assert chat_mgr.lock_chat("chat-2", "admin-1").success is True
+        assert chat_mgr._cleanup_thread is not None and chat_mgr._cleanup_thread.is_alive()
+    finally:
+        chat_mgr.shutdown()
+
+    repo_mgr = RepoLockManager(idle_timeout=0.02, cleanup_interval=0.02, hard_timeout=60)
+    try:
+        assert repo_mgr._cleanup_thread is None
+        acq = repo_mgr.acquire("/tmp/ghostap-test-repo", "chat-1")
+        assert acq.success is True
+        assert repo_mgr._cleanup_thread is not None and repo_mgr._cleanup_thread.is_alive()
+        repo_mgr.release("/tmp/ghostap-test-repo", "chat-1")
+
+        deadline = time.monotonic() + 1.5
+        while repo_mgr._cleanup_thread is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert repo_mgr._cleanup_thread is None
+
+        acq2 = repo_mgr.acquire("/tmp/ghostap-test-repo", "chat-2")
+        assert acq2.success is True
+        assert repo_mgr._cleanup_thread is not None and repo_mgr._cleanup_thread.is_alive()
+    finally:
+        repo_mgr.shutdown()

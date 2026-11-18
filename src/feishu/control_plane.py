@@ -89,9 +89,18 @@ class ControlPlane:
             if ev.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED}:
                 return
             key = self._pending_exit_key(ev.chat_id, ev.project_id)
+            chat_prefix = f"{ev.chat_id}:"
+            with self._pending_exit_lock:
+                matching_keys = [
+                    pending_key
+                    for pending_key in self._pending_exits
+                    if pending_key == key or pending_key.startswith(chat_prefix)
+                ]
+            if not matching_keys:
+                matching_keys = [key]
             with self._event_lock:
-                self._event_q.append(key)
-            self._wakeup.set()
+                self._event_q.extend(matching_keys)
+                self._wakeup.set()
         except Exception:
             logger.debug("Unexpected error in on_scheduler_event", exc_info=True)
             return
@@ -103,8 +112,8 @@ class ControlPlane:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             with self._pending_exit_lock:
-                has_pending_exits = bool(self._pending_exits)
-            self._wakeup.wait(timeout=0.2 if has_pending_exits else None)
+                pending_keys = list(self._pending_exits)
+            self._wakeup.wait(timeout=5.0 if pending_keys else None)
             if self._stop_event.is_set():
                 return
 
@@ -113,6 +122,9 @@ class ControlPlane:
                 while self._event_q:
                     keys.add(self._event_q.popleft())
                 self._wakeup.clear()
+
+            if not keys and pending_keys:
+                keys.update(pending_keys)
 
             for key in keys:
                 try:
@@ -174,7 +186,9 @@ class ControlPlane:
                 message_id=message_id,
                 requested_at=time.time(),
             )
-        self._wakeup.set()
+        with self._event_lock:
+            self._event_q.append(key)
+            self._wakeup.set()
 
     def should_defer_exit(self, *, chat_id: str, project_id: Optional[str]) -> bool:
         tasks = self._scheduler.list_tasks(chat_id=chat_id, project_id=project_id, include_done=False, limit=200)

@@ -196,10 +196,10 @@ class RepoLockManager:
 
     def _ensure_cleanup_thread(self) -> None:
         """Start the background cleanup daemon on first use (double-checked locking)."""
-        if self._cleanup_thread is not None:
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             return
         with self._thread_mu:
-            if self._cleanup_thread is not None:
+            if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
                 return
             self._cleanup_thread = threading.Thread(
                 target=self._cleanup_loop,
@@ -557,6 +557,13 @@ class RepoLockManager:
                 self._cleanup_idle()
             except Exception:
                 logger.error("RepoLock: cleanup error", exc_info=True)
+                continue
+            with self._mu:
+                if not self._locks and not self._path_to_token:
+                    with self._thread_mu:
+                        if self._cleanup_thread is threading.current_thread():
+                            self._cleanup_thread = None
+                            return
 
     def _cleanup_idle(self) -> None:
         now = time.monotonic()

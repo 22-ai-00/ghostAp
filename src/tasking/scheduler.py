@@ -853,6 +853,18 @@ class TaskScheduler:
         if state.spec.task_id and self._by_task_id.get(state.spec.task_id) == run_id:
             self._by_task_id.pop(state.spec.task_id, None)
 
+    def _next_reap_delay_unlocked(self) -> float | None:
+        if not self._terminal_order:
+            return None
+        oldest_id = self._terminal_order[0]
+        if oldest_id in self._active_run_ids:
+            return None
+        oldest_state = self._states.get(oldest_id)
+        if oldest_state is None:
+            return 0.05
+        ts = oldest_state.ended_at or oldest_state.created_at
+        return max(0.05, (ts + self._REAP_DEFAULT_MAX_AGE) - time.time())
+
     def _dispatch_loop(self):
         """调度循环：不断从队列中挑选可运行任务并投递到线程池。
 
@@ -870,11 +882,12 @@ class TaskScheduler:
                 task = self._pick_next_task_unlocked()
                 if not task:
                     self._reap_completed_states()
-                    has_work = bool(self._active_run_ids) or any(self._queues.values())
-                    if has_work:
-                        self._cv.wait(timeout=0.2)
-                    elif self._terminal_order:
-                        self._cv.wait(timeout=15.0)
+                    reap_wait = self._next_reap_delay_unlocked()
+                    if any(self._queues.values()) and not self._active_run_ids:
+                        wait_s = 0.2 if reap_wait is None else min(0.2, reap_wait)
+                        self._cv.wait(timeout=wait_s)
+                    elif reap_wait is not None:
+                        self._cv.wait(timeout=reap_wait)
                     else:
                         self._cv.wait()
                     continue
