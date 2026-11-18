@@ -25,24 +25,29 @@ class ControlPlane:
         self._project_manager = project_manager
         self._exit_handler_fn = exit_handler_fn
 
-        self._pending_exit_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._state_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._pending_exits: dict[str, _PendingExit] = {}  # key -> pending exit
-
         self._event_q: Deque[str] = deque()
-        self._event_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._wakeup = threading.Event()
         self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
         self._system_cmd_gate_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._system_cmd_inflight_by_chat: dict[str, int] = {}
         self._system_cmd_runs_by_chat: dict[str, set[str]] = {}
 
-        self._thread = threading.Thread(
+    def _ensure_thread_locked(self) -> None:
+        if self._stop_event.is_set():
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        thread = threading.Thread(
             target=self._loop,
             name="control_plane",
             daemon=True,
         )
-        self._thread.start()
+        self._thread = thread
+        thread.start()
 
     def is_system_cmd_inflight(self, chat_id: str) -> bool:
         authoritative = getattr(self._scheduler, "has_running_task", None)
@@ -90,17 +95,19 @@ class ControlPlane:
                 return
             key = self._pending_exit_key(ev.chat_id, ev.project_id)
             chat_prefix = f"{ev.chat_id}:"
-            with self._pending_exit_lock:
+            with self._state_lock:
+                if not self._pending_exits:
+                    return
                 matching_keys = [
                     pending_key
                     for pending_key in self._pending_exits
                     if pending_key == key or pending_key.startswith(chat_prefix)
                 ]
-            if not matching_keys:
-                matching_keys = [key]
-            with self._event_lock:
+                if not matching_keys:
+                    return
                 self._event_q.extend(matching_keys)
                 self._wakeup.set()
+                self._ensure_thread_locked()
         except Exception:
             logger.debug("Unexpected error in on_scheduler_event", exc_info=True)
             return
@@ -111,20 +118,26 @@ class ControlPlane:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            with self._pending_exit_lock:
+            with self._state_lock:
                 pending_keys = list(self._pending_exits)
-            self._wakeup.wait(timeout=5.0 if pending_keys else None)
+                has_queued = bool(self._event_q)
+                if not pending_keys and not has_queued:
+                    if self._thread is threading.current_thread():
+                        self._thread = None
+                    self._wakeup.clear()
+                    return
+            if not has_queued:
+                self._wakeup.wait(timeout=5.0)
             if self._stop_event.is_set():
-                return
+                break
 
             keys: set[str] = set()
-            with self._event_lock:
+            with self._state_lock:
                 while self._event_q:
                     keys.add(self._event_q.popleft())
                 self._wakeup.clear()
-
-            if not keys and pending_keys:
-                keys.update(pending_keys)
+                if not keys and self._pending_exits:
+                    keys.update(self._pending_exits)
 
             for key in keys:
                 try:
@@ -132,8 +145,12 @@ class ControlPlane:
                 except Exception:
                     continue
 
+        with self._state_lock:
+            if self._thread is threading.current_thread():
+                self._thread = None
+
     def _maybe_finalize_deferred_exit(self, key: str) -> None:
-        with self._pending_exit_lock:
+        with self._state_lock:
             pending = self._pending_exits.get(key)
         if not pending:
             return
@@ -148,7 +165,7 @@ class ControlPlane:
         if has_running_non_system:
             return
 
-        with self._pending_exit_lock:
+        with self._state_lock:
             pending = self._pending_exits.pop(key, None)
         if not pending:
             return
@@ -179,16 +196,16 @@ class ControlPlane:
 
     def request_deferred_exit(self, *, message_id: str, chat_id: str, project_id: Optional[str]) -> None:
         key = self._pending_exit_key(chat_id, project_id)
-        with self._pending_exit_lock:
+        with self._state_lock:
             self._pending_exits[key] = _PendingExit(
                 chat_id=chat_id,
                 project_id=project_id,
                 message_id=message_id,
                 requested_at=time.time(),
             )
-        with self._event_lock:
             self._event_q.append(key)
             self._wakeup.set()
+            self._ensure_thread_locked()
 
     def should_defer_exit(self, *, chat_id: str, project_id: Optional[str]) -> bool:
         tasks = self._scheduler.list_tasks(chat_id=chat_id, project_id=project_id, include_done=False, limit=200)
@@ -200,5 +217,7 @@ class ControlPlane:
     def stop(self):
         self._stop_event.set()
         self._wakeup.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+        with self._state_lock:
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)

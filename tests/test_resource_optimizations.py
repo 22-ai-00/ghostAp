@@ -460,3 +460,155 @@ def test_chat_lock_and_repo_lock_cleanup_threads_retire_and_restart(monkeypatch)
         assert repo_mgr._cleanup_thread is not None and repo_mgr._cleanup_thread.is_alive()
     finally:
         repo_mgr.shutdown()
+
+
+def test_task_scheduler_threads_start_lazily_and_retire_when_idle():
+    """TaskScheduler threads stay dormant at idle, start on demand, and retire cleanly."""
+    scheduler = TaskScheduler(max_concurrent=1)
+    scheduler._idle_dispatch_timeout = 0.05
+    try:
+        assert not scheduler._dispatcher.is_alive()
+        assert not scheduler._event_dispatcher.is_alive()
+        assert not scheduler._completion_dispatcher.is_alive()
+
+        events_seen: list[TaskStatus] = []
+        scheduler.add_listener(lambda ev: events_seen.append(ev.status))
+        done = threading.Event()
+        handle = scheduler.submit(
+            TaskSpec(chat_id="lazy-c", name="lazy-task"),
+            lambda _ctx: "ok",
+        )
+        handle.add_done_callback(lambda _ev: done.set())
+        assert done.wait(timeout=2.0)
+
+        # Wait for event + completion dispatchers to retire after idle grace timeout
+        deadline = time.monotonic() + 2.0
+        while (
+            scheduler._event_dispatcher.is_alive()
+            or scheduler._completion_dispatcher.is_alive()
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler._event_dispatcher.is_alive()
+        assert not scheduler._completion_dispatcher.is_alive()
+        assert TaskStatus.SUCCEEDED in events_seen
+
+        # Force immediate reap cycle -> _dispatcher also retires when history clears
+        with scheduler._cv:
+            st = scheduler._states.get(handle.run_id)
+            if st is not None:
+                st.ended_at = time.time() - (scheduler._REAP_DEFAULT_MAX_AGE + 10)
+            scheduler._cv.notify_all()
+        deadline = time.monotonic() + 2.0
+        while scheduler._dispatcher.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler._dispatcher.is_alive()
+
+        # Re-submitting re-spawns dormant threads transparently
+        done2 = threading.Event()
+        handle2 = scheduler.submit(
+            TaskSpec(chat_id="lazy-c", name="lazy-task-2"),
+            lambda _ctx: "ok2",
+        )
+        handle2.add_done_callback(lambda _ev: done2.set())
+        assert done2.wait(timeout=2.0)
+    finally:
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_control_plane_thread_starts_lazily_and_retires_when_empty():
+    """ControlPlane starts no thread until request_deferred_exit and retires when empty."""
+    from src.tasking import TaskStatus
+
+    scheduler = MagicMock()
+    scheduler.list_tasks.return_value = []
+    project_mgr = MagicMock()
+    submitted: list[tuple] = []
+    scheduler.submit.side_effect = lambda spec, fn: submitted.append((spec, fn))
+
+    cp = ControlPlane(scheduler, project_mgr, lambda *_a, **_kw: None)
+    try:
+        assert cp._thread is None
+
+        # Unrelated completion event while no deferred exit is pending keeps thread dormant
+        cp.on_scheduler_event(
+            SimpleNamespace(
+                chat_id="c1",
+                project_id="p1",
+                run_id="r1",
+                task_type="coding",
+                status=TaskStatus.SUCCEEDED,
+            )
+        )
+        assert cp._thread is None
+
+        cp.request_deferred_exit(message_id="m1", chat_id="c1", project_id="p1")
+        deadline = time.monotonic() + 1.5
+        while not submitted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(submitted) == 1
+
+        deadline = time.monotonic() + 1.5
+        while cp._thread is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert cp._thread is None
+
+        # Second deferred exit restarts thread cleanly
+        cp.request_deferred_exit(message_id="m2", chat_id="c2", project_id="p2")
+        deadline = time.monotonic() + 1.5
+        while len(submitted) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(submitted) == 2
+    finally:
+        cp.stop()
+
+
+def test_message_cache_lazy_cleanup_retires_and_restarts():
+    """MessageCache(lazy_cleanup=True) spawns cleanup thread on demand and retires on empty."""
+    cache = MessageCache(ttl=0.05, max_size=10, cleanup_interval=0.02, lazy_cleanup=True)
+    try:
+        cache.start_cleanup_thread()
+        assert cache._cleanup_thread is None
+
+        assert cache.is_duplicate("k1") is False
+        assert cache._cleanup_thread is not None and cache._cleanup_thread.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while cache._cleanup_thread is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cache._cleanup_thread is None
+
+        assert cache.is_duplicate("k2") is False
+        assert cache._cleanup_thread is not None and cache._cleanup_thread.is_alive()
+    finally:
+        cache.stop_cleanup_thread()
+
+
+def test_ws_health_trigger_disconnect_skips_when_loop_stopped(monkeypatch):
+    """_trigger_disconnect avoids blocking 5s if SDK loop is not running."""
+    from src.feishu.ws_health import WSHealthMonitor
+
+    fake_client = SimpleNamespace(_client=SimpleNamespace(_conn=object(), _disconnect=MagicMock()))
+    monitor = WSHealthMonitor(fake_client, SimpleNamespace())
+    monkeypatch.setattr("lark_channel.ws.client.loop", SimpleNamespace(is_closed=lambda: False, is_running=lambda: False))
+    start = time.monotonic()
+    assert monitor._trigger_disconnect(reason="application shutdown") is False
+    assert (time.monotonic() - start) < 0.2
+    fake_client._client._disconnect.assert_not_called()
+
+
+def test_feishu_ws_client_init_keeps_single_thread(monkeypatch):
+    """Isolated FeishuWSClient initialization starts zero background threads."""
+    from src.feishu.ws_client import FeishuWSClient
+
+    before_names = {t.name for t in threading.enumerate()}
+    client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+    try:
+        after_names = {t.name for t in threading.enumerate()}
+        new_threads = after_names - before_names
+        assert not new_threads, f"unexpected startup threads: {new_threads}"
+        client._message_cache.start_cleanup_thread()
+        client._card_event_cache.start_cleanup_thread()
+        assert client._message_cache._cleanup_thread is None
+        assert client._card_event_cache._cleanup_thread is None
+    finally:
+        client.close()

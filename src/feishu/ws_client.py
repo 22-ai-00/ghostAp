@@ -482,14 +482,29 @@ class FeishuWSClient(WSManagedGroupsMixin):
             for name, session_timeout in manager_timeouts.items()
         }
         self._intent_recognizer = IntentRecognizer()
-        self._message_cache = MessageCache(ttl=self.settings.message_cache_ttl, max_size=self.settings.message_cache_max_size, cleanup_interval=60)
+        self._message_cache = MessageCache(
+            ttl=self.settings.message_cache_ttl,
+            max_size=self.settings.message_cache_max_size,
+            cleanup_interval=60,
+            lazy_cleanup=True,
+        )
         self._message_ingress_guard = MessageIngressGuard(
             message_cache=self._message_cache,
             message_expire_seconds=self.settings.message_expire_seconds,
         )
-        self._card_event_cache = MessageCache(ttl=self.settings.message_cache_ttl, max_size=self.settings.message_cache_max_size, cleanup_interval=60)
+        self._card_event_cache = MessageCache(
+            ttl=self.settings.message_cache_ttl,
+            max_size=self.settings.message_cache_max_size,
+            cleanup_interval=60,
+            lazy_cleanup=True,
+        )
         # Card action dedupe (user rapid clicks): short TTL, per-action key.
-        self._card_action_dedup_cache = MessageCache(ttl=self.settings.card.action_dedup_ttl, max_size=self.settings.card.action_dedup_max_size, cleanup_interval=30)
+        self._card_action_dedup_cache = MessageCache(
+            ttl=self.settings.card.action_dedup_ttl,
+            max_size=self.settings.card.action_dedup_max_size,
+            cleanup_interval=30,
+            lazy_cleanup=True,
+        )
         self._card_advisory_dispatcher = _CardAdvisoryDispatcher(
             max_pending=_MAX_PENDING_CARD_ADVISORIES
         )
@@ -726,7 +741,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         # Initialize ChatLockGate (ingress-level chat-lock interception).
         from .chat_lock_gate import ChatLockGate
         _clm = getattr(self._handler_ctx, "chat_lock_manager", None)
-        _lock_dedup = MessageCache(ttl=30, max_size=1_000, cleanup_interval=60)
+        _lock_dedup = MessageCache(ttl=30, max_size=1_000, cleanup_interval=60, lazy_cleanup=True)
         self._chat_lock_gate = ChatLockGate(
             _clm, _lock_dedup, handler=system_handler,
         )
@@ -1223,8 +1238,11 @@ class FeishuWSClient(WSManagedGroupsMixin):
                     len(verified.deleted),
                 )
                 try:
+                    import linecache
+
                     from ..utils.memory_tuning import trim_process_heap
 
+                    linecache.clearcache()
                     gc.collect()
                     trim_process_heap()
                 except Exception:

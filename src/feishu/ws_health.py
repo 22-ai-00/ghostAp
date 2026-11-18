@@ -86,7 +86,11 @@ class WSHealthMonitor:
         try:
             from lark_channel.ws import client as lark_ws_client_impl
 
-            fut = asyncio.run_coroutine_threadsafe(client._disconnect(), lark_ws_client_impl.loop)
+            loop = getattr(lark_ws_client_impl, "loop", None)
+            if loop is None or loop.is_closed() or not loop.is_running():
+                logger.debug("跳过触发 WS 断连 (%s): SDK event loop 未运行", reason)
+                return False
+            fut = asyncio.run_coroutine_threadsafe(client._disconnect(), loop)
             fut.result(timeout=5)
             logger.warning("飞书长连接 watchdog 已触发重连: %s", reason)
             return True

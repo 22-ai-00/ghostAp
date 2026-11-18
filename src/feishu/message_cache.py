@@ -13,11 +13,14 @@ class MessageCache:
         ttl: int = 300,
         max_size: int = 1000,
         cleanup_interval: int = 60,
+        *,
+        lazy_cleanup: bool = False,
     ):
         self._cache: OrderedDict[str, float] = OrderedDict()
         self._ttl = ttl
         self._max_size = max_size
         self._cleanup_interval = cleanup_interval
+        self._lazy_cleanup = bool(lazy_cleanup)
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._last_cleanup = time.time()
         self._cleanup_thread: Optional[threading.Thread] = None
@@ -25,27 +28,47 @@ class MessageCache:
         self._stop_event = threading.Event()
         self._wakeup = threading.Event()
 
-    def start_cleanup_thread(self):
-        if self._cleanup_thread is not None:
+    def _spawn_cleanup_thread_unlocked(self) -> None:
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             return
-        self._running = True
-        self._stop_event.clear()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="message_cache_cleanup")
-        self._cleanup_thread.start()
+        thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="message_cache_cleanup")
+        self._cleanup_thread = thread
+        thread.start()
+
+    def start_cleanup_thread(self):
+        with self._lock:
+            self._running = True
+            self._stop_event.clear()
+            if self._lazy_cleanup and not self._cache:
+                return
+            self._spawn_cleanup_thread_unlocked()
 
     def stop_cleanup_thread(self):
-        self._running = False
-        self._stop_event.set()
-        self._wakeup.set()
-        if self._cleanup_thread:
-            self._cleanup_thread.join(timeout=2)
-            self._cleanup_thread = None
+        with self._lock:
+            self._running = False
+            self._stop_event.set()
+            self._wakeup.set()
+            thread = self._cleanup_thread
+        if thread is not None:
+            thread.join(timeout=2)
+            with self._lock:
+                if self._cleanup_thread is thread:
+                    self._cleanup_thread = None
 
     def _cleanup_loop(self):
-        while self._running:
+        while True:
             with self._lock:
+                if not self._running:
+                    if self._cleanup_thread is threading.current_thread():
+                        self._cleanup_thread = None
+                    return
                 has_entries = bool(self._cache)
                 if not has_entries:
+                    if self._lazy_cleanup:
+                        if self._cleanup_thread is threading.current_thread():
+                            self._cleanup_thread = None
+                        self._wakeup.clear()
+                        return
                     self._wakeup.clear()
                     wait_timeout = None
                 elif self._ttl > 0:
@@ -58,6 +81,9 @@ class MessageCache:
                 self._wakeup.wait()
                 continue
             if self._stop_event.wait(timeout=wait_timeout):
+                with self._lock:
+                    if self._cleanup_thread is threading.current_thread():
+                        self._cleanup_thread = None
                 return
             if self._running:
                 self._do_cleanup()
@@ -102,6 +128,8 @@ class MessageCache:
             self._cache[message_id] = current_time
             if was_empty or self._ttl <= 0:
                 self._wakeup.set()
+            if self._lazy_cleanup and self._running:
+                self._spawn_cleanup_thread_unlocked()
 
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
@@ -148,5 +176,7 @@ class MessageCache:
             self._cache[message_id] = current_time
             if was_empty or self._ttl <= 0:
                 self._wakeup.set()
+            if self._lazy_cleanup and self._running:
+                self._spawn_cleanup_thread_unlocked()
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)

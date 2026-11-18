@@ -256,6 +256,22 @@ class TaskHandle:
         self._scheduler._register_completion_callback(self._completion, callback)
 
 
+class _IdleThread:
+    """Lightweight placeholder when an on-demand scheduler thread is dormant."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.daemon = True
+
+    @staticmethod
+    def is_alive() -> bool:
+        return False
+
+    @staticmethod
+    def join(timeout: Optional[float] = None) -> None:
+        return None
+
+
 class TaskScheduler:
     """Thread-safe scheduler with project serialization and a system fast lane."""
 
@@ -265,6 +281,7 @@ class TaskScheduler:
     }
     _TERMINAL_STATUSES = frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED})
     _REAP_DEFAULT_MAX_AGE = 300.0
+    _DISPATCH_IDLE_TIMEOUT_S = 1.0
     _RUN_ID_GENERATION_ATTEMPTS = 16
 
     def __init__(
@@ -361,20 +378,11 @@ class TaskScheduler:
         )
         self._completion_callbacks_pending = 0
         self._completion_callback_local = threading.local()
+        self._idle_dispatch_timeout = float(self._DISPATCH_IDLE_TIMEOUT_S)
         self._event_dispatch_stopping = False
         self._completion_dispatch_stopping = False
-        self._event_dispatcher = threading.Thread(
-            target=self._event_dispatch_loop,
-            name="task_scheduler_events",
-            daemon=True,
-        )
-        self._completion_dispatcher = threading.Thread(
-            target=self._completion_dispatch_loop,
-            name="task_scheduler_completions",
-            daemon=True,
-        )
-        self._event_dispatcher.start()
-        self._completion_dispatcher.start()
+        self._event_dispatcher: Any = _IdleThread("task_scheduler_events")
+        self._completion_dispatcher: Any = _IdleThread("task_scheduler_completions")
 
         self._rate_limiters: dict[str, RateLimiter] = {}
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
@@ -383,12 +391,43 @@ class TaskScheduler:
         self._by_task_id: dict[str, str] = {}
         self._admission_fenced = False
         self._stopped = False
-        self._dispatcher = threading.Thread(
-            target=self._dispatch_loop,
-            name="task_scheduler_dispatcher",
-            daemon=True,
-        )
-        self._dispatcher.start()
+        self._dispatcher: Any = _IdleThread("task_scheduler_dispatcher")
+
+    def _ensure_dispatcher_unlocked(self) -> None:
+        if self._stopped or self._admission_fenced:
+            return
+        if not self._dispatcher.is_alive():
+            thread = threading.Thread(
+                target=self._dispatch_loop,
+                name="task_scheduler_dispatcher",
+                daemon=True,
+            )
+            self._dispatcher = thread
+            thread.start()
+
+    def _ensure_event_dispatcher_unlocked(self) -> None:
+        if self._event_dispatch_stopping:
+            return
+        if not self._event_dispatcher.is_alive():
+            thread = threading.Thread(
+                target=self._event_dispatch_loop,
+                name="task_scheduler_events",
+                daemon=True,
+            )
+            self._event_dispatcher = thread
+            thread.start()
+
+    def _ensure_completion_dispatcher_unlocked(self) -> None:
+        if self._completion_dispatch_stopping:
+            return
+        if not self._completion_dispatcher.is_alive():
+            thread = threading.Thread(
+                target=self._completion_dispatch_loop,
+                name="task_scheduler_completions",
+                daemon=True,
+            )
+            self._completion_dispatcher = thread
+            thread.start()
 
     def register_policy(
         self,
@@ -536,6 +575,7 @@ class TaskScheduler:
             if spec.project_id:
                 self._by_project[str(spec.project_id)].append(run_id)
             self._requeue_item_unlocked(key, item)
+            self._ensure_dispatcher_unlocked()
 
             self._emit(state)
             self._cv.notify_all()
@@ -717,9 +757,12 @@ class TaskScheduler:
         with self._cv:
             self._stopped = True
             self._maybe_stop_event_dispatcher_unlocked()
+            dispatcher = self._dispatcher
+            event_dispatcher = self._event_dispatcher
+            completion_dispatcher = self._completion_dispatcher
             self._cv.notify_all()
         if wait or shutdown_executor:
-            self._dispatcher.join(timeout=2)
+            dispatcher.join(timeout=2)
         if shutdown_executor:
             for executor in (self._executor, self._system_executor):
                 try:
@@ -727,9 +770,9 @@ class TaskScheduler:
                 except Exception:
                     logger.debug("failed to shutdown executor", exc_info=True)
         if wait and self._event_dispatch_stopping:
-            self._event_dispatcher.join(timeout=2)
+            event_dispatcher.join(timeout=2)
         if wait and self._completion_dispatch_stopping:
-            self._completion_dispatcher.join(timeout=2)
+            completion_dispatcher.join(timeout=2)
 
     def fence_admission(self) -> None:
         """Reject new work and cancel work that has not entered its callback.
@@ -877,6 +920,8 @@ class TaskScheduler:
             observed_task: _QueuedTask | None = None
             with self._cv:
                 if self._stopped:
+                    if self._dispatcher is threading.current_thread():
+                        self._dispatcher = _IdleThread("task_scheduler_dispatcher")
                     return
 
                 task = self._pick_next_task_unlocked()
@@ -888,8 +933,16 @@ class TaskScheduler:
                         self._cv.wait(timeout=wait_s)
                     elif reap_wait is not None:
                         self._cv.wait(timeout=reap_wait)
-                    else:
+                    elif (
+                        any(self._queues.values())
+                        or self._active_run_ids
+                        or self._worker_futures
+                    ):
                         self._cv.wait()
+                    else:
+                        if self._dispatcher is threading.current_thread():
+                            self._dispatcher = _IdleThread("task_scheduler_dispatcher")
+                        return
                     continue
 
                 state = self._states.get(task.run_id)
@@ -1231,15 +1284,30 @@ class TaskScheduler:
             completion = self._completions.pop(st.run_id, None)
             if completion is not None:
                 completion_callbacks = completion.complete(ev)
-        self._event_queue.put((ev, tuple(self._listeners)))
+        listeners = tuple(self._listeners)
+        if listeners:
+            self._event_queue.put((ev, listeners))
+            self._ensure_event_dispatcher_unlocked()
         if completion_callbacks:
             self._completion_callbacks_pending += len(completion_callbacks)
             self._completion_queue.put((ev, completion_callbacks))
+            self._ensure_completion_dispatcher_unlocked()
 
     def _event_dispatch_loop(self) -> None:
         while True:
-            item = self._event_queue.get()
+            try:
+                item = self._event_queue.get(timeout=self._idle_dispatch_timeout)
+            except queue.Empty:
+                with self._cv:
+                    if self._event_queue.empty():
+                        if self._event_dispatcher is threading.current_thread():
+                            self._event_dispatcher = _IdleThread("task_scheduler_events")
+                        return
+                continue
             if item is None:
+                with self._cv:
+                    if self._event_dispatcher is threading.current_thread():
+                        self._event_dispatcher = _IdleThread("task_scheduler_events")
                 return
             event, listeners = item
             for listener in listeners:
@@ -1264,8 +1332,19 @@ class TaskScheduler:
 
     def _completion_dispatch_loop(self) -> None:
         while True:
-            item = self._completion_queue.get()
+            try:
+                item = self._completion_queue.get(timeout=self._idle_dispatch_timeout)
+            except queue.Empty:
+                with self._cv:
+                    if self._completion_queue.empty():
+                        if self._completion_dispatcher is threading.current_thread():
+                            self._completion_dispatcher = _IdleThread("task_scheduler_completions")
+                        return
+                continue
             if item is None:
+                with self._cv:
+                    if self._completion_dispatcher is threading.current_thread():
+                        self._completion_dispatcher = _IdleThread("task_scheduler_completions")
                 return
             event, callbacks = item
             for callback in callbacks:
@@ -1304,10 +1383,12 @@ class TaskScheduler:
     def _maybe_stop_event_dispatcher_unlocked(self) -> None:
         if self._stopped and not self._active_run_ids and not self._event_dispatch_stopping:
             self._event_dispatch_stopping = True
-            self._event_queue.put(None)
+            if self._event_dispatcher.is_alive():
+                self._event_queue.put(None)
         if self._stopped and not self._active_run_ids and not self._completion_dispatch_stopping:
             self._completion_dispatch_stopping = True
-            self._completion_queue.put(None)
+            if self._completion_dispatcher.is_alive():
+                self._completion_queue.put(None)
 
     def _pop_queued_item_unlocked(self, run_id: str, key: str) -> Optional[_QueuedTask]:
         q = self._queues.get(key)
