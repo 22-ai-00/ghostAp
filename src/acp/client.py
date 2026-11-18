@@ -70,6 +70,7 @@ from .models import (
     ToolCallInfo,
 )
 from .native_commands import normalize_acp_available_commands
+from .swarm_lifecycle import parse_swarm_tool_signal
 
 logger = logging.getLogger(__name__)
 
@@ -1213,6 +1214,7 @@ def _parse_tool_call(
         child_metadata_malformed=child_metadata_malformed,
         is_context_compaction=is_context_compaction,
         full_content=full_content,
+        swarm_signal=parse_swarm_tool_signal(title, raw_input, raw_output),
     )
 
 
@@ -1369,11 +1371,13 @@ class GhostAPClient(Client):
         trust_codex_extensions: bool = False,
         on_available_commands: Callable[[str, list[ACPAvailableCommand]], None] | None = None,
         on_usage_update: Callable[[str, ACPUsageInfo], None] | None = None,
+        on_transport_activity: Callable[[str], None] | None = None,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
         self._on_available_commands = on_available_commands
         self._on_usage_update = on_usage_update
+        self._on_transport_activity = on_transport_activity
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._capture_full_tool_content = bool(capture_full_tool_content)
         self._trust_codex_extensions = bool(trust_codex_extensions)
@@ -1420,12 +1424,22 @@ class GhostAPClient(Client):
         except Exception:
             logger.debug("[ACP] history record failed", exc_info=True)
 
+    def _emit_transport_activity(self, session_id: str) -> None:
+        callback = self._on_transport_activity
+        if callback is None:
+            return
+        try:
+            callback(session_id)
+        except Exception:
+            logger.debug("[ACP] transport activity callback failed", exc_info=True)
+
     # ------------------------------------------------------------------
     # Core callback: session_update
     # ------------------------------------------------------------------
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Receive agent's streaming updates — the core event handler."""
         try:
+            self._emit_transport_activity(session_id)
             if isinstance(update, SessionInfoUpdate):
                 info = _parse_session_info_update(update)
                 if (
@@ -1612,6 +1626,7 @@ class GhostAPClient(Client):
     ) -> RequestPermissionResponse:
         """Select an allowance offered by the backend without local policy."""
         del tool_call, kwargs
+        self._emit_transport_activity(session_id)
         if not options:
             return self._deny_permission(session_id, "empty_options")
         ordered = sorted(

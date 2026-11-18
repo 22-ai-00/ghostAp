@@ -38,6 +38,7 @@ class EmojiReaction:
     _ALLOWED_AUTO_REACTIONS = {
         EmojiType.TYPING,
         EmojiType.GET,
+        EmojiType.ROCKET,
         EmojiType.PARTY,
     }
 
@@ -68,6 +69,16 @@ class EmojiReaction:
 
     @staticmethod
     def on_multi_task_done() -> str:
+        return EmojiType.PARTY
+
+    @staticmethod
+    def on_swarm_working() -> str:
+        """Reaction added when a Swarm background workflow starts working."""
+        return EmojiType.ROCKET
+
+    @staticmethod
+    def on_swarm_done() -> str:
+        """Reaction added when a Swarm background workflow completes overall."""
         return EmojiType.PARTY
 
     @staticmethod

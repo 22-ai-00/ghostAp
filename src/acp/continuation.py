@@ -135,7 +135,14 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
 
 
 def _requests_explicit_user_input(result: PromptResult) -> bool:
-    text = str(result.text or "").strip().casefold()
+    if (
+        getattr(result, "swarm_completed", False) is True
+        and str(getattr(result, "swarm_final_text", "") or "").strip()
+    ):
+        raw_text = result.swarm_final_text
+    else:
+        raw_text = result.text
+    text = str(raw_text or "").strip().casefold()
     if not text:
         return False
     if any(marker in text for marker in _USER_INPUT_MARKERS):
@@ -296,6 +303,21 @@ def merge_prompt_results(
             *current.modified_files,
         },
         output_tokens=output_tokens,
+        swarm_used=bool(
+            getattr(previous, "swarm_used", False)
+            or getattr(current, "swarm_used", False)
+        ),
+        swarm_completed=bool(
+            getattr(current, "swarm_completed", False)
+            or (
+                getattr(previous, "swarm_completed", False)
+                and not getattr(current, "swarm_used", False)
+            )
+        ),
+        swarm_final_text=(
+            str(getattr(current, "swarm_final_text", "") or "")
+            or str(getattr(previous, "swarm_final_text", "") or "")
+        ),
     )
 
 

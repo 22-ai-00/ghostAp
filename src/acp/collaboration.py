@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 from .models import ToolCallInfo
+from .swarm_lifecycle import merge_swarm_tool_signal
 
 TRANSIENT_CHILD_STATUSES = frozenset({"pending", "running"})
 TERMINAL_CHILD_STATUSES = frozenset(
@@ -419,6 +420,10 @@ def merge_tool_call_snapshot(
             or _snapshot_has_malformed_child_metadata(previous)
             or _snapshot_has_malformed_child_metadata(current)
         ),
+        swarm_signal=merge_swarm_tool_signal(
+            previous.swarm_signal,
+            current.swarm_signal,
+        ),
     )
 
 
@@ -526,6 +531,10 @@ def merge_tool_call_sequence(
                             not crosses_turn_boundary
                             and previous.is_context_compaction is True
                         )
+                    ),
+                    swarm_signal=merge_swarm_tool_signal(
+                        previous.swarm_signal if not crosses_turn_boundary else None,
+                        tool_call.swarm_signal,
                     ),
                 )
             else:

@@ -485,6 +485,8 @@ UI_TEXT = {
     "mode_invalid_project_path": "⚠️ {msg}\n\n请切换到有效目录后重试",
     "mode_project_dir_label": "📂 项目目录: {path}",
     "mode_exec_complete": "✅ 执行完成",
+    "mode_swarm_exec_complete_notice": "✅ Swarm 后台协作任务已全部完成\n\n{summary}",
+    "mode_swarm_exec_complete_notice_empty": "✅ Swarm 后台协作任务已全部完成",
     "mode_native_cmd_complete": "✅ 原生命令 `{command}` 已执行完成",
     "mode_native_cmd_complete_with_tools": "✅ 原生命令 `{command}` 已执行完成（{tool_count} 次内部操作）",
     "mode_exec_cancelled_title": "执行已取消",

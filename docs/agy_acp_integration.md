@@ -34,3 +34,11 @@ GhostAP 使用 `model/effort`（当存在思考档位时）或裸 `model` ID 作
 - 子进程环境清理（`src/utils/env.py`）移除父级 Antigravity 会话注入的 `ANTIGRAVITY_AGENT`、`ANTIGRAVITY_LS_ADDRESS`、`ANTIGRAVITY_CSRF_TOKEN`、`ANTIGRAVITY_CONVERSATION_ID`、`ANTIGRAVITY_TRAJECTORY_ID`、`ANTIGRAVITY_SOURCE_METADATA`，避免从 AGY 会话内部派生子 `agy acp` 进程时串用父会话或语言服务器上下文。
 - 权限请求继续通过 GhostAP 的 ACP `request_permission` 回调处理（采用后端提供的允许项，不传递 `--dangerously-skip-permissions`）。
 - Employee 隔离环境当前仅替换员工 `HOME` 而不投影 `~/.gemini/antigravity-cli` 认证状态，因此数字员工 `/hire` 入口暂不暴露 `agy`，避免形成运行时假支持。
+
+## Swarm 后台协作生命周期
+
+AGY 原生 `/swarm` 在首个 `session/prompt` 回合创建后台 worker 后即会先返回 `end_turn`，随后由后台 worker 通过共享消息板触发无显式 `session/prompt` 包装的反应式唤醒回合：
+
+- **工作中状态与表情反馈**：`ACPSession` 与 `SwarmLifecycleTracker` 识别 `swarm`（`add` / `kill` / `status` / `model`）、`swarm_wait`、`post_message`、`read_board` 与 `exit_plan_mode` 信号；当检测到任务型 Swarm worker 启动或进入 `swarm_wait` 等待时，立即向原消息添加 `Fire`（`EmojiReaction.on_swarm_working()`）表情表示 Swarm 正在后台协作中，同时保持流式卡片、COT 过程流与 `RepoLock` 活跃，不因首轮 `end_turn` 提前结单或发 `PARTY`。
+- **完整终态与完成通知**：在收到带 `[done]` 的最终汇报（或全部任务 worker 清理完成并给出最终总结）且短暂静默收敛后，GhostAP 才关闭主卡并添加 `PARTY`（`EmojiReaction.on_swarm_done()`）完成表情，同时发送一条简明飞书完成通知回复。
+- **中断与空闲保护**：用户在等候期间执行 `/stop` 或卡片停止时，会立即唤醒并取消 Swarm 等待周期；后台等待期间 `UsageUpdate` 与 `request_permission` 帧也会刷新传输活动时间戳，避免误触发短空闲超时。

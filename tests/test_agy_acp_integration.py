@@ -5,11 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from acp.schema import (
+    AgentMessageChunk,
+    PromptResponse,
+    TextContentBlock,
+    ToolCallProgress,
+    ToolCallStart,
+)
 from lark_oapi.core.model.base_response import BaseResponse
 from lark_oapi.core.model.raw_response import RawResponse
 
@@ -17,7 +25,9 @@ import src.acp.helper as helper_mod
 import src.acp.providers as providers_mod
 import src.feishu.handlers.programming as programming_mod
 from src.acp.agy_selection import compose_agy_model_selection, split_agy_model_selection
+from src.acp.client import GhostAPClient
 from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+from src.acp.session import ACPSession
 from src.acp.sync_adapter import SyncACPSession
 from src.agent.intent_recognizer import IntentRecognizer, IntentType
 from src.agent_session.backend_resolver import is_cli_backend
@@ -30,6 +40,7 @@ from src.card.shared import build_mode_buttons
 from src.card.state.models import TextBlock
 from src.feishu.cot import FeishuCOTAPIClient, FeishuCOTStream
 from src.feishu.dispatcher import MessageDispatcher
+from src.feishu.emoji import EmojiReaction, EmojiType
 from src.feishu.product_catalog import PUBLIC_ACTIONS
 from src.mode import InteractionMode, ModeManager
 from src.project.context import ProjectContext
@@ -462,3 +473,401 @@ def test_agy_cot_and_card_complete_cleanly_across_continuation_turn() -> None:
         assert not any(c.get("status") == "error" for c in cot_contents)
     finally:
         programming.abort()
+
+
+def test_acp_session_holds_open_across_agy_swarm_reactive_turns(tmp_path: Path) -> None:
+    session_id = "sess-agy-swarm-e2e"
+
+    async def scenario():
+        acp_session = ACPSession("agy", ["acp"], str(tmp_path))
+        acp_session._swarm_settle_scale = 0.02
+        acp_session._session_id = session_id
+        acp_session._state.session_id = session_id
+        acp_session._state.is_active = True
+        client = GhostAPClient(on_event=acp_session._dispatch_event, root_dir=str(tmp_path))
+        acp_session._client = client
+        acp_session._bind_session_info_callback()
+
+        turn1_finished = asyncio.Event()
+        reactive_task: asyncio.Task[None] | None = None
+
+        async def emit_reactive_turns() -> None:
+            await turn1_finished.wait()
+            await asyncio.sleep(0.05)
+            # Turn 2: board wakeup -> swarm_wait
+            await client.session_update(
+                session_id,
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id="c_read",
+                    title="read_board",
+                    kind="other",
+                    status="in_progress",
+                    raw_input={"since": 0},
+                ),
+            )
+            await client.session_update(
+                session_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id="c_read",
+                    status="completed",
+                    raw_output="worker-1 started",
+                ),
+            )
+            await client.session_update(
+                session_id,
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id="c_wait",
+                    title="swarm_wait",
+                    kind="other",
+                    status="in_progress",
+                    raw_input={"since": 1},
+                ),
+            )
+            await client.session_update(
+                session_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id="c_wait",
+                    status="completed",
+                    raw_output={"status": "woken"},
+                ),
+            )
+            await asyncio.sleep(0.05)
+            # Turn 3: [done] post + final answer
+            await client.session_update(
+                session_id,
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id="c_done",
+                    title="post_message",
+                    kind="other",
+                    status="in_progress",
+                    raw_input={"text": "[done] All workers finished"},
+                ),
+            )
+            await client.session_update(
+                session_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id="c_done",
+                    status="completed",
+                    raw_output={"status": "posted"},
+                ),
+            )
+            await client.session_update(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(type="text", text="Swarm 全部重构与测试已完成。"),
+                ),
+            )
+
+        class _FakeConn:
+            async def prompt(self, *, session_id: str, prompt):
+                nonlocal reactive_task
+                del prompt
+                await client.session_update(
+                    session_id,
+                    ToolCallStart(
+                        session_update="tool_call",
+                        tool_call_id="c_add",
+                        title="swarm",
+                        kind="other",
+                        status="in_progress",
+                        raw_input={"action": "add", "name": "worker-1", "brief": "work"},
+                    ),
+                )
+                await client.session_update(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id="c_add",
+                        status="completed",
+                        raw_output={"status": "added", "name": "worker-1"},
+                    ),
+                )
+                await client.session_update(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text="已启动 worker-1，等待汇报。"),
+                    ),
+                )
+                reactive_task = asyncio.create_task(emit_reactive_turns())
+                turn1_finished.set()
+                return PromptResponse(stop_reason="end_turn")
+
+        acp_session._conn = _FakeConn()
+        events: list[ACPEvent] = []
+        result = await acp_session.prompt("run swarm", on_event=events.append)
+        assert reactive_task is not None
+        await reactive_task
+        return result, events
+
+    result, events = asyncio.run(scenario())
+    assert result.stop_reason == "end_turn"
+    assert result.swarm_used is True
+    assert result.swarm_completed is True
+    assert result.swarm_final_text == "Swarm 全部重构与测试已完成。"
+    assert "已启动 worker-1" in result.text
+    assert "Swarm 全部重构与测试已完成。" in result.text
+    assert any(ev.event_type is ACPEventType.TEXT_CHUNK and "全部重构" in (ev.text or "") for ev in events)
+
+
+def test_acp_session_cancel_wakes_active_swarm_wait_and_marks_user_cancel(tmp_path: Path) -> None:
+    session_id = "sess-agy-swarm-cancel"
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    try:
+        acp_session = ACPSession("agy", ["acp"], str(tmp_path))
+        acp_session._swarm_settle_scale = 0.05
+        acp_session._session_id = session_id
+        acp_session._state.session_id = session_id
+        acp_session._state.is_active = True
+        client = GhostAPClient(on_event=acp_session._dispatch_event, root_dir=str(tmp_path))
+        acp_session._client = client
+        acp_session._bind_session_info_callback()
+
+        cancel_calls: list[str] = []
+
+        class _FakeConn:
+            async def prompt(self, *, session_id: str, prompt):
+                del prompt
+                await client.session_update(
+                    session_id,
+                    ToolCallStart(
+                        session_update="tool_call",
+                        tool_call_id="c_add",
+                        title="swarm",
+                        kind="other",
+                        status="in_progress",
+                        raw_input={"action": "add", "name": "worker-1", "brief": "work"},
+                    ),
+                )
+                await client.session_update(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id="c_add",
+                        status="completed",
+                        raw_output={"status": "added", "name": "worker-1"},
+                    ),
+                )
+                return PromptResponse(stop_reason="end_turn")
+
+            async def cancel(self, *, session_id: str) -> None:
+                cancel_calls.append(session_id)
+
+        acp_session._conn = _FakeConn()
+        sync_session = SyncACPSession("agy", str(tmp_path), agent_cmd="agy", agent_args=["acp"])
+        sync_session._acp_session = acp_session
+        sync_session._loop = loop
+        sync_session._started = True
+
+        started = threading.Event()
+
+        def _on_event(ev: ACPEvent) -> None:
+            if ev.event_type is ACPEventType.TOOL_CALL_DONE:
+                started.set()
+
+        def _cancel_when_waiting() -> None:
+            assert started.wait(timeout=2.0)
+            for _ in range(50):
+                if acp_session.has_active_swarm_sync():
+                    break
+                time.sleep(0.01)
+            gen = sync_session.active_prompt_generation()
+            if gen is not None:
+                sync_session.mark_user_cancel(gen)
+            sync_session.cancel(wait=True, timeout=1.0)
+
+        canceller = threading.Thread(target=_cancel_when_waiting, daemon=True)
+        canceller.start()
+        result = sync_session.send_prompt("run swarm cancel", on_event=_on_event, timeout=5)
+        canceller.join(timeout=2.0)
+
+        assert cancel_calls == [session_id]
+        assert result.stop_reason == "cancelled"
+        assert result.cancellation_source == "user"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2.0)
+        loop.close()
+
+
+def test_agy_handler_swarm_adds_working_reaction_holds_until_done_and_notifies(tmp_path: Path) -> None:
+    assert EmojiReaction.on_swarm_working() == EmojiType.ROCKET
+    assert EmojiReaction.on_swarm_done() == EmojiType.PARTY
+    assert EmojiReaction.should_send(EmojiReaction.on_swarm_working()) is True
+    assert EmojiReaction.should_send(EmojiReaction.on_swarm_done()) is True
+
+    notice = programming_mod._format_swarm_completion_notice("Swarm 已全部完成并提交。")
+    assert notice == "✅ Swarm 后台协作任务已全部完成\n\nSwarm 已全部完成并提交。"
+    long_notice = programming_mod._format_swarm_completion_notice("A" * 350)
+    assert "完整结果见上方任务卡片" in long_notice
+    empty_notice = programming_mod._format_swarm_completion_notice("✅ 执行完成")
+    assert empty_notice == "✅ Swarm 后台协作任务已全部完成"
+
+    session_id = "sess-agy-handler-swarm"
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    try:
+        acp_session = ACPSession("agy", ["acp"], str(tmp_path))
+        acp_session._swarm_settle_scale = 0.02
+        acp_session._session_id = session_id
+        acp_session._state.session_id = session_id
+        acp_session._state.is_active = True
+        client = GhostAPClient(on_event=acp_session._dispatch_event, root_dir=str(tmp_path))
+        acp_session._client = client
+        acp_session._bind_session_info_callback()
+
+        working_reaction_seen = threading.Event()
+        reactions: list[tuple[str, str]] = []
+        replies: list[tuple[str, str]] = []
+
+        class _FakeConn:
+            async def prompt(self, *, session_id: str, prompt):
+                del prompt
+                await client.session_update(
+                    session_id,
+                    ToolCallStart(
+                        session_update="tool_call",
+                        tool_call_id="c_add_handler",
+                        title="swarm",
+                        kind="other",
+                        status="in_progress",
+                        raw_input={"action": "add", "name": "worker-1", "brief": "do task"},
+                    ),
+                )
+                await client.session_update(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id="c_add_handler",
+                        status="completed",
+                        raw_output={"status": "added", "name": "worker-1"},
+                    ),
+                )
+                await client.session_update(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text="已派出 worker-1 后台执行。"),
+                    ),
+                )
+
+                async def _finish_swarm() -> None:
+                    await asyncio.sleep(0.06)
+                    # Before [done] arrives, only the working reaction may exist (never PARTY).
+                    assert ("msg_origin", "Fire") in reactions
+                    assert ("msg_origin", "PARTY") not in reactions
+                    assert not replies
+                    await client.session_update(
+                        session_id,
+                        ToolCallStart(
+                            session_update="tool_call",
+                            tool_call_id="c_done_handler",
+                            title="post_message",
+                            kind="other",
+                            status="in_progress",
+                            raw_input={"text": "[done] Worker finished cleanly"},
+                        ),
+                    )
+                    await client.session_update(
+                        session_id,
+                        ToolCallProgress(
+                            session_update="tool_call_update",
+                            tool_call_id="c_done_handler",
+                            status="completed",
+                            raw_output={"status": "posted"},
+                        ),
+                    )
+                    await client.session_update(
+                        session_id,
+                        AgentMessageChunk(
+                            session_update="agent_message_chunk",
+                            content=TextContentBlock(type="text", text="Swarm 所有子任务已全部完成。"),
+                        ),
+                    )
+
+                asyncio.create_task(_finish_swarm())
+                return PromptResponse(stop_reason="end_turn")
+
+        acp_session._conn = _FakeConn()
+        sync_session = SyncACPSession("agy", str(tmp_path), agent_cmd="agy", agent_args=["acp"])
+        sync_session._acp_session = acp_session
+        sync_session._loop = loop
+        sync_session._started = True
+
+        handler = object.__new__(programming_mod.AGYModeHandler)
+        handler._current_model = None
+        handler._active_programming_runs = {}
+        handler._active_programming_runs_lock = threading.Lock()
+        handler.ctx = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=60,
+                claude_execution_timeout=60,
+                programming_finalization_reserve_s=0,
+                programming_max_execution_windows=1,
+                programming_agent_idle_timeout_s=30,
+                default_reply_mode="reply",
+                card=SimpleNamespace(delivery_api_timeout=2.0),
+            ),
+            message_linker=MagicMock(),
+            context_manager=MagicMock(),
+        )
+
+        def _add_reaction(mid: str, emoji: str) -> None:
+            reactions.append((mid, emoji))
+            if emoji == EmojiType.ROCKET:
+                working_reaction_seen.set()
+
+        def _reply_text(mid: str, text: str) -> None:
+            replies.append((mid, text))
+
+        handler.add_reaction = _add_reaction
+        handler.reply_text = _reply_text
+        handler.upload_acp_image = lambda _img: None
+
+        card_client = _AgyCardClient()
+        delivery = CardDelivery(card_client)
+        metadata = build_programming_metadata("agy", model_name="gemini-4-hydrogen")
+
+        try:
+            with patch("src.thread.get_current_thread_id", return_value=None):
+                fallback = handler._handle_response_with_delivery(
+                    message_id="msg_origin",
+                    chat_id="oc_swarm_chat",
+                    text="/swarm optimize codebase",
+                    session=sync_session,
+                    project=None,
+                    cwd=str(tmp_path),
+                    global_working_dir=str(tmp_path),
+                    metadata=metadata,
+                    delivery=delivery,
+                    delivery_timeout=2.0,
+                    project_id=None,
+                )
+        finally:
+            delivery.shutdown(timeout=2.0)
+
+        assert fallback is False
+        assert working_reaction_seen.is_set() is True
+        assert reactions == [
+            ("msg_origin", "Fire"),
+            ("msg_origin", "PARTY"),
+        ]
+        assert replies == [
+            ("msg_origin", "✅ Swarm 后台协作任务已全部完成\n\nSwarm 所有子任务已全部完成。"),
+        ]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2.0)
+        loop.close()

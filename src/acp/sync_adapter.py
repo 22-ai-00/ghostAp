@@ -1257,10 +1257,31 @@ class SyncACPSession(PromptGenerationTracker):
                     if future.done():
                         return future.result(timeout=0)
                     idle_elapsed = time.time() - last_activity_ts[0]
-                    if idle_elapsed >= effective_idle_timeout:
+                    swarm_active = bool(
+                        getattr(self._acp_session, "has_active_swarm_sync", lambda: False)()
+                    )
+                    if swarm_active:
+                        now_mono = time.monotonic()
+                        transport_ts = float(
+                            getattr(
+                                self._acp_session,
+                                "last_transport_activity_monotonic",
+                                now_mono,
+                            )
+                        )
+                        transport_idle = max(0.0, now_mono - transport_ts)
+                        idle_elapsed = min(idle_elapsed, transport_idle)
+                        idle_limit = (
+                            max(effective_idle_timeout, min(float(effective_timeout), 1800.0))
+                            if effective_idle_timeout >= 60.0
+                            else effective_idle_timeout
+                        )
+                    else:
+                        idle_limit = effective_idle_timeout
+                    if idle_elapsed >= idle_limit:
                         raise TimeoutError(
                             f"ACP prompt 空闲超时 ({idle_elapsed:.0f}s 无活动, "
-                            f"idle_timeout={effective_idle_timeout}s)"
+                            f"idle_timeout={idle_limit}s)"
                         )
                     # Agent still active — continue waiting
         except (asyncio.CancelledError, concurrent.futures.CancelledError):

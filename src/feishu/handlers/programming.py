@@ -26,6 +26,7 @@ from ...acp.manager import ACPSessionManager
 from ...acp.native_commands import parse_slash_command
 from ...acp.outcome import IncompleteToolTrace, PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
+from ...acp.swarm_lifecycle import is_swarm_working_event
 from ...agent_session import SyncSession
 from ...card.actions import dispatch as card_action_ids
 from ...card.builders.core import CoreBuilder
@@ -354,6 +355,18 @@ def _has_reconciled_stale_child_history(
     if goal is not None and goal_status != "completed":
         return False
     return child_lifecycle_proof.all_observed_children_terminal()
+
+
+def _format_swarm_completion_notice(final_response: str) -> str:
+    """Build a concise Feishu completion notice for finished Swarm runs."""
+    cleaned = str(final_response or "").strip()
+    if not cleaned or cleaned == UI_TEXT["mode_exec_complete"]:
+        return UI_TEXT["mode_swarm_exec_complete_notice_empty"]
+    if len(cleaned) > 300:
+        summary = cleaned[:300].rstrip() + "…\n（完整结果见上方任务卡片）"
+    else:
+        summary = cleaned
+    return UI_TEXT["mode_swarm_exec_complete_notice"].format(summary=summary)
 
 
 def build_programming_session_callbacks(
@@ -1737,6 +1750,8 @@ class ProgrammingModeHandler(BaseHandler):
         seen_image_ids: set[str] = set()
         image_failures = [0]
         child_lifecycle_proof = AuthoritativeChildLifecycleProof()
+        swarm_working_notified = [False]
+        swarm_completed_flag = [False]
         active_run = self._get_active_programming_run(chat_id, project)
         if active_run is not None:
             active_run.session = session
@@ -1744,6 +1759,16 @@ class ProgrammingModeHandler(BaseHandler):
         def on_event(event) -> None:
             update_count[0] += 1
             child_lifecycle_proof.observe_event(event)
+            if not swarm_working_notified[0] and is_swarm_working_event(event):
+                swarm_working_notified[0] = True
+                try:
+                    self.add_reaction(message_id, EmojiReaction.on_swarm_working())
+                except Exception as exc:
+                    logger.warning(
+                        "添加 Swarm 工作中表情回复异常: %s",
+                        exc,
+                        exc_info=True,
+                    )
             if active_run is not None:
                 active_run.observe(event)
             if prog_session is not None:
@@ -1913,6 +1938,9 @@ class ProgrammingModeHandler(BaseHandler):
                 on_window_rollover=_on_window_rollover,
             )
             result = execution.result
+            swarm_completed_flag[0] = bool(
+                swarm_working_notified[0] or getattr(result, "swarm_completed", False)
+            )
             assessment = execution.assessment
             _log_prompt_execution(self.mode_name, execution)
             prompt_outcome = assessment.outcome
@@ -2104,6 +2132,18 @@ class ProgrammingModeHandler(BaseHandler):
                     prog_session.abort()
                     if final_response:
                         self.reply_text(message_id, final_response)
+                elif prompt_outcome is PromptOutcome.COMPLETED and swarm_completed_flag[0]:
+                    try:
+                        self.reply_text(
+                            message_id,
+                            _format_swarm_completion_notice(final_response),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "发送 Swarm 完成通知失败: %s",
+                            exc,
+                            exc_info=True,
+                        )
 
         if prog_session is None:
             if terminal_exception is not None:
@@ -2239,6 +2279,17 @@ class ProgrammingModeHandler(BaseHandler):
                     logger.debug("Failed to mark active programming card stopping", exc_info=True)
             run_session = getattr(active_run, "session", None)
             if run_session is not None and callable(getattr(run_session, "cancel", None)):
+                active_gen = getattr(
+                    run_session,
+                    "active_prompt_generation",
+                    lambda: None,
+                )()
+                mark_user_cancel = getattr(run_session, "mark_user_cancel", None)
+                if active_gen is not None and callable(mark_user_cancel):
+                    try:
+                        mark_user_cancel(active_gen)
+                    except Exception:
+                        logger.debug("Failed to mark active programming run user cancel", exc_info=True)
                 try:
                     run_session.cancel(wait=False)
                 except Exception:
@@ -2247,7 +2298,22 @@ class ProgrammingModeHandler(BaseHandler):
         manager = self._get_session_manager()
         if manager is not None and callable(getattr(manager, "cancel_session", None)):
             try:
-                if manager.cancel_session(chat_id, project_id=pid, thread_id=thread_id, wait=False):
+                try:
+                    cancelled_mgr = manager.cancel_session(
+                        chat_id,
+                        project_id=pid,
+                        thread_id=thread_id,
+                        wait=False,
+                        user_initiated=True,
+                    )
+                except TypeError:
+                    cancelled_mgr = manager.cancel_session(
+                        chat_id,
+                        project_id=pid,
+                        thread_id=thread_id,
+                        wait=False,
+                    )
+                if cancelled_mgr:
                     cancelled = True
             except Exception:
                 logger.debug("Failed to cancel managed programming session", exc_info=True)

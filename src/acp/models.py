@@ -108,6 +108,7 @@ class ToolCallInfo:
     # request a full, sanitized projection (for example Workflow pagination).
     # Ordinary cards continue to use the bounded ``content`` field.
     full_content: object | None = None
+    swarm_signal: object | None = None
 
 
 @dataclass
@@ -213,6 +214,9 @@ class PromptResult:
     goal: ACPGoalInfo | None = None
     cancellation_source: str | None = None
     usage: ACPUsageInfo | None = None
+    swarm_used: bool = False
+    swarm_completed: bool = False
+    swarm_final_text: str = ""
 
     # ---- aggregation helpers ----
     def add_text(self, chunk: str) -> None:

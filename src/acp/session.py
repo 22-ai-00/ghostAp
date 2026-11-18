@@ -41,7 +41,8 @@ from .models import (
     PromptResult,
 )
 from .native_commands import build_acp_prompt_texts
-from .outcome import has_transient_child_lifecycle
+from .outcome import _tool_incompleteness_details, has_transient_child_lifecycle
+from .swarm_lifecycle import SwarmLifecycleTracker
 from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,10 @@ class ACPSession:
         self._attempted_load_targets: set[str] = set()
         self._available_commands: tuple[ACPAvailableCommand, ...] = ()
         self._last_usage: ACPUsageInfo | None = None
+        self._prompt_cancelled = False
+        self._swarm_active = False
+        self._last_transport_activity_monotonic = time.monotonic()
+        self._swarm_settle_scale = 1.0
 
     def _uses_official_codex_acp(self) -> bool:
         return any(
@@ -553,6 +558,43 @@ class ACPSession:
             if expected_sid and session_id and session_id != expected_sid:
                 return
             self._last_usage = usage
+            self._last_transport_activity_monotonic = time.monotonic()
+
+    def _on_transport_activity(
+        self,
+        session_id: str,
+        *,
+        transport_epoch: int | None = None,
+        load_epoch: int | None = None,
+    ) -> None:
+        with self._handler_lock:
+            if (
+                self._closing
+                or self._force_dead
+                or (
+                    transport_epoch is not None
+                    and transport_epoch != self._transport_epoch
+                )
+                or (load_epoch is not None and load_epoch != self._load_epoch)
+            ):
+                return
+            expected_sid = self._loading_session_id or self._session_id
+            if expected_sid and session_id and session_id != expected_sid:
+                return
+            self._last_transport_activity_monotonic = time.monotonic()
+
+    def has_active_swarm_sync(self) -> bool:
+        """Thread-safe check for whether the active prompt is awaiting Swarm quiescence."""
+        with self._handler_lock:
+            return bool(getattr(self, "_swarm_active", False))
+
+    @property
+    def last_transport_activity_monotonic(self) -> float:
+        """Thread-safe monotonic timestamp of the latest ACP transport frame."""
+        with self._handler_lock:
+            return float(
+                getattr(self, "_last_transport_activity_monotonic", time.monotonic())
+            )
 
     def get_available_commands(self) -> list[ACPAvailableCommand]:
         """Return latest live native slash commands advertised by this ACP session."""
@@ -589,8 +631,18 @@ class ACPSession:
             transport_epoch=transport_epoch,
             load_epoch=load_epoch,
         )
+        client._on_transport_activity = lambda session_id: self._on_transport_activity(
+            session_id,
+            transport_epoch=transport_epoch,
+            load_epoch=load_epoch,
+        )
 
-    async def _wait_for_lifecycle_change(self, revision: int) -> None:
+    async def _wait_for_lifecycle_change(
+        self,
+        revision: int,
+        *,
+        timeout: float | None = None,
+    ) -> None:
         loop = asyncio.get_running_loop()
         with self._handler_lock:
             if self._closing:
@@ -602,7 +654,13 @@ class ACPSession:
                 self._lifecycle_event_loop = loop
             event = self._lifecycle_event
             event.clear()
-        await event.wait()
+        if timeout is None:
+            await event.wait()
+        else:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=max(0.001, float(timeout)))
+            except TimeoutError:
+                pass
         with self._handler_lock:
             if self._closing:
                 raise RuntimeError("ACP session is closing")
@@ -1008,6 +1066,14 @@ class ACPSession:
         should_replay_deferred_children = (
             replay_deferred_child_events or await_child_quiescence
         )
+        scale = max(0.001, float(getattr(self, "_swarm_settle_scale", 1.0) or 1.0))
+        swarm_tracker = SwarmLifecycleTracker(
+            done_text_settle_s=1.5 * scale,
+            done_quiet_settle_s=3.0 * scale,
+            all_killed_text_settle_s=2.0 * scale,
+            idle_roster_text_settle_s=3.0 * scale,
+            turn_gap_reset_s=2.0 * scale,
+        )
 
         async def _drain_prompt_tail() -> None:
             quiet_s = 0.05
@@ -1107,14 +1173,21 @@ class ACPSession:
                             result.set_plan(ev.plan)
                         if codex_child_monitor is not None and ev.tool_call:
                             codex_child_monitor.observe_tool_call(ev.tool_call)
-                        if child_lifecycle_event:
-                            if child_call_id:
-                                self._logical_task_child_call_ids.add(
-                                    child_call_id
+                        swarm_changed = swarm_tracker.observe_event(
+                            ev,
+                            last_event_monotonic[0],
+                        )
+                        self._swarm_active = swarm_tracker.active
+                        self._last_transport_activity_monotonic = last_event_monotonic[0]
+                        if child_lifecycle_event or swarm_changed or swarm_tracker.active:
+                            if child_lifecycle_event:
+                                if child_call_id:
+                                    self._logical_task_child_call_ids.add(
+                                        child_call_id
+                                    )
+                                self._logical_task_child_source_ids.update(
+                                    _child_source_ids(ev)
                                 )
-                            self._logical_task_child_source_ids.update(
-                                _child_source_ids(ev)
-                            )
                             self._lifecycle_revision += 1
                             lifecycle_changed = True
                     except Exception:
@@ -1161,6 +1234,9 @@ class ACPSession:
             self._event_generation += 1
             event_generation = self._event_generation
             self._event_handler = _collector
+            self._prompt_cancelled = False
+            self._swarm_active = False
+            self._last_transport_activity_monotonic = time.monotonic()
         collector_detached = False
         child_monitor_stop = asyncio.Event()
         child_monitor_task: asyncio.Task[None] | None = None
@@ -1256,6 +1332,12 @@ class ACPSession:
                 session_id=self._session_id,
                 prompt=[text_block(part) for part in build_acp_prompt_texts(text)],
             )
+            response_stop_reason = (
+                str(getattr(response, "stop_reason", "") or "").strip().casefold()
+            )
+            waited_post_response = False
+            cancelled_during_post_wait = False
+            marked_prompt_returned = False
 
             while True:
                 # A continuation can produce text and referenced images after
@@ -1265,6 +1347,10 @@ class ACPSession:
                 _discover_changed_images()
                 _emit_codex_child_lifecycle()
                 with self._handler_lock:
+                    if not marked_prompt_returned:
+                        marked_prompt_returned = True
+                        if response_stop_reason == "end_turn":
+                            swarm_tracker.on_prompt_response_returned(time.monotonic())
                     goal_requires_wait = self._goal_requires_prompt_wait_locked()
                     child_requires_wait = (
                         await_child_quiescence
@@ -1272,9 +1358,51 @@ class ACPSession:
                             collected_tool_call_snapshots
                         )
                     )
+                    swarm_requires_wait = False
+                    swarm_wait_timeout: float | None = None
+                    if (
+                        await_goal_quiescence
+                        and response_stop_reason == "end_turn"
+                        and swarm_tracker.active
+                    ):
+                        try:
+                            merged_snapshots = merge_tool_call_sequence(
+                                collected_tool_call_snapshots
+                            )
+                            has_incomplete_outer = (
+                                _tool_incompleteness_details(merged_snapshots)[1] > 0
+                            )
+                        except Exception:
+                            has_incomplete_outer = True
+                        swarm_requires_wait, swarm_wait_timeout = (
+                            swarm_tracker.evaluate_wait(
+                                time.monotonic(),
+                                has_incomplete_outer_tools=has_incomplete_outer,
+                            )
+                        )
+                    if (
+                        (waited_post_response or swarm_requires_wait)
+                        and self._prompt_cancelled
+                    ):
+                        cancelled_during_post_wait = True
+                        self._swarm_active = False
+                        if (
+                            self._event_generation != event_generation
+                            or self._event_handler is not _collector
+                        ):
+                            raise RuntimeError(
+                                "ACP prompt collector ownership changed"
+                            )
+                        result.goal = self._goal if self._goal_known else None
+                        self._event_handler = None
+                        self._event_generation += 1
+                        collector_detached = True
+                        break
+                    self._swarm_active = bool(swarm_requires_wait)
                     should_wait = (
                         (await_goal_quiescence and goal_requires_wait)
                         or child_requires_wait
+                        or swarm_requires_wait
                     )
                     lifecycle_revision = self._lifecycle_revision
                     if not should_wait:
@@ -1288,9 +1416,14 @@ class ACPSession:
                         result.goal = self._goal if self._goal_known else None
                         self._event_handler = None
                         self._event_generation += 1
+                        self._swarm_active = False
                         collector_detached = True
                         break
-                await self._wait_for_lifecycle_change(lifecycle_revision)
+                waited_post_response = True
+                await self._wait_for_lifecycle_change(
+                    lifecycle_revision,
+                    timeout=swarm_wait_timeout,
+                )
                 await _drain_prompt_tail()
 
         finally:
@@ -1303,14 +1436,15 @@ class ACPSession:
                     pass
             if self._client is not None:
                 self._client.release_local_image_snapshot(image_snapshot)
-            if not collector_detached:
-                with self._handler_lock:
-                    if (
-                        self._event_generation == event_generation
-                        and self._event_handler is _collector
-                    ):
-                        self._event_handler = None
-                        self._event_generation += 1
+            with self._handler_lock:
+                self._swarm_active = False
+                if (
+                    not collector_detached
+                    and self._event_generation == event_generation
+                    and self._event_handler is _collector
+                ):
+                    self._event_handler = None
+                    self._event_generation += 1
 
         # Finalize named snapshots at their latest observation position while
         # preserving every anonymous call as an independent event.
@@ -1325,7 +1459,18 @@ class ACPSession:
             result.tool_calls = list(collected_tool_call_snapshots)
             logger.debug("[ACP:%s] tool_calls finalization failed", self._agent_cmd, exc_info=True)
 
-        result.stop_reason = str(getattr(response, "stop_reason", "") or "")
+        result.stop_reason = (
+            "cancelled"
+            if cancelled_during_post_wait
+            else str(getattr(response, "stop_reason", "") or "")
+        )
+        if swarm_tracker.active:
+            result.swarm_used = True
+            result.swarm_completed = (
+                not cancelled_during_post_wait
+                and result.stop_reason.strip().casefold() == "end_turn"
+            )
+            result.swarm_final_text = swarm_tracker.final_turn_text.strip()
         # Best-effort: attach local tool results (execute/read/write/permission) produced during this prompt.
         try:
             store = ACPHistoryStore()
@@ -1422,6 +1567,11 @@ class ACPSession:
 
     async def cancel(self, timeout: float | None = None) -> None:
         """Cancel the current prompt execution."""
+        with self._handler_lock:
+            self._prompt_cancelled = True
+            self._swarm_active = False
+            self._lifecycle_revision += 1
+        self._wake_lifecycle_waiter()
         if self._conn and self._session_id:
             pause_error: BaseException | None = None
             try:
