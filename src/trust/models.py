@@ -15,7 +15,6 @@ class TrustZone(StrEnum):
 
 class ActorKind(StrEnum):
     OWNER = "owner"
-    EMPLOYEE = "employee"
     UNKNOWN = "unknown"
 
 
@@ -26,7 +25,6 @@ class ManagedGroupStatus(StrEnum):
 
 class ManagedGroupOrigin(StrEnum):
     GHOSTAP_CREATED = "ghostap_created"
-    EMPLOYEE_CREATED = "employee_created"
     OWNER_ADOPTED = "owner_adopted"
 
 

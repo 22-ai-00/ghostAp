@@ -6,7 +6,7 @@ import logging
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,13 +67,11 @@ class SyncClaudeCLISession(_BaseCLISession):
         config: Optional[ClaudeCLIConfig] = None,
         *,
         model_name: Optional[str] = None,
-        employee_process_env: Mapping[str, str] | None = None,
     ):
         super().__init__(
             cwd,
             config or ClaudeCLIConfig(),
             model_name=model_name,
-            employee_process_env=employee_process_env,
         )
 
     def _module_hooks(self) -> _CLIModuleHooks:

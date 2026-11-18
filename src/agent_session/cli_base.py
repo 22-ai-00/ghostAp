@@ -7,7 +7,7 @@ import os
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -46,7 +46,6 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
         config: Any,
         *,
         model_name: Optional[str] = None,
-        employee_process_env: Mapping[str, str] | None = None,
     ) -> None:
         self._cwd = cwd
         self._cfg = config
@@ -59,9 +58,6 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self._active_prompt_generation: int | None = None
         self._user_cancel_generation: int | None = None
         self._force_dead = False
-        self._employee_process_env = (
-            dict(employee_process_env) if employee_process_env is not None else None
-        )
 
         self.session_id: str = ""
         self.created_at: float = time.time()
@@ -133,11 +129,6 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
     def is_server_healthy(self, healthcheck_timeout: float = 2.0) -> bool:
         del healthcheck_timeout
         return True
-
-    @property
-    def employee_process_env(self) -> dict[str, str] | None:
-        env = self._employee_process_env
-        return None if env is None else dict(env)
 
     def send_prompt(
         self,
@@ -255,9 +246,7 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
         try:
             from ..utils.env import build_clean_env
 
-            env = build_clean_env(
-                dict(self._employee_process_env) if self._employee_process_env is not None else None
-            )
+            env = build_clean_env()
             self._prepare_env(env)
 
             popen_kwargs: dict[str, Any] = {

@@ -6,7 +6,7 @@ import json
 import logging
 import shutil
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -79,13 +79,11 @@ class SyncCodexCLISession(_BaseCLISession):
         config: Optional[CodexCLIConfig] = None,
         *,
         model_name: Optional[str] = None,
-        employee_process_env: Mapping[str, str] | None = None,
     ):
         super().__init__(
             cwd,
             config or CodexCLIConfig(),
             model_name=model_name,
-            employee_process_env=employee_process_env,
         )
 
     def _module_hooks(self) -> _CLIModuleHooks:

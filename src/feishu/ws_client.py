@@ -54,10 +54,6 @@ from ..access_control import (
 from ..acp.manager import ACPSessionManager
 from ..acp.telemetry import build_idle_health_config_for_manager
 from ..agent.intent_recognizer import IntentRecognizer
-from ..autonomous.provisioning.notification_state import (
-    hire_notification_message_uuid,
-)
-from ..autonomous.provisioning.slash_commands import SlashPermissionRequired
 from ..card.ui_text import UI_TEXT
 from ..config import IngressAccessMode, get_settings
 from ..config.env_file_store import AtomicEnvFileStore
@@ -127,16 +123,17 @@ from .message_cache import MessageCache
 from .renderers.deep_renderer import DeepRenderer
 from .renderers.spec_renderer import SpecRenderer
 from .slash_command_parser import CommandMatch, SlashCommandParser
+from .slash_commands import SlashPermissionRequired
 from .ws_card_action_handler import (
     CardActionInspector,
     _extract_behavior_value,
     bind_managed_trust_revisions,
     classify_card_action_error,
 )
-from .ws_employee_bridge import WSEmployeeBridgeMixin
 from .ws_event_router import MessageIngressGuard, WSErrorAction, classify_ws_error
 from .ws_health import WSHealthMonitor
 from .ws_lifecycle import ObservedLarkWSClient
+from .ws_managed_groups import WSManagedGroupsMixin
 from .ws_resource_manager import EngineResourceGroup
 
 
@@ -162,9 +159,7 @@ def _configured_managed_group_owner_id(settings: Any) -> str:
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("ghostap.audit")
 _LARK_MENTION_PLACEHOLDER_RE = re.compile(r"@_user_[0-9]+|@all")
-_EMPLOYEE_HANDOFF_GRACE_SECONDS = 0.25
-_EMPLOYEE_HANDOFF_MAX_SECONDS = 3.0
-_EMPLOYEE_WARNING_RETRY_DELAYS = (0.0, 0.05, 0.2)
+_MAIN_WARNING_RETRY_DELAYS = (0.0, 0.05, 0.2)
 _MAIN_BOT_IDENTITY_RETRY_SECONDS = 1.0
 _MAIN_SLASH_SYNC_RETRY_SECONDS = 60.0
 _BOOTSTRAP_ACCESS_OPERATIONS = frozenset(
@@ -181,58 +176,6 @@ class _MentionedGroupCommand:
     chat_id: str
     message_id: str
     bot_open_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class _EmployeeTargetedCommand:
-    tenant_key: str
-    chat_id: str
-    message_id: str
-    agent_id: str
-    bot_principal_id: str
-    app_id: str
-    bot_open_id: str
-    channel_generation: int
-    connection_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class _MainBotWarningReplyTransport:
-    """Narrow recovered-reply adapter with explicit durable coordinates."""
-
-    handler: Any
-    main_app_id: str
-
-    def send_warning(
-        self,
-        *,
-        message_id: str,
-        tenant_key: str,
-        chat_id: str,
-        text: str,
-        idempotency_key: str,
-    ) -> str:
-        from ..autonomous.acceptance.main_bot_warning_outbox import (
-            MainBotWarningPermanentDeliveryError,
-            MainBotWarningRetryableDeliveryError,
-        )
-        from .handlers.base import (
-            DurableMainBotReplyError,
-            DurableMainBotReplyPermanentError,
-        )
-
-        try:
-            return self.handler.reply_durable_text(
-                message_id=message_id,
-                tenant_key=tenant_key,
-                chat_id=chat_id,
-                text=text,
-                idempotency_key=idempotency_key,
-            )
-        except DurableMainBotReplyPermanentError as exc:
-            raise MainBotWarningPermanentDeliveryError(exc.error_code) from exc
-        except DurableMainBotReplyError as exc:
-            raise MainBotWarningRetryableDeliveryError(str(exc)) from exc
 
 
 class _MessageIngressReservation:
@@ -301,35 +244,9 @@ class _MessageIngressReservation:
             return self.release()
 
 
-def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
-    if status == "polling":
-        return (
-            "独立飞书智能体注册请求已提交，正在等待你在上方链接中完成授权确认。"
-            "确认前注册接口会持续返回 400 authorization_pending，这是设备授权"
-            "流程的正常等待状态；请按链接完成授权，期间请勿重复发送 /hire。"
-        )
-    if status == "ready":
-        return (
-            f"✅ 员工 **{employee_name}** 基础配置已就绪，系统将自动完成启用，"
-            "无需手动激活；完成后会再次通知。"
-        )
-    if status == "active":
-        return f"✅ 员工 **{employee_name}** 已激活，可以加入 Team 群协作。"
-    if status == "action_required":
-        return (
-            f"⚠️ 员工 **{employee_name}** 创建未能自动收敛，已转为人工处理；"
-            f"可使用 `/fire {employee_name}` 清理后重试。"
-        )
-    return None
-
-
-def _employee_hire_status_uuid(intent_id: str, status: str) -> str:
-    return hire_notification_message_uuid(intent_id, status)
-
-
-def _employee_warning_uuid(message_id: str, label: str) -> str:
+def _main_warning_uuid(message_id: str, label: str) -> str:
     digest = hashlib.sha256(f"{message_id}\0{label}".encode("utf-8")).hexdigest()
-    return "employee-warning-" + digest[:32]
+    return "main-warning-" + digest[:32]
 
 
 def _ignore_ws_event(_data: object) -> None:
@@ -485,7 +402,7 @@ class _CardAdvisoryDispatcher:
             self._closed = True
 
 
-class FeishuWSClient(WSEmployeeBridgeMixin):
+class FeishuWSClient(WSManagedGroupsMixin):
     """Feishu WS Client 的服务端运行态。
 
     该类面向"长连接服务"场景：
@@ -497,13 +414,10 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         self,
         message_callback: Callable[[str, str, str, Optional[str]], None],
     ):
-        self._employee_department_runtime = None
-        self._employee_runtime_init_cleanup_done = False
         try:
             self._initialize(message_callback)
         except BaseException:
             self._close_scheduler_after_initialization_failure()
-            self._close_employee_runtime_after_initialization_failure()
             raise
 
     def _initialize(
@@ -537,10 +451,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         self._slash_permission_notifications: set[tuple[str, str]] = set()
         self._slash_permission_unroutable_logs: set[str] = set()
         self._pending_slash_permission: SlashPermissionRequired | None = None
-        self._employee_runtime_recovery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._employee_runtime_recovery_thread: Optional[threading.Thread] = None
-        self._employee_runtime_recovery_started = False
-        self._employee_runtime_recovery_error: Exception | None = None
         self._main_ws_connected = False
         self._restart_readiness_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._restart_readiness_blocker: str | None = None
@@ -661,41 +571,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         except Exception:
             logger.warning("ChatLockManager initialization failed", exc_info=True)
 
-        self._employee_department_runtime = None
-        try:
-            from ..autonomous.gateway.env_scope import (
-                local_employee_environment,
-            )
-            from ..autonomous.provisioning.composition import (
-                EmployeeDepartmentRuntime,
-            )
-
-            self._employee_department_runtime = EmployeeDepartmentRuntime.from_settings(
-                self.settings,
-                managed_group_registry=self._managed_group_registry,
-                managed_group_owner_id=self._managed_group_owner_id,
-                employee_environment_provider=lambda authority: local_employee_environment(
-                    authority,
-                    traex_auth_home=getattr(
-                        self.settings,
-                        "autonomous_employee_traex_auth_home",
-                        "~/.trae",
-                    ),
-                ),
-                manager_client_factory=self._get_api_client,
-                notification_link=lambda state, url, expire_in: self._reply_employee_hire_message(
-                    state,
-                    f"请在 {expire_in} 秒内完成独立飞书智能体注册：{url}",
-                ),
-                notification_status=self._reply_employee_hire_status,
-                recover_immediately=False,
-            )
-        except Exception as exc:
-            logger.error(
-                "Employee Department composition failed closed: %s",
-                type(exc).__name__,
-            )
-
         # ------------------------------------------------------------------
         # Handler infrastructure
         # ------------------------------------------------------------------
@@ -736,32 +611,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             enable_streaming=self._enable_streaming,
             repo_lock_manager=_repo_lock_mgr,
             chat_lock_manager=_chat_lock_mgr,
-            employee_hire_service=(
-                self._employee_department_runtime.hire_service
-                if self._employee_department_runtime is not None
-                else None
-            ),
-            employee_fire_service=(
-                self._employee_department_runtime.fire_service
-                if self._employee_department_runtime is not None
-                else None
-            ),
-            employee_hire_readiness=(
-                self._employee_department_runtime.readiness
-                if self._employee_department_runtime is not None
-                else None
-            ),
-            employee_membership_service=(
-                self._employee_department_runtime.membership_service
-                if self._employee_department_runtime is not None
-                else None
-            ),
-            employee_data_composition=(
-                self._employee_department_runtime.data_composition
-                if self._employee_department_runtime is not None
-                else None
-            ),
-            employee_runtime_facade=self._employee_department_runtime,
             tenant_key_resolver=get_current_tenant_key,
             channel_client_factory=self._get_channel_client,
             ingress_access_policy_provider=(
@@ -801,20 +650,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         handlers["spec"].renderer = SpecRenderer(handlers["spec"])
         self._handler_ctx.managers.update(acp_managers)
         self._handler_ctx.handlers.update(handlers)
-        if self._employee_department_runtime is not None:
-            bind_warning_transport = getattr(
-                self._employee_department_runtime,
-                "bind_main_bot_warning_transport",
-                None,
-            )
-            if not callable(bind_warning_transport):
-                raise RuntimeError("main Bot durable warning transport is unavailable")
-            bind_warning_transport(
-                _MainBotWarningReplyTransport(
-                    handler=handlers["coco"],
-                    main_app_id=self.settings.app_id,
-                )
-            )
         system_handler = handlers["system"]
 
         # Subscribe to hard-timeout reclaim events on RepoLockManager
@@ -1142,26 +977,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         spec_engines = spec_resources.stop_running_engines()
         workflow_engines = workflow_resources.stop_running_engines()
 
-        if not self._wait_for_employee_runtime_recovery(
-            _SHUTDOWN_DELEGATED_DRAIN_S
-        ):
-            logger.error(
-                "Employee recovery worker did not drain; preserving durable resources"
-            )
-            try:
-                self._scheduler.stop(wait=True, shutdown_executor=False)
-            except Exception:
-                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
-            return False
-
         delegated_idle = True
-        try:
-            if self._employee_department_runtime is not None:
-                self._employee_department_runtime.close()
-        except Exception:
-            logger.debug("Employee Department shutdown skipped", exc_info=True)
-            delegated_idle = False
-
         delegated_idle = (
             EngineResourceGroup.wait_stopped(deep_engines)
             and delegated_idle
@@ -1774,31 +1590,11 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         chat_type: str,
         message_id: str = "",
     ) -> EffectiveTrust | None:
-        """Resolve current Registry trust, or ``None`` for legacy test wiring.
-
-        A real Registry is authoritative.  Runtime lookup failure only removes
-        Employee actors; it can never turn an unknown sender into an Owner.
-        """
-
+        """Resolve current Registry trust, or ``None`` for legacy test wiring."""
+        del message_id
         registry = getattr(self, "_managed_group_registry", None)
         if type(registry) is not ManagedGroupRegistry:
             return None
-        employee_bot_ids: frozenset[str] = frozenset()
-        runtime = getattr(self, "_employee_department_runtime", None)
-        employee_ids = getattr(runtime, "trusted_employee_bot_open_ids", None)
-        if callable(employee_ids):
-            try:
-                resolved = employee_ids()
-                if isinstance(resolved, (tuple, frozenset)) and all(
-                    isinstance(value, str) and value.startswith("ou_")
-                    for value in resolved
-                ):
-                    employee_bot_ids = frozenset(resolved)
-            except Exception:
-                logger.warning(
-                    "managed ingress Employee identity snapshot unavailable",
-                    exc_info=True,
-                )
         try:
             groups = registry.managed_groups()
             group = next(
@@ -1815,7 +1611,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 owner_id=getattr(self, "_managed_group_owner_id", ""),
                 managed_groups=groups,
                 project_grants=grants,
-                employee_bot_ids=employee_bot_ids,
             )
         except Exception:
             logger.critical(
@@ -1826,36 +1621,12 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 owner_id=getattr(self, "_managed_group_owner_id", ""),
                 managed_groups=(),
                 project_grants=(),
-                employee_bot_ids=frozenset(),
             )
-        trust = resolver.resolve(
+        return resolver.resolve(
             sender_id=sender_id,
             chat_id=chat_id,
             chat_type=chat_type,
         )
-        if trust.actor is ActorKind.EMPLOYEE:
-            validator = getattr(runtime, "is_valid_employee_continuation", None)
-            if not message_id or not callable(validator):
-                return resolver.resolve(
-                    sender_id="",
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                )
-            try:
-                valid = validator(
-                    sender_open_id=sender_id,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                )
-            except Exception:
-                valid = False
-            if valid is not True:
-                return resolver.resolve(
-                    sender_id="",
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                )
-        return trust
 
     @staticmethod
     def _managed_trust_access_decision(
@@ -1880,7 +1651,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             )
         allowed = (
             trust.zone is TrustZone.MANAGED_AGENT_GROUP
-            and trust.actor in {ActorKind.OWNER, ActorKind.EMPLOYEE}
+            and trust.actor is ActorKind.OWNER
         )
         return AccessDecision(
             allowed=allowed,
@@ -1980,7 +1751,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             )
         return (
             trust.zone is TrustZone.MANAGED_AGENT_GROUP
-            and trust.actor in {ActorKind.OWNER, ActorKind.EMPLOYEE}
+            and trust.actor is ActorKind.OWNER
             and trust.managed_group is not None
             and current_group_revision == trust.group_revision
             and current_grant_revision == trust.grant_revision
@@ -2084,8 +1855,8 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             return
         message_id, chat_id, chat_type, _sender_id = ingress_facts
         is_p2p = chat_type == "p2p"
-        employee_candidate = self._parse_uniquely_mentioned_group_command(data)
-        if employee_candidate is not None:
+        mentioned_command = self._parse_uniquely_mentioned_group_command(data)
+        if mentioned_command is not None:
             main_bot_open_id = self._main_bot_open_id
             if (
                 not isinstance(main_bot_open_id, str)
@@ -2096,42 +1867,13 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                     self._access_identifier_hash(chat_id),
                 )
                 return
-            if employee_candidate.bot_open_id == main_bot_open_id:
-                # A mention is routing metadata, not an Employee authority
-                # fact.  Self-addressed commands retain the ordinary trust,
-                # project, origin, and control-queue path.
-                employee_candidate = None
+            if mentioned_command.bot_open_id != main_bot_open_id:
+                return
 
-        configured_owner = getattr(self, "_managed_group_owner_id", "")
-        defer_employee_target_trust = bool(
-            employee_candidate is not None
-            and isinstance(configured_owner, str)
-            and configured_owner
-            and _sender_id == configured_owner
-        )
-        if (
-            employee_candidate is not None
-            and isinstance(configured_owner, str)
-            and configured_owner
-            and not defer_employee_target_trust
-        ):
-            return
-
-        message = data.event.message
-        causal_message_id = (
-            getattr(message, "parent_id", None)
-            or getattr(message, "root_id", None)
-            or ""
-        )
-        effective_trust = (
-            None
-            if employee_candidate is not None
-            else self._resolve_effective_trust(
-                sender_id=_sender_id,
-                chat_id=chat_id,
-                chat_type=chat_type,
-                message_id=causal_message_id,
-            )
+        effective_trust = self._resolve_effective_trust(
+            sender_id=_sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
         )
         trust_decision = self._message_trust_access_decision(
             effective_trust,
@@ -2150,29 +1892,14 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
         tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
 
-        # Ordinary routes have already resolved their current trust.  A
-        # uniquely Employee-addressed command from the configured Owner uses
-        # bounded deferred admission so the WS callback never blocks on the
-        # durable Registry; the worker rechecks that authority before target
-        # lookup, warning delivery, or handoff.
         text = self._extract_text_from_message(data)
         command_match = SlashCommandParser.parse(text)
-        ingress_decision = (
-            AccessDecision(
-                allowed=True,
-                operation=AccessOperation.NORMAL_MESSAGE,
-                reason_code="employee_target_deferred_trust",
-                prospective_allowed=True,
-            )
-            if defer_employee_target_trust
-            else trust_decision
-            or self._decide_ingress_access(
-                message_id=message_id,
-                sender_id=_sender_id,
-                chat_id=chat_id,
-                chat_type=chat_type,
-                command_match=command_match,
-            )
+        ingress_decision = trust_decision or self._decide_ingress_access(
+            message_id=message_id,
+            sender_id=_sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            command_match=command_match,
         )
         if not ingress_decision.allowed:
             return
@@ -2183,7 +1910,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             )
         if (
             ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
-            and employee_candidate is None
             and not self._managed_ingress_action_allowed(
                 effective_trust,
                 text=text,
@@ -2201,10 +1927,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         project_id = managed_group.project_id if managed_group is not None else None
         thread_root_id = None
         thread_ctx = None
-        if (
-            employee_candidate is None
-            and ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
-        ):
+        if ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS:
             try:
                 parent_id = getattr(data.event.message, "parent_id", None)
                 root_id = getattr(data.event.message, "root_id", None)
@@ -2234,8 +1957,7 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 project_id = None
 
         if (
-            employee_candidate is None
-            and ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
+            ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
             and managed_group is None
             and not project_id
         ):
@@ -2265,14 +1987,10 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             text and (text.lstrip().startswith("/") or SystemHandler.is_exit_command(text))
         )
         is_system = bool(
-            has_leading_slash
-            if employee_candidate is not None
-            else (
-                text
-                and SystemHandler.is_fast_lane_system_command(
-                    text,
-                    in_programming_mode=in_programming_mode,
-                )
+            text
+            and SystemHandler.is_fast_lane_system_command(
+                text,
+                in_programming_mode=in_programming_mode,
             )
         )
         is_shell_fast = (
@@ -2293,8 +2011,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
 
         control_queue_key = self._build_control_queue_key(chat_id=chat_id, project_id=project_id, text=text)
         queue_key = shell_queue_key or control_queue_key
-        if employee_candidate is not None:
-            queue_key = f"{chat_id}:employee-handoff"
         if not queue_key and thread_root_id and self.settings.thread_programming_enabled:
             queue_suffix = project_id or "default"
             queue_key = f"{chat_id}:{queue_suffix}:t:{thread_root_id}"
@@ -2318,12 +2034,8 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             )
 
         with TraceContext(request_id):
-            task_type = (
-                "employee_target_handoff"
-                if employee_candidate is not None
-                else ("spec_command" if is_spec else "feishu_message")
-            )
-            if employee_candidate is None and is_system:
+            task_type = "spec_command" if is_spec else "feishu_message"
+            if is_system:
                 tl = (text or "").strip().lower()
                 if tl in {"/help", "/帮助"}:
                     task_type = "system_help"
@@ -2361,14 +2073,12 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                     lambda ctx,
                     _sf=is_shell_fast,
                     _trust=effective_trust,
-                    _candidate=employee_candidate,
                     _reservation=reservation: self._run_reserved_message(
                         _reservation,
                         data,
                         task_ctx=ctx,
                         shell_fast_tracked=_sf,
                         effective_trust=_trust,
-                        employee_candidate=_candidate,
                     ),
                 )
             except (
@@ -2377,33 +2087,22 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 TaskQueueFullError,
             ) as e:
                 logger.warning(f"Backpressure applied: {get_error_detail(e)}")
-                if employee_candidate is not None:
-                    if not self._schedule_employee_handoff_warning(
-                        employee_candidate,
-                        reservation=reservation,
-                        request_id=request_id,
-                        sender_id=_sender_id,
-                        sender_union_id=_sender_union_id,
-                        tenant_key=tenant_key,
-                    ):
-                        raise
-                else:
-                    warning_text = (
-                        UI_TEXT["ws_backpressure_spec"]
-                        if is_spec
-                        else UI_TEXT["ws_backpressure_generic"]
+                warning_text = (
+                    UI_TEXT["ws_backpressure_spec"]
+                    if is_spec
+                    else UI_TEXT["ws_backpressure_generic"]
+                )
+                delivered: object = None
+                try:
+                    delivered = self._handler_ctx.handlers["coco"].reply_text(
+                        message_id,
+                        warning_text,
                     )
-                    delivered: object = None
-                    try:
-                        delivered = self._handler_ctx.handlers["coco"].reply_text(
-                            message_id,
-                            warning_text,
-                        )
-                    finally:
-                        if isinstance(delivered, str) and delivered:
-                            reservation.commit()
-                        else:
-                            reservation.release()
+                finally:
+                    if isinstance(delivered, str) and delivered:
+                        reservation.commit()
+                    else:
+                        reservation.release()
                 return
             except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
                 reservation.release()
@@ -2457,7 +2156,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         task_ctx=None,
         shell_fast_tracked: bool = False,
         effective_trust: EffectiveTrust | None = None,
-        employee_candidate: _MentionedGroupCommand | None = None,
         message_reservation_id: str | None = None,
         message_reservation_owner: str | None = None,
     ):
@@ -2517,16 +2215,10 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 event_tenant_key if isinstance(event_tenant_key, str) else ""
             )
 
-            causal_message_id = (
-                getattr(message, "parent_id", None)
-                or getattr(message, "root_id", None)
-                or ""
-            )
             current_trust = self._resolve_effective_trust(
                 sender_id=_sender_id,
                 chat_id=chat_id,
                 chat_type=chat_type,
-                message_id=causal_message_id,
             )
             trust_decision = self._message_trust_access_decision(
                 current_trust,
@@ -2576,97 +2268,14 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
             ):
                 return
 
-            employee_target = None
-            if employee_candidate is not None:
-                if (
-                    employee_candidate.tenant_key != _tenant_key
-                    or employee_candidate.chat_id != chat_id
-                    or employee_candidate.message_id != message_id
-                ):
-                    audit_logger.warning(
-                        "EMPLOYEE_TARGET_CANDIDATE_EVENT_MISMATCH chat_hash=%s",
-                        self._access_identifier_hash(chat_id),
-                    )
-                    return
-                main_bot_open_id = (
-                    self._main_bot_open_id or self._sync_main_bot_identity()
-                )
-                if not main_bot_open_id:
-                    set_current_sender_id(_sender_id)
-                    set_current_sender_union_id(_sender_union_id or None)
-                    set_current_is_p2p(_is_p2p)
-                    set_current_tenant_key(_tenant_key or None)
-                    delivered = self._reply_text_with_bounded_retry(
-                        employee_candidate.message_id,
-                        UI_TEXT["ws_main_bot_identity_unavailable"],
-                        label="main Bot identity warning",
-                    )
-                    if not delivered:
-                        release_message_reservation()
-                    return
-                if employee_candidate.bot_open_id != main_bot_open_id:
-                    from ..autonomous.provisioning.composition import (
-                        EmployeeTargetResolutionUnknownError,
-                    )
-
-                    try:
-                        employee_target = self._resolve_ready_employee_target(
-                            employee_candidate
-                        )
-                    except EmployeeTargetResolutionUnknownError:
-                        set_current_sender_id(_sender_id)
-                        set_current_sender_union_id(_sender_union_id or None)
-                        set_current_is_p2p(_is_p2p)
-                        set_current_tenant_key(_tenant_key or None)
-                        self._reply_employee_handoff_unknown(employee_candidate)
-                        return
-                    if employee_target is None:
-                        set_current_sender_id(_sender_id)
-                        set_current_sender_union_id(_sender_union_id or None)
-                        set_current_is_p2p(_is_p2p)
-                        set_current_tenant_key(_tenant_key or None)
-                        anchored = self._reply_employee_handoff_unconfirmed(
-                            employee_candidate
-                        )
-                        if not anchored:
-                            # A definite no-READY result cannot conceal
-                            # Employee execution, so a failed warning prepare
-                            # may safely allow the platform to retry this origin.
-                            release_message_reservation()
-                        return
-
             if (
                 ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
-                and employee_target is None
                 and not self._managed_ingress_action_allowed(
                     current_trust,
                     text=text,
                     command_match=command_match,
                 )
             ):
-                return
-
-            if employee_target is not None:
-                if (
-                    employee_target.tenant_key != _tenant_key
-                    or employee_target.chat_id != chat_id
-                    or employee_target.message_id != message_id
-                ):
-                    audit_logger.warning(
-                        "EMPLOYEE_TARGET_HANDOFF_EVENT_MISMATCH chat_hash=%s",
-                        self._access_identifier_hash(chat_id),
-                    )
-                    return
-                set_current_sender_id(_sender_id)
-                set_current_sender_union_id(_sender_union_id or None)
-                set_current_is_p2p(_is_p2p)
-                set_current_tenant_key(_tenant_key or None)
-                must_remain_fenced = self._complete_employee_target_handoff(
-                    employee_target
-                )
-                if not must_remain_fenced:
-                    # Only a durable handoff denial reaches this branch.
-                    release_message_reservation()
                 return
 
             if ingress_decision.operation is AccessOperation.BOOTSTRAP_HELP:
@@ -2769,23 +2378,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
                 command_match=command_match,
             ):
                 return
-
-            # Publish every authorized main-Bot group message before any
-            # programming/engine mode can bypass SMART routing.  When the
-            # canonical ledger is composed, failure is fail-closed so the
-            # current event can never execute without its durable context.
-            if not _is_p2p and text:
-                runtime = getattr(self, "_employee_department_runtime", None)
-                record_group_event = getattr(runtime, "record_group_event", None)
-                if callable(record_group_event):
-                    record_group_event(
-                        tenant_key=_tenant_key,
-                        chat_id=chat_id,
-                        thread_id=getattr(message, "thread_id", None) or "",
-                        message_id=message_id,
-                        sender_id=_sender_id,
-                        text=text,
-                    )
 
             # 3. Handle Images (if any)
             is_image_only = False
@@ -4099,7 +3691,6 @@ class FeishuWSClient(WSEmployeeBridgeMixin):
         if kind != "connected":
             return
         self._main_ws_connected = True
-        self._start_employee_runtime_recovery()
         self._try_publish_restart_readiness()
 
     def _publish_restart_participation(self) -> str:

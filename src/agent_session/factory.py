@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Callable, Optional
 
 from ..acp.providers import normalize_acp_model_name
@@ -23,31 +21,6 @@ from .protocol import SyncSession
 from .wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
 logger = logging.getLogger(__name__)
-_EMPLOYEE_SESSION_ENV: ContextVar[dict[str, str] | None] = ContextVar(
-    "employee_session_env", default=None
-)
-
-
-@contextmanager
-def employee_session_environment(env: dict[str, str]):
-    """Expose one validated employee environment to the synchronous factory."""
-    if _EMPLOYEE_SESSION_ENV.get() is not None:
-        raise RuntimeError("nested employee session environment is forbidden")
-    if not isinstance(env, dict) or not env or any(
-        not isinstance(key, str) or not key or not isinstance(value, str) or not value
-        for key, value in env.items()
-    ):
-        raise ValueError("employee session environment must be explicit")
-    token = _EMPLOYEE_SESSION_ENV.set(dict(env))
-    try:
-        yield
-    finally:
-        _EMPLOYEE_SESSION_ENV.reset(token)
-
-
-def current_employee_session_environment() -> dict[str, str] | None:
-    value = _EMPLOYEE_SESSION_ENV.get()
-    return None if value is None else dict(value)
 
 
 def _normalize_model(agent_type: str, model_name: str | None) -> str | None:
@@ -94,7 +67,6 @@ def _start_base_session(
     model_name: str | None,
     *,
     capture_full_tool_content: bool = False,
-    employee_env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
     startup_retries: int | None = None,
     startup_log_failures: bool | None = None,
@@ -106,7 +78,6 @@ def _start_base_session(
             session: SyncSession = SyncCodexCLISession(
                 cwd=cwd,
                 model_name=model_name,
-                employee_process_env=employee_env,
                 config=CodexCLIConfig(command=command),
             )
         else:
@@ -116,7 +87,6 @@ def _start_base_session(
             session = SyncClaudeCLISession(
                 cwd=cwd,
                 model_name=model_name,
-                employee_process_env=employee_env,
                 **cli_kwargs,
             )
         session.start()
@@ -129,8 +99,6 @@ def _start_base_session(
         kwargs["retries"] = startup_retries
     if startup_log_failures is not None:
         kwargs["log_failures"] = startup_log_failures
-    if employee_env is not None:
-        kwargs["env"] = employee_env
     if capture_full_tool_content:
         kwargs["capture_full_tool_content"] = True
     return start_session_with_retry(
@@ -168,9 +136,8 @@ def create_engine_session(
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
 ) -> SyncSession:
-    """Create the long-lived Deep/Spec/Workflow/employee session chain."""
+    """Create the long-lived Deep/Spec/Workflow session chain."""
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
-    employee_env = current_employee_session_environment()
     logger.info(
         "[SessionFactory] engine agent=%s cwd=%s model=%s thread=%s",
         agent,
@@ -183,7 +150,6 @@ def create_engine_session(
         normalized_cwd,
         model,
         capture_full_tool_content=capture_full_tool_content,
-        employee_env=employee_env,
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,
         startup_log_failures=startup_log_failures,

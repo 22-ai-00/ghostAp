@@ -9,14 +9,14 @@ import pytest
 from lark_oapi.core.model.base_response import BaseResponse
 from lark_oapi.core.model.raw_response import RawResponse
 
-from src.autonomous.provisioning.slash_commands import (
+from src.feishu.handlers.system import SystemHandler
+from src.feishu.slash_commands import (
     SlashCommand,
     SlashCommandAPIError,
     SlashCommandReconciler,
     SlashPermissionRequired,
 )
-from src.autonomous.provisioning.slash_lark import LarkSlashCommandAPI
-from src.feishu.handlers.system import SystemHandler
+from src.feishu.slash_lark import LarkSlashCommandAPI
 from src.feishu.ws_client import FeishuWSClient
 
 _APP_ID = "cli_a9224f1c7ca25bd2"

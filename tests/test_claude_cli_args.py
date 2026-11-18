@@ -64,28 +64,26 @@ def test_engine_factory_passes_selected_model_to_claude_cli() -> None:
     cli_session.assert_called_once_with(
         cwd="/tmp",
         model_name="claude-opus-4-8[1m]",
-        employee_process_env=None,
     )
 
 
-def test_employee_claude_1m_uses_direct_argv_and_copied_env() -> None:
-    original_env = {
-        "PATH": "/usr/bin",
-        "HOME": "/tmp/employee",
-        "ANTHROPIC_BETAS": "existing-beta",
-    }
-    original_snapshot = dict(original_env)
+def test_claude_cli_1m_uses_direct_argv_and_applies_beta_env() -> None:
     session = SyncClaudeCLISession(
         cwd="/tmp",
         model_name="claude-opus-4-8[1m]",
         config=ClaudeCLIConfig(add_dir=False),
-        employee_process_env=original_env,
     )
     session.session_id = "session-1"
-    with patch(
-        "src.agent_session.claude_cli.subprocess.Popen",
-        return_value=_completed_process(),
-    ) as popen:
+    with (
+        patch(
+            "src.agent_session.claude_cli.subprocess.Popen",
+            return_value=_completed_process(),
+        ) as popen,
+        patch(
+            "src.utils.env.build_clean_env",
+            return_value={"PATH": "/usr/bin", "ANTHROPIC_BETAS": "existing-beta"},
+        ),
+    ):
         result = session.send_prompt("review directly")
 
     assert result.stop_reason == "end_turn"
@@ -96,7 +94,6 @@ def test_employee_claude_1m_uses_direct_argv_and_copied_env() -> None:
     assert env["ANTHROPIC_BETAS"] == (
         "existing-beta,context-1m-2025-08-07"
     )
-    assert original_env == original_snapshot
 
 
 @pytest.mark.parametrize("command", ["claude", "claude-w"])

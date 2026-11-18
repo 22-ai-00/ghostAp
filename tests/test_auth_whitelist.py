@@ -140,7 +140,6 @@ class TestWhitelistEnforcement:
         client._mode_manager = MagicMock()
         client._image_handler = None
         client._enable_streaming = False
-        client._employee_department_runtime = MagicMock()
         client._handle_image_content = MagicMock()
         client._is_likely_shell_command_message = MagicMock(return_value=False)
         coco_handler = MagicMock()

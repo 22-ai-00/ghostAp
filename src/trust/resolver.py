@@ -31,15 +31,12 @@ class TrustZoneResolver:
     owner_id: str
     managed_groups: tuple[ManagedGroupRecord, ...]
     project_grants: tuple[ProjectGrant, ...]
-    employee_bot_ids: frozenset[str]
 
     def __post_init__(self) -> None:
         if not isinstance(self.managed_groups, tuple):
             raise TypeError("managed_groups must be a tuple")
         if not isinstance(self.project_grants, tuple):
             raise TypeError("project_grants must be a tuple")
-        if not isinstance(self.employee_bot_ids, frozenset):
-            raise TypeError("employee_bot_ids must be a frozenset")
 
     def resolve(
         self,
@@ -89,8 +86,6 @@ class TrustZoneResolver:
 
         if sender_id == group.owner_id:
             actor = ActorKind.OWNER
-        elif sender_id in self.employee_bot_ids:
-            actor = ActorKind.EMPLOYEE
         else:
             return _unknown_trust()
         return EffectiveTrust(

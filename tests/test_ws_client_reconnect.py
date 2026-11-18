@@ -1,16 +1,10 @@
 import asyncio
-import hashlib
 import json
 import os
 import threading
 from types import SimpleNamespace
 
 import pytest
-
-from src.feishu.ws_client import (
-    _employee_hire_status_text,
-    _employee_hire_status_uuid,
-)
 
 
 def test_ws_health_logs_recovery_duration_after_disconnect(
@@ -159,7 +153,6 @@ def test_connected_activity_marks_the_participating_instance_ready() -> None:
     client = object.__new__(ws.FeishuWSClient)
     client._ws_health_monitor = FakeHealthMonitor()
     client._restart_gate = FakeGate()
-    client._employee_department_runtime = None
     client._handler_ctx = type("HandlerContext", (), {"handlers": {"coco": object()}})()
 
     client._record_ws_activity("pong")
@@ -191,14 +184,7 @@ def test_connected_readiness_waits_for_required_reply_wiring() -> None:
     client = object.__new__(ws.FeishuWSClient)
     client._ws_health_monitor = FakeHealthMonitor()
     client._restart_gate = FakeGate()
-    client._employee_department_runtime = None
-    client._employee_runtime_recovery_lock = threading.Lock()
-    client._employee_runtime_recovery_thread = None
-    client._employee_runtime_recovery_started = False
-    client._employee_runtime_recovery_error = None
-    client._employee_runtime_init_cleanup_done = False
     client._closed = False
-    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
     client._handler_ctx = SimpleNamespace(handlers={})
 
     client._record_ws_activity("connected")
@@ -210,73 +196,7 @@ def test_connected_readiness_waits_for_required_reply_wiring() -> None:
     assert client._restart_gate.ready.is_set()
 
 
-def _make_connected_recovery_client(*, recover=None):
-    from unittest.mock import MagicMock
-
-    from src.feishu import ws_client as ws
-
-    runtime = SimpleNamespace(
-        recover=recover or MagicMock(),
-        close=MagicMock(),
-        membership_service=SimpleNamespace(
-            reconcile_projected_memberships=MagicMock(
-                return_value=SimpleNamespace(removed=0, degraded=0)
-            )
-        ),
-    )
-    client = object.__new__(ws.FeishuWSClient)
-    client._ws_health_monitor = SimpleNamespace(record_activity=MagicMock())
-    client._restart_gate = SimpleNamespace(mark_ready=MagicMock(return_value="G" * 24))
-    client._employee_department_runtime = runtime
-    client._employee_runtime_recovery_lock = threading.Lock()
-    client._employee_runtime_recovery_thread = None
-    client._employee_runtime_recovery_started = False
-    client._employee_runtime_recovery_error = None
-    client._employee_runtime_init_cleanup_done = False
-    client._closed = False
-    _bind_reply_transport(client)
-    return client
-
-
-def test_employee_recovery_worker_delegates_startup_once_across_reconnects() -> None:
-    client = _make_connected_recovery_client()
-
-    client._record_ws_activity("connected")
-    client._record_ws_activity("connected")
-    client._employee_runtime_recovery_thread.join(1.0)
-
-    client._employee_department_runtime.recover.assert_called_once_with()
-    reconcile = (
-        client._employee_department_runtime.membership_service
-        .reconcile_projected_memberships
-    )
-    # Membership audit is part of runtime.recover(), before that runtime can
-    # open admission or start dispatch.  The WS wrapper must not run a second,
-    # necessarily-late audit after recover() returns.
-    reconcile.assert_not_called()
-
-
-def test_employee_recovery_failure_does_not_block_ready_reply_wiring(
-    tmp_path,
-) -> None:
-    from unittest.mock import MagicMock
-
-    failure = RuntimeError("journal replay failed")
-    client = _make_connected_recovery_client(
-        recover=MagicMock(side_effect=failure)
-    )
-    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
-    client._handler_ctx.main_bot_outbound_audit = lambda *_args: None
-    client._handler_ctx.main_bot_outbound_audit_failure = lambda _error: None
-
-    client._record_ws_activity("connected")
-    client._employee_runtime_recovery_thread.join(1.0)
-
-    client._restart_gate.mark_ready.assert_called_once_with(service_pid=os.getpid())
-    assert client._employee_runtime_recovery_error is failure
-
-
-def test_employee_disabled_marks_real_restart_gate_ready(tmp_path) -> None:
+def test_connected_marks_real_restart_gate_ready(tmp_path) -> None:
     from src.feishu import ws_client as ws
     from src.utils.restart_gate import RestartGate
 
@@ -286,65 +206,16 @@ def test_employee_disabled_marks_real_restart_gate_ready(tmp_path) -> None:
     gate.publish_participation(service_pid=os.getpid())
 
     client = object.__new__(ws.FeishuWSClient)
-    client.settings = SimpleNamespace(autonomous_visible_employee_limit=0)
+    client.settings = SimpleNamespace()
     client._ws_health_monitor = SimpleNamespace(record_activity=lambda _kind: None)
     client._restart_gate = gate
     client._restart_generation = None
-    client._employee_department_runtime = None
     client._closed = False
     _bind_reply_transport(client)
 
     client._record_ws_activity("connected")
 
     assert gate.ready_generation(service_pid=os.getpid()) == client._restart_generation
-
-
-def test_connected_activity_after_close_does_not_start_employee_recovery() -> None:
-    client = _make_connected_recovery_client()
-    client._closed = True
-
-    client._record_ws_activity("connected")
-
-    assert client._employee_runtime_recovery_thread is None
-    client._employee_department_runtime.recover.assert_not_called()
-
-
-def test_employee_recovery_drain_reports_live_worker_after_timeout() -> None:
-    from unittest.mock import MagicMock
-
-    from src.feishu import ws_client as ws
-
-    worker = SimpleNamespace(
-        join=MagicMock(),
-        is_alive=MagicMock(return_value=True),
-    )
-    client = object.__new__(ws.FeishuWSClient)
-    client._employee_runtime_recovery_thread = worker
-
-    assert client._wait_for_employee_runtime_recovery(0.01) is False
-    worker.join.assert_called_once_with(timeout=0.01)
-
-
-
-
-def test_employee_hire_status_uuid_is_stable_per_intent_and_status() -> None:
-    expected = hashlib.sha256(
-        b"employee-hire-status:hire-intent-1:active"
-    ).hexdigest()[:50]
-
-    assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
-    assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
-    assert _employee_hire_status_uuid("hire-intent-1", "ready") != expected
-
-
-def test_ready_hire_notice_describes_automatic_enablement() -> None:
-    text = _employee_hire_status_text("Atlas", "ready")
-
-    assert text is not None
-    assert "自动" in text
-    assert "无需手动激活" in text
-    assert "/status" not in text
-    assert "等待激活" not in text
 
 
 def test_main_dispatcher_acknowledges_p2p_chat_entered_event() -> None:
@@ -642,179 +513,18 @@ def test_main_ws_acknowledges_bot_deleted_events() -> None:
 
 
 
-def test_recovered_hire_notification_restores_trusted_recipient_scope() -> None:
-    from unittest.mock import MagicMock
-
-    from src.feishu.ws_client import FeishuWSClient
-    from src.project.mapper import MessageLinker
-    from src.thread.manager import get_current_tenant_key
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._message_linker = MessageLinker()
-    client._get_chat_mode = MagicMock(return_value="p2p")
-    reply_text = _bind_reply_transport(client, return_value="om_status")
-    state = SimpleNamespace(
-        intent_id="hire_1",
-        tenant_key="tenant-a",
-        message_id="om_hire",
-        chat_id="oc_requester_dm",
-        requester_principal_id="ou_requester",
-        employee_name="Atlas",
-    )
-
-    assert client._reply_employee_hire_status(state, "ready") == "om_status"
-
-    origin = client._message_linker.query("om_hire")
-    assert origin is not None
-    assert origin["chat_id"] == "oc_requester_dm"
-    assert origin["sender_id"] == "ou_requester"
-    assert origin["chat_type"] == "p2p"
-    assert origin["tenant_key"] == "tenant-a"
-    reply_text.assert_called_once()
-    assert get_current_tenant_key() is None
-
-
-def test_recovered_hire_notification_rejects_conflicting_recipient_scope() -> None:
-    from unittest.mock import MagicMock
-
-    from src.feishu.ws_client import FeishuWSClient
-    from src.project.mapper import MessageLinker
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._message_linker = MessageLinker()
-    client._message_linker.register_trusted_origin_if_absent(
-        "om_hire",
-        chat_id="oc_other",
-        sender_id="ou_other",
-        chat_type="p2p",
-    )
-    client._get_chat_mode = MagicMock(return_value="p2p")
-    reply_text = _bind_reply_transport(client)
-    state = SimpleNamespace(
-        intent_id="hire_1",
-        tenant_key="tenant-a",
-        message_id="om_hire",
-        chat_id="oc_requester_dm",
-        requester_principal_id="ou_requester",
-        employee_name="Atlas",
-    )
-
-    assert client._reply_employee_hire_status(state, "ready") is None
-    reply_text.assert_not_called()
-    client._get_chat_mode.assert_not_called()
-
-
-def test_employee_runtime_recovery_requires_bound_reply_transport() -> None:
-    from unittest.mock import MagicMock
-
-    from src.feishu.ws_client import FeishuWSClient
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._employee_department_runtime = SimpleNamespace(
-        recover=MagicMock(),
-        close=MagicMock(),
-    )
-    client._handler_ctx = SimpleNamespace(handlers={})
-
-    with pytest.raises(RuntimeError, match="reply transport"):
-        client._recover_employee_runtime_after_handler_binding()
-    client._employee_department_runtime.recover.assert_not_called()
-    client._employee_department_runtime.close.assert_called_once_with()
-
-    client._handler_ctx.handlers["coco"] = SimpleNamespace(
-        reply_text=MagicMock()
-    )
-    client._employee_department_runtime.close.reset_mock()
-    client._recover_employee_runtime_after_handler_binding()
-
-    client._employee_department_runtime.recover.assert_called_once_with()
-    client._employee_department_runtime.close.assert_not_called()
-
-
-def test_employee_runtime_recovery_failure_closes_runtime_once() -> None:
-    from unittest.mock import MagicMock
-
-    from src.feishu.ws_client import FeishuWSClient
-
-    runtime = SimpleNamespace(
-        recover=MagicMock(side_effect=RuntimeError("journal replay failed")),
-        close=MagicMock(),
-    )
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._employee_department_runtime = runtime
-    _bind_reply_transport(client)
-
-    with pytest.raises(RuntimeError, match="journal replay failed"):
-        client._recover_employee_runtime_after_handler_binding()
-
-    runtime.close.assert_called_once_with()
-
-
-def test_ws_client_init_failure_after_employee_runtime_composition_closes_once(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    from unittest.mock import MagicMock
-
-    from src.autonomous.provisioning.composition import (
-        EmployeeDepartmentRuntime,
-    )
-    from src.feishu import ws_client as ws
-
-    settings = ws.get_settings().model_copy(update={"restart_gate_dir": ""})
-    monkeypatch.setattr(ws, "get_settings", lambda: settings)
-    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", tmp_path)
-    monkeypatch.setattr(ws, "ProjectManager", MagicMock())
-    runtime = SimpleNamespace(
-        hire_service=None,
-        fire_service=None,
-        readiness=None,
-        membership_service=None,
-        data_composition=None,
-        close=MagicMock(),
-    )
-    initialization_error = RuntimeError("handler construction failed")
-    monkeypatch.setattr(
-        EmployeeDepartmentRuntime,
-        "from_settings",
-        lambda *_args, **_kwargs: runtime,
-    )
-
-    def fail_after_runtime(*_args, **_kwargs):
-        raise initialization_error
-
-    monkeypatch.setattr(ws, "HandlerContext", fail_after_runtime)
-
-    with pytest.raises(RuntimeError) as caught:
-        ws.FeishuWSClient(message_callback=lambda *_args: None)
-
-    assert caught.value is initialization_error
-    runtime.close.assert_called_once_with()
-
-
 def test_ws_client_init_failure_does_not_leave_scheduler_holding_client(
     monkeypatch,
     tmp_path,
 ) -> None:
     from unittest.mock import MagicMock
 
-    from src.autonomous.provisioning.composition import (
-        EmployeeDepartmentRuntime,
-    )
     from src.feishu import ws_client as ws
 
     settings = ws.get_settings().model_copy(update={"restart_gate_dir": ""})
     monkeypatch.setattr(ws, "get_settings", lambda: settings)
     monkeypatch.setattr(ws, "_CHECKOUT_ROOT", tmp_path)
     monkeypatch.setattr(ws, "ProjectManager", MagicMock())
-    runtime = SimpleNamespace(
-        hire_service=None,
-        fire_service=None,
-        readiness=None,
-        membership_service=None,
-        data_composition=None,
-        close=MagicMock(),
-    )
     initialization_error = RuntimeError("handler construction failed")
     schedulers = []
     build_scheduler = ws._build_task_scheduler
@@ -824,11 +534,6 @@ def test_ws_client_init_failure_does_not_leave_scheduler_holding_client(
         schedulers.append(scheduler)
         return scheduler
 
-    monkeypatch.setattr(
-        EmployeeDepartmentRuntime,
-        "from_settings",
-        lambda *_args, **_kwargs: runtime,
-    )
     monkeypatch.setattr(ws, "_build_task_scheduler", capture_scheduler)
     monkeypatch.setattr(
         ws,

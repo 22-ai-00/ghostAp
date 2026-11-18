@@ -62,32 +62,10 @@ def _build_real_ws_graph(tmp_path: Path, monkeypatch):
     scheduler.get_state = MagicMock(return_value=None)
     scheduler.submit = MagicMock(side_effect=_run_submitted_task)
 
-    audit = SimpleNamespace(record_attempt=MagicMock(), mark_incomplete=MagicMock())
-
-    def _runtime_stub(_settings, **kwargs):
-        rt = SimpleNamespace(
-            hire_service=None,
-            fire_service=None,
-            membership_service=None,
-            data_composition=None,
-            main_bot_outbound_audit=audit,
-            readiness=lambda: SimpleNamespace(ready=True),
-            bind_main_bot_warning_transport=MagicMock(),
-            queue_main_bot_warning=MagicMock(return_value=True),
-            _environment_provider=lambda _a: SimpleNamespace(credential_env={}, provider_files={}),
-            close=MagicMock(),
-        )
-        rt._service = SimpleNamespace(_on_registration_status=kwargs.get("notification_status"))
-        return rt
-
     with (
         patch("src.feishu.ws_client.get_settings", return_value=settings),
         patch("src.config.get_settings", return_value=settings),
         patch("src.feishu.ws_client._build_task_scheduler", return_value=scheduler),
-        patch(
-            "src.autonomous.provisioning.composition.EmployeeDepartmentRuntime.from_settings",
-            side_effect=_runtime_stub,
-        ),
     ):
         client = FeishuWSClient(lambda *_a: None)
 
@@ -128,9 +106,6 @@ def _build_real_ws_graph(tmp_path: Path, monkeypatch):
                 handler.im_client = fake_im
             except AttributeError:
                 pass
-    system_emp = getattr(client._handler_ctx.handlers["system"], "employee", None)
-    if system_emp is not None:
-        system_emp._im_client = fake_im
 
     client._project_manager.create_project("demo", "DemoProj", str(repo_dir), chat_id="oc_e2e")
     project = client._project_manager.get_project_for_chat("demo", "oc_e2e")

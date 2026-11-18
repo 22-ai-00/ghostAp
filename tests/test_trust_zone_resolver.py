@@ -18,7 +18,6 @@ from src.trust.models import (
 from src.trust.resolver import TrustZoneResolver
 
 OWNER_ID = "ou_owner"
-EMPLOYEE_ID = "ou_employee_bot"
 GROUP_ID = "oc_managed"
 
 
@@ -63,7 +62,6 @@ def _resolver(
         owner_id=OWNER_ID,
         managed_groups=((group or _group()),),
         project_grants=((grant or _grant()),),
-        employee_bot_ids=frozenset({EMPLOYEE_ID}),
     )
 
 
@@ -102,32 +100,25 @@ def test_owner_p2p_and_managed_group_owner_resolve_to_distinct_zones() -> None:
     ) == managed_owner
 
 
-def test_managed_employee_and_unknown_sources_resolve_fail_closed() -> None:
+def test_unknown_group_and_non_owner_p2p_resolve_fail_closed() -> None:
     resolver = _resolver()
 
-    employee = resolver.resolve(
-        sender_id=EMPLOYEE_ID,
-        chat_id=GROUP_ID,
-        chat_type="group",
-    )
     unknown_member = resolver.resolve(
         sender_id="ou_stranger",
         chat_id=GROUP_ID,
         chat_type="group",
     )
-    employee_p2p = resolver.resolve(
-        sender_id=EMPLOYEE_ID,
-        chat_id="oc_employee_p2p",
+    unknown_p2p = resolver.resolve(
+        sender_id="ou_stranger",
+        chat_id="oc_unknown_p2p",
         chat_type="p2p",
     )
 
-    assert employee.zone is TrustZone.MANAGED_AGENT_GROUP
-    assert employee.actor is ActorKind.EMPLOYEE
     assert unknown_member.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
     assert unknown_member.actor is ActorKind.UNKNOWN
     assert unknown_member.managed_group is None
-    assert employee_p2p.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
-    assert employee_p2p.actor is ActorKind.UNKNOWN
+    assert unknown_p2p.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+    assert unknown_p2p.actor is ActorKind.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -146,7 +137,6 @@ def test_inactive_or_invalid_managed_group_provenance_is_unknown(
         owner_id=OWNER_ID,
         managed_groups=(group,),
         project_grants=(() if grant is None else (grant,)),
-        employee_bot_ids=frozenset({EMPLOYEE_ID}),
     )
 
     trust = resolver.resolve(

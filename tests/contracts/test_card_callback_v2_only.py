@@ -3,9 +3,6 @@ from __future__ import annotations
 import inspect
 import json
 
-from src.autonomous.outbox.cards import build_employee_status_card
-from src.autonomous.outbox.models import EmployeeCardState
-from src.autonomous.provisioning.lark_app import current_registration_manifest
 from src.card.builders.core import CoreBuilder
 from src.feishu import ws_client
 from src.feishu.handlers.base import BaseHandler
@@ -19,20 +16,9 @@ def test_main_bot_registers_only_latest_card_callback() -> None:
     assert "register_p1" not in source
 
 
-def test_employee_registration_manifest_replaces_old_callback_subscription() -> None:
-    assert current_registration_manifest().callbacks == ("card.action.trigger",)
-
-
 def test_representative_cards_are_card_json_2_only() -> None:
     cards = [
         CoreBuilder._wrap_card("标题", "blue", []),
-        build_employee_status_card(
-            title="任务",
-            state=EmployeeCardState.RUNNING,
-            summary="处理中",
-            progress_percent=50,
-            attempt_id="attempt-1",
-        ),
     ]
 
     for card in cards:

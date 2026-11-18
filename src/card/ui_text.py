@@ -63,11 +63,11 @@ UI_TEXT = {
     "system_help_deep_prompt": "💭 启动 Deep Engine\n\n请发送: `/deep <你的需求>`\n\n例如: `/deep 帮我重构 src/feishu 模块`",
     "system_autonomous_manager_retired": (
         "⚠️ 独立 Autonomous Manager 命令面已退役，本次命令未执行。"
-        "请使用 `/hire <名字>` 创建数字员工，并通过员工自己的会话继续任务。"
+        "请直接向 GhostAP 发送任务，或进入编程模式（如 `/coco`、`/agy`）后使用原生 `/goal` 命令。"
     ),
     "system_autonomous_manager_retired_goal": (
         "⚠️ 独立 Autonomous Manager 命令面已退役；原命令未执行。"
-        "请先使用 `/hire <名字>` 创建数字员工，再在员工会话中提交任务：{task}"
+        "请直接向 GhostAP 发送任务，或在编程模式中使用原生命令：{task}"
     ),
     "system_new_project_usage": "用法: `/new 项目名 [路径]`",
     "system_close_project_usage": "用法: `/close <项目名>`\n例如: `/close myApp`",
@@ -251,18 +251,6 @@ UI_TEXT = {
         "流程：自动绑定可用推荐 Agent Pool 与主编排器 → "
         "全自动生成、验证并执行脚本 → 汇总结果"
     ),
-    "system_help_section_hire": "👤 数字员工 · 雇佣与管理",
-    "system_help_section_hire_body": (
-        "`/hire <名字>` · 自动选择推荐可用工具和后端默认模型\n"
-        "`/h <名字>` · `/hire` 的简写\n"
-        "`/hire <名字> --tool codex --model <模型>` · 受控覆盖工具或模型\n"
-        "`/employees`（`/roster`） · 查看在职员工\n"
-        "`/employee-role <员工名> <职责>` · 设置员工职责\n"
-        "`/fire <名字或ID> [--drain]` · 退役员工，可等待当前任务排空\n"
-        "`/history <名字或ID>` · 查看员工执行历史\n"
-        "`/employee-memory <名字或ID>` · 查看员工记忆\n"
-        "以上管理命令由配置管理员在主 Bot 私聊使用"
-    ),
     "system_help_tips": (
         "**💡 使用提示**\n"
         "1. 发送 `/menu` 打开完整快捷菜单\n"
@@ -439,14 +427,6 @@ UI_TEXT = {
     "ws_message_prestart_terminal": (
         "⚠️ 消息任务在开始执行前因服务中断而终止，GhostAP 主 Bot 未执行。"
         "请重新发送该命令。"
-    ),
-    "ws_employee_handoff_unconfirmed": (
-        "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
-        "请查看员工回复后再决定是否重试。"
-    ),
-    "ws_employee_handoff_unknown": (
-        "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
-        "请先等待目标员工回复，或联系管理员核查。"
     ),
     "ws_main_bot_identity_unavailable": (
         "⚠️ 暂时无法确认该命令的处理方；GhostAP 主 Bot 未执行。"

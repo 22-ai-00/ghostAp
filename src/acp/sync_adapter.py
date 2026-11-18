@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..config import get_settings
-from ..employee_session_scope import record_employee_session_outcome
 from ..utils.errors import get_error_detail, sanitize_futures_msg
 from .client import ACPHistoryStore
 from .diagnostics import (
@@ -1285,11 +1284,9 @@ class SyncACPSession(PromptGenerationTracker):
                         )
                     # Agent still active — continue waiting
         except (asyncio.CancelledError, concurrent.futures.CancelledError):
-            record_employee_session_outcome("canceled")
             self._force_dead = True
             raise RuntimeError("ACP agent 进程在执行过程中意外终止")
         except TimeoutError as e:
-            record_employee_session_outcome("timeout")
             agent_type_str = getattr(self, "_agent_type", "unknown")
             if getattr(self, "_log_failures", True):
                 logger.error("[ACP:%s] prompt 执行超时 (timeout=%ss): %s", agent_type_str, effective_timeout, get_error_detail(e), exc_info=True)

@@ -12,13 +12,13 @@ from typing import Protocol
 from lark_oapi.core.model.base_request import BaseRequest
 from lark_oapi.core.model.base_response import BaseResponse
 
-from ..autonomous.provisioning.slash_commands import (
+from .product_catalog import get_slash_discoverable_actions
+from .slash_commands import (
     SlashCommand,
     SlashCommandReconciler,
     VerifiedSlashState,
 )
-from ..autonomous.provisioning.slash_lark import LarkSlashCommandAPI
-from .product_catalog import get_slash_discoverable_actions
+from .slash_lark import LarkSlashCommandAPI
 
 
 class _AsyncLarkClient(Protocol):

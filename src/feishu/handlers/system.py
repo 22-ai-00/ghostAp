@@ -36,7 +36,6 @@ from ..slash_command_parser import CommandMatch, SlashCommandParser
 from .access_admin import AccessAdminMixin
 from .acp_activation import ACPActivationMixin
 from .base import BaseHandler
-from .employee import EmployeeHandler
 from .lock_commands import LockCommandsMixin
 
 if TYPE_CHECKING:
@@ -72,10 +71,9 @@ class _ACPActivationEffect:
 class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, BaseHandler):
     """Help, exit, shell, directory, and intercepted-command handling."""
 
-    # `/status` remains the established Deep/Spec diagnostics command. The
-    # Standalone v5 Manager was superseded by the Journal-backed employee/Team
-    # runtime. Keep its old spellings fail-closed with an explicit migration
-    # message instead of reviving the obsolete process-local command surface.
+    # `/status` remains the established Deep/Spec diagnostics command.  Keep
+    # retired v5 Manager command spellings fail-closed instead of reviving
+    # the obsolete process-local command surface.
     _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()
     _DIRECT_TOOL_COMMAND_TO_MODE: dict[str, str] = {
         "/coco": "coco",
@@ -104,7 +102,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/project",
             "/coco_status",
             *(f"/{mode}_info" for mode in _INFO_COMMAND_MODES),
-            "/employees",
             "/exit",
             "/stop",
             "/lock",
@@ -132,11 +129,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/btw",
             "/setadmin",
             "/access",
-            "/employee-role",
-            "/hire",
-            "/fire",
-            "/history",
-            "/employee-memory",
             "/goal",
             "/approve",
             "/runs",
@@ -154,7 +146,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/project",
             "/coco_status",
             *(f"/{mode}_info" for mode in _INFO_COMMAND_MODES),
-            "/employees",
             "/exit",
             *_DIRECT_TOOL_COMMAND_TO_MODE.keys(),
         }
@@ -176,11 +167,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/unlock",
             "/setadmin",
             "/access",
-            "/employee-role",
-            "/hire",
-            "/fire",
-            "/history",
-            "/employee-memory",
             "/btw",
             "/info",
             "/stop",
@@ -191,7 +177,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
 
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
-        self.employee = EmployeeHandler(ctx)
         # All state transitions for one activation generation share this
         # re-entrant lock.  The critical sections are deliberately limited to
         # generation/card writes and the short durable commit + mode transition;
@@ -251,12 +236,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/unlock": lambda m, c, t, p: self._handle_lock_command(m, c, "unlock"),
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
             "/access": lambda m, c, t, p: self._handle_access_command(m, c, ""),
-            "/employees": lambda m, c, t, p: self.employee.list_employees_roster(m, c),
-            "/employee-role": lambda m, c, t, p: self.employee.update_employee_role(m, c, ""),
-            "/hire": lambda m, c, t, p: self.employee.hire_employee(m, c, ""),
-            "/fire": lambda m, c, t, p: self.employee.fire_employee(m, c, ""),
-            "/history": lambda m, c, p: self.employee.show_employee_history(m, c, ""),
-            "/employee-memory": lambda m, c, t, p: self.employee.show_employee_memory(m, c, ""),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -269,46 +248,6 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             ("/acp", self.handle_acp_command),
             ("/cmds", lambda m, c, t, p: self.show_tool_commands(m, c, t, p)),
             ("/model", self.handle_model_command),
-            (
-                "/employee-role",
-                lambda m, c, t, p: self.employee.update_employee_role(
-                    m,
-                    c,
-                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
-                ),
-            ),
-            (
-                "/hire",
-                lambda m, c, t, p: self.employee.hire_employee(
-                    m,
-                    c,
-                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
-                ),
-            ),
-            (
-                "/fire",
-                lambda m, c, t, p: self.employee.fire_employee(
-                    m,
-                    c,
-                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
-                ),
-            ),
-            (
-                "/history",
-                lambda m, c, t, p: self.employee.show_employee_history(
-                    m,
-                    c,
-                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
-                ),
-            ),
-            (
-                "/employee-memory",
-                lambda m, c, t, p: self.employee.show_employee_memory(
-                    m,
-                    c,
-                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
-                ),
-            ),
         ]
 
     def _handle_direct_mode_enter(

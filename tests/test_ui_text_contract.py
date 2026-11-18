@@ -99,29 +99,6 @@ def test_ui_text_required_keys_exist_and_are_str(key):
     )
 
 
-def test_employee_help_matches_current_lifecycle_command_contract():
-    """Employee 帮助只宣传已实现的自动雇佣与生命周期命令。"""
-    body = UI_TEXT["system_help_section_hire_body"]
-
-    for command in (
-        "`/hire <名字>`",
-        "`/h <名字>`",
-        "`/roster`",
-        "`/employee-role <员工名> <职责>`",
-        "`/fire <名字或ID> [--drain]`",
-        "`/history <名字或ID>`",
-        "`/employee-memory <名字或ID>`",
-    ):
-        assert command in body
-
-    assert "自动选择推荐可用工具和后端默认模型" in body
-    assert "--tool" in body
-    assert "--model" in body
-    assert "弹出工具+模型选择" not in body
-    assert "--prompt" not in body
-    assert "配置管理员在主 Bot 私聊" in body
-
-
 def test_programming_help_discovers_all_session_info_commands():
     body = UI_TEXT["system_help_section_modes_body"]
 

@@ -227,7 +227,6 @@ def _make_ws_client() -> MagicMock:
     client._pending_image_keys = {}
     client._pending_image_only = set()
     client._chat_lock_gate = MagicMock()
-    client._employee_department_runtime = MagicMock()
     client._handle_image_content = MagicMock()
     client._dispatch_message_logic = MagicMock()
     client._dispatch_empty_text = MagicMock()
