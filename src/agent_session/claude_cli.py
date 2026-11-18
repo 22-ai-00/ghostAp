@@ -3,31 +3,22 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
-import threading
-import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
 from ..acp.claude_capabilities import strip_1m_suffix
 from ..acp.claude_selection import (
     CLAUDE_DEFAULT_MODEL_TOKEN,
     split_claude_model_selection,
 )
-from ..acp.client import (
-    emit_referenced_changed_local_image_events,
-    snapshot_local_image_artifacts,
-)
 from ..acp.execution_instructions import AUTONOMOUS_EXECUTION_PROMPT
 from ..acp.models import ACPEvent, ACPEventType, PromptResult
-from ..acp.prompt_generation import PromptGenerationTracker
-from ..utils.errors import get_error_detail
+from .cli_base import _BaseCLISession, _CLIModuleHooks
 from .process_cleanup import terminate_and_reap_process_tree
-from .protocol import _PromptRetryMixin
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +49,17 @@ class ClaudeCLIConfig:
     add_dir: bool = True
 
 
-class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
+class SyncClaudeCLISession(_BaseCLISession):
     """Claude Code CLI backend.
 
     - Uses `claude -p` (print and exit) per prompt.
     - Uses `--session-id` for the first prompt and `--resume <id>` afterwards.
     - Emits TEXT_CHUNK ACP events only (no plan/tool events).
     """
+
+    _display_name = "Claude"
+    _log_prefix = "ClaudeCLI"
+    _missing_binary_prefix = "Claude CLI"
 
     def __init__(
         self,
@@ -74,418 +69,97 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         model_name: Optional[str] = None,
         employee_process_env: Mapping[str, str] | None = None,
     ):
-        self._cwd = cwd
-        self._cfg = config or ClaudeCLIConfig()
-        self._model_name = (model_name or "").strip() or None
-        self._proc: Optional[subprocess.Popen] = None
-        self._proc_group_id: int | None = None
-        self._cancel_event = threading.Event()
-        self._prompt_generation_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._prompt_generation = 0
-        self._active_prompt_generation: int | None = None
-        self._user_cancel_generation: int | None = None
-        self._force_dead = False
-        self._employee_process_env = (
-            dict(employee_process_env) if employee_process_env is not None else None
+        super().__init__(
+            cwd,
+            config or ClaudeCLIConfig(),
+            model_name=model_name,
+            employee_process_env=employee_process_env,
         )
 
-        self.session_id: str = ""
-        self.created_at: float = time.time()
-        self.last_active: float = time.time()
-        self.message_count: int = 0
-        self.last_query: str = ""
-        self.is_resumed: bool = False
-
-    def describe_agent(self) -> str:
-        return f"cmd={self._cfg.command} cwd={self._cwd} backend=cli"
+    def _module_hooks(self) -> _CLIModuleHooks:
+        return _CLIModuleHooks(
+            popen=subprocess.Popen,
+            which=shutil.which,
+            terminate_and_reap=_terminate_and_reap_process,
+            terminate_grace_s=_CLI_TERMINATE_GRACE_S,
+            logger=logger,
+        )
 
     def start(self, startup_timeout: float = 60) -> str:
         # No long-running server here; just validate executable and mint a session id.
-        if not shutil.which(self._cfg.command):
-            raise RuntimeError(f"未找到 Claude CLI 可执行文件: {self._cfg.command}")
+        super().start(startup_timeout)
         if not self.session_id:
             self.session_id = str(uuid.uuid4())
         return self.session_id
 
-    def load_session(self, session_id: str, timeout: float) -> None:
-        # Claude CLI uses local persistence; we just switch to target session id.
-        del timeout
-        self.session_id = session_id
-        self.is_resumed = True
-
-    def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
-        # Claude CLI manages its own history; GhostAP doesn't parse it here.
-        return []
-
-    def is_server_running(self) -> bool:
-        # Per-prompt spawn — no persistent server to check.
-        return True
-
-    def is_server_healthy(self, healthcheck_timeout: float = 2.0) -> bool:
-        return True
-
-    @property
-    def employee_process_env(self) -> dict[str, str] | None:
-        env = self._employee_process_env
-        return None if env is None else dict(env)
-
-    def send_prompt(
-        self,
-        text: str,
-        on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[float] = None,
-        idle_timeout: Optional[float] = None,
-        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
-    ) -> PromptResult:
-        self._cancel_event.clear()
-        prompt_generation = self._begin_prompt_generation()
-        generation_consumed = False
-        try:
-            result = self._send_prompt_once(
-                text,
-                on_event=on_event,
-                timeout=timeout,
-                idle_timeout=idle_timeout,
-                activity_predicate=activity_predicate,
-            )
-            user_cancelled = self._consume_prompt_generation(prompt_generation)
-            generation_consumed = True
-            if str(result.stop_reason or "").strip().casefold() in {
-                "cancelled",
-                "canceled",
-            }:
-                if user_cancelled:
-                    result.cancellation_source = "user"
-                elif result.cancellation_source is None:
-                    result.cancellation_source = "provider"
-            return result
-        finally:
-            if not generation_consumed:
-                self._consume_prompt_generation(prompt_generation)
-
-    def _send_prompt_once(
-        self,
-        text: str,
-        on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[float] = None,
-        idle_timeout: Optional[float] = None,
-        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
-    ) -> PromptResult:
+    def _ensure_session_ready(self, which: Callable[[str], Optional[str]]) -> None:
+        del which
         if not self.session_id:
             self.start()
 
-        self.last_active = time.time()
-        self.message_count += 1
-        self.last_query = text
-        image_snapshot = (
-            snapshot_local_image_artifacts(self._cwd)
-            if on_event is not None
-            else {}
-        )
-        media_references: list[str] = []
+    def _build_args(self, text: str, resumed: bool) -> list[str]:
+        # Print mode otherwise falls back to dontAsk and denies tools that
+        # would need a permission prompt. Apply the backend's own unattended
+        # authorization mode on every invocation, including resumed turns.
+        args: list[str] = [
+            self._cfg.command,
+            "-p",
+            "--permission-mode",
+            "bypassPermissions",
+            "--append-system-prompt",
+            AUTONOMOUS_EXECUTION_PROMPT,
+        ]
+        if self._cfg.add_dir:
+            args += ["--add-dir", self._cwd]
+        base_model, effort = split_claude_model_selection(self._model_name)
+        if base_model and base_model != CLAUDE_DEFAULT_MODEL_TOKEN:
+            args += ["--model", strip_1m_suffix(base_model)]
+        if effort:
+            args += ["--effort", effort]
 
-        def _build_args(resumed: bool) -> list[str]:
-            # Print mode otherwise falls back to dontAsk and denies tools that
-            # would need a permission prompt. Apply the backend's own unattended
-            # authorization mode on every invocation, including resumed turns.
-            args: list[str] = [
-                self._cfg.command, "-p",
-                "--permission-mode", "bypassPermissions",
-                "--append-system-prompt", AUTONOMOUS_EXECUTION_PROMPT,
-            ]
-            if self._cfg.add_dir:
-                args += ["--add-dir", self._cwd]
-            base_model, effort = split_claude_model_selection(self._model_name)
-            if base_model and base_model != CLAUDE_DEFAULT_MODEL_TOKEN:
-                args += ["--model", strip_1m_suffix(base_model)]
-            if effort:
-                args += ["--effort", effort]
+        if resumed:
+            args += ["--resume", self.session_id]
+        else:
+            args += ["--session-id", self.session_id]
 
-            if resumed:
-                args += ["--resume", self.session_id]
-            else:
-                args += ["--session-id", self.session_id]
+        args.append("--")
+        args.append(text)
+        return args
 
-            args.append("--")
-            args.append(text)
-            return args
+    def _prepare_env(self, env: dict[str, str]) -> None:
+        # Claude Code CLI refuses to launch inside another Claude Code session.
+        # Apply model-implied betas on top of the sanitized base environment.
+        from ..utils.env import apply_anthropic_betas
 
-        def _run_once(resumed: bool) -> tuple[int, str, str, str]:
-            """Run one claude invocation and return (returncode, stdout, stderr, state)."""
-            args = _build_args(resumed)
-            chunks: list[str] = []
-            ensure_process_stopped: Callable[[], bool] | None = None
-            try:
-                # Claude Code CLI refuses to launch inside another Claude Code session.
-                # Our process may run under Claude Code / other wrappers, so we must
-                # explicitly unset the guard env to avoid nested-session crash.
-                from ..utils.env import build_clean_env
+        apply_anthropic_betas(env, self._model_name)
 
-                env = build_clean_env(
-                    dict(self._employee_process_env)
-                    if self._employee_process_env is not None
-                    else None
-                )
-                from ..utils.env import apply_anthropic_betas
+    def _consume_stdout_line(
+        self,
+        line: str,
+        output_chunks: list[str],
+        emit: Callable[[ACPEvent], None],
+    ) -> str:
+        output_chunks.append(line)
+        emit(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=line))
+        return ""
 
-                apply_anthropic_betas(env, self._model_name)
+    def _handle_process_exit(
+        self,
+        *,
+        rc: int,
+        out: str,
+        err: str,
+        state: str,
+        backend_error: str,
+        on_event: Optional[Callable[[ACPEvent], None]],
+    ) -> PromptResult:
+        del state, backend_error
+        output = out
+        if rc != 0 and err:
+            output = (output + "\n" + err).strip("\n")
+            if on_event:
+                on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="\n" + err))
 
-                self._proc = subprocess.Popen(
-                    args,
-                    cwd=self._cwd,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=(os.name == "posix"),
-                )
-                self._proc_group_id = (
-                    getattr(self._proc, "pid", None)
-                    if os.name == "posix"
-                    else None
-                )
-
-                started_at = time.monotonic()
-                deadline = (started_at + timeout) if timeout else None
-                effective_idle_timeout = (
-                    float(idle_timeout)
-                    if idle_timeout is not None and float(idle_timeout) > 0
-                    else 0.0
-                )
-                last_activity_at = [started_at]
-                assert self._proc.stdout is not None
-
-                # Watchdog thread: terminates the process on timeout or cancel
-                # since blocking readline cannot check these conditions.
-                terminated_reason: list[str] = []
-                proc_ref = self._proc
-                proc_group_id = self._proc_group_id
-                cleanup_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-                cleanup_done = threading.Event()
-                cleanup_succeeded = [False]
-
-                def _ensure_process_stopped() -> bool:
-                    with cleanup_lock:
-                        if cleanup_done.is_set():
-                            return cleanup_succeeded[0]
-                        cleanup_succeeded[0] = _terminate_and_reap_process(
-                            proc_ref,
-                            process_group_id=proc_group_id,
-                        )
-                        cleanup_done.set()
-                        if not cleanup_succeeded[0]:
-                            self._force_dead = True
-                        return cleanup_succeeded[0]
-
-                ensure_process_stopped = _ensure_process_stopped
-
-                def _watchdog():
-                    while True:
-                        if self._cancel_event.is_set():
-                            terminated_reason.append("cancelled")
-                            _ensure_process_stopped()
-                            return
-                        try:
-                            leader_exited = proc_ref.poll() is not None
-                        except Exception:
-                            _ensure_process_stopped()
-                            return
-                        if leader_exited:
-                            # A descendant may still own stdout/stderr after the
-                            # CLI leader exits. Converge the whole process group
-                            # before letting the blocking reader wait for EOF.
-                            _ensure_process_stopped()
-                            return
-                        if deadline and time.monotonic() > deadline:
-                            terminated_reason.append("timeout")
-                            _ensure_process_stopped()
-                            return
-                        if (
-                            effective_idle_timeout > 0
-                            and time.monotonic() - last_activity_at[0]
-                            >= effective_idle_timeout
-                        ):
-                            terminated_reason.append("idle_timeout")
-                            _ensure_process_stopped()
-                            return
-                        wait_timeout = 0.1
-                        if deadline is not None:
-                            wait_timeout = min(
-                                wait_timeout,
-                                max(0.0, deadline - time.monotonic()),
-                            )
-                        if effective_idle_timeout > 0:
-                            wait_timeout = min(
-                                wait_timeout,
-                                max(
-                                    0.0,
-                                    effective_idle_timeout
-                                    - (time.monotonic() - last_activity_at[0]),
-                                ),
-                            )
-                        self._cancel_event.wait(timeout=wait_timeout)
-
-                watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-                watchdog_thread.start()
-
-                for line in self._proc.stdout:
-                    if terminated_reason:
-                        break
-                    if self._cancel_event.is_set():
-                        _ensure_process_stopped()
-                        return (1, "".join(chunks), "", "cancelled")
-                    if deadline and time.monotonic() > deadline:
-                        try:
-                            leader_running = proc_ref.poll() is None
-                        except Exception:
-                            leader_running = True
-                        if leader_running:
-                            _ensure_process_stopped()
-                            return (1, "".join(chunks), "", "timeout")
-                    chunks.append(line)
-                    event = ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=line)
-                    counts_as_activity = True
-                    if activity_predicate is not None:
-                        try:
-                            counts_as_activity = bool(activity_predicate(event))
-                        except Exception:
-                            counts_as_activity = False
-                            logger.warning(
-                                "Claude CLI activity predicate failed closed",
-                                exc_info=True,
-                            )
-                    if counts_as_activity:
-                        last_activity_at[0] = time.monotonic()
-                    if on_event:
-                        on_event(event)
-
-                if terminated_reason:
-                    _ensure_process_stopped()
-                    return (1, "".join(chunks), "", terminated_reason[0])
-                try:
-                    self._proc.wait(timeout=_CLI_TERMINATE_GRACE_S)
-                except subprocess.TimeoutExpired:
-                    reaped = _ensure_process_stopped()
-                    if not reaped:
-                        self._force_dead = True
-                    if deadline and time.monotonic() >= deadline:
-                        return (1, "".join(chunks), "", "timeout")
-                    raise
-
-                rc = int(self._proc.returncode or 0)
-                err = (self._proc.stderr.read() or "").strip("\n") if self._proc.stderr else ""
-                return (rc, "".join(chunks).strip("\n"), err, "ok")
-            finally:
-                proc = self._proc
-                proc_group_id = self._proc_group_id
-                if proc is None:
-                    self._proc = None
-                    self._proc_group_id = None
-                elif (
-                    ensure_process_stopped()
-                    if ensure_process_stopped is not None
-                    else _terminate_and_reap_process(
-                        proc,
-                        process_group_id=proc_group_id,
-                    )
-                ):
-                    self._proc = None
-                    self._proc_group_id = None
-                else:
-                    self._force_dead = True
-                    self._proc = proc
-                    self._proc_group_id = proc_group_id
-
-        try:
-            rc, out, err, state = _run_once(resumed=self.is_resumed)
-            media_references.extend((out, err))
-
-            if state == "cancelled":
-                self.is_resumed = True
-                return PromptResult(stop_reason="cancelled", text=out)
-            if state in {"timeout", "idle_timeout"}:
-                self.is_resumed = True
-                reason = "空闲超时" if state == "idle_timeout" else "执行超时"
-                timeout_text = (out + f"\n❌ Claude {reason}").strip()
-                return PromptResult(stop_reason="timeout", text=timeout_text)
-
-            output = out
-            if rc != 0 and err:
-                output = (output + "\n" + err).strip("\n")
-                if on_event:
-                    on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="\n" + err))
-
-            self.is_resumed = True
-            stop_reason = "end_turn" if rc == 0 else "failed"
-            return PromptResult(stop_reason=stop_reason, text=output)
-
-        except (subprocess.SubprocessError, OSError, TimeoutError) as e:
-            self.is_resumed = True
-            return PromptResult(stop_reason="error", text=f"❌ Claude 执行异常: {get_error_detail(e)}")
-        finally:
-            if on_event is not None:
-                try:
-                    emit_referenced_changed_local_image_events(
-                        self._cwd,
-                        image_snapshot,
-                        media_references,
-                        on_event,
-                    )
-                except Exception:
-                    logger.warning(
-                        "[ClaudeCLI] local image artifact discovery failed",
-                        exc_info=True,
-                    )
-
-    def cancel(self, wait: bool = False, timeout: float = 2.0) -> None:
-        """Signal cancellation — the streaming loop will terminate the process."""
-        del wait, timeout  # CLI transport has no acknowledgment protocol.
-        self._cancel_event.set()
-        proc = self._proc
-        if proc:
-            try:
-                proc.terminate()
-            except Exception:
-                logger.debug("SyncClaudeCLISession.cancel: terminate failed", exc_info=True)
-
-    def close(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        if _terminate_and_reap_process(
-            proc,
-            process_group_id=self._proc_group_id,
-        ):
-            self._proc = None
-            self._proc_group_id = None
-            return
-        self._force_dead = True
-        self._proc = proc
-        raise RuntimeError("Claude CLI failed to terminate subprocess")
-
-    def to_snapshot(self) -> dict:
-        from .backend_resolver import agent_type_for_cli_command
-
-        return {
-            "session_id": self.session_id,
-            "agent_type": agent_type_for_cli_command(self._cfg.command),
-            "cwd": self._cwd,
-            "created_at": self.created_at,
-            "last_active": self.last_active,
-            "message_count": self.message_count,
-            "last_query": self.last_query,
-            "is_resumed": self.is_resumed,
-            "backend": "cli",
-            "model_name": self._model_name,
-        }
-
-    def get_session_info(self) -> str:
-        duration = int(time.time() - self.created_at)
-        minutes, seconds = divmod(duration, 60)
-        resumed_info = " (已恢复)" if self.is_resumed else ""
-        return (
-            f"📊 Claude 会话信息{resumed_info} (CLI):\n"
-            f"- 会话ID: {self.session_id}\n"
-            f"- 消息数: {self.message_count}\n"
-            f"- 持续时间: {minutes}分{seconds}秒"
-        )
+        self.is_resumed = True
+        stop_reason = "end_turn" if rc == 0 else "failed"
+        return PromptResult(stop_reason=stop_reason, text=output)
