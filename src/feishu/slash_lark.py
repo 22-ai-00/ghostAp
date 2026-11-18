@@ -7,6 +7,7 @@ import re
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+import lark_oapi.core  # noqa: F401
 from lark_oapi.api.application.v7 import (
     AppSlashCommand,
     AppSlashCommandI18n,

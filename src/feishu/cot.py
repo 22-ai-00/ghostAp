@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+import lark_oapi.core  # noqa: F401
 from lark_oapi.core.enum import AccessTokenType, HttpMethod
 from lark_oapi.core.model.base_request import BaseRequest
 from lark_oapi.core.model.base_response import BaseResponse

@@ -640,3 +640,247 @@ assert not errors, f"concurrent _sync_main_bot_identity failed: {errors}"
         check=False,
     )
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_ws_event_handler_and_log_level_avoid_loading_feishu_channel():
+    """Accessing WS dispatcher/log level must not hydrate FeishuChannel or Drive/Wiki APIs."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+import src.main as main_mod
+main_mod._activate_lark_import_cache()
+main_mod._load_feishu_runtime()
+
+import src.feishu.ws_client as ws_mod
+from src.feishu.ws_client import FeishuWSClient
+
+client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+try:
+    handler = client._build_event_handler()
+    log_level = getattr(ws_mod, "ChannelLogLevel")
+    assert handler is not None
+    assert log_level is not None
+    assert "FeishuChannel" not in ws_mod.__dict__
+    assert "lark_channel.channel.channel" not in sys.modules
+    assert "lark_channel.api.drive" not in sys.modules
+    assert "lark_channel.api.wiki" not in sys.modules
+    lc_mods = [m for m in sys.modules if m == "lark_channel" or m.startswith("lark_channel.")]
+    assert len(lc_mods) <= 90, f"too many lark_channel modules loaded: {len(lc_mods)}"
+finally:
+    client.close()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_concurrent_lazy_sdk_hydration_across_threads():
+    """Concurrent threads touching lazy SDK trees hydrate core safely without circular import errors."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import threading
+import src.main as main_mod
+main_mod._activate_lark_import_cache()
+main_mod._load_feishu_runtime()
+
+import lark_oapi as lark
+import lark_channel as lc
+from src.feishu.ws_client import FeishuWSClient
+
+ws = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+try:
+    for _ in range(3):
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def run(fn):
+            barrier.wait()
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        def check_client():
+            assert lark.Client.builder().app_id("a").app_secret("b").build() is not None
+
+        def check_im_req():
+            from lark_oapi.api.im.v1 import CreateMessageRequest
+            assert CreateMessageRequest is not None
+
+        def check_transport():
+            from lark_oapi.core.http import Transport
+            assert Transport is not None
+
+        def check_resource():
+            c = lark.Client.builder().app_id("a").app_secret("b").build()
+            assert c.im.v1.message is not None
+
+        def check_channel_client():
+            assert lc.Client.builder().app_id("a").app_secret("b").build() is not None
+
+        def check_feishu_channel():
+            from lark_channel import FeishuChannel
+            assert FeishuChannel is not None
+
+        def check_cardkit():
+            from lark_oapi.api.cardkit.v1 import CreateCardRequest
+            assert CreateCardRequest is not None
+
+        def check_ws_api_client():
+            assert ws._get_api_client() is not None
+
+        threads = [
+            threading.Thread(target=run, args=(fn,))
+            for fn in (
+                check_client,
+                check_im_req,
+                check_transport,
+                check_resource,
+                check_channel_client,
+                check_feishu_channel,
+                check_cardkit,
+                check_ws_api_client,
+            )
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        assert not errors, f"concurrent lazy hydration errors: {errors}"
+finally:
+    ws.close()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_httpx_transport_cached_ssl_multipart_async_and_ws_compat(tmp_path):
+    """Verify SSLContext caching, DEBUG None queries, async multipart upload, retry, and WS requests compat."""
+    repo_root = Path(__file__).resolve().parents[1]
+    payload_file = tmp_path / "retry_upload.txt"
+    payload_file.write_bytes(b"hello-retry-payload")
+    script = f"""
+import asyncio
+import io
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+import httpx
+
+from src.utils.lark_lazy import (
+    _httpx_client_kwargs_for,
+    install_lazy_lark_channel,
+    install_lazy_lark_oapi,
+)
+
+install_lazy_lark_oapi()
+install_lazy_lark_channel()
+
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+from src.feishu.im_client import FeishuIMClient
+
+captured = []
+file_calls = 0
+observed_compat = []
+
+def handler(request: httpx.Request) -> httpx.Response:
+    global file_calls
+    captured.append((request.method, str(request.url), request.read()))
+    if request.url.path == "/open-apis/auth/v3/tenant_access_token/internal":
+        return httpx.Response(200, json={{"code": 0, "tenant_access_token": "t-tok", "expire": 7200}})
+    if request.url.path == "/open-apis/im/v1/files":
+        file_calls += 1
+        if file_calls == 1:
+            return httpx.Response(500, json={{"code": 999, "msg": "retry me"}})
+        return httpx.Response(200, json={{"code": 0, "data": {{"file_key": "file_retry_ok"}}}})
+    if request.url.path == "/open-apis/im/v1/images":
+        return httpx.Response(200, json={{"code": 0, "data": {{"image_key": "img_ok"}}}})
+    if request.url.path == "/ws/endpoint":
+        return httpx.Response(200, json={{"code": 0, "data": {{"URL": "wss://example.invalid"}}}})
+    return httpx.Response(404)
+
+transport = httpx.MockTransport(handler)
+orig_client = httpx.Client
+orig_async_client = httpx.AsyncClient
+
+def patched_client(**kw):
+    observed_compat.append(kw)
+    return orig_client(transport=transport, **{{k: v for k, v in kw.items() if k != "transport"}})
+
+def patched_async_client(**kw):
+    return orig_async_client(transport=transport, **{{k: v for k, v in kw.items() if k != "transport"}})
+
+client = (
+    lark.Client.builder()
+    .app_id("cli_x")
+    .app_secret("sec_x")
+    .domain("https://open.feishu.cn")
+    .log_level(lark.LogLevel.DEBUG)
+    .build()
+)
+
+# Real httpx.Client gets cached SSLContext; mocked clients do not
+kw1 = _httpx_client_kwargs_for(client.config, orig_client, httpx_mod=httpx)
+kw2 = _httpx_client_kwargs_for(client.config, orig_client, httpx_mod=httpx)
+assert kw1.get("verify") is not None and kw1.get("verify") is kw2.get("verify")
+fake_cls = type("FakeClient", (), {{"__module__": "tests.fake"}})
+assert "verify" not in _httpx_client_kwargs_for(client.config, fake_cls)
+
+with patch("httpx.Client", side_effect=patched_client), patch(
+    "httpx.AsyncClient", side_effect=patched_async_client
+), patch("time.sleep"):
+    from lark_oapi.ws import client as oapi_ws
+    from lark_channel.ws import client as chan_ws
+
+    r1 = oapi_ws.requests.post(
+        "https://open.feishu.cn/ws/endpoint",
+        json={{"a": 1}},
+        allow_redirects=False,
+        verify=False,
+    )
+    r2 = chan_ws.requests.Session().post("https://open.feishu.cn/ws/endpoint", json={{"b": 2}})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert observed_compat[0].get("verify") is False
+    assert "requests" not in sys.modules
+
+    im = FeishuIMClient(
+        lambda: client,
+        SimpleNamespace(im_api_max_retries=2, im_api_retry_delay_s=0.01),
+    )
+    assert im.upload_file({str(payload_file)!r}, file_type="stream", file_name="hello.txt") == "file_retry_ok"
+    assert im.upload_image_bytes(b"PNGDATA") == "img_ok"
+
+    req_async = CreateImageRequest.builder().request_body(
+        CreateImageRequestBody.builder().image_type("message").image(io.BytesIO(b"ASYNCIMG")).build()
+    ).build()
+    aresp = asyncio.run(client.im.v1.image.acreate(req_async))
+    assert aresp.success() and aresp.data.image_key == "img_ok"
+
+file_reqs = [c for c in captured if "/open-apis/im/v1/files" in c[1]]
+assert len(file_reqs) == 2
+assert b"hello-retry-payload" in file_reqs[0][2]
+assert b"hello-retry-payload" in file_reqs[1][2]
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import lark_channel.core  # noqa: F401
 from lark_channel import ws
 from lark_channel.core.const import UTF_8
 from lark_channel.core.json import JSON

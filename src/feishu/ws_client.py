@@ -436,6 +436,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         self._message_ingress_bindings_inflight = 0
         self._message_ingress_bindings_fenced = False
         self._api_client: Optional[lark.Client] = None
+        self._api_client_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._main_bot_open_id = ""
         self._main_bot_identity_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._main_bot_identity_cond = threading.Condition(self._main_bot_identity_lock)
@@ -1151,16 +1152,28 @@ class FeishuWSClient(WSManagedGroupsMixin):
 
     def _get_api_client(self) -> lark.Client:
         """延迟构造 `lark_oapi.Client`（用于调用消息/卡片 API）。"""
-        if self._api_client is None:
-            self._api_client = (
-                lark.Client.builder()
-                .app_id(self.settings.app_id)
-                .app_secret(self.settings.app_secret)
-                .log_level(lark.LogLevel.INFO)
-                .timeout(30)  # 30s timeout for all API calls (card delivery protection)
-                .build()
-            )
-        return self._api_client
+        client = getattr(self, "_api_client", None)
+        if client is not None:
+            return client
+        lock = getattr(self, "_api_client_lock", None)
+        if lock is None:
+            lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            self._api_client_lock = lock
+        with lock:
+            client = getattr(self, "_api_client", None)
+            if client is None:
+                import lark_oapi.core  # noqa: F401
+
+                client = (
+                    lark.Client.builder()
+                    .app_id(self.settings.app_id)
+                    .app_secret(self.settings.app_secret)
+                    .log_level(lark.LogLevel.INFO)
+                    .timeout(30)  # 30s timeout for all API calls (card delivery protection)
+                    .build()
+                )
+                self._api_client = client
+            return client
 
     def _get_channel_client(self) -> "FeishuChannel":
         """Return the process-shared Channel SDK client for programming cards.
@@ -3697,6 +3710,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         if lock is None:
             lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
             self._restart_readiness_lock = lock
+        published_now = False
         with lock:
             if getattr(self, "_restart_generation", None) is not None:
                 return True
@@ -3704,10 +3718,22 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 service_pid=os.getpid()
             )
             self._restart_readiness_blocker = None
+            published_now = True
             logger.info(
                 "GhostAP restart readiness published generation=%s",
                 self._restart_generation,
             )
+        if published_now:
+            try:
+                import linecache
+
+                from ..utils.memory_tuning import trim_process_heap
+
+                linecache.clearcache()
+                gc.collect()
+                trim_process_heap()
+            except Exception:
+                pass
         return True
 
     def _record_ws_activity(self, kind: str) -> None:
@@ -3785,8 +3811,9 @@ class FeishuWSClient(WSManagedGroupsMixin):
         self._message_cache.start_cleanup_thread()
         self._card_event_cache.start_cleanup_thread()
         self._ws_health_monitor.start_watchdog()
-        # Hydrate lark_oapi.core synchronously before spawning background threads
-        # (lark_oapi.core <-> lark_oapi.core.model is unsafe under first-import races).
+        # Hydrate lark_oapi.core and lark_channel.core synchronously before spawning background threads
+        # (core <-> core.model is unsafe under first-import races).
+        import lark_channel.core  # noqa: F401
         import lark_oapi.core  # noqa: F401
 
         self._start_main_slash_command_sync()
@@ -3865,15 +3892,24 @@ def __getattr__(name: str) -> Any:
 
         globals()["reconcile_main_agent_slash_commands"] = reconcile_main_agent_slash_commands
         return reconcile_main_agent_slash_commands
-    if name not in _LAZY_CHANNEL_ATTRS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from lark_channel import EventDispatcherHandler as ChannelEventDispatcherHandler
-    from lark_channel import FeishuChannel
-    from lark_channel import LogLevel as ChannelLogLevel
-    from lark_channel import TransportConfig as ChannelTransportConfig
+    if name == "ChannelEventDispatcherHandler":
+        from lark_channel import EventDispatcherHandler as ChannelEventDispatcherHandler
 
-    globals()["FeishuChannel"] = FeishuChannel
-    globals()["ChannelEventDispatcherHandler"] = ChannelEventDispatcherHandler
-    globals()["ChannelLogLevel"] = ChannelLogLevel
-    globals()["ChannelTransportConfig"] = ChannelTransportConfig
-    return globals()[name]
+        globals()["ChannelEventDispatcherHandler"] = ChannelEventDispatcherHandler
+        return ChannelEventDispatcherHandler
+    if name == "ChannelLogLevel":
+        from lark_channel import LogLevel as ChannelLogLevel
+
+        globals()["ChannelLogLevel"] = ChannelLogLevel
+        return ChannelLogLevel
+    if name == "ChannelTransportConfig":
+        from lark_channel import TransportConfig as ChannelTransportConfig
+
+        globals()["ChannelTransportConfig"] = ChannelTransportConfig
+        return ChannelTransportConfig
+    if name == "FeishuChannel":
+        from lark_channel import FeishuChannel
+
+        globals()["FeishuChannel"] = FeishuChannel
+        return FeishuChannel
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

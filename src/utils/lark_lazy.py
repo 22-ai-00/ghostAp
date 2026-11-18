@@ -27,6 +27,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -36,7 +37,79 @@ from pathlib import Path
 from typing import Any, Optional
 
 _INSTALL_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+_CORE_HYDRATION_LOCK = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+_CORE_STATE_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+_CORE_HYDRATED_PREFIXES: set[str] = set()
+_CORE_HYDRATING_THREADS: dict[str, int] = {}
+_CORE_READY_EVENTS: dict[str, threading.Event] = {}
+_SSL_CTX_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+_SSL_CTX_CACHE: dict[tuple[bool, str, str], Any] = {}
 _BLOCKED_HTTPX_SUBMODULES = frozenset({"httpx._main"})
+
+
+def _ensure_core_hydrated(pkg_prefix: str) -> None:
+    """Ensure ``<pkg_prefix>.core`` finishes importing before concurrent submodule use."""
+    core_name = f"{pkg_prefix}.core"
+    if pkg_prefix in _CORE_HYDRATED_PREFIXES and core_name in sys.modules:
+        return
+    if _CORE_HYDRATING_THREADS.get(pkg_prefix) == threading.get_ident():
+        return
+    while True:
+        if pkg_prefix in _CORE_HYDRATED_PREFIXES and core_name in sys.modules:
+            return
+        if _CORE_HYDRATING_THREADS.get(pkg_prefix) == threading.get_ident():
+            return
+        with _CORE_STATE_LOCK:
+            ev = _CORE_READY_EVENTS.get(pkg_prefix)
+            in_sys = core_name in sys.modules
+            hydrated = pkg_prefix in _CORE_HYDRATED_PREFIXES
+        if hydrated and in_sys:
+            return
+        if in_sys and ev is not None and not ev.is_set():
+            ev.wait(timeout=30.0)
+            continue
+        with _CORE_HYDRATION_LOCK:
+            if pkg_prefix in _CORE_HYDRATED_PREFIXES and core_name in sys.modules:
+                return
+            if _CORE_HYDRATING_THREADS.get(pkg_prefix) == threading.get_ident():
+                return
+            if core_name not in sys.modules:
+                with _CORE_STATE_LOCK:
+                    _CORE_HYDRATED_PREFIXES.discard(pkg_prefix)
+                importlib.import_module(core_name)
+                if pkg_prefix in _CORE_HYDRATED_PREFIXES and core_name in sys.modules:
+                    return
+                with _CORE_STATE_LOCK:
+                    ev = _CORE_READY_EVENTS.get(pkg_prefix)
+                    if ev is None or ev.is_set():
+                        if core_name in sys.modules:
+                            _CORE_HYDRATED_PREFIXES.add(pkg_prefix)
+                        return
+            else:
+                with _CORE_STATE_LOCK:
+                    ev = _CORE_READY_EVENTS.get(pkg_prefix)
+                    if ev is None or ev.is_set():
+                        _CORE_HYDRATED_PREFIXES.add(pkg_prefix)
+                        return
+        ev.wait(timeout=30.0)
+
+
+def _get_cached_ssl_context(httpx_mod: Any, *, trust_env: bool) -> Any:
+    """Return a cached ``ssl.SSLContext`` matching ``trust_env`` CA env vars."""
+    create_ssl_context = getattr(httpx_mod, "create_ssl_context", None)
+    if not callable(create_ssl_context):
+        return None
+    key = (
+        bool(trust_env),
+        os.environ.get("SSL_CERT_FILE", "") if trust_env else "",
+        os.environ.get("SSL_CERT_DIR", "") if trust_env else "",
+    )
+    with _SSL_CTX_LOCK:
+        ctx = _SSL_CTX_CACHE.get(key)
+        if ctx is None:
+            ctx = create_ssl_context(trust_env=bool(trust_env))
+            _SSL_CTX_CACHE[key] = ctx
+        return ctx
 
 _TOP_LEVEL_SUBMODULES = frozenset(
     {"api", "card", "channel", "client", "core", "event", "scene", "ws"}
@@ -134,6 +207,7 @@ class _LazyLarkPackage(types.ModuleType):
         self.__path__ = [str(pkg_dir)]
         self.__package__ = fullname
         self._lazy_pkg_dir = pkg_dir
+        self._pkg_prefix = fullname.split(".", 1)[0]
         self._lazy_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
 
@@ -145,6 +219,12 @@ class _LazyLarkRootModule(_LazyLarkPackage):
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(f"module 'lark_oapi' has no attribute {name!r}")
+
+        if (
+            name not in {"api", "channel", "event", "scene"}
+            and not (self._lazy_pkg_dir / "api" / name).is_dir()
+        ):
+            _ensure_core_hydrated("lark_oapi")
 
         with self._lazy_lock:
             if name in self.__dict__:
@@ -212,6 +292,12 @@ class _LazyChannelRootModule(_LazyLarkPackage):
         if name.startswith("_"):
             raise AttributeError(f"module 'lark_channel' has no attribute {name!r}")
 
+        if (
+            name not in {"api", "channel", "event"}
+            and not (self._lazy_pkg_dir / "api" / name).is_dir()
+        ):
+            _ensure_core_hydrated("lark_channel")
+
         with self._lazy_lock:
             if name in self.__dict__:
                 return self.__dict__[name]
@@ -272,6 +358,8 @@ class _LazyChannelSubpackage(_LazyLarkPackage):
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+        _ensure_core_hydrated(self._pkg_prefix)
 
         with self._lazy_lock:
             if name in self.__dict__:
@@ -337,6 +425,8 @@ class _LazyModelPackage(_LazyLarkPackage):
         if name.startswith("_"):
             raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
 
+        _ensure_core_hydrated(self._pkg_prefix)
+
         with self._lazy_lock:
             if name in self.__dict__:
                 return self.__dict__[name]
@@ -368,6 +458,9 @@ class _LazyVersionPackage(_LazyLarkPackage):
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+        if not (self._lazy_pkg_dir / name).is_dir():
+            _ensure_core_hydrated(self._pkg_prefix)
 
         with self._lazy_lock:
             if name in self.__dict__:
@@ -432,6 +525,8 @@ class _LazyVersionProxy:
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
+
+        _ensure_core_hydrated(self._pkg_prefix)
 
         with self._lock:
             if name in self.__dict__:
@@ -562,6 +657,7 @@ def _build_lazy_client_module(
     pkg_root: Path, *, pkg_prefix: str = "lark_oapi"
 ) -> types.ModuleType:
     """Construct the lazy drop-in replacement for ``<pkg_prefix>.client``."""
+    _ensure_core_hydrated(pkg_prefix)
     core_mod = importlib.import_module(f"{pkg_prefix}.core")
     JSON = core_mod.JSON
     logger = core_mod.logger
@@ -826,7 +922,9 @@ def _build_lazy_decryptor_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi
     return mod
 
 
-def _httpx_client_kwargs_for(conf: Any, client_cls: Any) -> dict[str, Any]:
+def _httpx_client_kwargs_for(
+    conf: Any, client_cls: Any, *, httpx_mod: Any = None
+) -> dict[str, Any]:
     proxy_url = getattr(conf, "proxy_url", None)
     trust_env = getattr(conf, "trust_env_proxy", None)
     kwargs: dict[str, Any] = {}
@@ -840,11 +938,22 @@ def _httpx_client_kwargs_for(conf: Any, client_cls: Any) -> dict[str, Any]:
             raise RuntimeError("installed httpx does not support explicit proxy configuration")
     if trust_env is not None:
         kwargs["trust_env"] = trust_env
+    if (
+        isinstance(client_cls, type)
+        and getattr(client_cls, "__module__", "").split(".")[0] == "httpx"
+    ):
+        ssl_ctx = _get_cached_ssl_context(
+            httpx_mod if httpx_mod is not None else sys.modules.get("httpx"),
+            trust_env=True if trust_env is None else bool(trust_env),
+        )
+        if ssl_ctx is not None:
+            kwargs["verify"] = ssl_ctx
     return kwargs
 
 
 def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi") -> types.ModuleType:
     """Construct an ``httpx``-unified ``<pkg_prefix>.core.http.transport`` module."""
+    _ensure_core_hydrated(pkg_prefix)
     const_mod = importlib.import_module(f"{pkg_prefix}.core.const")
     UTF_8 = const_mod.UTF_8
     USER_AGENT = const_mod.USER_AGENT
@@ -937,12 +1046,12 @@ def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi
                 else:
                     content = JSON.marshal(req.body).encode(UTF_8)
 
-            client_kwargs = _httpx_client_kwargs_for(conf, httpx.Client)
+            client_kwargs = _httpx_client_kwargs_for(conf, httpx.Client, httpx_mod=httpx)
             with httpx.Client(**client_kwargs) as client:
                 response = client.request(
                     str(req.http_method.name),
                     url,
-                    headers=req.headers,
+                    headers=headers,
                     params=req.queries,
                     content=content,
                     timeout=conf.timeout,
@@ -960,7 +1069,7 @@ def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi
                     sdk_logger.debug(
                         f"{str(req.http_method.name)} request completed with status {response.status_code}, "
                         f"headers_count: {len(headers)}, "
-                        f"params_count: {len(req.queries)}, "
+                        f"params_count: {len(req.queries or ())}, "
                         f"body_present: {content is not None}"
                     )
 
@@ -989,12 +1098,14 @@ def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi
             elif req.body is not None:
                 json_ = json.loads(JSON.marshal(req.body))
 
-            client_kwargs = _httpx_client_kwargs_for(conf, httpx.AsyncClient)
+            client_kwargs = _httpx_client_kwargs_for(
+                conf, httpx.AsyncClient, httpx_mod=httpx
+            )
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.request(
                     str(req.http_method.name),
                     url,
-                    headers=req.headers,
+                    headers=headers,
                     params=req.queries,
                     json=json_,
                     data=data,
@@ -1014,7 +1125,7 @@ def _build_lazy_transport_module(pkg_root: Path, *, pkg_prefix: str = "lark_oapi
                         sdk_logger.debug(
                             f"{str(req.http_method.name)} request completed with status {response.status_code}, "
                             f"headers_count: {len(headers)}, "
-                            f"params_count: {len(req.queries)}, "
+                            f"params_count: {len(req.queries or ())}, "
                             f"body_present: {json_ is not None or files is not None or data is not None}"
                         )
 
@@ -1050,6 +1161,8 @@ class _LazyHttpPackage(_LazyLarkPackage):
             "_redact_body_for_log",
         ):
             raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+        _ensure_core_hydrated(self._pkg_prefix)
 
         with self._lazy_lock:
             if name in self.__dict__:
@@ -1112,7 +1225,23 @@ class _HttpxRequestsCompat:
         ) -> Any:
             import httpx
 
+            is_real_httpx = (
+                isinstance(httpx.Client, type)
+                and getattr(httpx.Client, "__module__", "").split(".")[0] == "httpx"
+            )
+            explicit_verify = kwargs.pop("verify", None)
             client_kwargs: dict[str, Any] = {"trust_env": self.trust_env}
+            if explicit_verify is not None:
+                client_kwargs["verify"] = explicit_verify
+            elif is_real_httpx:
+                ssl_ctx = _get_cached_ssl_context(httpx, trust_env=bool(self.trust_env))
+                if ssl_ctx is not None:
+                    client_kwargs["verify"] = ssl_ctx
+            if "allow_redirects" in kwargs:
+                allow_redirects = bool(kwargs.pop("allow_redirects"))
+                kwargs.setdefault("follow_redirects", allow_redirects)
+            elif is_real_httpx:
+                kwargs.setdefault("follow_redirects", True)
             proxy_url = _HttpxRequestsCompat._extract_proxy_url(proxies)
             if proxy_url:
                 params = inspect.signature(httpx.Client).parameters
@@ -1290,10 +1419,42 @@ class _HydratingVersionLoader(importlib.abc.Loader):
         return None
 
     def exec_module(self, module: types.ModuleType) -> None:
+        _ensure_core_hydrated(self._res_pkg_name.split(".", 1)[0])
         res_pkg = importlib.import_module(self._res_pkg_name)
         _exec_real_init(res_pkg, self._res_init)
         code = compile(self._version_file.read_text(encoding="utf-8"), str(self._version_file), "exec")
         exec(code, module.__dict__)
+
+
+class _CoreHydrationLoader(importlib.machinery.SourceFileLoader):
+    """Track active ``<pkg_prefix>.core`` hydration for re-entrant lazy imports."""
+
+    def __init__(self, fullname: str, path: str, pkg_prefix: str) -> None:
+        super().__init__(fullname, path)
+        self._pkg_prefix = pkg_prefix
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> Any:
+        with _CORE_STATE_LOCK:
+            _CORE_HYDRATED_PREFIXES.discard(self._pkg_prefix)
+            ev = _CORE_READY_EVENTS.get(self._pkg_prefix)
+            if ev is None:
+                ev = threading.Event()
+                _CORE_READY_EVENTS[self._pkg_prefix] = ev
+            ev.clear()
+        return super().create_module(spec)
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        with _CORE_STATE_LOCK:
+            ev = _CORE_READY_EVENTS.get(self._pkg_prefix)
+        _CORE_HYDRATING_THREADS[self._pkg_prefix] = threading.get_ident()
+        try:
+            super().exec_module(module)
+            with _CORE_STATE_LOCK:
+                _CORE_HYDRATED_PREFIXES.add(self._pkg_prefix)
+        finally:
+            _CORE_HYDRATING_THREADS.pop(self._pkg_prefix, None)
+            if ev is not None:
+                ev.set()
 
 
 class _LazyLarkFinder(importlib.abc.MetaPathFinder):
@@ -1323,6 +1484,17 @@ class _LazyLarkFinder(importlib.abc.MetaPathFinder):
             loader = _LazyLarkLoader(self._pkg_root, pkg_prefix=self._pkg_prefix)
             return importlib.util.spec_from_loader(fullname, loader, is_package=False)
 
+        if fullname == f"{self._pkg_prefix}.core":
+            core_dir = self._pkg_root / "core"
+            core_init = core_dir / "__init__.py"
+            if core_init.is_file():
+                return importlib.util.spec_from_file_location(
+                    fullname,
+                    str(core_init),
+                    loader=_CoreHydrationLoader(fullname, str(core_init), self._pkg_prefix),
+                    submodule_search_locations=[str(core_dir)],
+                )
+
         if fullname == f"{self._pkg_prefix}.core.utils.decryptor":
             decryptor_file = self._pkg_root / "core" / "utils" / "decryptor.py"
             if decryptor_file.is_file():
@@ -1347,7 +1519,7 @@ class _LazyLarkFinder(importlib.abc.MetaPathFinder):
                     fullname, loader, origin=str(transport_file), is_package=False
                 )
 
-        if fullname == "lark_channel.ws.client":
+        if fullname == f"{self._pkg_prefix}.ws.client":
             ws_client_file = self._pkg_root / "ws" / "client.py"
             if ws_client_file.is_file():
                 return importlib.util.spec_from_loader(

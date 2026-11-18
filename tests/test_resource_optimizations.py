@@ -679,3 +679,25 @@ def test_upload_file_rebuilds_request_and_rewinds_on_retry(tmp_path, monkeypatch
     assert len(seen_reqs) == 2
     assert seen_reqs[0] is not seen_reqs[1]
     assert seen_contents == [b"payload-bytes", b"payload-bytes"]
+
+
+def test_publish_restart_readiness_trims_heap_once(monkeypatch):
+    """_try_publish_restart_readiness performs one-shot linecache/gc/heap trim on publish."""
+    from src.feishu.ws_client import FeishuWSClient
+
+    client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+    trim_calls: list[bool] = []
+    clear_calls: list[bool] = []
+    monkeypatch.setattr(client, "_main_bot_reply_chain_readiness", lambda: (True, None))
+    monkeypatch.setattr(client._restart_gate, "mark_ready", lambda service_pid: 42)
+    monkeypatch.setattr("src.utils.memory_tuning.trim_process_heap", lambda: trim_calls.append(True) or True)
+    monkeypatch.setattr("linecache.clearcache", lambda: clear_calls.append(True))
+
+    try:
+        client._main_ws_connected = True
+        assert client._try_publish_restart_readiness() is True
+        assert client._try_publish_restart_readiness() is True
+        assert len(trim_calls) == 1
+        assert len(clear_calls) == 1
+    finally:
+        client.close()

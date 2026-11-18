@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import lark_oapi.core  # noqa: F401
 from lark_oapi.core.model.base_request import BaseRequest
 from lark_oapi.core.model.base_response import BaseResponse
 
