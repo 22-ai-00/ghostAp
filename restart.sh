@@ -183,6 +183,7 @@ start_service_process() {
     fi
 
     unset VIRTUAL_ENV
+    export MALLOC_ARENA_MAX="${GHOSTAP_MALLOC_ARENA_MAX:-2}"
     if [ -x "$PYTHON_BIN" ]; then
         if [ "$mode" = "append" ]; then
             nohup "${detach_cmd[@]}" "$PYTHON_BIN" -m src.main >> "$LOG_FILE" 2>&1 &

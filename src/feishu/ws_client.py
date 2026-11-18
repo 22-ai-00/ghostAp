@@ -730,7 +730,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         # Initialize ChatLockGate (ingress-level chat-lock interception).
         from .chat_lock_gate import ChatLockGate
         _clm = getattr(self._handler_ctx, "chat_lock_manager", None)
-        _lock_dedup = MessageCache(ttl=30, max_size=10_000, cleanup_interval=60)
+        _lock_dedup = MessageCache(ttl=30, max_size=1_000, cleanup_interval=60)
         self._chat_lock_gate = ChatLockGate(
             _clm, _lock_dedup, handler=system_handler,
         )

@@ -94,11 +94,6 @@ class ACPSessionManager:
         ) = resolve_idle_health_collaborators_for_manager(
             config=idle_health_config,
         )
-        if keepalive_interval > 0:
-            self._keepalive_thread = threading.Thread(
-                target=self._keepalive_loop, daemon=True, name=f"acp-keepalive-{agent_type}"
-            )
-            self._keepalive_thread.start()
     @contextlib.contextmanager
     def _acquire_lock(self, timeout: float = 30.0):
         """Context manager to acquire lock with timeout, preventing deadlocks."""
@@ -239,11 +234,28 @@ class ACPSessionManager:
             sync_claude_cli_session_cls=SyncClaudeCLISession,
             get_settings_fn=get_settings,
         )
+    def _ensure_keepalive_started_unlocked(self) -> None:
+        """Start the keepalive monitor thread lazily when an active session is tracked."""
+        if self._keepalive_interval <= 0 or self._keepalive_stop.is_set():
+            return
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            daemon=True,
+            name=f"acp-keepalive-{self._agent_type}",
+        )
+        self._keepalive_thread.start()
+
     def _keepalive_loop(self) -> None:
         while not self._keepalive_stop.wait(timeout=self._keepalive_interval):
             try:
                 # Take snapshot under lock, then release — iteration is lock-free
                 with self._acquire_lock():
+                    if not self._sessions:
+                        if self._keepalive_thread is threading.current_thread():
+                            self._keepalive_thread = None
+                        return
                     snapshot = list(self._sessions.items())
                 # Lock released here; safe to iterate without blocking session ops
                 now = time.time()
@@ -269,6 +281,11 @@ class ACPSessionManager:
                                     self._end_session_unlocked(key)
                     except Exception:
                         logger.debug("[ACP:%s] Keepalive check error for key=%s", self._agent_type.upper(), key[-16:], exc_info=True)
+                with self._acquire_lock():
+                    if not self._sessions:
+                        if self._keepalive_thread is threading.current_thread():
+                            self._keepalive_thread = None
+                        return
             except Exception:
                 logger.debug("[ACP:%s] Keepalive loop iteration error", self._agent_type.upper(), exc_info=True)
     @staticmethod
@@ -394,6 +411,7 @@ class ACPSessionManager:
             pass
         with self._acquire_lock():
             self._sessions[key] = session
+            self._ensure_keepalive_started_unlocked()
         # 会话成功启动后触发 Telemetry 事件（best-effort）。
         try:
             from ..agent_session.backend_resolver import is_cli_backend
@@ -911,18 +929,19 @@ class ACPSessionManager:
         deadline = time.monotonic() + timeout
         failures: list[BaseException] = []
         self._keepalive_stop.set()
-        if self._keepalive_thread is not None:
-            self._keepalive_thread.join(
+        keepalive_thread = self._keepalive_thread
+        if keepalive_thread is not None:
+            keepalive_thread.join(
                 timeout=min(
                     5.0,
                     self._remaining_before(deadline, "cleanup keepalive"),
                 )
             )
-            if self._keepalive_thread.is_alive():
+            if keepalive_thread.is_alive():
                 failures.append(
                     TimeoutError("ACP keepalive thread did not stop")
                 )
-            else:
+            elif self._keepalive_thread is keepalive_thread:
                 self._keepalive_thread = None
         try:
             with self._acquire_lock(

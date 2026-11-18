@@ -62,6 +62,12 @@ class GCMonitor:
 
                 # Trigger garbage collection
                 gc.collect()
+                try:
+                    from .memory_tuning import trim_process_heap
+
+                    trim_process_heap()
+                except Exception:
+                    pass
 
                 mem_percent_after = process.memory_percent()
                 logger.info(f"[{label}] GC后内存: {mem_percent_after:.1f}%")

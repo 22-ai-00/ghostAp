@@ -870,7 +870,13 @@ class TaskScheduler:
                 task = self._pick_next_task_unlocked()
                 if not task:
                     self._reap_completed_states()
-                    self._cv.wait(timeout=0.2)
+                    has_work = bool(self._active_run_ids) or any(self._queues.values())
+                    if has_work:
+                        self._cv.wait(timeout=0.2)
+                    elif self._terminal_order:
+                        self._cv.wait(timeout=15.0)
+                    else:
+                        self._cv.wait()
                     continue
 
                 state = self._states.get(task.run_id)

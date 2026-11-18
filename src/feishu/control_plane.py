@@ -102,7 +102,9 @@ class ControlPlane:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            self._wakeup.wait(timeout=0.2)
+            with self._pending_exit_lock:
+                has_pending_exits = bool(self._pending_exits)
+            self._wakeup.wait(timeout=0.2 if has_pending_exits else None)
             if self._stop_event.is_set():
                 return
 
@@ -172,6 +174,7 @@ class ControlPlane:
                 message_id=message_id,
                 requested_at=time.time(),
             )
+        self._wakeup.set()
 
     def should_defer_exit(self, *, chat_id: str, project_id: Optional[str]) -> bool:
         tasks = self._scheduler.list_tasks(chat_id=chat_id, project_id=project_id, include_done=False, limit=200)

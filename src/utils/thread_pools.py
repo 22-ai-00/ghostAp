@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, TypeVar
@@ -12,6 +13,18 @@ _IO_POOL: ThreadPoolExecutor | None = None
 _LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
 
+def _default_io_workers() -> int:
+    raw = os.environ.get("GHOSTAP_IO_POOL_WORKERS", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val >= 1:
+                return val
+        except ValueError:
+            pass
+    return min(8, max(4, (os.cpu_count() or 2) * 2))
+
+
 def get_io_pool() -> ThreadPoolExecutor:
     """Pool for I/O-bound work: card delivery, Feishu API, notifications."""
     global _IO_POOL
@@ -19,7 +32,7 @@ def get_io_pool() -> ThreadPoolExecutor:
         with _LOCK:
             if _IO_POOL is None:
                 _IO_POOL = ThreadPoolExecutor(
-                    max_workers=16,
+                    max_workers=_default_io_workers(),
                     thread_name_prefix="ghostap-io",
                 )
     return _IO_POOL

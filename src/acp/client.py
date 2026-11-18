@@ -19,6 +19,7 @@ import stat
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -214,26 +215,25 @@ class ACPHistoryStore:
         if not p.exists():
             return []
 
+        items: deque[dict] | list[dict] = deque(maxlen=limit) if limit > 0 else []
         try:
-            raw = p.read_text(encoding="utf-8")
+            with p.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            items.append(obj)
+                    except (ValueError, json.JSONDecodeError):
+                        # Corrupt line: skip
+                        continue
         except Exception as e:
             logger.info("[ACP] history read failed: %s", get_error_detail(e))
             return []
 
-        items: list[dict] = []
-        for line in raw.splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-                if isinstance(obj, dict):
-                    items.append(obj)
-            except (ValueError, json.JSONDecodeError):
-                # Corrupt line: skip
-                continue
-
-        return items[-limit:] if limit > 0 else items
+        return list(items) if limit > 0 else items
 
 
 def _safe_resolve_path(root_dir: str, user_path: str) -> Path:

@@ -23,6 +23,7 @@ class MessageCache:
         self._cleanup_thread: Optional[threading.Thread] = None
         self._running = False
         self._stop_event = threading.Event()
+        self._wakeup = threading.Event()
 
     def start_cleanup_thread(self):
         if self._cleanup_thread is not None:
@@ -35,13 +36,22 @@ class MessageCache:
     def stop_cleanup_thread(self):
         self._running = False
         self._stop_event.set()
+        self._wakeup.set()
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
             self._cleanup_thread = None
 
     def _cleanup_loop(self):
         while self._running:
-            self._stop_event.wait(timeout=self._cleanup_interval)
+            with self._lock:
+                has_entries = bool(self._cache)
+                if not has_entries:
+                    self._wakeup.clear()
+            if not has_entries:
+                self._wakeup.wait()
+                continue
+            if self._stop_event.wait(timeout=self._cleanup_interval):
+                return
             if self._running:
                 self._do_cleanup()
 
@@ -82,6 +92,7 @@ class MessageCache:
                 del self._cache[message_id]
 
             self._cache[message_id] = current_time
+            self._wakeup.set()
 
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
@@ -125,5 +136,6 @@ class MessageCache:
         with self._lock:
             self._cache.pop(message_id, None)
             self._cache[message_id] = current_time
+            self._wakeup.set()
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)

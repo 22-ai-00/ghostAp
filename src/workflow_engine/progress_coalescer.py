@@ -42,6 +42,7 @@ class ProgressCoalescer:
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._latest_snapshot: Optional[Any] = None
         self._stop_event = threading.Event()
+        self._has_work = threading.Event()
 
         # Daemon thread — dies with the main process
         self._thread = threading.Thread(
@@ -63,6 +64,7 @@ class ProgressCoalescer:
 
         with self._lock:
             self._latest_snapshot = snapshot
+            self._has_work.set()
 
     def flush_immediate(self, snapshot: Any) -> None:
         """Flush a snapshot immediately, bypassing the debounce timer.
@@ -79,6 +81,7 @@ class ProgressCoalescer:
 
         with self._lock:
             self._latest_snapshot = snapshot
+            self._has_work.set()
 
         # Min-interval guard: skip if we just flushed within 200ms
         now = time.monotonic()
@@ -101,6 +104,7 @@ class ProgressCoalescer:
             return
 
         self._stop_event.set()
+        self._has_work.set()
 
         # Force flush one last time before exiting
         with self._lock:
@@ -158,19 +162,19 @@ class ProgressCoalescer:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Main daemon thread loop: wake every debounce_s, render latest snapshot."""
+        """Main daemon thread loop: block until work arrives, then debounce and render."""
         while not self._stop_event.is_set():
-            # Sleep in small increments to allow prompt stop
-            sleep_start = time.monotonic()
-            while time.monotonic() - sleep_start < self._debounce_s:
-                if self._stop_event.is_set():
-                    return
-                time.sleep(min(0.1, self._debounce_s))
+            self._has_work.wait()
+            if self._stop_event.is_set():
+                return
+            if self._stop_event.wait(timeout=self._debounce_s):
+                return
 
-            # Grab the latest snapshot under lock
+            # Grab the latest snapshot under lock and clear wakeup gate atomically
             with self._lock:
                 snapshot = self._latest_snapshot
                 self._latest_snapshot = None
+                self._has_work.clear()
 
             if snapshot is not None:
                 try:

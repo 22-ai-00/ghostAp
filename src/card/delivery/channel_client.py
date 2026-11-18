@@ -14,6 +14,7 @@ import logging
 import re
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
@@ -109,7 +110,7 @@ class LarkChannelCardAPIClient:
         self._outbound_audit_failure = outbound_audit_failure
         self._tenant_key_resolver = tenant_key_resolver
         self._outbound_target_aliases = outbound_target_aliases
-        self._audit_aliases_by_target: dict[str, tuple[str, ...]] = {}
+        self._audit_aliases_by_target: OrderedDict[str, tuple[str, ...]] = OrderedDict()
         self._audit_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     def _api_timeout_seconds(self) -> float:
@@ -211,6 +212,8 @@ class LarkChannelCardAPIClient:
                 raise
         return targets
 
+    _MAX_AUDIT_ALIASES = 4096
+
     def _remember_aliases(
         self,
         targets: tuple[str, ...],
@@ -221,7 +224,10 @@ class LarkChannelCardAPIClient:
         with self._audit_lock:
             for identifier in identifiers:
                 if isinstance(identifier, str) and identifier:
+                    self._audit_aliases_by_target.pop(identifier, None)
                     self._audit_aliases_by_target[identifier] = targets
+                    while len(self._audit_aliases_by_target) > self._MAX_AUDIT_ALIASES:
+                        self._audit_aliases_by_target.popitem(last=False)
 
     def _send_options(
         self,

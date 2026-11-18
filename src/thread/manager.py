@@ -21,11 +21,21 @@ class ThreadContextManager:
         self._aliases: dict[str, str] = {}
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._ttl = ttl
+        self._cleanup_interval = cleanup_interval
         self._on_evict = on_evict
         self._cleanup_stop = threading.Event()
+        self._closed = False
+        self._cleanup_thread: Optional[threading.Thread] = None
+
+    def _ensure_cleanup_started_unlocked(self) -> None:
+        """Start the thread-context cleanup daemon lazily once contexts exist."""
+        if self._closed or self._cleanup_interval <= 0:
+            return
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            return
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop,
-            args=(cleanup_interval,),
+            args=(self._cleanup_interval,),
             daemon=True,
             name="thread-ctx-cleanup",
         )
@@ -62,6 +72,7 @@ class ThreadContextManager:
                 if root != thread_root_id
             }
             self._aliases.update({alias: thread_root_id for alias in aliases})
+            self._ensure_cleanup_started_unlocked()
         alias_info = ",".join(aliases[:3]) if aliases else "none"
         logger.info(
             "[Thread] Registered: root=%s aliases=%s chat=%s project=%s mode=%s tool=%s model=%s",
@@ -124,11 +135,18 @@ class ThreadContextManager:
         return ctx
 
     def close(self) -> None:
+        self._closed = True
         self._cleanup_stop.set()
         with self._lock:
+            cleanup_thread = self._cleanup_thread
             remaining = list(self._contexts.values())
             self._contexts.clear()
             self._aliases.clear()
+        if cleanup_thread is not None and cleanup_thread.is_alive():
+            cleanup_thread.join(timeout=2.0)
+            with self._lock:
+                if self._cleanup_thread is cleanup_thread and not cleanup_thread.is_alive():
+                    self._cleanup_thread = None
         if self._on_evict:
             for ctx in remaining:
                 try:
@@ -142,6 +160,11 @@ class ThreadContextManager:
                 self._evict_expired()
             except Exception:
                 logger.debug("[Thread] Cleanup error", exc_info=True)
+            with self._lock:
+                if not self._contexts:
+                    if self._cleanup_thread is threading.current_thread():
+                        self._cleanup_thread = None
+                    return
 
     def _evict_expired(self) -> None:
         now = time.time()

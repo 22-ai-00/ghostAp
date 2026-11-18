@@ -269,6 +269,12 @@ class BaseEngine:
         get_gc_monitor(
             memory_threshold_percent=self._gc_threshold_default,
         ).check_and_collect(**gc_kwargs)
+        try:
+            from .utils.memory_tuning import maybe_trim_process_heap
+
+            maybe_trim_process_heap(min_interval_s=30.0)
+        except Exception:
+            pass
 
     def save_state(self, filepath: Optional[str] = None) -> str:
         if not self._project:

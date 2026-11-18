@@ -7,6 +7,7 @@ import logging
 import queue
 import threading
 import uuid as _uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -119,7 +120,7 @@ class FeishuCardAPIClient:
         self._outbound_audit_failure = outbound_audit_failure
         self._tenant_key_resolver = tenant_key_resolver
         self._outbound_target_aliases = outbound_target_aliases
-        self._audit_aliases_by_message: dict[str, tuple[str, ...]] = {}
+        self._audit_aliases_by_message: OrderedDict[str, tuple[str, ...]] = OrderedDict()
         self._cardkit_entity_routes = _CardKitEntityRoutes(
             cardkit_route_capacity
         )
@@ -167,6 +168,8 @@ class FeishuCardAPIClient:
                 raise
         return targets
 
+    _MAX_AUDIT_ALIASES = 4096
+
     def _remember_message_audit_aliases(
         self,
         message_id: str,
@@ -175,7 +178,10 @@ class FeishuCardAPIClient:
         if not isinstance(message_id, str) or not message_id or not aliases:
             return
         with self._audit_alias_lock:
+            self._audit_aliases_by_message.pop(message_id, None)
             self._audit_aliases_by_message[message_id] = aliases
+            while len(self._audit_aliases_by_message) > self._MAX_AUDIT_ALIASES:
+                self._audit_aliases_by_message.popitem(last=False)
 
     def _api_timeout_seconds(self) -> float:
         try:

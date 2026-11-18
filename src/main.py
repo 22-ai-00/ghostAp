@@ -24,15 +24,40 @@ logger = logging.getLogger(__name__)
 
 
 def _activate_lark_import_cache():
-    """Activate the uv-environment cache before importing the generated SDK."""
+    """Activate lazy Lark SDK loading (or import cache fallback) before SDK import."""
 
     if any(name == "lark_oapi" or name.startswith("lark_oapi.") for name in sys.modules):
+        existing = sys.modules.get("lark_oapi")
+        if getattr(existing, "_IS_LAZY_LARK_ROOT", False):
+            return None
         logger.warning("Lark SDK import cache bypassed because the SDK was imported early")
         return None
 
     started_at = time.perf_counter()
+    if os.environ.get("GHOSTAP_DISABLE_LAZY_LARK", "").strip().lower() not in {"1", "true", "yes"}:
+        try:
+            try:
+                from utils.lark_lazy import install_lazy_lark_oapi
+            except ImportError:
+                from .utils.lark_lazy import install_lazy_lark_oapi
+
+            if install_lazy_lark_oapi():
+                logger.info(
+                    "Lark SDK lazy loader activated in %.3fs",
+                    time.perf_counter() - started_at,
+                )
+                return None
+        except Exception as exc:
+            logger.debug(
+                "Lazy Lark loader unavailable; falling back to import cache: %s",
+                type(exc).__name__,
+            )
+
     try:
-        from .utils.lark_import_cache import activate_lark_oapi_import_cache
+        try:
+            from utils.lark_import_cache import activate_lark_oapi_import_cache
+        except ImportError:
+            from .utils.lark_import_cache import activate_lark_oapi_import_cache
 
         result = activate_lark_oapi_import_cache()
     except Exception as exc:
@@ -224,6 +249,15 @@ class Application:
             level=logging.INFO,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
+        try:
+            try:
+                from utils.memory_tuning import configure_runtime_memory_tuning
+            except ImportError:
+                from .utils.memory_tuning import configure_runtime_memory_tuning
+
+            configure_runtime_memory_tuning()
+        except Exception:
+            logger.debug("Runtime memory tuning skipped", exc_info=True)
 
         logger.info("=" * 50)
         logger.info("GhostAP - 飞书机器人远程开发服务")
