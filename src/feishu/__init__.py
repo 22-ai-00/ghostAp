@@ -1,3 +1,15 @@
+import os as _os
+
+if _os.environ.get("GHOSTAP_DISABLE_LAZY_LARK", "").strip().lower() not in {"1", "true", "yes"}:
+    try:
+        if __package__ == "feishu":
+            from utils.lark_lazy import install_lazy_lark_oapi as _install_lazy_lark_oapi
+        else:
+            from ..utils.lark_lazy import install_lazy_lark_oapi as _install_lazy_lark_oapi
+        _install_lazy_lark_oapi()
+    except Exception:
+        pass
+
 from .emoji import EmojiType
 from .image_handler import FeishuImageHandler
 from .message_cache import MessageCache
