@@ -1399,10 +1399,6 @@ class FeishuWSClient(WSManagedGroupsMixin):
     def _sync_main_bot_identity(self) -> str:
         """Resolve the main app's bot Open ID outside the WS ACK path."""
 
-        from lark_oapi.core.enum import AccessTokenType, HttpMethod
-        from lark_oapi.core.model.base_request import BaseRequest
-        from lark_oapi.core.model.base_response import BaseResponse
-
         cond = self._ensure_main_bot_identity_sync_state()
         with cond:
             while self._main_bot_identity_inflight:
@@ -1412,6 +1408,13 @@ class FeishuWSClient(WSManagedGroupsMixin):
             now = time.monotonic()
             if now < self._main_bot_identity_next_retry_at:
                 return ""
+            # Hydrate lark_oapi.core while holding the sync guard so concurrent
+            # callers never race between core.enum and core.model.__init__.
+            import lark_oapi.core  # noqa: F401
+            from lark_oapi.core.enum import AccessTokenType, HttpMethod
+            from lark_oapi.core.model.base_request import BaseRequest
+            from lark_oapi.core.model.base_response import BaseResponse
+
             self._main_bot_identity_inflight = True
 
         resolved_open_id: str | None = None
@@ -3782,6 +3785,10 @@ class FeishuWSClient(WSManagedGroupsMixin):
         self._message_cache.start_cleanup_thread()
         self._card_event_cache.start_cleanup_thread()
         self._ws_health_monitor.start_watchdog()
+        # Hydrate lark_oapi.core synchronously before spawning background threads
+        # (lark_oapi.core <-> lark_oapi.core.model is unsafe under first-import races).
+        import lark_oapi.core  # noqa: F401
+
         self._start_main_slash_command_sync()
 
         # Registry reconciliation must precede marker-based Team restore.

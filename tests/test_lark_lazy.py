@@ -590,3 +590,53 @@ assert "psutil" in sys.modules
         check=False,
     )
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_concurrent_sync_main_bot_identity_never_hits_lark_core_circular_import():
+    """Concurrent callers entering _sync_main_bot_identity hydrate lark_oapi.core safely."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import src.main as main_mod
+main_mod._activate_lark_import_cache()
+main_mod._load_feishu_runtime()
+from src.feishu.ws_client import FeishuWSClient
+
+client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+mock_api = MagicMock()
+mock_api.request.return_value = SimpleNamespace(
+    success=lambda: True,
+    raw=None,
+    data=None,
+)
+client._get_api_client = lambda: mock_api
+
+barrier = threading.Barrier(4)
+errors = []
+
+def _worker():
+    barrier.wait()
+    try:
+        client._sync_main_bot_identity()
+    except Exception as exc:
+        errors.append(repr(exc))
+
+threads = [threading.Thread(target=_worker) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(timeout=5)
+assert not errors, f"concurrent _sync_main_bot_identity failed: {errors}"
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
