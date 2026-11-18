@@ -3,17 +3,6 @@ import json
 
 class FeishuMessageFormatter:
     @staticmethod
-    def _text(text: str, styles: list = None) -> dict:
-        node = {"tag": "text", "text": text}
-        if styles:
-            node["style"] = styles
-        return node
-
-    @staticmethod
-    def _md(text: str) -> list:
-        return [{"tag": "md", "text": text}]
-
-    @staticmethod
     def format_coco_enter() -> tuple[str, str]:
         md_text = """现在你可以直接发送消息与 Coco 对话，进行远程开发。
 
@@ -58,14 +47,3 @@ class FeishuMessageFormatter:
     @staticmethod
     def format_warning(message: str) -> str:
         return f"⚠️ **警告**: {message}"
-
-    @staticmethod
-    def safe_truncate_markdown(content: str, max_length: int = 25000, keep_head: bool = True) -> str:
-        if not content or len(content) <= max_length:
-            return content or ""
-        notice = f"\n\n> ⚠️ 内容过长（超过 {max_length} 字符），已自动截断。"
-        available = max_length - len(notice)
-        truncated = content[:available] if keep_head else content[-available:]
-        if truncated.count("```") % 2:
-            truncated = truncated + "\n```" if keep_head else "```\n" + truncated
-        return truncated + notice if keep_head else notice + "\n\n" + truncated

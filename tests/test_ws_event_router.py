@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import logging
 from pathlib import Path
 
 import pytest
@@ -88,50 +87,6 @@ def test_ws_event_router_has_explicit_exception_contract():
     assert classify_ws_error(RuntimeError("import optional"), phase="import_guard").action == WSErrorAction.USE_COMPAT_FALLBACK
     assert classify_ws_error(RuntimeError("dispatch failed"), phase="dispatch").action == WSErrorAction.REPLY_INTERNAL_ERROR
     assert classify_ws_error(RuntimeError("cleanup failed"), phase="cleanup").action == WSErrorAction.LOG_AND_CONTINUE
-
-
-def test_ws_error_handler_dispatches_user_visible_diagnostic_with_log(caplog):
-    from src.feishu.ws_event_router import WSErrorAction, handle_ws_error
-
-    replies: list[str] = []
-
-    with caplog.at_level(logging.ERROR, logger="src.feishu.ws_event_router"):
-        action = handle_ws_error(
-            RuntimeError("dispatch failed"),
-            phase="dispatch",
-            reply_internal_error=lambda exc: replies.append(str(exc)),
-        )
-
-    assert action == WSErrorAction.REPLY_INTERNAL_ERROR
-    assert replies == ["dispatch failed"]
-    assert "WebSocket dispatch failed" in caplog.text
-
-
-def test_ws_error_handler_recoverable_import_uses_fallback_without_user_reply(caplog):
-    from src.feishu.ws_event_router import WSErrorAction, handle_ws_error
-
-    fallbacks: list[str] = []
-
-    with caplog.at_level(logging.WARNING, logger="src.feishu.ws_event_router"):
-        action = handle_ws_error(
-            RuntimeError("optional import missing"),
-            phase="import_guard",
-            compat_fallback=lambda exc: fallbacks.append(str(exc)),
-        )
-
-    assert action == WSErrorAction.USE_COMPAT_FALLBACK
-    assert fallbacks == ["optional import missing"]
-    assert "compat fallback" in caplog.text
-
-
-def test_ws_error_handler_fatal_error_propagates_without_success_masking():
-    from src.feishu.ws_event_router import handle_ws_error
-
-    class FatalWSBug(Exception):
-        pass
-
-    with pytest.raises(FatalWSBug):
-        handle_ws_error(FatalWSBug("router invariant broken"), phase="unexpected")
 
 
 def test_ws_key_paths_do_not_leave_exception_taxonomy_as_backlog_debt():

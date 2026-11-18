@@ -448,11 +448,6 @@ def _reset_all_singletons():
         _reset_providers_for_testing()
     except Exception:
         pass
-    try:
-        from src.utils.env import _reset_env_for_testing
-        _reset_env_for_testing()
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------

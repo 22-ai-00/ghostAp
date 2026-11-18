@@ -130,23 +130,19 @@ class MessageLinker:
                 return None
             return rec.get("request_id")
 
-    def register_trusted_origin_if_absent(
+    def _register_trusted_origin(
         self,
         origin_message_id: str,
         *,
         chat_id: str,
         sender_id: str,
         chat_type: str,
+        tenant_key: str | None = None,
     ) -> bool:
-        """Atomically create a complete card provenance record.
-
-        This is intentionally compare-and-set: a partial or conflicting record
-        is never upgraded or overwritten by a Chat API fallback.
-        """
-        if not all(
-            isinstance(value, str) and bool(value)
-            for value in (origin_message_id, chat_id, sender_id, chat_type)
-        ):
+        required = (origin_message_id, chat_id, sender_id, chat_type)
+        if tenant_key is not None:
+            required = (*required, tenant_key)
+        if not all(isinstance(value, str) and bool(value) for value in required):
             return False
         if chat_type not in {"p2p", "group", "topic_group"}:
             return False
@@ -158,68 +154,15 @@ class MessageLinker:
                 if now - timestamp > self._ttl:
                     self._evict_origin_unlocked(origin_message_id)
                 else:
-                    return (
+                    matched = (
                         rec.get("origin_message_id") == origin_message_id
                         and rec.get("chat_id") == chat_id
                         and rec.get("sender_id") == sender_id
                         and rec.get("chat_type") == chat_type
                     )
-            self._origins[origin_message_id] = (
-                {
-                    "origin_message_id": origin_message_id,
-                    "request_id": None,
-                    "chat_id": chat_id,
-                    "project_id": None,
-                    "chat_type": chat_type,
-                    "sender_id": sender_id,
-                    "tenant_key": None,
-                    "reply_message_ids": [],
-                    "task_run_ids": [],
-                },
-                now,
-            )
-            self._cleanup_unlocked(now)
-            return True
-
-    def register_trusted_origin_with_tenant(
-        self,
-        origin_message_id: str,
-        *,
-        chat_id: str,
-        sender_id: str,
-        chat_type: str,
-        tenant_key: str,
-    ) -> bool:
-        """Atomically validate trusted coordinates and attach their tenant."""
-
-        if not all(
-            isinstance(value, str) and bool(value)
-            for value in (
-                origin_message_id,
-                chat_id,
-                sender_id,
-                chat_type,
-                tenant_key,
-            )
-        ):
-            return False
-        if chat_type not in {"p2p", "group", "topic_group"}:
-            return False
-        with self._lock:
-            now = time.time()
-            item = self._origins.get(origin_message_id)
-            if item is not None:
-                rec, timestamp = item
-                if now - timestamp > self._ttl:
-                    self._evict_origin_unlocked(origin_message_id)
-                else:
-                    if (
-                        rec.get("origin_message_id") != origin_message_id
-                        or rec.get("chat_id") != chat_id
-                        or rec.get("sender_id") != sender_id
-                        or rec.get("chat_type") != chat_type
-                        or rec.get("tenant_key") not in {None, "", tenant_key}
-                    ):
+                    if tenant_key is None:
+                        return matched
+                    if not matched or rec.get("tenant_key") not in {None, "", tenant_key}:
                         return False
                     rec["tenant_key"] = tenant_key
                     self._origins[origin_message_id] = (rec, now)
@@ -242,6 +185,40 @@ class MessageLinker:
             )
             self._cleanup_unlocked(now)
             return True
+
+    def register_trusted_origin_if_absent(
+        self,
+        origin_message_id: str,
+        *,
+        chat_id: str,
+        sender_id: str,
+        chat_type: str,
+    ) -> bool:
+        """Atomically create a complete card provenance record."""
+        return self._register_trusted_origin(
+            origin_message_id,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            chat_type=chat_type,
+        )
+
+    def register_trusted_origin_with_tenant(
+        self,
+        origin_message_id: str,
+        *,
+        chat_id: str,
+        sender_id: str,
+        chat_type: str,
+        tenant_key: str,
+    ) -> bool:
+        """Atomically validate trusted coordinates and attach their tenant."""
+        return self._register_trusted_origin(
+            origin_message_id,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            chat_type=chat_type,
+            tenant_key=tenant_key,
+        )
 
     def link_reply(self, origin_message_id: str, reply_message_id: str) -> None:
         if not origin_message_id or not reply_message_id:

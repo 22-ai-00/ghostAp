@@ -1997,7 +1997,6 @@ def test_enter_tool_card_buttons_use_the_shared_explicit_controller(
         first,
         origin_message_id="card-message",
     )
-    client._handler_ctx.handlers[tool_name].handle_card_enter.assert_not_called()
 
 
 def test_model_actions_are_registered_to_the_system_controller(tmp_path):

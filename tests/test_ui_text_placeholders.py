@@ -148,23 +148,6 @@ class TestReviewRound2TextCorrections:
         assert "关闭" in text
 
 
-class TestDeepErrorFallbackNoPrefix:
-    """AC-20: deep_error_no_detail empty action_prefix fallback uses UI_TEXT."""
-
-    def test_fallback_key_exists(self):
-        """deep_error_fallback_no_prefix must exist in UI_TEXT."""
-        assert "deep_error_fallback_no_prefix" in UI_TEXT
-
-    def test_fallback_contains_retry_guidance(self):
-        """Fallback text must contain actionable retry guidance."""
-        text = UI_TEXT["deep_error_fallback_no_prefix"]
-        assert "重试" in text or "重新发送" in text or "/deep" in text or "/help" in text
-
-    def test_fallback_has_no_placeholder(self):
-        """Fallback text should be a plain string with no format placeholders."""
-        text = UI_TEXT["deep_error_fallback_no_prefix"]
-        assert "{" not in text
-
 class TestLockUITextPlaceholders:
     """Verify LOCK_UI_TEXT format strings use lock_undo_window_display."""
 

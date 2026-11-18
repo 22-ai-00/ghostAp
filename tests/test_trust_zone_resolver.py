@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 import pytest
 
 from src.access_control import AccessDecision, AccessOperation
-from src.feishu.route_decision import RouteDecision, RouteTarget
 from src.trust.models import (
     ActorKind,
     EffectiveTrust,
@@ -160,7 +159,7 @@ def test_inactive_or_invalid_managed_group_provenance_is_unknown(
     assert trust.actor is ActorKind.UNKNOWN
 
 
-def test_effective_trust_is_immutable_in_access_and_route_contexts() -> None:
+def test_effective_trust_is_immutable_in_access_context() -> None:
     trust = _resolver().resolve(
         sender_id=OWNER_ID,
         chat_id=GROUP_ID,
@@ -173,12 +172,7 @@ def test_effective_trust_is_immutable_in_access_and_route_contexts() -> None:
         prospective_allowed=True,
         effective_trust=trust,
     )
-    route = RouteDecision(
-        target=RouteTarget.PROGRAMMING_MODE,
-        effective_trust=trust,
-    )
 
     assert access.effective_trust is trust
-    assert route.effective_trust is trust
     with pytest.raises(FrozenInstanceError):
         trust.group_revision = 8  # type: ignore[misc]

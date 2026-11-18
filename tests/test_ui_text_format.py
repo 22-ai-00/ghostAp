@@ -124,7 +124,7 @@ class TestUITextFrozenProxy:
     def test_frozen_proxy_raises_on_assignment(self):
         """UI_TEXT['key'] = 'x' should raise TypeError."""
         with pytest.raises(TypeError):
-            UI_TEXT["orch_plan_archived"] = "tampered"  # type: ignore[index]
+            UI_TEXT["system_help_title"] = "tampered"  # type: ignore[index]
 
 # ---------------------------------------------------------------------------
 # Strict UI_TEXT placeholder validation (merged from test_ui_text_placeholder_strict.py)

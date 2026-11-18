@@ -3,7 +3,6 @@ from .models import (
     DeepProject,
     DeepProjectStatus,
     EngineRunState,
-    ProgressUpdate,
 )
 from .progress import DeepProgress
 from .reporter import ProgressReporter
@@ -16,6 +15,5 @@ __all__ = [
     "DeepProject",
     "DeepProjectStatus",
     "EngineRunState",
-    "ProgressUpdate",
     "ProgressReporter",
 ]

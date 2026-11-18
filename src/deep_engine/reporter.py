@@ -83,15 +83,6 @@ class ProgressReporter:
 
     # --- Card title helpers ---
 
-    def get_project_done_title(self, project: DeepProject) -> str:
-        if project.status == DeepProjectStatus.COMPLETED:
-            return "🎉 全部任务完成！"
-        elif project.status == DeepProjectStatus.FAILED:
-            return "⚠️ 执行完成（有失败）"
-        if project.status == DeepProjectStatus.CANCELLED:
-            return "⏹️ 执行已取消"
-        return "❌ 执行未完成"
-
     def get_context_injected_title(self) -> str:
         return "💬 上下文已注入"
 

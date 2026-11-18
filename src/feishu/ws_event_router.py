@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import secrets
 import threading
 import time
@@ -10,8 +9,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
-
-logger = logging.getLogger(__name__)
 
 
 class WSErrorAction(str, Enum):
@@ -36,32 +33,6 @@ def classify_ws_error(error: Exception, *, phase: str) -> WSErrorClassification:
     if phase in {"cleanup", "dedup", "best_effort_notify"}:
         return WSErrorClassification(WSErrorAction.LOG_AND_CONTINUE, phase, False)
     return WSErrorClassification(WSErrorAction.PROPAGATE, phase, False)
-
-
-def handle_ws_error(
-    error: Exception,
-    *,
-    phase: str,
-    reply_internal_error: Callable[[Exception], None] | None = None,
-    compat_fallback: Callable[[Exception], None] | None = None,
-) -> WSErrorAction:
-    """Apply the WS error taxonomy to the smallest observable behavior unit."""
-
-    classification = classify_ws_error(error, phase=phase)
-    if classification.action == WSErrorAction.USE_COMPAT_FALLBACK:
-        logger.warning("WebSocket %s failed; using compat fallback: %s", phase, str(error))
-        if compat_fallback is not None:
-            compat_fallback(error)
-        return classification.action
-    if classification.action == WSErrorAction.REPLY_INTERNAL_ERROR:
-        logger.error("WebSocket dispatch failed: %s", str(error), exc_info=True)
-        if reply_internal_error is not None:
-            reply_internal_error(error)
-        return classification.action
-    if classification.action == WSErrorAction.LOG_AND_CONTINUE:
-        logger.debug("WebSocket %s best-effort failure ignored: %s", phase, str(error), exc_info=True)
-        return classification.action
-    raise error
 
 
 class DuplicateMessageCache(Protocol):

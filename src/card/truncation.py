@@ -62,20 +62,3 @@ def truncate_bash_output(
     if max_lines is None:
         max_lines = TRUNCATION_LIMITS["bash_max_lines"]
     return truncate_card_string(value, max_chars=max_chars, max_lines=max_lines, notice=notice)
-
-
-def cap_reasoning_tail(
-    value: str,
-    max_chars: int | None = None,
-) -> str:
-    """Keep the *tail* of reasoning content, capping at ``max_chars``.
-
-    If over the limit, returns ``"...\\n" + last max_chars characters``.
-    """
-    if not value:
-        return value
-    if max_chars is None:
-        max_chars = TRUNCATION_LIMITS["reasoning_tail_max"]
-    if len(value) <= max_chars:
-        return value
-    return "...\n" + value[-max_chars:]

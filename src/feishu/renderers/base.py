@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from src.card.shared.truncation import check_and_truncate_payload as _check_and_truncate
 from src.card.thresholds import THRESHOLDS
 
 if TYPE_CHECKING:
@@ -176,17 +175,12 @@ class BaseRenderer:
         """Return a CardSessionFactory bound to this handler's delivery.
 
         Uses lazy caching: creates factory on first call, reuses thereafter.
-        Call _invalidate_session_factory() if the delivery instance changes.
         """
         if self._session_factory is None:
             from ...card.session.factory import CardSessionFactory
             delivery = self.handler.get_card_delivery()
             self._session_factory = CardSessionFactory(delivery)
         return self._session_factory
-
-    def _invalidate_session_factory(self) -> None:
-        """Invalidate cached factory (e.g. after delivery reconnect)."""
-        self._session_factory = None
 
     def get_default_ui_state(self) -> dict[str, Any]:
         """
@@ -290,15 +284,6 @@ class BaseRenderer:
             final_lines.insert(0, summary)
 
         return "\n".join(final_lines)
-
-    def _check_and_truncate_payload(
-        self, card_content: str, max_size: int | None = None, *, engine_type: str | None = None
-    ) -> str:
-        """Check if card content exceeds size limit and truncate if necessary.
-
-        Delegates to src.card.shared.truncation.
-        """
-        return _check_and_truncate(card_content, max_size, engine_type=engine_type)
 
     def _create_rotator(
         self,

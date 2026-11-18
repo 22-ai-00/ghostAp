@@ -27,9 +27,6 @@ UI_TEXT = {
     "time_hours_mins_ago": "{hours} 小时 {minutes} 分钟前",
     "time_days_ago": "{days} 天前",
     # Deep Engine
-    "deep_cmd_help_usage": "📝 请提供需求描述\n\n用法: `/deep <你的需求描述>`\n\n例如: `/deep 帮我写一个 Python 爬虫，爬取豆瓣电影 Top250`",
-    "deep_task_exists": "⚠️ 当前项目已有 Deep Agent 任务在执行中\n\n发送 `/deep_status` 查看进度\n发送 `/stop_deep` 停止任务",
-    "deep_no_task_running": "⚠️ 当前没有正在运行的 Deep Agent 任务\n\n请先使用 `/deep <需求>` 启动任务，或使用 `/deep_status all` 查看所有项目任务",
     "deep_status_empty": "📊 当前没有进行中的任务\n\n发送 `/deep <需求>` 开始一个复杂任务",
     "deep_stop_all_success": "⏹ 已发送停止信号：{count} 个 Deep Agent 任务将在当前步骤完成后停止",
     "deep_no_active_tasks": "📊 当前没有正在执行的 Deep Agent 任务",
@@ -62,9 +59,6 @@ UI_TEXT = {
         "- `/spec_save`：立即落盘保存状态（用于断点续传）\n"
         "- `/stop_spec`：停止\n"
     ),
-    # Generic Engine Lifecycle
-    "engine_no_active_task": "📊 当前没有正在执行的 {engine_prefix} 任务",
-    "engine_stop_no_active": "📊 当前没有正在执行的 {engine_prefix} 任务",
     # System Commands
     "system_help_deep_prompt": "💭 启动 Deep Engine\n\n请发送: `/deep <你的需求>`\n\n例如: `/deep 帮我重构 src/feishu 模块`",
     "system_autonomous_manager_retired": (
@@ -429,7 +423,6 @@ UI_TEXT = {
     "mode_session_fail_msg": "{name} 会话启动失败，请重新发送 /{cmd} 开始",
     # ── Deep Engine Card Prompts ──
     "deep_error_no_detail": "任务异常中断，发送 {engine_cmd} 重试",
-    "deep_error_fallback_no_prefix": "任务异常中断，发送 /deep 重试或 /help 查看可用命令",
     # ── Shell Truncation ──
     "shell_truncated": "\n…(已截断，使用 /shell cat <path> 查看完整输出)…",
     # ── Streaming Card Collapsible / Continuation ──
@@ -648,7 +641,6 @@ UI_TEXT = {
     # --- Session rotation truncation ---
     "card_session_rotation_truncated": "⚠️ 这是最后一张卡片，内容将精简显示。后续输出合并于此，超出部分可能被截断。{cmd_hint}",
     # --- Task orchestrator ---
-    "orch_plan_archived": "✅ 规划完成 — 共 {task_count} 个任务\n{task_list}",
     "orch_continuation_link": "↓ 第 {seq} 篇 · [{link_text} →](lark://message/{msg_id})",
     "orch_continuation_link_fallback": "↓ 第 {seq} 篇 · 请查看下方最新卡片",
     "orch_archived_navigate_fallback": "↓ 内容已续至下方卡片，请查看下方最新卡片",

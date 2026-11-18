@@ -17,22 +17,6 @@ class DeepProjectStatus(Enum):
 
 
 @dataclass
-class ProgressUpdate:
-    project_id: str
-    completed_count: int
-    total_count: int
-    status: DeepProjectStatus
-    message: str
-    timestamp: float = field(default_factory=time.time)
-
-    @property
-    def progress_percent(self) -> float:
-        if self.total_count == 0:
-            return 0.0
-        return (self.completed_count / self.total_count) * 100
-
-
-@dataclass
 class DeepProject:
     project_id: str
     name: str

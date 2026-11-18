@@ -82,15 +82,10 @@ _REQUIRED_UI_TEXT_KEYS = [
     "time_hours_ago",
     "time_days_ago",
     # Deep Engine
-    "deep_cmd_help_usage",
-    "deep_task_exists",
-    "deep_no_task_running",
+    "deep_status_empty",
     # Spec Engine
     "spec_status_empty",
     "spec_cmd_help_usage",
-    # Generic Engine Lifecycle
-    "engine_no_active_task",
-    "engine_stop_no_active",
 ]
 
 

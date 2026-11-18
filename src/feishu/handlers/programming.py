@@ -2376,16 +2376,6 @@ class ProgrammingModeHandler(BaseHandler):
     # ------------------------------------------------------------------
     # Card actions
     # ------------------------------------------------------------------
-    def handle_card_enter(self, message_id: str, chat_id: str, project_id: str, value: Optional[dict] = None):
-        if project_id:
-            project = self.project_manager.get_project_for_chat(project_id, chat_id)
-            if project:
-                self.project_manager.set_active_project(chat_id, project_id)
-                self.enter_mode(message_id, chat_id, project=project)
-                return
-
-        self.enter_mode(message_id, chat_id)
-
     def handle_card_exit(self, message_id: str, chat_id: str, project_id: str, value: Optional[dict] = None):
         if project_id:
             project = self.project_manager.get_project_for_chat(project_id, chat_id)

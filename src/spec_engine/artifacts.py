@@ -224,23 +224,6 @@ def parse_acceptance_criteria(text: str, decompose_fn: Optional[callable] = None
     return criteria
 
 
-def extract_criteria_from_llm_response(text: str) -> list[str]:
-    criteria = []
-    for line in text.strip().split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("- ") or stripped.startswith("* "):
-            criterion = stripped[2:].strip()
-        elif len(stripped) > 2 and stripped[0].isdigit() and stripped[1] in ".、):） ":
-            criterion = stripped[2:].strip()
-        elif len(stripped) > 3 and stripped[:2].isdigit() and stripped[2] in ".、):） ":
-            criterion = stripped[3:].strip()
-        else:
-            continue
-        if criterion:
-            criteria.append(criterion)
-    return criteria
-
-
 def parse_tasks(text: str) -> list[SpecTask]:
     tasks = []
     for line in text.strip().split("\n"):

@@ -8,7 +8,6 @@ TRUNCATION_LIMITS: dict[str, int] = {
     "card_string_max_lines": 6,
     "bash_max_chars": 240,
     "bash_max_lines": 8,
-    "reasoning_tail_max": 500,
 }
 
 # ──────────────────────────────────────────────────────────────

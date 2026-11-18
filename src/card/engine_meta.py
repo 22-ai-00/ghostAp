@@ -40,16 +40,3 @@ def engine_type_to_cmd(engine_type: str | None, fallback: str = "命令") -> str
         The slash command string (e.g. "/deep") or the fallback.
     """
     return ENGINE_CMD_MAP.get(engine_type or "", fallback)
-
-
-def engine_type_to_name(engine_type: str | None, fallback: str = "") -> str:
-    """Map engine_type to user-facing display name.
-
-    Args:
-        engine_type: The engine type key (e.g. "deep", "spec").
-        fallback: Value to return when engine_type is not recognized.
-
-    Returns:
-        The display name (e.g. "Deep") or the fallback.
-    """
-    return ENGINE_NAME_MAP.get(engine_type or "", fallback)

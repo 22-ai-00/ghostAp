@@ -1,22 +1,14 @@
 import json
 import unittest
-from unittest.mock import MagicMock
 
-from src.feishu.handlers.base import BaseHandler
-from src.feishu.renderers.base import BaseRenderer
+from src.card.shared.truncation import check_and_truncate_payload
 
 
 class TestCardPayloadSafety(unittest.TestCase):
-    def setUp(self):
-        self.mock_handler = MagicMock(spec=BaseHandler)
-        self.mock_handler.ctx = MagicMock()
-        self.mock_handler.settings = MagicMock()
-        self.renderer = BaseRenderer(self.mock_handler)
-
     def test_payload_no_truncation(self):
         """Test small payload passes through"""
         small_content = json.dumps({"text": "hello"})
-        result = self.renderer._check_and_truncate_payload(small_content, max_size=1000)
+        result = check_and_truncate_payload(small_content, max_size=1000)
         self.assertEqual(result, small_content)
 
     def test_payload_truncation(self):
@@ -28,7 +20,7 @@ class TestCardPayloadSafety(unittest.TestCase):
 
         # Set limit smaller than content so truncation path is taken.
         max_size = 10000
-        result = self.renderer._check_and_truncate_payload(content, max_size=max_size)
+        result = check_and_truncate_payload(content, max_size=max_size)
 
         # Verify result is valid JSON
         truncated_card = json.loads(result)
@@ -45,7 +37,7 @@ class TestCardPayloadSafety(unittest.TestCase):
         card = {"body": {"nested": {"deep": long_text}}}
         content = json.dumps(card)
 
-        result = self.renderer._check_and_truncate_payload(content, max_size=12000)
+        result = check_and_truncate_payload(content, max_size=12000)
         truncated_card = json.loads(result)
 
         deep_val = truncated_card["body"]["nested"]["deep"]
@@ -62,7 +54,7 @@ class TestCardPayloadSafety(unittest.TestCase):
         # Set impossible limit
         max_size = 100
 
-        result = self.renderer._check_and_truncate_payload(content, max_size=max_size)
+        result = check_and_truncate_payload(content, max_size=max_size)
 
         # Should return fallback card
         fallback = json.loads(result)

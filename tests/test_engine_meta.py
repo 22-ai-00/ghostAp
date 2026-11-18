@@ -5,7 +5,6 @@ from src.card.engine_meta import (
     ENGINE_LABELS,
     ENGINE_NAME_MAP,
     engine_type_to_cmd,
-    engine_type_to_name,
 )
 
 
@@ -33,23 +32,6 @@ class TestEngineMeta:
                 engine_type_to_cmd(engine_type)
                 if fallback is None
                 else engine_type_to_cmd(engine_type, fallback=fallback)
-            )
-            assert actual == expected, (engine_type, fallback)
-
-    def test_engine_type_to_name(self):
-        """engine_type_to_name handles known/unknown types with default and custom fallbacks."""
-        cases = (
-            ("deep", None, "Deep"),
-            ("spec", None, "Spec"),
-            ("unknown", None, ""),
-            (None, None, ""),
-            (None, "Engine", "Engine"),
-        )
-        for engine_type, fallback, expected in cases:
-            actual = (
-                engine_type_to_name(engine_type)
-                if fallback is None
-                else engine_type_to_name(engine_type, fallback=fallback)
             )
             assert actual == expected, (engine_type, fallback)
 

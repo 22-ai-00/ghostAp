@@ -983,9 +983,6 @@ class BaseHandler:
             chat_id=chat_id,
         )
 
-    def _collect_lock_conflict_context(self, e):
-        return self.lock_helper._collect_lock_conflict_context(e)
-
     def send_chat_lock_intercept_card(self, message_id, chat_id, chat_lock_manager):
         return self.lock_helper.send_chat_lock_intercept_card(message_id, chat_id, chat_lock_manager)
 

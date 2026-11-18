@@ -590,15 +590,6 @@ class SpecReporter:
     # Title helpers (for card headers)
     # ------------------------------------------------------------------
 
-    def get_project_done_title(self, project: SpecProject) -> str:
-        if project.status == SpecProjectStatus.COMPLETED:
-            return "🎉 Spec 模式完成！"
-        elif project.status == SpecProjectStatus.FAILED:
-            return "⚠️ Spec 模式终止"
-        elif project.status == SpecProjectStatus.CANCELLED:
-            return "⏹️ Spec 模式已停止"
-        return "🔄 Spec 模式执行中"
-
     def format_goal_rewritten(self, guidance: str, new_requirement: str) -> str:
         # 截断过长的新目标，避免卡片内容过长
         preview = new_requirement if len(new_requirement) <= 500 else new_requirement[:500] + "..."

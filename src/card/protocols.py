@@ -108,13 +108,6 @@ class Dispatchable(Protocol):
     def dispatch(self, event: "CardEvent") -> None: ...
 
 
-@runtime_checkable
-class ManagedDispatchable(Dispatchable, Protocol):
-    """Extended protocol that also supports lifecycle management (close)."""
-
-    def close(self) -> None: ...
-
-
 # ---------------------------------------------------------------------------
 # Delivery layer protocols
 # ---------------------------------------------------------------------------
@@ -247,7 +240,6 @@ __all__ = [
     "TTLState",
     "RendererProtocol",
     "Dispatchable",
-    "ManagedDispatchable",
     "CardAPIClient",
     "StreamBridge",
     "ProcessEventSink",
