@@ -33,7 +33,6 @@ GhostAP 使用 `model/effort`（当存在思考档位时）或裸 `model` ID 作
 - 认证复用本机 `agy` CLI 自身状态（例如 `~/.gemini/antigravity-cli`）；GhostAP 不读取、不复制也不硬编码用户凭据。
 - 子进程环境清理（`src/utils/env.py`）移除父级 Antigravity 会话注入的 `ANTIGRAVITY_AGENT`、`ANTIGRAVITY_LS_ADDRESS`、`ANTIGRAVITY_CSRF_TOKEN`、`ANTIGRAVITY_CONVERSATION_ID`、`ANTIGRAVITY_TRAJECTORY_ID`、`ANTIGRAVITY_SOURCE_METADATA`，避免从 AGY 会话内部派生子 `agy acp` 进程时串用父会话或语言服务器上下文。
 - 权限请求继续通过 GhostAP 的 ACP `request_permission` 回调处理（采用后端提供的允许项，不传递 `--dangerously-skip-permissions`）。
-- Employee 隔离环境当前仅替换员工 `HOME` 而不投影 `~/.gemini/antigravity-cli` 认证状态，因此数字员工 `/hire` 入口暂不暴露 `agy`，避免形成运行时假支持。
 
 ## Swarm 后台协作生命周期
 

@@ -97,60 +97,39 @@ def test_readme_card_tree_documents_current_pipeline_directories() -> None:
     assert old_card_summary not in text
 
 
-def test_public_positioning_matches_agent_department_contract() -> None:
+def test_public_positioning_matches_product_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     contract = (ROOT / "docs" / "product-contract.md").read_text(
         encoding="utf-8"
     )
 
-    assert "Agent Department" in readme
-    assert "主 Bot 是控制面" in readme
+    assert "主 Bot" in readme
     assert "provider/transport" in readme
     assert (
-        'description = "飞书原生 Agent Department 控制面与研发执行网关"'
+        'description = "飞书原生多工具 AI 研发控制面与执行网关"'
         in pyproject
     )
     for boundary in (
-        "Main Bot: control plane",
-        "Employee Bot: execution identity",
-            "Host Shell: direct host execution",
+        "Main Bot: unified control plane",
+        "Host Shell: direct host execution",
         "single-host and file-backed",
         "Direct programming keeps the selected Agent",
     ):
         assert boundary in contract
 
 
-def test_public_docs_do_not_promise_rejected_hire_prompt() -> None:
-    public = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "README.md", ROOT / "docs" / "product-contract.md")
-    )
-    fenced_blocks = "\n".join(
-        match.group(1)
-        for match in re.finditer(r"```[^\n]*\n(.*?)```", public, re.DOTALL)
-    )
-    assert re.search(
-        r"(?im)^\s*/hire\b[^\n]*\s--prompt(?:\s|=|$)",
-        fenced_blocks,
-    ) is None
-    assert "Arbitrary `/hire --prompt` input is rejected." in public
-
-
-def test_readme_documents_current_employee_bot_command_boundaries() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    employee_section = readme.split(
-        "### Agent Department（持久数字员工）",
-        maxsplit=1,
-    )[1].split("## 全自动执行", maxsplit=1)[0]
-
-    assert "员工 Bot 私聊" in employee_section
-    assert "`/status`" in employee_section
-    assert "`@员工 /task <需求>`" in employee_section
-    assert "恰好一个目标员工" in employee_section
-    assert "`/roster`" in employee_section
-    assert "`/employee-role <员工名> <职责>`" in employee_section
-    assert "配置管理员在主 Bot 私聊" in employee_section
+def test_public_docs_do_not_reference_retired_employee_department() -> None:
+    for path in (
+        ROOT / "README.md",
+        ROOT / "AGENTS.md",
+        ROOT / "docs" / "product-contract.md",
+        ROOT / "pyproject.toml",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "Agent Department" not in text, path.name
+        assert "src/autonomous" not in text, path.name
+        assert "/hire" not in text, path.name
 
 
 def test_readme_discovers_all_programming_session_info_commands() -> None:

@@ -65,39 +65,11 @@ uv run python scripts/test_inventory.py tests/
 - `src/chat_lock.py`、`src/repo_lock.py`、`src/utils/lock_order.py`：聊天/仓库锁定和锁定顺序强制执行。
 - `src/config/`：pydantic 设置包和配置验证。
 
-## 自主工作系统 (`src/autonomous/`)
-
-- **现役生产面是 Employee Department**。旧 Goal/Run Manager、AgentRuntime、Policy/Broker、Scheduler/Reporter/Verifier 已退役，不要重新接回生产入口。
-
-- **Journal 是唯一事实源**。所有状态变更通过 `JournalWriter.write_event()` 记录。投影和快照可从 Journal 重放重建。
-- **域对象冻结**。`domain/` 下的 dataclass 都是 `frozen=True`，状态变更使用 `dataclasses.replace()` 而非赋值。
-- **Effect 在派发前必须锚定**。PREPARED 和 EXECUTING 帧必须 fsync 并锚定后才能发起外部调用。
-- **终态需要 finalization**。Run 在有未解决 Effect 或未处置已提交 Effect 时不能进入终态。
-- **飞书 SDK 使用官方包**。消息/卡片投递使用 `lark-oapi`，WebSocket 事件订阅使用 `lark-channel-sdk`。不要手写 HTTP 调用。
-
-关键模块入口：
-
-- `src/autonomous/provisioning/composition.py`：Employee Department 生产组装根。
-- `src/autonomous/provisioning/hire_service.py`：员工创建与配置编排。
-- `src/autonomous/gateway/coordinator.py`：现役 Effect 派发与恢复协调。
-- `src/autonomous/domain/employees.py`：冻结员工身份、生命周期状态与凭据引用域模型。
-- `src/autonomous/journal/writer.py`：单写入者，fsync + flock。
-- `src/autonomous/runtime/employee_actor.py`：现役员工 actor 执行循环。
-- `src/autonomous/supervisor/employee_channels.py`：员工 Channel SDK 进程生命周期。
-- `src/autonomous/provisioning/channel_worker.py`：由 supervisor 通过文件路径启动的 Channel 子进程入口。
-
-测试命令：
-
-```bash
-uv run pytest tests/autonomous/ -q
-uv run ruff check src/autonomous/           # 0 错误
-```
-
 ## 策略与传输
 
 GhostAP 有两个独立的维度：
 
-- 执行策略：普通编程、Deep、Spec、Workflow 和 Autonomous。
+- 执行策略：普通编程、Deep、Spec 和 Workflow。
 - 工具传输：ACP 直接模式和 shell CLI 桥接模式。
 
 保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini、Traex、Grok、DSH 和 AGY 上工作，除非用户明确限定范围或后端不支持。
@@ -106,7 +78,7 @@ GhostAP 有两个独立的维度：
 
 - SMART 是默认聊天/项目状态，可直接路由简单意图或类 shell 命令。
 - 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini`、`/traex`、`/grok`、`/dsh` 和 `/agy` 设置持久聊天+项目编程状态，直到 `/exit`。
-- Deep、Spec 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。Autonomous 同理。
+- Deep、Spec 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。
 - SMART 中的类 shell 文本必须保持 shell 执行，包括 `./restart.sh rr` 等命令，而不是被项目聊天自由文本编程路由窃取。
 
 ## 卡片与 UI 规则

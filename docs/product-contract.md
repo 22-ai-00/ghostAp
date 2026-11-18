@@ -1,14 +1,14 @@
 # GhostAP Product Contract
 
-GhostAP is a Feishu/Lark-native Agent Department gateway for a trusted
-engineering environment.
+GhostAP is a Feishu/Lark-native AI engineering gateway for a trusted engineering
+environment.
 
-- Main Bot: control plane for projects, employees, teams, tasks, approvals, audit.
-- Employee Bot: execution identity with its own Channel, history, memory and stop.
+- Main Bot: unified control plane for projects, programming sessions, Deep/Spec/
+  Workflow engines, managed groups, access control, and outbound delivery.
 - Provider/model/engine: replaceable execution capability, shown under Advanced.
 - Host Shell: direct host execution without a GhostAP command policy or
   operating-system sandbox.
-- Built-in employee profile: single-host and file-backed; it does not claim
+- Persistent storage: single-host and file-backed; it does not claim
   multi-replica linearizability or privileged-host rollback resistance.
 
 ## Public command truth
@@ -25,10 +25,7 @@ engineering environment.
   confirmation or continuation gate.
 - Users retain explicit stop and configuration controls. Tool permissions and
   execution safety are delegated to the selected Agent backend.
-- `/hire <name>` creates a durable Employee Bot through the controlled
-  tool/model/profile flow. Arbitrary `/hire --prompt` input is rejected.
-- The standalone Autonomous Manager command surface is retired. Employee and team
-  actually connected to production.
+- The standalone Autonomous Manager and Employee Department surfaces are retired.
 - Deep and Spec remain protected execution strategies rather than being rewritten
   as a shared workflow.
 - Workflow generates task-specific JavaScript and scales from one Agent to the
@@ -37,5 +34,5 @@ engineering environment.
   semantic work.
 
 This contract describes product boundaries. GhostAP does not add command-risk
-filtering, ACP tool filtering, Workflow isolation, or employee process isolation;
-identity access and file-backed durability remain control-plane concerns.
+filtering, ACP tool filtering, or Workflow isolation; identity access and
+file-backed durability remain control-plane concerns.

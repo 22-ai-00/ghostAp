@@ -977,14 +977,14 @@ def test_unconfigured_enforced_private_setadmin_uses_narrow_bootstrap_route(
 
 def test_handle_message_records_trusted_chat_origin(mock_ws_client: FeishuWSClient):
     """Message events are the authoritative source for DM provenance."""
-    msg = create_mock_message("/hire 柳七月", message_id="om_hire", chat_id="oc_dm")
+    msg = create_mock_message("/projects", message_id="om_projects", chat_id="oc_dm")
     msg.event.message.chat_type = "p2p"
     msg.event.sender.sender_id.open_id = "ou_admin"
     msg.event.sender.sender_id.union_id = "on_admin"
 
     mock_ws_client._handle_message(msg)
 
-    origin = mock_ws_client._message_linker.query("om_hire")
+    origin = mock_ws_client._message_linker.query("om_projects")
     assert origin is not None
     assert origin["chat_id"] == "oc_dm"
     assert origin["chat_type"] == "p2p"

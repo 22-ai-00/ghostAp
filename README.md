@@ -1,10 +1,6 @@
 # GhostAP
 
-GhostAP 是一个面向受信工程环境的飞书/Lark 原生 Agent Department
-Gateway。主 Bot 是控制面，负责项目、员工、团队、任务、审批和审计；员工 Bot
-是拥有独立 Channel、历史、记忆和停止语义的执行身份。底层
-provider/transport、模型和执行引擎均可替换，普通编程仍可直接连接用户选定的
-Agent。
+GhostAP 是一个面向受信工程环境的飞书/Lark 原生 AI 研发控制面与执行网关。主 Bot 作为统一控制面管理项目、受管群、直接编程会话及长任务引擎；底层 provider/transport、模型和执行引擎均可替换，普通编程仍可直接连接用户选定的 Agent。
 
 完整边界以 [产品合同](docs/product-contract.md) 为准。
 
@@ -12,12 +8,12 @@ Agent。
 
 | 能力 | 产品边界 |
 | --- | --- |
-| 主 Bot 控制面 | 管理项目、员工、团队、任务、审批和审计，不冒充员工输出 |
+| 主 Bot 控制面 | 管理项目、受管群、任务调度、锁控制、权限引导和投递审计 |
 | 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、Grok、DSH、AGY 后端保持多轮直连 |
-| Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
+| 长任务引擎 | Deep 单次规划自主执行、Spec 结构化闭环审查、Workflow 多 Agent JS 编排 |
 | 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
 | Host Shell | 直接宿主机执行；GhostAP 不增加命令过滤或操作系统沙箱 |
-| 本地持久化 | Journal、Vault、Blob 和项目状态面向单机文件存储，不承诺多副本线性一致性或对特权宿主机的回滚抵抗 |
+| 本地持久化 | 项目状态与受管群注册表面向单机文件存储，不承诺多副本线性一致性或对特权宿主机的回滚抵抗 |
 
 ## 运行模型
 
@@ -25,7 +21,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 
 | 维度 | 说明 |
 | --- | --- |
-| 产品身份 | 主 Bot 是控制面；Employee Bot 是独立执行身份 |
+| 产品身份 | 主 Bot 为统一控制面与消息交互入口 |
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的直接宿主执行能力，不是 Agent provider |
 
@@ -91,7 +87,6 @@ DEFAULT_ACP_TOOL=coco
 ADMIN_USER_IDS=
 INGRESS_ACCESS_MODE=legacy_allow_all
 ADMIN_BOOTSTRAP_SCOPE=p2p_only
-EMPLOYEE_GROUP_CONTEXT_RETENTION_DAYS=30
 ```
 
 常用配置：
@@ -110,7 +105,7 @@ WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 `INGRESS_ACCESS_MODE` 默认使用 `legacy_allow_all`，当前飞书 App 收到的私聊和群聊可
 直接使用 `/dsh` 等普通功能；需要用户与群双白名单隔离时可显式改为 `enforced`。
 该配置和管理员列表只控制谁可以通过飞书入口操作服务；Shell、
-ACP、Workflow 和 Employee 执行不再叠加 GhostAP 自己的风险策略、工具过滤或
+ACP 与 Workflow 执行不再叠加 GhostAP 自己的风险策略、工具过滤或
 进程沙箱。Codex、Claude 等后端按各自权限模型处理执行请求。
 
 更多参数见 `.env.example` 和 `src/config/settings.py`。各 AI 后端所需的密钥、登录态或 CLI 配置应按对应工具自己的方式准备，GhostAP 只读取必要的环境变量和本地命令。
@@ -201,46 +196,6 @@ Spec 同时支持编程、写作、研究和其他领域任务。规格阶段先
 
 Spec 的阶段、任务进度、子代理输出和多角色审查结论汇总到主卡，不再按子任务或迭代轮次发送新卡。只有内容达到卡片容量边界时续接，历史内容保留。
 
-### Agent Department（持久数字员工）
-
-| 命令 | 作用 |
-| --- | --- |
-| `/hire <名字>` | 由配置管理员在主 Bot 私聊中雇佣持久数字员工 |
-| `/h <名字>` | `/hire` 的简写 |
-| `/hire <名字> --tool codex --model <模型> --role coder` | 使用受控参数发起雇佣 |
-| `/employees`、`/roster` | 查看在职数字员工 |
-| `/employee-role <员工名> <职责>` | 由配置管理员在主 Bot 私聊中设置数字员工职责 |
-| `/fire <名字或ID> [--drain]` | 退役持久数字员工；可等待当前任务排空 |
-| `/history <名字>`、`/employee-memory <名字>` | 由主 Bot 管理员读取授权范围内的员工历史或记忆 |
-
-**雇佣数字员工流程（/hire）：**
-
-1. 配置管理员在主 Bot 私聊发送 `/hire 小明`，系统使用已保存且可用的工具配置；
-   未配置时自动选择推荐的可用工具及其后端默认模型。
-2. 系统先把准入事实写入 Journal，再自动启动雇佣流程；需要创建飞书应用时，
-   按返回的注册链接完成开放平台操作。
-3. 凭据写入加密 Vault，独立 Channel、Slash Commands 和身份校验全部就绪后，
-   员工才进入可用状态；等待或失败不会被报告成创建成功。
-
-如需覆盖自动选择，可直接使用受控命令行参数：
-
-```
-/hire 小明 --tool codex --model <模型名> --role coder --profile standard --effort default
-```
-
-员工创建后：
-
-- Journal、加密 Blob/Vault 是事实源，`identity.json` 仅是可安全重建的投影，不含密钥。
-- 员工 Bot 私聊支持 `/task <需求>`、`/status`、`/history [天数]`、`/memory`
-  和 `/stop`；其中 `/status` 返回当前员工的持久任务状态。
-- 在受管员工群中，只有恰好一个目标员工的 `@员工 /task <需求>` 会进入该员工的
-  任务通道；未知员工、多员工提及和其他 Slash 命令不会作为员工任务分派。
-- 员工使用自己的 Bot 接收任务、更新卡片和返回结果，不回退到主 Bot 代发。
-- `/hire` 拒绝任意提示词注入；工作风格由受控 role/profile 与持久上下文形成。
-
-旧的独立 Autonomous Manager 命令面已经退役并默认拒绝，不是 Agent Department
-的生产入口。
-
 ## 全自动执行
 
 普通编程、Deep、Spec 和 Workflow 使用已保存或自动绑定配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。`/wf <需求>` 自动绑定包含 1–8 个 `tool+model` Agent 的推荐 Agent Pool（`A1`、`A2` 等稳定标识）与自动选择的主编排器；池绑定后即冻结，脚本生成、验证与执行全自动推进，不要求确认或继续批准门。
@@ -262,7 +217,6 @@ Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequen
 | `src/deep_engine/` | Deep 单次自主执行 |
 | `src/spec_engine/` | Spec 结构化闭环和多视角审查 |
 | `src/workflow_engine/` | JS Workflow 生成、验证、运行时和卡片渲染 |
-| `src/autonomous/` | v5 自主工作系统（详见下方） |
 | `src/card/` | CardSession 事件管线、纯渲染和卡片投递 |
 | `src/project/`、`src/project_chat/`、`src/thread/` | 项目、群绑定和线程上下文 |
 | `src/chat_lock.py`、`src/repo_lock.py`、`src/utils/lock_order.py` | 聊天锁、仓库锁和锁顺序约束 |
@@ -277,24 +231,13 @@ handler -> session -> render
 
 渲染层保持纯函数；投递层不反向依赖会话层。跨层共享类型放在 `src/card/protocols.py` 或 `src/card/events/`。
 
-## Agent Department 耐久架构（src/autonomous/）
-
-生产 Employee Department 使用 Journal-backed 持久化架构，所有状态变更通过事务帧记录，并通过 Vault、Blob、独立员工 Channel 和 Durable Outbox 完成恢复。生产组装根位于 `provisioning/composition.py`，现役执行面由 `gateway/coordinator.py`、`runtime/employee_actor.py` 和 `supervisor/employee_channels.py` 构成；旧 Goal/Run Manager 不再是产品入口。
-
 **关键依赖：**
-- `lark-oapi==1.7.2`：REST API 消息发送、卡片更新、机器人管理
-- `lark-channel-sdk==1.2.0`：WebSocket 事件订阅（持久收件箱）
-
-**测试：**
-
-```bash
-uv run python -m pytest tests/autonomous/ -q
-uv run ruff check src/autonomous/         # 0 错误
-```
+- `lark-oapi==1.7.2`：REST API 消息发送、卡片更新、开放平台交互
+- `lark-channel-sdk==1.2.0`：WebSocket 事件订阅与接收
 
 ## 访问与运维
 
-- Host Shell、ACP、Workflow 和 Employee 都直接使用宿主机能力；GhostAP 不提供
+- Host Shell、ACP 和 Workflow 都直接使用宿主机能力；GhostAP 不提供
   命令风险策略、工具过滤、Bubblewrap、Seatbelt 或 Node VM 隔离。
 - 飞书消息有过期检查和去重缓存，避免重复执行。
 - ACP 权限请求采用后端提供的授权选项，由后端权限模型负责。
@@ -322,7 +265,6 @@ uv run ruff check .
 ```text
 ghostAp/
 ├── src/                 # 应用代码
-│   ├── autonomous/      # v5 自主工作系统
 │   ├── card/            # 飞书卡片事件、渲染、投递和状态管线
 │   │   ├── actions/
 │   │   ├── delivery/
@@ -332,7 +274,6 @@ ghostAp/
 │   │   ├── state/
 │   │   ├── timers/
 ├── tests/               # 测试
-│   ├── autonomous/      # 自主系统测试（unit/integration/chaos/security/contract）
 ├── docs/                # 架构记录和接入指南
 ├── scripts/             # 辅助脚本
 ├── ux/                  # UI 预览和验证资产

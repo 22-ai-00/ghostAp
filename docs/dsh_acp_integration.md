@@ -54,5 +54,3 @@ GhostAP 当前使用 profile 默认的 `standard`，不把这些预设伪装成�
   fail-closed。
 - ACP stdout 只承载协议帧；诊断由 DSH 插件写入 stderr。
 - DSH `cordis` 预设具有更高进程内能力，GhostAP 不自动切换到该预设。
-- Employee 隔离环境当前不会投影 `$DSH_HOME` profile 与凭据，因此雇佣入口不
-  暴露 DSH；待有独立、最小权限的 profile 投影后再启用，避免形成运行时假支持。
