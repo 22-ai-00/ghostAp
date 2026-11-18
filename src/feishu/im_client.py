@@ -212,16 +212,24 @@ class FeishuIMClient:
         client = self.api_client_factory()
         resolved_name = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as file_obj:
-            body_builder = (
-                CreateFileRequestBody.builder()
-                .file_type(file_type)
-                .file_name(resolved_name)
-                .file(file_obj)
-            )
-            if duration is not None:
-                body_builder.duration(duration)
-            request = CreateFileRequest.builder().request_body(body_builder.build()).build()
-            response = self._execute_with_retry(lambda: client.im.v1.file.create(request), "上传文件", max_retries)
+            def _upload_once():
+                file_obj.seek(0)
+                body_builder = (
+                    CreateFileRequestBody.builder()
+                    .file_type(file_type)
+                    .file_name(resolved_name)
+                    .file(file_obj)
+                )
+                if duration is not None:
+                    body_builder.duration(duration)
+                request = (
+                    CreateFileRequest.builder()
+                    .request_body(body_builder.build())
+                    .build()
+                )
+                return client.im.v1.file.create(request)
+
+            response = self._execute_with_retry(_upload_once, "上传文件", max_retries)
 
         if response is None:
             return None

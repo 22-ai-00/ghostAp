@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -28,14 +29,25 @@ class SpecHandler(BaseEngineHandler):
     def __init__(self, ctx: "HandlerContext", renderer: "RendererProtocol | None" = None) -> None:
         super().__init__(ctx)
         self._renderer: "RendererProtocol | None" = renderer
+        self._renderer_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @property
     def renderer(self) -> "RendererProtocol":
-        if self._renderer is None:
-            from ..renderers import get_renderer
+        renderer = self._renderer
+        if renderer is not None:
+            return renderer
+        lock = getattr(self, "_renderer_lock", None)
+        if lock is None:
+            lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            self._renderer_lock = lock
+        with lock:
+            renderer = self._renderer
+            if renderer is None:
+                from ..renderers import get_renderer
 
-            self._renderer = get_renderer("spec", self)
-        return self._renderer
+                renderer = get_renderer("spec", self)
+                self._renderer = renderer
+            return renderer
 
     @renderer.setter
     def renderer(self, value: "RendererProtocol") -> None:

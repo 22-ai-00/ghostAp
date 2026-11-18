@@ -612,3 +612,70 @@ def test_feishu_ws_client_init_keeps_single_thread(monkeypatch):
         assert client._card_event_cache._cleanup_thread is None
     finally:
         client.close()
+
+
+def test_deep_and_spec_handler_lazy_renderer_thread_safe(monkeypatch):
+    """Concurrent lazy renderer access instantiates each handler renderer once."""
+    from src.feishu.handlers.deep import DeepHandler
+    from src.feishu.handlers.spec import SpecHandler
+
+    dh = DeepHandler(MagicMock())
+    sh = SpecHandler(MagicMock())
+    created: list[tuple[str, object]] = []
+
+    def fake_get_renderer(kind, _handler):
+        obj = object()
+        created.append((kind, obj))
+        return obj
+
+    monkeypatch.setattr("src.feishu.renderers.get_renderer", fake_get_renderer)
+    barrier = threading.Barrier(8)
+    deep_refs: list[object] = []
+    spec_refs: list[object] = []
+
+    def worker(idx: int) -> None:
+        barrier.wait()
+        if idx % 2 == 0:
+            deep_refs.append(dh.renderer)
+        else:
+            spec_refs.append(sh.renderer)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(created) == 2
+    assert len({id(ref) for ref in deep_refs}) == 1
+    assert len({id(ref) for ref in spec_refs}) == 1
+
+
+def test_upload_file_rebuilds_request_and_rewinds_on_retry(tmp_path, monkeypatch):
+    """FeishuIMClient.upload_file rebuilds CreateFileRequest and rewinds stream on retry."""
+    from src.feishu.im_client import FeishuIMClient
+
+    payload = tmp_path / "sample.bin"
+    payload.write_bytes(b"payload-bytes")
+    seen_reqs: list[object] = []
+    seen_contents: list[bytes] = []
+
+    def fake_create(req):
+        seen_reqs.append(req)
+        seen_contents.append(req.request_body.file.read())
+        req.request_body = "mutated_by_sdk"
+        if len(seen_reqs) == 1:
+            return SimpleNamespace(success=lambda: False, code=500, msg="transient")
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(file_key="fk_ok"))
+
+    fake_client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(file=SimpleNamespace(create=fake_create))))
+    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+    im = FeishuIMClient(
+        lambda: fake_client,
+        SimpleNamespace(im_api_max_retries=2, im_api_retry_delay_s=0.01),
+    )
+
+    assert im.upload_file(str(payload)) == "fk_ok"
+    assert len(seen_reqs) == 2
+    assert seen_reqs[0] is not seen_reqs[1]
+    assert seen_contents == [b"payload-bytes", b"payload-bytes"]
