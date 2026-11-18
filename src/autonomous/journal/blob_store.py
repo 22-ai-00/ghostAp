@@ -136,21 +136,6 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
-def _mkdir_durable(directory: Path) -> None:
-    missing: list[Path] = []
-    current = directory
-    while not current.exists():
-        missing.append(current)
-        current = current.parent
-    if not current.is_dir():
-        raise BlobPublishError(f"blob parent is not a directory: {current}")
-    for path in reversed(missing):
-        path.mkdir(mode=0o700)
-        path.chmod(0o700)
-        _fsync_directory(path.parent)
-    directory.chmod(0o700)
-
-
 @dataclass(frozen=True)
 class BlobRef:
     """Immutable reference to one encrypted content-addressed blob."""
@@ -573,21 +558,6 @@ class BlobStore:
         if _sha256(plaintext) != ref.payload_hash:
             raise BlobIntegrityError("payload hash mismatch")
         return plaintext
-
-    def cleanup_orphan_temps(self) -> int:
-        self._require_open()
-        removed = 0
-        for filename in os.listdir(self._root_fd):
-            if not filename.startswith(".blob-") or not filename.endswith(".tmp"):
-                continue
-            try:
-                os.unlink(filename, dir_fd=self._root_fd)
-                removed += 1
-            except FileNotFoundError:
-                continue
-        if removed:
-            self._fsync_root()
-        return removed
 
     def iter_blob_ids(self) -> tuple[str, ...]:
         """Return owned content-address IDs without parsing encrypted labels."""

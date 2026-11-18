@@ -19,13 +19,8 @@ from .materializer import DailyHistoryMaterializer
 from .models import (
     DataKind,
     EmployeeDataDocumentV1,
-    ExecutionAttemptContext,
-    ExecutionHistoryPayloadV1,
-    ExecutionHistoryRecordV1,
-    SafeExecutionSummary,
-    ToolUsageV1,
 )
-from .ports import AuthenticatedExecutionTerminal, PublishEmployeeDocumentCommand
+from .ports import PublishEmployeeDocumentCommand
 from .projection import DataProjectionState
 from .query import EmployeeDataRequestContextFactory, EmployeeMemoryQuery, HistoryRangeQuery
 from .service import EmployeeDataService
@@ -78,62 +73,6 @@ class EmployeeDataComposition:
     memory_query: EmployeeMemoryQuery
     context_factory: EmployeeDataRequestContextFactory
     workspace_projector: EmployeeWorkspaceProjector | None = None
-
-    def record_terminal(
-        self,
-        terminal: AuthenticatedExecutionTerminal,
-    ) -> None:
-        """Record one terminal execution outcome from trusted orchestration."""
-        binding = self.state.execution_attempts.get(terminal.attempt_id)
-        if binding is None:
-            raise ValueError(f"no anchored attempt: {terminal.attempt_id}")
-        ctx = ExecutionAttemptContext(
-            tenant_key=binding.tenant_key,
-            agent_id=binding.agent_id,
-            owner_principal_id=binding.owner_principal_id,
-            requester_principal_id=binding.requester_principal_id,
-            task_id=binding.task_id,
-            run_id=binding.run_id,
-            attempt_id=binding.attempt_id,
-            message_id=binding.message_id,
-            thread_root_id=binding.thread_root_id,
-            chat_id=binding.chat_id,
-            tool=binding.tool,
-            model=binding.model,
-            effort=binding.effort,
-            started_at=binding.started_at,
-            terminal_epoch=binding.terminal_epoch,
-        )
-        ended_at = datetime.now(UTC).isoformat()
-        record = ExecutionHistoryRecordV1.from_attempt(
-            ctx,
-            ended_at=ended_at,
-            status=terminal.status,
-            safe_summary=SafeExecutionSummary.build(
-                status=terminal.status,
-                tool_count=len(terminal.tool_usage),
-                attachment_count=len(terminal.attachments),
-            ),
-            prompt_tokens=terminal.prompt_tokens,
-            completion_tokens=terminal.completion_tokens,
-            tool_usage=tuple(
-                ToolUsageV1(t["name"], t["count"], t["duration_ms"], t["status"])
-                for t in terminal.tool_usage
-            ) if terminal.tool_usage else (),
-            predecessor_sequence=0,
-            predecessor_hash="",
-            shard_timezone=self.service.shard_timezone,
-        )
-        payload = ExecutionHistoryPayloadV1(
-            record_id=record.record_id,
-            occurrence_key=record.occurrence_key,
-            request_text=terminal.request_text[:1_000_000],
-            result_text=terminal.result_text[:1_000_000],
-            error_detail=terminal.error_detail[:100_000],
-            attachments=terminal.attachments,
-            tool_calls=(),
-        )
-        self.service.record_history(record, payload)
 
     def publish_document(
         self,
@@ -231,10 +170,6 @@ class EmployeeDataComposition:
                 agent_id,
                 self.service.read_blob,
             )
-
-    def gc_unreferenced_blobs(self) -> int:
-        """Quarantine blobs not referenced by any projected record or document."""
-        return self.service.quarantine_unreferenced_blobs()
 
     def close(self) -> None:
         """Release the owned encrypted BlobStore; the shared Writer is external."""

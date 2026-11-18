@@ -3,8 +3,6 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
-import pytest
-
 from src.autonomous.workforce.identity import AgentIdentity
 
 
@@ -95,52 +93,6 @@ def test_session_host_projects_explicit_environment(monkeypatch, tmp_path) -> No
     assert "require_tool_filter" not in created
 
 
-def test_run_agent_session_dispatches_one_prompt_with_timeout(monkeypatch, tmp_path) -> None:
-    module = _load_session_host_module()
-    workspace = tmp_path / "agent" / "workspace"
-    workspace.mkdir(parents=True)
-    probe = _ProbeSession(result="done")
-    create_calls = 0
-
-    def fake_create_engine_session(**_kwargs) -> _ProbeSession:
-        nonlocal create_calls
-        create_calls += 1
-        return probe
-
-    monkeypatch.setattr(module, "create_engine_session", fake_create_engine_session)
-
-    host = module.EmployeeSessionHost()
-    result = host.run_agent_session(
-        _agent(workspace),
-        "execute task",
-        timeout=3.5,
-        env={"HOME": str(tmp_path / "employee-home"), "PATH": "/usr/bin"},
-    )
-
-    assert result == "done"
-    assert create_calls == 1
-    assert probe.prompts == [("execute task", 3.5)]
-    assert probe.closed
-
-
-def test_run_agent_session_defaults_timeout_and_releases_on_success(monkeypatch, tmp_path) -> None:
-    module = _load_session_host_module()
-    workspace = tmp_path / "agent" / "workspace"
-    workspace.mkdir(parents=True)
-    probe = _ProbeSession(result="done")
-
-    monkeypatch.setattr(module, "create_engine_session", lambda **_kwargs: probe)
-
-    host = module.EmployeeSessionHost()
-    assert host.run_agent_session(
-        _agent(workspace),
-        "heartbeat",
-        env={"HOME": str(tmp_path / "employee-home"), "PATH": "/usr/bin"},
-    ) == "done"
-    assert probe.prompts == [("heartbeat", 600.0)]
-    assert host._sessions == {}
-
-
 def test_open_employee_session_does_not_install_ghostap_execution_policy(
     monkeypatch, tmp_path
 ) -> None:
@@ -174,48 +126,4 @@ def test_open_employee_session_does_not_install_ghostap_execution_policy(
         lease.close()
 
     assert not lease.is_server_healthy()
-    assert host._sessions == {}
-
-
-def test_run_agent_session_fails_without_text_output(monkeypatch, tmp_path) -> None:
-    module = _load_session_host_module()
-    workspace = tmp_path / "agent" / "workspace"
-    workspace.mkdir(parents=True)
-    probe = _ProbeSession(result="")
-
-    monkeypatch.setattr(module, "create_engine_session", lambda **_kwargs: probe)
-
-    host = module.EmployeeSessionHost()
-    with pytest.raises(
-        module.EmployeeSessionUnavailableError,
-        match="employee backend returned no output",
-    ):
-        host.run_agent_session(
-            _agent(workspace),
-            "echo",
-            env={"HOME": str(tmp_path / "employee-home"), "PATH": "/usr/bin"},
-        )
-
-    assert probe.closed
-    assert host._sessions == {}
-
-
-def test_run_agent_session_timeout_releases_session(monkeypatch, tmp_path) -> None:
-    module = _load_session_host_module()
-    workspace = tmp_path / "agent" / "workspace"
-    workspace.mkdir(parents=True)
-    probe = _ProbeSession(exception=TimeoutError("deadline"))
-
-    monkeypatch.setattr(module, "create_engine_session", lambda **_kwargs: probe)
-
-    host = module.EmployeeSessionHost()
-    with pytest.raises(TimeoutError, match="deadline"):
-        host.run_agent_session(
-            _agent(workspace),
-            "long task",
-            timeout=0.2,
-            env={"HOME": str(tmp_path / "employee-home"), "PATH": "/usr/bin"},
-        )
-
-    assert probe.closed
     assert host._sessions == {}

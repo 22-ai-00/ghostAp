@@ -16,11 +16,14 @@ from src.autonomous.data.composition import (
     LegacyEmployeeDataUnsupportedError,
     build_employee_data_composition,
 )
-from src.autonomous.data.models import DataKind, ExecutionAttemptContext
-from src.autonomous.data.ports import (
-    AuthenticatedExecutionTerminal,
-    PublishEmployeeDocumentCommand,
+from src.autonomous.data.models import (
+    DataKind,
+    ExecutionAttemptContext,
+    ExecutionHistoryPayloadV1,
+    ExecutionHistoryRecordV1,
+    SafeExecutionSummary,
 )
+from src.autonomous.data.ports import PublishEmployeeDocumentCommand
 from src.autonomous.data.query import AuthenticatedDataRequest, HistoryQuerySpec
 from src.autonomous.journal.writer import JournalWriter
 
@@ -108,16 +111,29 @@ class TestFullComposition:
             terminal_epoch=1,
         )
         composition.service.start_attempt(ctx)
-        terminal = AuthenticatedExecutionTerminal(
-            attempt_id="attempt_1",
+        record = ExecutionHistoryRecordV1.from_attempt(
+            ctx,
+            ended_at="2026-07-12T00:31:00+00:00",
             status="completed",
+            safe_summary=SafeExecutionSummary.build(
+                status="completed",
+                tool_count=0,
+                attachment_count=0,
+            ),
+            prompt_tokens=100,
+            completion_tokens=50,
+            predecessor_sequence=0,
+            predecessor_hash="",
+            shard_timezone=composition.service.shard_timezone,
+        )
+        payload = ExecutionHistoryPayloadV1(
+            record_id=record.record_id,
+            occurrence_key=record.occurrence_key,
             request_text="do something",
             result_text="done",
             error_detail="",
-            prompt_tokens=100,
-            completion_tokens=50,
         )
-        composition.record_terminal(terminal)
+        composition.service.record_history(record, payload)
         assert len(composition.state.history_records) == 1
         history_event = next(
             event
@@ -272,19 +288,6 @@ class TestFullComposition:
             reopened.service._blob_store.close()  # noqa: SLF001
             writer_two.close()
 
-    def test_unanchored_attempt_raises(
-        self, composition: EmployeeDataComposition
-    ) -> None:
-        terminal = AuthenticatedExecutionTerminal(
-            attempt_id="nonexistent_attempt",
-            status="failed",
-            request_text="",
-            result_text="",
-            error_detail="no such attempt",
-        )
-        with pytest.raises(ValueError, match="no anchored attempt"):
-            composition.record_terminal(terminal)
-
     def test_memory_summary_publishes(
         self, composition: EmployeeDataComposition
     ) -> None:
@@ -378,7 +381,7 @@ class TestFullComposition:
 
         def collect() -> None:
             try:
-                gc_results.append(composition.gc_unreferenced_blobs())
+                gc_results.append(composition.service.quarantine_unreferenced_blobs())
             except Exception as exc:
                 errors.append(exc)
             finally:

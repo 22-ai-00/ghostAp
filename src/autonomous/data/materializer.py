@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import secrets
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,36 +102,6 @@ class DailyHistoryMaterializer:
             if manifest is not None:
                 manifests.append(manifest)
         return manifests
-
-    def verify_shard(
-        self,
-        state: DataProjectionState,
-        tenant_key: str,
-        agent_id: str,
-        day: str,
-    ) -> bool:
-        """Check if existing shard matches projection."""
-        target = self._root / agent_id / "history" / f"{day}.jsonl"
-        if not target.exists():
-            return False
-        try:
-            file_stat = os.stat(str(target), follow_symlinks=False)
-            if not stat.S_ISREG(file_stat.st_mode):
-                return False
-        except OSError:
-            return False
-        content = target.read_bytes()
-        day_key = (tenant_key, agent_id, day)
-        record_ids = state.history_by_employee_day.get(day_key, [])
-        rows: list[bytes] = []
-        for record_id in record_ids:
-            metadata = state.history_records.get(record_id)
-            if metadata is None or metadata.tombstoned:
-                continue
-            row = self._metadata_to_row(metadata)
-            rows.append(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
-        expected = b"\n".join(rows) + b"\n" if rows else b""
-        return content == expected
 
     @staticmethod
     def _metadata_to_row(metadata: HistoryMetadataRecord) -> dict[str, Any]:

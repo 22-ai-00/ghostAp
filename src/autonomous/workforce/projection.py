@@ -18,7 +18,7 @@ from ..domain import (
 )
 from ..journal.frame import JournalEvent
 from ..journal.writer import AnchorMismatchError, CommitState
-from .authority import AuthorityMode, AuthoritySnapshot
+from .authority import AuthorityMode
 
 if TYPE_CHECKING:
     from ..journal.projections import ProjectionState
@@ -37,15 +37,6 @@ class WorkforceProjectionState:
     authority_epoch: int = 0
     authority_mode: AuthorityMode = AuthorityMode.LEGACY_WRITE
     authority_cutover_sequence: int = 0
-
-    def authority_snapshot(self) -> AuthoritySnapshot:
-        """Return the replayable writer-authority view for mutation guards."""
-
-        return AuthoritySnapshot(
-            epoch=self.authority_epoch,
-            mode=self.authority_mode,
-            cutover_sequence=self.authority_cutover_sequence,
-        )
 
 
 _WORKFORCE_EVENTS = frozenset(

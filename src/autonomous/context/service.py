@@ -20,28 +20,9 @@ from .models import (
     AuthorizedContextRequest,
     ContextUnavailableError,
     ContextUnavailableReason,
-    EmployeeExecutionInput,
     ThreadContextConfig,
 )
 from .source import EmployeeMessageSourceFactory
-
-
-class EmployeeContextPort(Protocol):
-    def assemble(self, request: AuthorizedContextRequest) -> AssembledContext: ...
-
-
-class EmployeeExecutionDelegate(Protocol):
-    def execute(self, execution_input: EmployeeExecutionInput) -> str: ...
-
-
-class EmployeeExecutionAuthorityFence(Protocol):
-    """Atomically revalidate authority while invoking one execution callback."""
-
-    def run_if_current(
-        self,
-        request: AuthorizedContextRequest,
-        action: Callable[[], str],
-    ) -> str: ...
 
 
 class EmployeeGenerationAuthorityPort(Protocol):
@@ -414,53 +395,9 @@ def _resolve_binding(
     )
 
 
-class ContextPreparingExecutionPort:
-    """Prepare Context exactly once and delegate only after success."""
-
-    def __init__(
-        self,
-        *,
-        context_service: EmployeeContextPort,
-        authority_fence: EmployeeExecutionAuthorityFence,
-        delegate: EmployeeExecutionDelegate,
-    ) -> None:
-        if authority_fence is None:
-            raise ValueError("authority_fence is required")
-        self._context_service = context_service
-        self._authority_fence = authority_fence
-        self._delegate = delegate
-
-    def execute(
-        self,
-        request: AuthorizedContextRequest,
-        *,
-        tool: str,
-        model: str,
-        effort: str,
-    ) -> str:
-        if not isinstance(request, AuthorizedContextRequest):
-            raise TypeError("request must be AuthorizedContextRequest")
-        snapshot = self._context_service.assemble(request)
-        execution_input = EmployeeExecutionInput(
-            request=request,
-            tool=tool,
-            model=model,
-            effort=effort,
-            context=snapshot,
-        )
-        return self._authority_fence.run_if_current(
-            request,
-            lambda: self._delegate.execute(execution_input),
-        )
-
-
 __all__ = [
     "AuthorizedGroupMemoryReader",
-    "ContextPreparingExecutionPort",
     "EmployeeContextService",
-    "EmployeeContextPort",
-    "EmployeeExecutionDelegate",
-    "EmployeeExecutionAuthorityFence",
     "EmployeeGenerationAuthorityPort",
     "GroupMemoryPort",
     "RequesterChatAclPort",

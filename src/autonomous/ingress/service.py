@@ -1170,20 +1170,6 @@ class EmployeeIngressService:
             and metadata.message_id == "om_" + hashlib.sha256(raw_message_id.encode("utf-8")).hexdigest()
         )
 
-    def _acceptance_for_key_unlocked(
-        self,
-        key: tuple[str, ...],
-    ) -> IngressAcceptance | None:
-        acceptance_id = self._transport_message_index.get(key)
-        record = self._state.by_acceptance_id.get(acceptance_id or "")
-        if (
-            record is None
-            or self._transport_message_key_for_record(record) != key
-            or record.transport_message_proof is not True
-        ):
-            return None
-        return record.acceptance
-
     def _message_acceptance_outcome_unlocked(
         self,
         key: MessageLogicalKey,

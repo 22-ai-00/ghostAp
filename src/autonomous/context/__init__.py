@@ -18,7 +18,6 @@ from .models import (
     ContextUnavailableError,
     ContextUnavailableReason,
     ContextWarning,
-    EmployeeExecutionInput,
     EmployeeMessageScope,
     MessageRevision,
     MessageSourceError,
@@ -28,9 +27,7 @@ from .models import (
 )
 from .service import (
     AuthorizedGroupMemoryReader,
-    ContextPreparingExecutionPort,
     EmployeeContextService,
-    EmployeeExecutionAuthorityFence,
 )
 from .source import (
     CredentialResolver,
@@ -52,10 +49,7 @@ __all__ = [
     "ContextUnavailableError",
     "ContextUnavailableReason",
     "CredentialResolver",
-    "ContextPreparingExecutionPort",
     "EmployeeContextService",
-    "EmployeeExecutionAuthorityFence",
-    "EmployeeExecutionInput",
     "EmployeeMessageSourceFactory",
     "EmployeeMessageScope",
     "EmployeeScopedMessageSource",

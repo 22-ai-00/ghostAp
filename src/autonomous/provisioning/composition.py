@@ -76,7 +76,7 @@ from ..outbox.lifecycle import EmployeeOutboxLifecycle
 from ..outbox.projection import OutboxProjectionState
 from ..outbox.service import EmployeeOutboxService
 from ..supervisor.employee_channels import (
-    ChannelProcessState,
+    ChannelProcessState,  # noqa: F401 — accessed via _composition_module()
     EmployeeChannelSupervisor,
 )
 from ..workforce.credential_vault import CredentialVault
@@ -665,134 +665,6 @@ class EmployeeDepartmentRuntime(
             return RuntimeReadiness(False, self._blockers or ("not_composed",))
         service_readiness: HireReadiness = self._service.readiness()
         return RuntimeReadiness(service_readiness.ready, service_readiness.blockers)
-
-    def _prepare_execution_probe(
-        self,
-        agent_id: str | None = None,
-    ) -> tuple[RuntimeReadiness, Any, tuple[DurableHireState, ...]]:
-        """Synchronize the common readiness boundary once per probe batch."""
-
-        projection = None
-        active: tuple[DurableHireState, ...] = ()
-        hire = self.hire_readiness()
-        if not hire.ready:
-            return hire, projection, active
-        if self._execution_blockers:
-            return RuntimeReadiness(False, self._execution_blockers), projection, active
-        if (
-            self._ingress is None
-            or self._router is None
-            or self._dispatch is None
-            or self._outbox is None
-            or self._outbox_delivery is None
-            or self._data is None
-            or self._context_service is None
-        ):
-            return RuntimeReadiness(False, ("employee_gateway",)), projection, active
-        if self._channels is None or not callable(getattr(self._channels, "update_card", None)):
-            return RuntimeReadiness(False, ("employee_outbox",)), projection, active
-        if self._service is None:
-            return RuntimeReadiness(False, ("not_composed",)), projection, active
-        try:
-            projection = self._service.synchronize_projection()
-            active = tuple(
-                state
-                for state in self._service.list_states()
-                if state.phase is HirePhase.ACTIVE and (agent_id is None or state.agent_id == agent_id)
-            )
-            if not active:
-                blocker = ("employee_not_active",) if agent_id is not None else ()
-                return RuntimeReadiness(not blocker, blocker), projection, active
-            if self._context_source_factory is None:
-                return (
-                    RuntimeReadiness(
-                        False,
-                        self._context_blockers or ("employee_context",),
-                    ),
-                    projection,
-                    active,
-                )
-            if not getattr(self._context_acl, "configured", False):
-                return (
-                    RuntimeReadiness(False, ("context_request_authority",)),
-                    projection,
-                    active,
-                )
-            self._data.service.rebuild_projection()
-            projection = self._service.synchronize_projection()
-            if not self._refresh_context_bindings(projection):
-                return (
-                    RuntimeReadiness(False, ("context_binding_sync",)),
-                    projection,
-                    active,
-                )
-            head = self._data.service.get_head()
-            if head.sequence != projection.cursor_sequence or head.logical_hash != projection.cursor_hash:
-                return (
-                    RuntimeReadiness(False, ("context_projection_stale",)),
-                    projection,
-                    active,
-                )
-            return RuntimeReadiness(True, ()), projection, active
-        except Exception:
-            return RuntimeReadiness(False, ("employee_context",)), projection, active
-
-    def _probe_employee_execution(
-        self,
-        projection: Any,
-        state: DurableHireState,
-        *,
-        chat_id: str | None,
-        probe_remote: bool = True,
-    ) -> RuntimeReadiness:
-        if chat_id is not None and (not isinstance(chat_id, str) or not chat_id.strip()):
-            return RuntimeReadiness(False, ("context_group_history",))
-        try:
-            employee = projection.employees.get(state.agent_id)
-            principal = projection.bot_principals.get(state.bot_principal_id)
-            status = self._channels.status(state.agent_id) if self._channels else None
-            status_state = getattr(status, "state", None)
-            if (
-                employee is None
-                or principal is None
-                or employee.bot_principal_id != state.bot_principal_id
-                or principal.agent_id != state.agent_id
-                or principal.tenant_key != state.tenant_key
-                or principal.app_id != state.app_id
-                or not principal.credential_ref
-            ):
-                return RuntimeReadiness(False, ("context_binding",))
-            if (
-                status_state is not ChannelProcessState.READY
-                or getattr(status, "generation", None) != state.channel_generation
-                or getattr(status, "identity", {}).get("app_id") != state.app_id
-                or getattr(status, "ready_metadata", {}).get("connection_id") != state.channel_connection_id
-            ):
-                return RuntimeReadiness(False, ("context_generation",))
-            if chat_id is not None and chat_id not in employee.member_groups:
-                return RuntimeReadiness(False, ("context_group_membership",))
-            # Team admission is based on anchored workforce membership and the
-            # current READY Channel binding.  Live Context probes run when the
-            # task is dispatched, where failures remain fail-closed, but they
-            # must not block chat routing or overwrite durable group status.
-            if not probe_remote:
-                return RuntimeReadiness(True, ())
-            if self._context_source_factory.probe(principal) is not True:
-                return RuntimeReadiness(False, ("context_credentials",))
-            probe_group_history = getattr(
-                self._context_source_factory,
-                "probe_group_history",
-                None,
-            )
-            groups_to_probe = (chat_id,) if chat_id is not None else tuple(sorted(employee.member_groups))
-            if groups_to_probe and not callable(probe_group_history):
-                return RuntimeReadiness(False, ("context_group_history",))
-            for group_id in groups_to_probe:
-                if probe_group_history(principal, group_id) is not True:
-                    return RuntimeReadiness(False, ("context_group_history",))
-            return RuntimeReadiness(True, ())
-        except Exception:
-            return RuntimeReadiness(False, ("employee_context",))
 
     def recover(self) -> EmployeeRecoverySummary:
         """Run startup recovery once and wait for its actual terminal result."""

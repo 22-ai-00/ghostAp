@@ -137,18 +137,6 @@ class TestDailyHistoryMaterializer:
         blob_store.close()
         writer.close()
 
-    def test_verify_shard_detects_mismatch(self, tmp_path: Path) -> None:
-        svc, state, writer, blob_store = _service(tmp_path)
-        _publish_record(svc)
-        mat = DailyHistoryMaterializer(tmp_path / "agents")
-        mat.materialize_day(state, "tenant_1", "agt_alpha", "2026-07-12")
-        assert mat.verify_shard(state, "tenant_1", "agt_alpha", "2026-07-12")
-        shard_path = tmp_path / "agents" / "agt_alpha" / "history" / "2026-07-12.jsonl"
-        shard_path.write_text("corrupted\n")
-        assert not mat.verify_shard(state, "tenant_1", "agt_alpha", "2026-07-12")
-        blob_store.close()
-        writer.close()
-
     def test_empty_day_returns_none(self, tmp_path: Path) -> None:
         state = DataProjectionState()
         mat = DailyHistoryMaterializer(tmp_path / "agents")

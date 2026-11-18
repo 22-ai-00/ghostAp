@@ -178,56 +178,6 @@ def test_conflicting_duplicate_and_late_terminal_progress_are_rejected(tmp_path)
         writer.close()
 
 
-def test_collaboration_publication_is_bound_to_employee_app_generation(tmp_path) -> None:
-    service, writer, _anchor = _runtime(tmp_path)
-    try:
-        queued = _snapshot()
-        service.append_snapshot(queued)
-        running = replace(
-            queued,
-            version=2,
-            state=EmployeeCardState.RUNNING,
-            progress_percent=50,
-        )
-        service.append_snapshot(running)
-        terminal = replace(
-            running,
-            version=3,
-            state=EmployeeCardState.COMPLETED,
-            progress_percent=100,
-            terminal_version=3,
-        )
-        service.append_snapshot(terminal)
-        effect = service.prepare_delivery(terminal.outbox_id, terminal.version)
-        service.mark_effect_executing(effect.effect_id)
-        service.commit_delivery(
-            effect.effect_id,
-            app_id="cli_alpha",
-            generation=3,
-            connection_id="conn_alpha",
-            message_id="om_employee_contribution",
-        )
-        assert service.record_collaboration_publication(
-            outbox_id=terminal.outbox_id,
-            team_run_id="teamrun2_x",
-            assignment_id="teamrun2_x:assignment:1",
-            causal_event_id="cause_x",
-        )
-        event = tuple(writer.replay())[-1].events[0]
-        assert event.payload["agent_id"] == "agt_alpha"
-        assert event.payload["app_id"] == "cli_alpha"
-        assert event.payload["generation"] == 3
-        assert service.record_collaboration_publication(
-            outbox_id=terminal.outbox_id,
-            team_run_id="teamrun2_x",
-            assignment_id="teamrun2_x:assignment:1",
-            causal_event_id="cause_x",
-        )
-    finally:
-        service.close()
-        writer.close()
-
-
 def test_restart_replays_snapshots_and_missing_blob_closes_only_employee(tmp_path) -> None:
     service, writer, anchor = _runtime(tmp_path)
     snapshot = _snapshot()

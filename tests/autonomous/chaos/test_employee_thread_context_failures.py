@@ -8,7 +8,6 @@ from contextlib import contextmanager
 import pytest
 
 from src.autonomous.context import (
-    ContextPreparingExecutionPort,
     ContextUnavailableError,
     ContextUnavailableReason,
     MessagePage,
@@ -22,8 +21,6 @@ from tests.autonomous.helpers import (
 )
 from tests.autonomous.integration.test_employee_context_service import (
     _composition,
-    _Delegate,
-    _Fence,
     _GroupBackend,
     _request,
 )
@@ -45,46 +42,13 @@ class _SourceFactory:
             self.close_calls += 1
 
 
-class _DispatchSpies(_Delegate):
-    def __init__(self) -> None:
-        super().__init__()
-        self.task_commits = []
-        self.acp_calls = []
-
-    def execute(self, execution_input):
-        self.task_commits.append(execution_input.request.current_message_id)
-        self.acp_calls.append(execution_input.request.current_message_id)
-        return super().execute(execution_input)
-
-
-def _port(*, source_factory, backend=None, config=None):
-    built = _composition(
-        source_factory=source_factory,
-        backend=backend,
-        config=config,
-    )
-    delegate = _DispatchSpies()
-    port = ContextPreparingExecutionPort(
-        context_service=built.service,
-        authority_fence=_Fence(),
-        delegate=delegate,
-    )
-    return built, delegate, port
-
-
-def _assert_zero_dispatch(delegate: _DispatchSpies) -> None:
-    assert delegate.calls == []
-    assert delegate.task_commits == []
-    assert delegate.acp_calls == []
-
-
 class _SlowSource(_FakeSource):
     def list_thread_messages(self, **kwargs):
         time.sleep(0.02)
         return super().list_thread_messages(**kwargs)
 
 
-def test_page_timeout_never_dispatches() -> None:
+def test_page_timeout_fails_closed() -> None:
     thread = [
         _msg("om_root", "root", create=1_000, position=0),
         _msg("om_current", "current", create=3_000, position=1),
@@ -97,16 +61,16 @@ def test_page_timeout_never_dispatches() -> None:
             ]
         )
     )
-    _built, delegate, port = _port(
+    built = _composition(
         source_factory=source_factory,
         config=ThreadContextConfig(fetch_timeout_seconds=0.001),
     )
 
     with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
+        built.service.assemble(_request())
 
     assert raised.value.reason is ContextUnavailableReason.DEADLINE
-    _assert_zero_dispatch(delegate)
+    assert built.source_factory.close_calls == 1
 
 
 class _FailingGroupBackend(_GroupBackend):
@@ -115,16 +79,15 @@ class _FailingGroupBackend(_GroupBackend):
         raise RuntimeError("unsafe group backend detail")
 
 
-def test_group_read_failure_stops_before_source_and_dispatch() -> None:
+def test_group_read_failure_stops_before_source() -> None:
     source_factory = _SourceFactory(_FakeSource(traversals=[]))
-    built, delegate, port = _port(
+    built = _composition(
         source_factory=source_factory,
         backend=_FailingGroupBackend(),
     )
 
     with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
+        built.service.assemble(_request())
 
     assert raised.value.reason is ContextUnavailableReason.MEMORY
     assert built.source_factory.calls == []
-    _assert_zero_dispatch(delegate)

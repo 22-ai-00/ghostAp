@@ -285,64 +285,6 @@ class EmployeeOutboxService:
                 )
             )
 
-    def record_collaboration_publication(
-        self,
-        *,
-        outbox_id: str,
-        team_run_id: str,
-        assignment_id: str,
-        causal_event_id: str,
-    ) -> bool:
-        """Anchor employee-Bot provenance for one visible team contribution."""
-
-        if not all((outbox_id, team_run_id, assignment_id, causal_event_id)):
-            raise ValueError("collaboration publication coordinates are required")
-        with self._mutex, self._writer.transaction_guard():
-            self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            record = self._state.by_outbox_id.get(outbox_id)
-            if record is None or record.binding is None:
-                raise OutboxConflictError("collaboration publication is not delivered")
-            snapshot = self._read_snapshot(record, record.latest)
-            if not snapshot.state.terminal:
-                raise OutboxConflictError("collaboration publication is not terminal")
-            for frame in self._writer.replay():
-                for existing in frame.events:
-                    if existing.event_type != "employee.outbox.collaboration_published":
-                        continue
-                    if existing.payload.get("causal_event_id") != causal_event_id:
-                        continue
-                    return (
-                        existing.aggregate_id == outbox_id
-                        and existing.payload.get("team_run_id") == team_run_id
-                        and existing.payload.get("assignment_id") == assignment_id
-                    )
-            event = JournalEvent(
-                event_type="employee.outbox.collaboration_published",
-                aggregate_id=outbox_id,
-                payload={
-                    "tenant_key": record.tenant_key,
-                    "chat_id": record.chat_id,
-                    "agent_id": record.agent_id,
-                    "app_id": record.binding.app_id,
-                    "generation": record.binding.generation,
-                    "team_run_id": team_run_id,
-                    "assignment_id": assignment_id,
-                    "causal_event_id": causal_event_id,
-                },
-            )
-            last = self._writer.get_last_frame()
-            result = self._writer.commit(
-                (event,),
-                self._writer.get_aggregate_versions((outbox_id,)),
-                expected_head_sequence=0 if last is None else last.sequence,
-                expected_head_hash="" if last is None else last.frame_hash,
-            )
-            if result.state is not CommitState.ANCHORED:
-                raise OutboxWriteDisabledError("collaboration publication was not anchored")
-            self._synchronize_projection_unlocked()
-            return True
-
     def prepare_delivery(
         self,
         outbox_id: str,

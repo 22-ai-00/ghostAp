@@ -592,70 +592,6 @@ class AuthorizedContextRequest:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class EmployeeExecutionInput:
-    """One authorized, context-complete input for the delegated executor."""
-
-    request: AuthorizedContextRequest
-    tool: str
-    model: str
-    effort: str
-    context: AssembledContext
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, AuthorizedContextRequest):
-            raise TypeError("request must be AuthorizedContextRequest")
-        if not isinstance(self.context, AssembledContext):
-            raise TypeError("context must be AssembledContext")
-        for field_name in ("tool", "effort"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} is required")
-        if (
-            not isinstance(self.model, str)
-            or self.model != self.model.strip()
-            or any(ord(character) < 32 for character in self.model)
-        ):
-            raise ValueError("model must be a trimmed string")
-        watermark = self.context.watermark
-        if watermark is None or (
-            watermark.tenant_key != self.request.tenant_key
-            or watermark.chat_id != self.request.chat_id
-            or watermark.thread_root_id
-            != self.request.thread_root_message_id
-            or (
-                self.request.feishu_thread_id
-                and watermark.feishu_thread_id != self.request.feishu_thread_id
-            )
-        ):
-            raise ValueError("context watermark authority mismatch")
-        current = [
-            message
-            for message in self.context.thread_messages
-            if message.is_current
-        ]
-        if (
-            len(current) != 1
-            or current[0].message_id != self.request.current_message_id
-        ):
-            raise ValueError("context current message mismatch")
-        current_message = current[0]
-        if (
-            current_message.sender_id
-            != self.request.source_requester_principal_id
-            or current_message.sender_id_type != "open_id"
-            or current_message.sender_tenant_key != self.request.tenant_key
-        ):
-            raise ValueError("context requester identity mismatch")
-        if (
-            self.context.system_prompt_tokens_reserved
-            != self.request.system_prompt_token_reserve
-            or self.context.constraints_digest
-            != self.request.constraints_digest
-        ):
-            raise ValueError("context trusted reservation mismatch")
-
-
 __all__ = [
     "AssembledContext",
     "AuthorizedContextRequest",
@@ -667,7 +603,6 @@ __all__ = [
     "ContextUnavailableError",
     "ContextUnavailableReason",
     "EmployeeMessageScope",
-    "EmployeeExecutionInput",
     "MessageRevision",
     "MessageSourceError",
     "ThreadContextConfig",

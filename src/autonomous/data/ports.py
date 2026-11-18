@@ -9,21 +9,6 @@ from .models import DataKind
 
 
 @dataclass(frozen=True)
-class AuthenticatedExecutionTerminal:
-    """Trusted terminal outcome from orchestration, not ACP output."""
-
-    attempt_id: str
-    status: str
-    request_text: str
-    result_text: str
-    error_detail: str
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    tool_usage: tuple = ()
-    attachments: tuple = ()
-
-
-@dataclass(frozen=True)
 class PublishEmployeeDocumentCommand:
     """Trusted document publish from orchestration."""
 
@@ -60,8 +45,6 @@ class MemoryQuerySpec:
 
 
 class EmployeeDataSink(Protocol):
-    """Write port for terminal outcomes and document publishes."""
-
-    def record_terminal(self, terminal: AuthenticatedExecutionTerminal) -> None: ...
+    """Write port for document publishes."""
 
     def publish_document(self, command: PublishEmployeeDocumentCommand) -> None: ...

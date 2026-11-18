@@ -1,21 +1,19 @@
 """Immutable Employee Department domain models."""
 
-from .employees import BotPrincipal, EmployeeDefinition, WorkerRuntime
+from .employees import BotPrincipal, EmployeeDefinition
 from .enums import (
     EmployeeIdOrigin,
     EmployeeState,
     WorkerType,
 )
-from .ids import canonical_hash, freeze, new_id, thaw
+from .ids import freeze, new_id, thaw
 
 __all__ = [
     "BotPrincipal",
     "EmployeeDefinition",
     "EmployeeIdOrigin",
     "EmployeeState",
-    "WorkerRuntime",
     "WorkerType",
-    "canonical_hash",
     "freeze",
     "new_id",
     "thaw",

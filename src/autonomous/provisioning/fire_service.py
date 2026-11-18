@@ -875,23 +875,6 @@ class EmployeeFireService:
             intent_id=intent_id,
         )
 
-    def _pending_external_mutation_fence_for(
-        self,
-        target: EmployeeFireTarget,
-    ) -> _PendingExternalMutationFence | None:
-        matches = tuple(
-            pending
-            for pending in self._pending_external_mutation_fences()
-            if (
-                pending.target.tenant_key,
-                pending.target.agent_id,
-            )
-            == (target.tenant_key, target.agent_id)
-        )
-        if len(matches) > 1:
-            raise FireServiceError("external mutation fence authority is ambiguous")
-        return matches[0] if matches else None
-
     def _pending_external_mutation_fences(
         self,
     ) -> tuple[_PendingExternalMutationFence, ...]:

@@ -3,30 +3,6 @@
 from enum import Enum
 
 
-class GoalType(str, Enum):
-    ONE_SHOT = "one_shot"
-    SCHEDULED = "scheduled"
-    STANDING = "standing"
-
-
-class AutonomyMode(str, Enum):
-    ASSIST = "assist"
-    SUPERVISED = "supervised"
-    BOUNDED_AUTONOMOUS = "bounded_autonomous"
-
-
-class MisfirePolicy(str, Enum):
-    RUN_ALL = "run_all"
-    SKIP = "skip"
-    RUN_LATEST = "run_latest"
-
-
-class OverlapPolicy(str, Enum):
-    FORBID = "forbid"
-    QUEUE = "queue"
-    ALLOW_PARALLEL = "allow_parallel"
-
-
 class WorkerType(str, Enum):
     LOGICAL = "logical"
     VISIBLE = "visible"

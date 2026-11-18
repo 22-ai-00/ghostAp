@@ -88,34 +88,6 @@ class EmployeeSessionHost:
             self._sessions[agent.agent_id] = session
         return _EmployeeSessionLease(self, agent.agent_id, session)
 
-    def run_agent_session(
-        self,
-        agent: AgentIdentity,
-        prompt: str,
-        *,
-        timeout: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> str:
-        if env is None:
-            raise EmployeeSessionUnavailableError("employee environment is required")
-        lease = self.open_employee_session(agent, env=env)
-        try:
-            result = lease.send_prompt(prompt, timeout=float(timeout or 600.0))
-            if not isinstance(result, str) or not result:
-                raise EmployeeSessionUnavailableError("employee backend returned no output")
-            return result
-        finally:
-            lease.close()
-
-    def preview_employee_session_prompt(self, agent: AgentIdentity, prompt: str) -> str:
-        from .employee_session import EmployeeSessionBootstrap
-        return EmployeeSessionBootstrap.from_agent(
-            tenant_key="employee",
-            agent=agent,
-            project_root=agent.workspace_path,
-            identity_version=0,
-        ).wrap_prompt(prompt)
-
     def cancel_employee_session(self, agent_id: str) -> bool:
         with self._lock:
             session = self._sessions.pop(agent_id, None)

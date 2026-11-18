@@ -14,7 +14,6 @@ from src.autonomous.context import (
     AuthorizedContextRequest,
     AuthorizedGroupMemoryReader,
     ContextLayer,
-    ContextPreparingExecutionPort,
     ContextUnavailableError,
     ContextUnavailableReason,
     EmployeeContextService,
@@ -163,21 +162,6 @@ class _SourceFactory:
             yield self.source
         finally:
             self.close_calls += 1
-
-
-class _Delegate:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def execute(self, execution_input):
-        self.calls.append(execution_input)
-        return "task_1"
-
-
-class _Fence:
-    def run_if_current(self, request, action):
-        del request
-        return action()
 
 
 def _composition(
@@ -684,22 +668,15 @@ def test_request_authority_failure_prevents_all_external_reads(
     assert built.source_factory.calls == []
 
 
-def test_authority_change_after_snapshot_closes_source_and_never_delegates() -> None:
+def test_authority_change_after_snapshot_closes_source() -> None:
     generation = _BooleanAuthority([True, True, False])
     built = _composition(generation=generation)
-    delegate = _Delegate()
-    port = ContextPreparingExecutionPort(
-        context_service=built.service,
-        authority_fence=_Fence(),
-        delegate=delegate,
-    )
 
     with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
+        built.service.assemble(_request())
 
     assert raised.value.reason is ContextUnavailableReason.SCOPE
     assert built.source_factory.close_calls == 1
-    assert delegate.calls == []
 
 
 def test_projection_head_mismatch_fails_before_memory_or_source_reads() -> None:

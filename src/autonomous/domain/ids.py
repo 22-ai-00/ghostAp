@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import uuid
 from collections.abc import Mapping
@@ -38,18 +36,6 @@ def thaw(value: Any) -> Any:
     if isinstance(value, frozenset):
         return sorted(thaw(item) for item in value)
     return value
-
-
-def canonical_hash(value: Any) -> str:
-    """Hash a JSON-compatible value using canonical UTF-8 serialization."""
-    payload = json.dumps(
-        thaw(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def strict_bool(value: Any, field_name: str) -> bool:

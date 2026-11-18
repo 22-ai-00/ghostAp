@@ -919,58 +919,6 @@ class EmployeeRuntimeIngressMixin:
             result.pop(open_id, None)
         return result, frozenset(ambiguous)
 
-    def wait_for_employee_message_acceptance(
-        self,
-        *,
-        tenant_key: str,
-        agent_id: str,
-        bot_principal_id: str,
-        app_id: str,
-        channel_generation: int,
-        connection_id: str,
-        chat_id: str,
-        message_id: str,
-        timeout: float,
-    ) -> bool:
-        """Prove that one employee transport anchored this exact message."""
-
-        ingress = self._ingress
-        if ingress is None:
-            return False
-        values = (tenant_key, agent_id, bot_principal_id, app_id, chat_id, message_id)
-        safe_identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
-        if any(
-            not isinstance(value, str) or not value or len(value) > 256 or safe_identifier.fullmatch(value) is None
-            for value in values
-        ) or (
-            not agent_id.startswith("agt_")
-            or not bot_principal_id.startswith("bot_")
-            or not app_id.startswith("cli_")
-            or not chat_id.startswith("oc_")
-            or not message_id.startswith("om_")
-        ):
-            return False
-        indexed_chat_id = "oc_" + hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
-        indexed_message_id = "om_" + hashlib.sha256(message_id.encode("utf-8")).hexdigest()
-        acceptance = ingress.wait_for_anchored_message_acceptance(
-            tenant_key=tenant_key,
-            agent_id=agent_id,
-            bot_principal_id=bot_principal_id,
-            app_id=app_id,
-            event_type="im.message.receive_v1",
-            chat_id=indexed_chat_id,
-            message_id=indexed_message_id,
-            channel_generation=channel_generation,
-            connection_id=connection_id,
-            timeout=timeout,
-        )
-        return (
-            getattr(acceptance, "status", None) == "accepted"
-            and getattr(acceptance, "acceptance", None) is not None
-            and getattr(acceptance, "channel_generation", None) == channel_generation
-            and getattr(acceptance, "connection_id", None) == connection_id
-        )
-
     def _employee_handoff_finalization_state(
         self,
     ) -> tuple[
@@ -1593,13 +1541,6 @@ class EmployeeRuntimeIngressMixin:
             )
             and len(getattr(authority, "target_bot_open_id_digest", "")) == 64
         )
-
-    @classmethod
-    def _employee_targeted_queue_owned(cls, record: object) -> bool:
-        """Return whether the Employee durably accepted response ownership."""
-
-        queued_sequence = getattr(record, "queued_sequence", 0)
-        return type(queued_sequence) is int and queued_sequence > 0 and cls._employee_targeted_authority_bound(record)
 
     def _validated_employee_terminal_ownership(
         self,

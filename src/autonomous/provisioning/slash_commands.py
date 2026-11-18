@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -143,16 +143,6 @@ class SlashPermissionRequired(SlashCommandAPIError):
 
 class SlashReconciliationError(RuntimeError):
     """Exact Slash desired state could not be verified."""
-
-
-class SlashCommandAPI(Protocol):
-    """Port for Feishu Slash Command OpenAPI."""
-
-    def list_commands(self, app_id: str) -> list[dict[str, Any]]: ...
-
-    def create_command(self, app_id: str, *, name: str, description: str, usage_hint: str) -> str: ...
-
-    def delete_command(self, app_id: str, command_id: str) -> bool: ...
 
 
 class AsyncSlashCommandAPI(Protocol):
@@ -327,13 +317,3 @@ class SlashCommandReconciler:
             if applied:
                 return
             raise SlashReconciliationError(f"Slash {method} {command.command} outcome could not be verified") from None
-
-
-@dataclass
-class CommandSyncResult:
-    """Outcome of slash command synchronization."""
-
-    created: list[str] = field(default_factory=list)
-    deleted: list[str] = field(default_factory=list)
-    unchanged: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)

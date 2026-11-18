@@ -8,7 +8,6 @@ from dataclasses import replace
 import pytest
 
 from src.autonomous.context import (
-    ContextPreparingExecutionPort,
     ContextUnavailableError,
     ContextUnavailableReason,
     ThreadContextConfig,
@@ -24,8 +23,6 @@ from tests.autonomous.helpers import (
 )
 from tests.autonomous.integration.test_employee_context_service import (
     _composition,
-    _Delegate,
-    _Fence,
     _request,
 )
 
@@ -46,17 +43,6 @@ class _SourceFactory:
             self.close_calls += 1
 
 
-def _execution_port(source_factory: _SourceFactory, *, config=None):
-    built = _composition(source_factory=source_factory, config=config)
-    delegate = _Delegate()
-    port = ContextPreparingExecutionPort(
-        context_service=built.service,
-        authority_fence=_Fence(),
-        delegate=delegate,
-    )
-    return built, delegate, port
-
-
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
@@ -75,7 +61,7 @@ def _execution_port(source_factory: _SourceFactory, *, config=None):
         ),
     ],
 )
-def test_cross_tenant_chat_thread_returns_fail_closed_and_never_dispatch(
+def test_cross_tenant_chat_thread_returns_fail_closed(
     mutation: dict[str, str],
     reason: ContextUnavailableReason,
 ) -> None:
@@ -92,13 +78,12 @@ def test_cross_tenant_chat_thread_returns_fail_closed_and_never_dispatch(
             ]
         )
     )
-    built, delegate, port = _execution_port(source_factory)
+    built = _composition(source_factory=source_factory)
 
     with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
+        built.service.assemble(_request())
 
     assert raised.value.reason is reason
-    assert delegate.calls == []
     assert built.source_factory.close_calls == 1
 
 
@@ -118,7 +103,7 @@ def test_cross_tenant_chat_thread_returns_fail_closed_and_never_dispatch(
         ),
     ],
 )
-def test_oversized_protected_current_fails_budget_and_never_dispatches(
+def test_oversized_protected_current_fails_budget(
     config: ThreadContextConfig,
 ) -> None:
     root = _msg("om_root", "", create=1_000, position=0)
@@ -131,14 +116,13 @@ def test_oversized_protected_current_fails_budget_and_never_dispatches(
             ]
         )
     )
-    built, delegate, port = _execution_port(
-        source_factory,
+    built = _composition(
+        source_factory=source_factory,
         config=config,
     )
 
     with pytest.raises(ContextUnavailableError) as raised:
-        port.execute(_request(), tool="codex", model="gpt", effort="high")
+        built.service.assemble(_request())
 
     assert raised.value.reason is ContextUnavailableReason.BUDGET
-    assert delegate.calls == []
     assert built.source_factory.close_calls == 1
