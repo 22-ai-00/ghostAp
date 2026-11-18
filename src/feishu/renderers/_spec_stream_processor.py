@@ -17,7 +17,6 @@ from ...card.render.build_heartbeat import BuildHeartbeat
 from ...card.spec_adapter import SpecCardSession
 from ...card.state.models import CardMetadata
 from ...card.ui_text import UI_TEXT
-from ...spec_engine import SpecEngineCallbacks
 from ...spec_engine.artifact_display import build_plan_display_payload, build_task_display_payloads
 from ...spec_engine.artifacts import parse_spec_artifact
 from ...spec_engine.models import (
@@ -28,6 +27,9 @@ from ...spec_engine.models import (
 )
 from ...spec_engine.retry_status import RetryEvent, RetryStatus
 from ...spec_engine.review_display import build_review_role_payloads, format_review_overview
+
+if TYPE_CHECKING:
+    from ...spec_engine import SpecEngineCallbacks
 from ._base_stream_processor import BaseStreamProcessor
 from .base import _dispatch_text_block
 
@@ -481,6 +483,8 @@ class SpecStreamProcessor(BaseStreamProcessor):
 
     def build_callbacks(self) -> SpecEngineCallbacks:
         """Assemble a SpecEngineCallbacks bound to this processor's methods."""
+        from ...spec_engine import SpecEngineCallbacks
+
         return SpecEngineCallbacks(
             on_analyzing_start=self.on_analyzing_start,
             on_analyzing_done=self.on_analyzing_done,

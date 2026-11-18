@@ -212,3 +212,158 @@ with (
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_install_lazy_lark_channel_lazy_resolution_and_exports():
+    """install_lazy_lark_channel() defers channel client/API loading until accessed."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from src.utils.lark_lazy import install_lazy_lark_channel
+
+assert install_lazy_lark_channel() is True
+import lark_channel
+assert getattr(lark_channel, "_IS_LAZY_LARK_CHANNEL_ROOT", False) is True
+
+from lark_channel import EventDispatcherHandler, LogLevel, TransportConfig
+assert EventDispatcherHandler.builder("", "") is not None
+assert LogLevel.WARNING is not None
+assert TransportConfig(kind="webhook", http_timeout_seconds=5.0).kind == "webhook"
+
+# EventDispatcherHandler / LogLevel / TransportConfig must not load FeishuChannel, client, or cardkit APIs
+assert type(sys.modules["lark_channel.channel"]).__name__ == "_LazyChannelSubpackage"
+assert "lark_channel.channel.channel" not in sys.modules
+assert "lark_channel.client" not in sys.modules
+assert not any(m.startswith("lark_channel.api.cardkit") for m in sys.modules)
+
+# Client builder & single-service lazy hydration
+client = (
+    lark_channel.Client.builder()
+    .app_id("cli_a")
+    .app_secret("sec_b")
+    .proxy_url(None)
+    .trust_env_proxy(False)
+    .build()
+)
+assert client.cardkit.v1.card is not None
+assert not any(m.startswith("lark_channel.api.drive") for m in sys.modules)
+assert not any(m.startswith("lark_channel.api.wiki") for m in sys.modules)
+
+from lark_channel.api.cardkit.v1.model.card import Card
+assert Card is not None
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_install_lazy_lark_channel_returns_false_when_real_sdk_loaded_early():
+    """If real lark_channel is already in sys.modules, install_lazy_lark_channel returns False."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import lark_channel  # noqa: F401
+from src.utils.lark_lazy import install_lazy_lark_channel
+
+assert install_lazy_lark_channel() is False
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_lazy_lark_oapi_root_client_exports_and_version_model_hydration():
+    """Lazy root attribute lookup skips core/card until needed and hydrates version models."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from src.utils.lark_lazy import install_lazy_lark_oapi
+
+assert install_lazy_lark_oapi() is True
+import lark_oapi as lark
+
+# Accessing a service subpackage directly must not eagerly import core or card
+assert lark.im.v1 is not None
+assert "lark_oapi.card" not in sys.modules
+assert "lark_oapi.core" not in sys.modules
+
+# Standard symbols exported by lark_oapi.client must resolve
+from lark_oapi.client import (
+    AppType,
+    BaseRequest,
+    BaseResponse,
+    Config,
+    Files,
+    JSON,
+    LogLevel,
+    RequestOption,
+    TokenManager,
+    Transport,
+    verify,
+)
+assert all(
+    sym is not None
+    for sym in (AppType, BaseRequest, BaseResponse, Config, Files, JSON, LogLevel, RequestOption, TokenManager, Transport, verify)
+)
+
+# Importing .version hydrates .model first
+import lark_oapi.api.im.v1.version as im_v1_version
+from lark_oapi.api.im.v1 import GetChatRequest
+assert getattr(im_v1_version, "GetChatRequest", None) is GetChatRequest
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+
+
+def test_feishu_ws_client_startup_defers_heavy_sdks_and_engines():
+    """Creating FeishuWSClient keeps acp, lark_channel.channel, and heavy engines unloaded."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+import src.main as main_mod
+
+main_mod._activate_lark_import_cache()
+main_mod._load_feishu_runtime()
+from src.feishu.ws_client import FeishuWSClient
+
+client = FeishuWSClient(message_callback=lambda *_a, **_kw: None)
+assert client is not None
+for forbidden in (
+    "acp",
+    "lark_channel.channel",
+    "lark_channel.channel.channel",
+    "src.workflow_engine.engine",
+    "src.spec_engine.engine",
+    "src.acp.client",
+    "src.acp.session",
+):
+    assert forbidden not in sys.modules, f"{forbidden} unexpectedly loaded at startup"
+assert len([m for m in sys.modules if m.startswith("lark_oapi")]) < 150
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"

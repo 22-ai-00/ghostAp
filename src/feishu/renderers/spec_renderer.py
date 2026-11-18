@@ -7,7 +7,6 @@ from ...card.events import CardEvent
 from ...card.render.budget import RenderBudget
 from ...card.state.models import CardMetadata
 from ...card.ui_text import UI_TEXT
-from ...spec_engine import SpecEngineCallbacks
 from ...spec_engine.review_display import build_review_role_payloads, format_review_overview
 from ._spec_stream_processor import SpecStreamProcessor
 from .base import BaseRenderer, EngineProfile
@@ -17,6 +16,7 @@ if TYPE_CHECKING:
     from ...card.session import CardSession
     from ...card.session.rotator import SessionRotator
     from ...project import ProjectContext
+    from ...spec_engine import SpecEngineCallbacks
     from ..handlers.spec import SpecHandler
 
 logger = logging.getLogger(__name__)

@@ -1,12 +1,14 @@
 import json
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..engine_base import BaseEngineManager
-from .engine import SpecEngine
 from .models import SpecProject
 from .storage import state_path_candidates
+
+if TYPE_CHECKING:
+    from .engine import SpecEngine
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
         engine_name: str,
         model_name: Optional[str],
     ) -> "SpecEngine":
+        from .engine import SpecEngine
+
         return SpecEngine(
             chat_id=chat_id,
             root_path=root_path,
@@ -47,6 +51,8 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
         normalized_agent = str(agent_type or "").strip().lower()
         if normalized_agent:
             if normalized_agent not in _KNOWN_SPEC_BACKENDS:
+                from .engine import SpecEngine
+
                 return SpecEngine._infer_engine_name(normalized_agent), normalized_agent, model_name
             if normalized_agent == "claude":
                 return "Claude", "claude", None

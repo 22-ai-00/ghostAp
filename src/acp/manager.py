@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -13,13 +14,21 @@ from ..config import get_settings
 from ..utils.errors import get_error_detail
 from . import startup_utils as _startup_utils
 from .helper import SessionKeyCodec
-from .sync_adapter import SyncACPSession
 from .telemetry import (
     IdleHealthConfig,
     resolve_idle_health_collaborators_for_manager,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    if name == "SyncACPSession":
+        from .sync_adapter import SyncACPSession
+
+        globals()["SyncACPSession"] = SyncACPSession
+        return SyncACPSession
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 @dataclass(frozen=True)
 class SessionReplacementResult:
     """Outcome of an identity-guarded session replacement."""
@@ -226,11 +235,12 @@ class ACPSessionManager:
                 ):
                     self._closing_sessions.pop(key, None)
     def _build_startup_coordinator(self) -> _startup_utils.SessionStartupCoordinator:
+        sync_acp_session_cls = getattr(sys.modules[__name__], "SyncACPSession")
         return _startup_utils.SessionStartupCoordinator(
             manager_agent_type=self._agent_type,
             session_starter=self._session_starter,
             session_telemetry=self._session_telemetry,
-            sync_acp_session_cls=SyncACPSession,
+            sync_acp_session_cls=sync_acp_session_cls,
             sync_claude_cli_session_cls=SyncClaudeCLISession,
             get_settings_fn=get_settings,
         )

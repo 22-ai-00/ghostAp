@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
 
 from ..acp.models import ACPEvent, PromptResult
-from ..acp.sync_adapter import SyncACPSession
 from ..config import get_settings
 from ..utils.errors import get_error_detail
 from .model_diagnostics import (
@@ -21,6 +21,15 @@ from .model_diagnostics import (
 from .protocol import SyncSession, _SessionWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "SyncACPSession":
+        from ..acp.sync_adapter import SyncACPSession
+
+        globals()["SyncACPSession"] = SyncACPSession
+        return SyncACPSession
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _prompt_kwargs(
@@ -376,7 +385,8 @@ class ModelFailureAwareSession(_SessionWrapper):
         timeout_s = max(1.0, timeout_s)
 
         def create_candidate() -> SyncSession:
-            return SyncACPSession(
+            sync_acp_session_cls = getattr(sys.modules[__name__], "SyncACPSession")
+            return sync_acp_session_cls(
                 agent_type=agent_type,
                 cwd=cwd,
                 agent_cmd=agent_cmd,

@@ -11,29 +11,30 @@
 
 import asyncio
 import contextvars
+import gc
 import hashlib
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import lark_oapi as lark
-from lark_channel import EventDispatcherHandler as ChannelEventDispatcherHandler
-from lark_channel import FeishuChannel
-from lark_channel import LogLevel as ChannelLogLevel
-from lark_channel import TransportConfig as ChannelTransportConfig
 from lark_channel.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
     P2CardActionTriggerResponse,
 )
 from lark_oapi.api.im.v1 import GetChatRequest
+
+if TYPE_CHECKING:
+    from lark_channel import FeishuChannel
 
 # NOTE: lark-oapi 的 event callback models 在不同版本中并不完整。
 # 本项目仅将 P2ImMessageReceiveV1 用于类型标注；运行时缺失不应导致 import 失败。
@@ -443,7 +444,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         self._main_bot_identity_cond = threading.Condition(self._main_bot_identity_lock)
         self._main_bot_identity_inflight = False
         self._main_bot_identity_next_retry_at = 0.0
-        self._channel_client: Optional[FeishuChannel] = None
+        self._channel_client: Optional["FeishuChannel"] = None
         self._slash_command_sync_thread: Optional[threading.Thread] = None
         self._slash_command_sync_wakeup = threading.Event()
         self._slash_permission_notice_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -1153,7 +1154,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
             )
         return self._api_client
 
-    def _get_channel_client(self) -> FeishuChannel:
+    def _get_channel_client(self) -> "FeishuChannel":
         """Return the process-shared Channel SDK client for programming cards.
 
         Inbound events use the dedicated raw Channel WebSocket client.  This
@@ -1163,12 +1164,16 @@ class FeishuWSClient(WSManagedGroupsMixin):
         """
         with self._channel_client_lock:
             if self._channel_client is None:
+                mod = sys.modules[__name__]
+                channel_cls = getattr(mod, "FeishuChannel")
+                log_level_cls = getattr(mod, "ChannelLogLevel")
+                transport_cfg_cls = getattr(mod, "ChannelTransportConfig")
                 timeout = float(self.settings.card.delivery_api_timeout)
-                self._channel_client = FeishuChannel(
+                self._channel_client = channel_cls(
                     app_id=self.settings.app_id,
                     app_secret=self.settings.app_secret,
-                    log_level=ChannelLogLevel.WARNING,
-                    transport=ChannelTransportConfig(
+                    log_level=log_level_cls.WARNING,
+                    transport=transport_cfg_cls(
                         kind="webhook",
                         http_timeout_seconds=timeout,
                     ),
@@ -1221,6 +1226,13 @@ class FeishuWSClient(WSManagedGroupsMixin):
                     len(verified.updated),
                     len(verified.deleted),
                 )
+                try:
+                    from ..utils.memory_tuning import trim_process_heap
+
+                    gc.collect()
+                    trim_process_heap()
+                except Exception:
+                    pass
                 return
 
             self._slash_command_sync_wakeup.wait(_MAIN_SLASH_SYNC_RETRY_SECONDS)
@@ -3707,8 +3719,9 @@ class FeishuWSClient(WSManagedGroupsMixin):
     def _build_event_handler(self):
         """Build the main Bot dispatcher with every subscribed event consumed."""
 
+        dispatcher_cls = getattr(sys.modules[__name__], "ChannelEventDispatcherHandler")
         event_builder = (
-            ChannelEventDispatcherHandler.builder("", "")
+            dispatcher_cls.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message)
             .register_p2_im_message_reaction_created_v1(_ignore_ws_event)
             .register_p2_im_message_reaction_deleted_v1(_ignore_ws_event)
@@ -3778,6 +3791,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 )
                 time.sleep(reconnect_delay)
                 continue
+            log_level_cls = getattr(sys.modules[__name__], "ChannelLogLevel")
             self._client = ObservedLarkWSClient(
                 self.settings.app_id,
                 self.settings.app_secret,
@@ -3786,7 +3800,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 # INFO/DEBUG. Lifecycle health is observed through hooks, so
                 # WARNING keeps diagnostics without persisting access_key or
                 # ticket query parameters.
-                log_level=ChannelLogLevel.WARNING,
+                log_level=log_level_cls.WARNING,
                 source="ghostap",
                 on_activity=self._record_ws_activity,
                 on_response_written=self._finish_card_advisories,
@@ -3806,3 +3820,28 @@ class FeishuWSClient(WSManagedGroupsMixin):
 
             logger.warning("飞书 WS 连接已断开，%.1fs 后重连...", reconnect_delay)
             time.sleep(reconnect_delay)
+
+
+_LAZY_CHANNEL_ATTRS = frozenset(
+    {
+        "FeishuChannel",
+        "ChannelEventDispatcherHandler",
+        "ChannelLogLevel",
+        "ChannelTransportConfig",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY_CHANNEL_ATTRS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from lark_channel import EventDispatcherHandler as ChannelEventDispatcherHandler
+    from lark_channel import FeishuChannel
+    from lark_channel import LogLevel as ChannelLogLevel
+    from lark_channel import TransportConfig as ChannelTransportConfig
+
+    globals()["FeishuChannel"] = FeishuChannel
+    globals()["ChannelEventDispatcherHandler"] = ChannelEventDispatcherHandler
+    globals()["ChannelLogLevel"] = ChannelLogLevel
+    globals()["ChannelTransportConfig"] = ChannelTransportConfig
+    return globals()[name]

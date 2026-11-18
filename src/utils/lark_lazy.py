@@ -45,6 +45,44 @@ _TOP_LEVEL_SYMBOL_MODULES = {
     "CardActionHandler": ("lark_oapi.card.action_handler", "CardActionHandler"),
 }
 
+_CHANNEL_TOP_SUBMODULES = frozenset(
+    {"api", "channel", "client", "core", "event", "ws"}
+)
+_CHANNEL_TOP_SYMBOL_MODULES = {
+    "EventContext": ("lark_channel.event.context", "EventContext"),
+    "CustomizedEvent": ("lark_channel.event.custom", "CustomizedEvent"),
+    "EventDispatcherHandler": ("lark_channel.event.dispatcher_handler", "EventDispatcherHandler"),
+    "FeishuChannel": ("lark_channel.channel.channel", "FeishuChannel"),
+    "TransportConfig": ("lark_channel.channel.config", "TransportConfig"),
+    "OutboundCard": ("lark_channel.channel.types", "OutboundCard"),
+    "FeishuChannelErrorCode": ("lark_channel.channel.errors", "FeishuChannelErrorCode"),
+}
+_CHANNEL_SUBPKG_SYMBOL_MODULES = {
+    "FeishuChannel": "lark_channel.channel.channel",
+    "TransportConfig": "lark_channel.channel.config",
+    "ChannelConfig": "lark_channel.channel.config",
+    "SafetyConfig": "lark_channel.channel.config",
+    "SecurityConfig": "lark_channel.channel.config",
+    "PolicyConfig": "lark_channel.channel.config",
+    "InboundConfig": "lark_channel.channel.config",
+    "OutboundConfig": "lark_channel.channel.config",
+    "KeepaliveConfig": "lark_channel.channel.config",
+    "MediaCacheConfig": "lark_channel.channel.config",
+    "ChatModeCacheConfig": "lark_channel.channel.config",
+    "ChatQueueConfig": "lark_channel.channel.config",
+    "DedupConfig": "lark_channel.channel.config",
+    "TextBatchConfig": "lark_channel.channel.config",
+    "RetryConfig": "lark_channel.channel.config",
+    "UATConfig": "lark_channel.channel.config",
+    "OutboundCard": "lark_channel.channel.types",
+    "FeishuChannelError": "lark_channel.channel.errors",
+    "FeishuChannelErrorCode": "lark_channel.channel.errors",
+    "OutboundSendError": "lark_channel.channel.errors",
+    "SendError": "lark_channel.channel.errors",
+    "ChannelEventName": "lark_channel.channel.events",
+    "Events": "lark_channel.channel.events",
+}
+
 
 def _to_snake_case(name: str) -> str:
     s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
@@ -130,6 +168,12 @@ class _LazyLarkRootModule(_LazyLarkPackage):
                 self.__dict__[name] = mod
                 return mod
 
+            # Check `lark_oapi.api.<svc>` before eagerly loading `core` or `card`
+            if (pkg_dir / "api" / name).is_dir():
+                mod = importlib.import_module(f"lark_oapi.api.{name}")
+                self.__dict__[name] = mod
+                return mod
+
             # Exports from `lark_oapi.core` (`from .core import *`)
             core_mod = importlib.import_module("lark_oapi.core")
             if hasattr(core_mod, name):
@@ -152,6 +196,113 @@ class _LazyLarkRootModule(_LazyLarkPackage):
                 return val
 
         raise AttributeError(f"module 'lark_oapi' has no attribute {name!r}")
+
+
+class _LazyChannelRootModule(_LazyLarkPackage):
+    """Lazy replacement for top-level ``lark_channel``."""
+
+    _IS_LAZY_LARK_CHANNEL_ROOT = True
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(f"module 'lark_channel' has no attribute {name!r}")
+
+        with self._lazy_lock:
+            if name in self.__dict__:
+                return self.__dict__[name]
+
+            if name == "Client":
+                client_mod = importlib.import_module("lark_channel.client")
+                val = client_mod.Client
+                self.__dict__["Client"] = val
+                return val
+
+            target = _CHANNEL_TOP_SYMBOL_MODULES.get(name)
+            if target is not None:
+                mod = importlib.import_module(target[0])
+                val = getattr(mod, target[1])
+                self.__dict__[name] = val
+                return val
+
+            pkg_dir = self._lazy_pkg_dir
+            if (
+                name in _CHANNEL_TOP_SUBMODULES
+                or (pkg_dir / name).is_dir()
+                or (pkg_dir / f"{name}.py").is_file()
+            ):
+                mod = importlib.import_module(f"lark_channel.{name}")
+                self.__dict__[name] = mod
+                return mod
+
+            core_mod = importlib.import_module("lark_channel.core")
+            if hasattr(core_mod, name):
+                val = getattr(core_mod, name)
+                self.__dict__[name] = val
+                return val
+
+            for submod_name in (
+                "lark_channel.channel.config",
+                "lark_channel.channel.errors",
+                "lark_channel.channel.events",
+                "lark_channel.channel.types",
+            ):
+                submod = importlib.import_module(submod_name)
+                if hasattr(submod, name):
+                    val = getattr(submod, name)
+                    self.__dict__[name] = val
+                    return val
+
+            channel_mod = importlib.import_module("lark_channel.channel")
+            if hasattr(channel_mod, name):
+                val = getattr(channel_mod, name)
+                self.__dict__[name] = val
+                return val
+
+        raise AttributeError(f"module 'lark_channel' has no attribute {name!r}")
+
+
+class _LazyChannelSubpackage(_LazyLarkPackage):
+    """Lazy package for ``lark_channel.channel`` avoiding eager full-tree load."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+        with self._lazy_lock:
+            if name in self.__dict__:
+                return self.__dict__[name]
+
+            target_mod_name = _CHANNEL_SUBPKG_SYMBOL_MODULES.get(name)
+            if target_mod_name is not None:
+                mod = importlib.import_module(target_mod_name)
+                if hasattr(mod, name):
+                    val = getattr(mod, name)
+                    self.__dict__[name] = val
+                    return val
+
+            pkg_dir = self._lazy_pkg_dir
+            if (pkg_dir / name).is_dir() or (pkg_dir / f"{name}.py").is_file():
+                mod = importlib.import_module(f"{self.__name__}.{name}")
+                self.__dict__[name] = mod
+                return mod
+
+            for submod_name in (
+                "lark_channel.channel.config",
+                "lark_channel.channel.errors",
+                "lark_channel.channel.events",
+                "lark_channel.channel.types",
+            ):
+                submod = importlib.import_module(submod_name)
+                if hasattr(submod, name):
+                    val = getattr(submod, name)
+                    self.__dict__[name] = val
+                    return val
+
+            _exec_real_init(self, pkg_dir / "__init__.py")
+            if name in self.__dict__:
+                return self.__dict__[name]
+
+        raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
 
 
 class _LazySubmodulePackage(_LazyLarkPackage):
@@ -240,6 +391,12 @@ class _LazyVersionPackage(_LazyLarkPackage):
                             self.__dict__[name] = val
                             return val
 
+            if model_dir.is_dir():
+                model_pkg = importlib.import_module(f"{self.__name__}.model")
+                _exec_real_init(model_pkg, model_dir / "__init__.py")
+                for k, v in vars(model_pkg).items():
+                    if not k.startswith("_") and k not in self.__dict__:
+                        self.__dict__[k] = v
             _exec_real_init(self, pkg_dir / "__init__.py")
             if name in self.__dict__:
                 return self.__dict__[name]
@@ -250,11 +407,20 @@ class _LazyVersionPackage(_LazyLarkPackage):
 class _LazyVersionProxy:
     """Lazy proxy for ``client.<svc>.<ver>`` (loads only accessed resources)."""
 
-    def __init__(self, config: Any, svc_name: str, ver_name: str, ver_dir: Path) -> None:
+    def __init__(
+        self,
+        config: Any,
+        svc_name: str,
+        ver_name: str,
+        ver_dir: Path,
+        *,
+        pkg_prefix: str = "lark_oapi",
+    ) -> None:
         self._config = config
         self._svc_name = svc_name
         self._ver_name = ver_name
         self._ver_dir = ver_dir
+        self._pkg_prefix = pkg_prefix
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._fallback_version: Any = None
 
@@ -268,7 +434,7 @@ class _LazyVersionProxy:
 
             res_file = self._ver_dir / "resource" / f"{name}.py"
             if res_file.is_file():
-                mod_name = f"lark_oapi.api.{self._svc_name}.{self._ver_name}.resource.{name}"
+                mod_name = f"{self._pkg_prefix}.api.{self._svc_name}.{self._ver_name}.resource.{name}"
                 res_mod = importlib.import_module(mod_name)
                 expected_cls = "".join(part.capitalize() for part in name.split("_"))
                 cls = getattr(res_mod, expected_cls, None)
@@ -303,11 +469,11 @@ class _LazyVersionProxy:
                             f"'{self._svc_name}.{self._ver_name}' has no resource {name!r}"
                         )
                     res_pkg = importlib.import_module(
-                        f"lark_oapi.api.{self._svc_name}.{self._ver_name}.resource"
+                        f"{self._pkg_prefix}.api.{self._svc_name}.{self._ver_name}.resource"
                     )
                     _exec_real_init(res_pkg, self._ver_dir / "resource" / "__init__.py")
                     ver_mod = importlib.import_module(
-                        f"lark_oapi.api.{self._svc_name}.{self._ver_name}.version"
+                        f"{self._pkg_prefix}.api.{self._svc_name}.{self._ver_name}.version"
                     )
                     cls_name = self._ver_name.capitalize()
                     ver_cls = getattr(ver_mod, cls_name, None)
@@ -326,10 +492,18 @@ class _LazyVersionProxy:
 class _LazyServiceProxy:
     """Lazy proxy for ``client.<svc>`` (loads only accessed API versions)."""
 
-    def __init__(self, config: Any, svc_name: str, svc_dir: Path) -> None:
+    def __init__(
+        self,
+        config: Any,
+        svc_name: str,
+        svc_dir: Path,
+        *,
+        pkg_prefix: str = "lark_oapi",
+    ) -> None:
         self._config = config
         self._svc_name = svc_name
         self._svc_dir = svc_dir
+        self._pkg_prefix = pkg_prefix
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._fallback_service: Any = None
 
@@ -343,7 +517,13 @@ class _LazyServiceProxy:
 
             ver_dir = self._svc_dir / name
             if ver_dir.is_dir() and re.fullmatch(r"v\d+", name):
-                proxy = _LazyVersionProxy(self._config, self._svc_name, name, ver_dir)
+                proxy = _LazyVersionProxy(
+                    self._config,
+                    self._svc_name,
+                    name,
+                    ver_dir,
+                    pkg_prefix=self._pkg_prefix,
+                )
                 self.__dict__[name] = proxy
                 return proxy
 
@@ -358,7 +538,9 @@ class _LazyServiceProxy:
                         raise AttributeError(
                             f"service '{self._svc_name}' has no attribute {name!r}"
                         )
-                    svc_mod = importlib.import_module(f"lark_oapi.api.{self._svc_name}.service")
+                    svc_mod = importlib.import_module(
+                        f"{self._pkg_prefix}.api.{self._svc_name}.service"
+                    )
                     for obj in vars(svc_mod).values():
                         if isinstance(obj, type) and obj.__module__ == svc_mod.__name__:
                             self._fallback_service = obj(self._config)
@@ -371,20 +553,36 @@ class _LazyServiceProxy:
         raise AttributeError(f"service '{self._svc_name}' has no attribute {name!r}")
 
 
-def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
-    """Construct the lazy drop-in replacement for ``lark_oapi.client``."""
-    from lark_oapi.core import JSON, logger
-    from lark_oapi.core import http as _core_http
-    from lark_oapi.core import token as _core_token
-    from lark_oapi.core.access_token import AccessToken
-    from lark_oapi.core.cache import ICache
-    from lark_oapi.core.const import APPLICATION_JSON, CONTENT_TYPE, UTF_8
-    from lark_oapi.core.enum import AppType, LogLevel
-    from lark_oapi.core.model import BaseRequest, BaseResponse, Config, RequestOption
-    from lark_oapi.core.token import TokenManager
-    from lark_oapi.core.utils.files import Files
+def _build_lazy_client_module(
+    pkg_root: Path, *, pkg_prefix: str = "lark_oapi"
+) -> types.ModuleType:
+    """Construct the lazy drop-in replacement for ``<pkg_prefix>.client``."""
+    core_mod = importlib.import_module(f"{pkg_prefix}.core")
+    JSON = core_mod.JSON
+    logger = core_mod.logger
+    _core_http = importlib.import_module(f"{pkg_prefix}.core.http")
+    _core_token = importlib.import_module(f"{pkg_prefix}.core.token")
+    TokenManager = _core_token.TokenManager
+    ICache = importlib.import_module(f"{pkg_prefix}.core.cache").ICache
+    const_mod = importlib.import_module(f"{pkg_prefix}.core.const")
+    APPLICATION_JSON = const_mod.APPLICATION_JSON
+    CONTENT_TYPE = const_mod.CONTENT_TYPE
+    UTF_8 = const_mod.UTF_8
+    enum_mod = importlib.import_module(f"{pkg_prefix}.core.enum")
+    AppType = enum_mod.AppType
+    LogLevel = enum_mod.LogLevel
+    model_mod = importlib.import_module(f"{pkg_prefix}.core.model")
+    BaseRequest = model_mod.BaseRequest
+    BaseResponse = model_mod.BaseResponse
+    Config = model_mod.Config
+    RequestOption = model_mod.RequestOption
+    Files = importlib.import_module(f"{pkg_prefix}.core.utils.files").Files
+    if pkg_prefix == "lark_oapi":
+        AccessToken: Any = importlib.import_module(f"{pkg_prefix}.core.access_token").AccessToken
+    else:
+        AccessToken = None
 
-    api_root = lark_root / "api"
+    api_root = pkg_root / "api"
 
     def _validate_domain(domain: str) -> None:
         if not isinstance(domain, str) or not domain:
@@ -406,11 +604,12 @@ def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
             )
 
     class Client:
-        """Drop-in lazy replacement for ``lark_oapi.Client``."""
+        """Drop-in lazy replacement for ``Client``."""
 
         def __init__(self) -> None:
             self._config: Optional[Config] = None
-            self.access_token: Optional[AccessToken] = None
+            if AccessToken is not None:
+                self.access_token: Any = None
             self._lazy_services_enabled: bool = False
             self._lazy_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
@@ -433,7 +632,9 @@ def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
                 with self._lazy_lock:
                     if name in self.__dict__:
                         return self.__dict__[name]
-                    proxy = _LazyServiceProxy(self._config, name, svc_dir)
+                    proxy = _LazyServiceProxy(
+                        self._config, name, svc_dir, pkg_prefix=pkg_prefix
+                    )
                     self.__dict__[name] = proxy
                     return proxy
             raise AttributeError(f"'{type(self).__name__}' object has no attribute {name!r}")
@@ -472,7 +673,7 @@ def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
             return resp
 
     class ClientBuilder:
-        """Drop-in replacement for ``lark_oapi.client.ClientBuilder``."""
+        """Drop-in replacement for ``ClientBuilder``."""
 
         def __init__(self) -> None:
             self._config = Config()
@@ -485,13 +686,22 @@ def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
             self._config.app_secret = app_secret
             return self
 
-        def client_assertion_provider(self, provider: Any) -> "ClientBuilder":
-            self._config.client_assertion_provider = provider
-            return self
+        if pkg_prefix == "lark_oapi":
+            def client_assertion_provider(self, provider: Any) -> "ClientBuilder":
+                self._config.client_assertion_provider = provider
+                return self
 
-        def oauth_base_url(self, oauth_base_url: str) -> "ClientBuilder":
-            self._config.oauth_base_url = oauth_base_url
-            return self
+            def oauth_base_url(self, oauth_base_url: str) -> "ClientBuilder":
+                self._config.oauth_base_url = oauth_base_url
+                return self
+        else:
+            def proxy_url(self, proxy_url: Optional[str]) -> "ClientBuilder":
+                self._config.proxy_url = proxy_url
+                return self
+
+            def trust_env_proxy(self, trust_env_proxy: Optional[bool]) -> "ClientBuilder":
+                self._config.trust_env_proxy = trust_env_proxy
+                return self
 
         def domain(self, domain: str) -> "ClientBuilder":
             _validate_domain(domain)
@@ -539,33 +749,60 @@ def _build_lazy_client_module(lark_root: Path) -> types.ModuleType:
             self._init_cache()
             self._init_logger()
             client._lazy_services_enabled = True
-            client.access_token = AccessToken(self._config)
+            if AccessToken is not None:
+                client.access_token = AccessToken(self._config)
             return client
 
-    mod = types.ModuleType("lark_oapi.client")
-    mod.__file__ = str(lark_root / "client.py")
-    mod.__package__ = "lark_oapi"
+    mod = types.ModuleType(f"{pkg_prefix}.client")
+    mod.__file__ = str(pkg_root / "client.py")
+    mod.__package__ = pkg_prefix
     mod.Client = Client
     mod.ClientBuilder = ClientBuilder
     mod._validate_domain = _validate_domain
+    mod.Config = Config
+    mod.BaseRequest = BaseRequest
+    mod.BaseResponse = BaseResponse
+    mod.RequestOption = RequestOption
+    mod.TokenManager = TokenManager
+    mod.Transport = _core_http.Transport
+    mod.verify = _core_token.verify
+    mod.JSON = JSON
+    mod.logger = logger
+    mod.AppType = AppType
+    mod.LogLevel = LogLevel
+    mod.Files = Files
+    mod.ICache = ICache
+    if AccessToken is not None:
+        mod.AccessToken = AccessToken
     return mod
 
 
 class _LazyLarkLoader(importlib.abc.Loader):
-    """Loader creating lazy ``lark_oapi`` package or ``client`` modules."""
+    """Loader creating lazy ``lark_oapi`` / ``lark_channel`` package or ``client`` modules."""
 
-    def __init__(self, lark_root: Path, pkg_dir: Optional[Path] = None) -> None:
-        self._lark_root = lark_root
+    def __init__(
+        self,
+        pkg_root: Path,
+        pkg_dir: Optional[Path] = None,
+        *,
+        pkg_prefix: str = "lark_oapi",
+    ) -> None:
+        self._pkg_root = pkg_root
         self._pkg_dir = pkg_dir
+        self._pkg_prefix = pkg_prefix
 
     def create_module(self, spec: importlib.machinery.ModuleSpec) -> types.ModuleType:
         fullname = spec.name
-        if fullname == "lark_oapi":
-            return _LazyLarkRootModule(fullname, self._lark_root)
-        if fullname == "lark_oapi.client":
-            return _build_lazy_client_module(self._lark_root)
+        if fullname == self._pkg_prefix:
+            if self._pkg_prefix == "lark_channel":
+                return _LazyChannelRootModule(fullname, self._pkg_root)
+            return _LazyLarkRootModule(fullname, self._pkg_root)
+        if fullname == f"{self._pkg_prefix}.client":
+            return _build_lazy_client_module(self._pkg_root, pkg_prefix=self._pkg_prefix)
         parts = fullname.split(".")
         assert self._pkg_dir is not None
+        if self._pkg_prefix == "lark_channel" and len(parts) == 2 and parts[1] == "channel":
+            return _LazyChannelSubpackage(fullname, self._pkg_dir)
         if len(parts) == 2 and parts[1] == "api":
             return _LazySubmodulePackage(fullname, self._pkg_dir)
         if len(parts) == 3 and parts[1] == "api":
@@ -601,10 +838,11 @@ class _HydratingVersionLoader(importlib.abc.Loader):
 
 
 class _LazyLarkFinder(importlib.abc.MetaPathFinder):
-    """``sys.meta_path`` finder intercepting eager ``lark_oapi`` packages."""
+    """``sys.meta_path`` finder intercepting eager ``lark_oapi`` or ``lark_channel`` packages."""
 
-    def __init__(self, lark_root: Path) -> None:
-        self._lark_root = lark_root
+    def __init__(self, pkg_root: Path, *, pkg_prefix: str = "lark_oapi") -> None:
+        self._pkg_root = pkg_root
+        self._pkg_prefix = pkg_prefix
 
     def find_spec(
         self,
@@ -613,49 +851,68 @@ class _LazyLarkFinder(importlib.abc.MetaPathFinder):
         target: Any = None,
     ) -> Optional[importlib.machinery.ModuleSpec]:
         del path, target
-        if fullname != "lark_oapi" and not fullname.startswith("lark_oapi."):
+        if fullname != self._pkg_prefix and not fullname.startswith(f"{self._pkg_prefix}."):
             return None
 
-        if fullname == "lark_oapi":
-            loader = _LazyLarkLoader(self._lark_root, self._lark_root)
+        if fullname == self._pkg_prefix:
+            loader = _LazyLarkLoader(
+                self._pkg_root, self._pkg_root, pkg_prefix=self._pkg_prefix
+            )
             return importlib.util.spec_from_loader(fullname, loader, is_package=True)
 
-        if fullname == "lark_oapi.client":
-            loader = _LazyLarkLoader(self._lark_root)
+        if fullname == f"{self._pkg_prefix}.client":
+            loader = _LazyLarkLoader(self._pkg_root, pkg_prefix=self._pkg_prefix)
             return importlib.util.spec_from_loader(fullname, loader, is_package=False)
 
         parts = fullname.split(".")
+        if self._pkg_prefix == "lark_channel" and len(parts) == 2 and parts[1] == "channel":
+            pkg_dir = self._pkg_root / "channel"
+            if pkg_dir.is_dir():
+                return importlib.util.spec_from_loader(
+                    fullname,
+                    _LazyLarkLoader(self._pkg_root, pkg_dir, pkg_prefix=self._pkg_prefix),
+                    is_package=True,
+                )
+
         if len(parts) >= 2 and parts[1] == "api":
             if len(parts) == 2:
-                pkg_dir = self._lark_root / "api"
+                pkg_dir = self._pkg_root / "api"
                 if pkg_dir.is_dir():
                     return importlib.util.spec_from_loader(
-                        fullname, _LazyLarkLoader(self._lark_root, pkg_dir), is_package=True
+                        fullname,
+                        _LazyLarkLoader(self._pkg_root, pkg_dir, pkg_prefix=self._pkg_prefix),
+                        is_package=True,
                     )
             elif len(parts) == 3:
-                pkg_dir = self._lark_root / "api" / parts[2]
+                pkg_dir = self._pkg_root / "api" / parts[2]
                 if pkg_dir.is_dir():
                     return importlib.util.spec_from_loader(
-                        fullname, _LazyLarkLoader(self._lark_root, pkg_dir), is_package=True
+                        fullname,
+                        _LazyLarkLoader(self._pkg_root, pkg_dir, pkg_prefix=self._pkg_prefix),
+                        is_package=True,
                     )
             elif len(parts) == 4 and parts[3] != "service":
-                pkg_dir = self._lark_root / "api" / parts[2] / parts[3]
+                pkg_dir = self._pkg_root / "api" / parts[2] / parts[3]
                 if pkg_dir.is_dir():
                     return importlib.util.spec_from_loader(
-                        fullname, _LazyLarkLoader(self._lark_root, pkg_dir), is_package=True
+                        fullname,
+                        _LazyLarkLoader(self._pkg_root, pkg_dir, pkg_prefix=self._pkg_prefix),
+                        is_package=True,
                     )
             elif len(parts) == 5 and parts[4] in ("model", "resource"):
-                pkg_dir = self._lark_root / "api" / parts[2] / parts[3] / parts[4]
+                pkg_dir = self._pkg_root / "api" / parts[2] / parts[3] / parts[4]
                 if pkg_dir.is_dir():
                     return importlib.util.spec_from_loader(
-                        fullname, _LazyLarkLoader(self._lark_root, pkg_dir), is_package=True
+                        fullname,
+                        _LazyLarkLoader(self._pkg_root, pkg_dir, pkg_prefix=self._pkg_prefix),
+                        is_package=True,
                     )
             elif len(parts) == 5 and parts[4] == "version":
-                ver_dir = self._lark_root / "api" / parts[2] / parts[3]
+                ver_dir = self._pkg_root / "api" / parts[2] / parts[3]
                 ver_file = ver_dir / "version.py"
                 res_init = ver_dir / "resource" / "__init__.py"
                 if ver_file.is_file() and res_init.is_file():
-                    res_pkg_name = f"lark_oapi.api.{parts[2]}.{parts[3]}.resource"
+                    res_pkg_name = f"{self._pkg_prefix}.api.{parts[2]}.{parts[3]}.resource"
                     return importlib.util.spec_from_loader(
                         fullname,
                         _HydratingVersionLoader(res_pkg_name, res_init, ver_file),
@@ -666,6 +923,32 @@ class _LazyLarkFinder(importlib.abc.MetaPathFinder):
         return None
 
 
+def _install_lazy_sdk(pkg_prefix: str, root_marker_attr: str) -> bool:
+    with _INSTALL_LOCK:
+        existing = sys.modules.get(pkg_prefix)
+        if existing is not None:
+            return bool(getattr(existing, root_marker_attr, False))
+        if any(name.startswith(f"{pkg_prefix}.") for name in sys.modules):
+            return False
+
+        if any(
+            isinstance(f, _LazyLarkFinder) and f._pkg_prefix == pkg_prefix
+            for f in sys.meta_path
+        ):
+            return True
+
+        spec = importlib.machinery.PathFinder.find_spec(pkg_prefix)
+        if spec is None or not spec.submodule_search_locations:
+            return False
+
+        pkg_root = Path(next(iter(spec.submodule_search_locations)))
+        if not pkg_root.is_dir():
+            return False
+
+        sys.meta_path.insert(0, _LazyLarkFinder(pkg_root, pkg_prefix=pkg_prefix))
+        return True
+
+
 def install_lazy_lark_oapi() -> bool:
     """Install lazy loading for ``lark_oapi`` if it has not been imported yet.
 
@@ -673,27 +956,12 @@ def install_lazy_lark_oapi() -> bool:
     installed as lazy root), or ``False`` if real ``lark_oapi`` was imported
     earlier or the SDK is unavailable.
     """
-    with _INSTALL_LOCK:
-        existing = sys.modules.get("lark_oapi")
-        if existing is not None:
-            return bool(getattr(existing, "_IS_LAZY_LARK_ROOT", False))
-        if any(name.startswith("lark_oapi.") for name in sys.modules):
-            return False
-
-        # Already installed finder, module not yet imported
-        if any(isinstance(f, _LazyLarkFinder) for f in sys.meta_path):
-            return True
-
-        spec = importlib.machinery.PathFinder.find_spec("lark_oapi")
-        if spec is None or not spec.submodule_search_locations:
-            return False
-
-        lark_root = Path(next(iter(spec.submodule_search_locations)))
-        if not lark_root.is_dir():
-            return False
-
-        sys.meta_path.insert(0, _LazyLarkFinder(lark_root))
-        return True
+    return _install_lazy_sdk("lark_oapi", "_IS_LAZY_LARK_ROOT")
 
 
-__all__ = ["install_lazy_lark_oapi"]
+def install_lazy_lark_channel() -> bool:
+    """Install lazy loading for ``lark_channel`` if it has not been imported yet."""
+    return _install_lazy_sdk("lark_channel", "_IS_LAZY_LARK_CHANNEL_ROOT")
+
+
+__all__ = ["install_lazy_lark_channel", "install_lazy_lark_oapi"]

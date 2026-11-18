@@ -10,7 +10,6 @@ with review-driven iteration cycles.
 # ---------------------------------------------------------------------------
 from ..engine_base import ReviewPerspective as _ReviewPerspective
 from ..utils.ui_text import SPEC_UI_TEXT as _SPEC_UI_TEXT
-from .engine import SpecEngine, SpecEngineCallbacks
 from .manager import SpecEngineManager
 from .models import (
     SpecCycle,
@@ -27,6 +26,16 @@ _ReviewPerspective.register_display_names(
     {k: v for k, v in _SPEC_UI_TEXT.items() if k.startswith("perspective_")}
 )
 del _ReviewPerspective, _SPEC_UI_TEXT  # keep namespace clean
+
+
+def __getattr__(name: str):
+    if name in ("SpecEngine", "SpecEngineCallbacks"):
+        from .engine import SpecEngine, SpecEngineCallbacks
+
+        globals()["SpecEngine"] = SpecEngine
+        globals()["SpecEngineCallbacks"] = SpecEngineCallbacks
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Engine

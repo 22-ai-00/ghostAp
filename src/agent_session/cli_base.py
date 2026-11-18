@@ -5,20 +5,35 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from ..acp.client import (
-    emit_referenced_changed_local_image_events,
-    snapshot_local_image_artifacts,
-)
 from ..acp.models import ACPEvent, PromptResult
 from ..acp.prompt_generation import PromptGenerationTracker
 from ..utils.errors import get_error_detail
 from .protocol import _PromptRetryMixin
+
+
+def __getattr__(name: str) -> Any:
+    if name in (
+        "emit_referenced_changed_local_image_events",
+        "snapshot_local_image_artifacts",
+    ):
+        from ..acp.client import (
+            emit_referenced_changed_local_image_events,
+            snapshot_local_image_artifacts,
+        )
+
+        globals()["emit_referenced_changed_local_image_events"] = (
+            emit_referenced_changed_local_image_events
+        )
+        globals()["snapshot_local_image_artifacts"] = snapshot_local_image_artifacts
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass(frozen=True)
@@ -175,7 +190,11 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self.last_active = time.time()
         self.message_count += 1
         self.last_query = text
-        image_snapshot = snapshot_local_image_artifacts(self._cwd) if on_event is not None else {}
+        image_snapshot = (
+            getattr(sys.modules[__name__], "snapshot_local_image_artifacts")(self._cwd)
+            if on_event is not None
+            else {}
+        )
         media_references: list[str] = []
 
         try:
@@ -214,7 +233,10 @@ class _BaseCLISession(_PromptRetryMixin, PromptGenerationTracker):
         finally:
             if on_event is not None:
                 try:
-                    emit_referenced_changed_local_image_events(
+                    getattr(
+                        sys.modules[__name__],
+                        "emit_referenced_changed_local_image_events",
+                    )(
                         self._cwd,
                         image_snapshot,
                         media_references,

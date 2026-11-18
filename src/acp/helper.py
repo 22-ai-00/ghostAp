@@ -5,13 +5,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import shutil
+import sys
 import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-
-from acp.exceptions import RequestError
-from acp.stdio import spawn_agent_process
 
 from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
@@ -29,7 +27,6 @@ from .claude_selection import (
     compose_claude_model_selection,
     split_claude_model_selection,
 )
-from .client import GhostAPClient
 from .dsh_selection import (
     DSH_MODEL_CONFIG_ID,
     DSH_REASONING_CONFIG_ID,
@@ -53,9 +50,33 @@ from .traex_selection import (
     load_traex_model_metadata,
     split_traex_model_selection,
 )
-from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    if name == "RequestError":
+        from acp.exceptions import RequestError
+
+        globals()["RequestError"] = RequestError
+        return RequestError
+    if name == "spawn_agent_process":
+        from acp.stdio import spawn_agent_process
+
+        globals()["spawn_agent_process"] = spawn_agent_process
+        return spawn_agent_process
+    if name == "GhostAPClient":
+        from .client import GhostAPClient
+
+        globals()["GhostAPClient"] = GhostAPClient
+        return GhostAPClient
+    if name in ("LateFrameTolerantMessageQueue", "build_acp_process_env"):
+        from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
+
+        globals()["LateFrameTolerantMessageQueue"] = LateFrameTolerantMessageQueue
+        globals()["build_acp_process_env"] = build_acp_process_env
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _TOOLS = (
     "coco",
@@ -705,9 +726,10 @@ async def discover_agy_model_options(
 async def _probe_acp_models(
     tool_name: str, cwd: str | None, current_model: str | None = None
 ) -> list[ACPModelOption]:
+    request_error_cls = getattr(sys.modules[__name__], "RequestError")
     try:
         return await _probe_acp_models_once(tool_name, cwd)
-    except RequestError as exc:
+    except request_error_cls as exc:
         # A retired model in traecli.toml can prevent session/new from exposing
         # any capabilities. Bootstrap only this disposable discovery session;
         # the returned catalog must still come from the live ACP connection.
@@ -734,14 +756,20 @@ async def _probe_acp_models_once(
         return []
     command, args = provider.get_serve_command(bootstrap_model)
 
-    client = GhostAPClient(on_event=lambda _event: None)
-    async with spawn_agent_process(
+    mod = sys.modules[__name__]
+    client_cls = getattr(mod, "GhostAPClient")
+    spawn_fn = getattr(mod, "spawn_agent_process")
+    build_env_fn = getattr(mod, "build_acp_process_env")
+    queue_cls = getattr(mod, "LateFrameTolerantMessageQueue")
+
+    client = client_cls(on_event=lambda _event: None)
+    async with spawn_fn(
         client,
         command,
         *args,
-        env=build_acp_process_env(command, args),
+        env=build_env_fn(command, args),
         cwd=cwd or str(Path.cwd()),
-        queue=LateFrameTolerantMessageQueue(),
+        queue=queue_cls(),
     ) as (connection, _process):
         await connection.initialize(protocol_version=1)
         response = await connection.new_session(cwd=cwd or str(Path.cwd()))

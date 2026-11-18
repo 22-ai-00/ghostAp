@@ -26,27 +26,36 @@ logger = logging.getLogger(__name__)
 def _activate_lark_import_cache():
     """Activate lazy Lark SDK loading (or import cache fallback) before SDK import."""
 
-    if any(name == "lark_oapi" or name.startswith("lark_oapi.") for name in sys.modules):
-        existing = sys.modules.get("lark_oapi")
-        if getattr(existing, "_IS_LAZY_LARK_ROOT", False):
-            return None
-        logger.warning("Lark SDK import cache bypassed because the SDK was imported early")
-        return None
-
-    started_at = time.perf_counter()
     if os.environ.get("GHOSTAP_DISABLE_LAZY_LARK", "").strip().lower() not in {"1", "true", "yes"}:
+        started_at = time.perf_counter()
         try:
             try:
-                from utils.lark_lazy import install_lazy_lark_oapi
-            except ImportError:
-                from .utils.lark_lazy import install_lazy_lark_oapi
-
-            if install_lazy_lark_oapi():
-                logger.info(
-                    "Lark SDK lazy loader activated in %.3fs",
-                    time.perf_counter() - started_at,
+                from utils.lark_lazy import (
+                    install_lazy_lark_channel,
+                    install_lazy_lark_oapi,
                 )
-                return None
+            except ImportError:
+                from .utils.lark_lazy import (
+                    install_lazy_lark_channel,
+                    install_lazy_lark_oapi,
+                )
+
+            oapi_already_lazy = getattr(
+                sys.modules.get("lark_oapi"), "_IS_LAZY_LARK_ROOT", False
+            )
+            channel_already_lazy = getattr(
+                sys.modules.get("lark_channel"), "_IS_LAZY_LARK_CHANNEL_ROOT", False
+            )
+            oapi_ok = install_lazy_lark_oapi()
+            channel_ok = install_lazy_lark_channel()
+            if oapi_ok or channel_ok:
+                if not (oapi_already_lazy and channel_already_lazy):
+                    logger.info(
+                        "Lark SDK lazy loader activated in %.3fs",
+                        time.perf_counter() - started_at,
+                    )
+                if oapi_ok:
+                    return None
         except Exception as exc:
             logger.debug(
                 "Lazy Lark loader unavailable; falling back to import cache: %s",
@@ -296,6 +305,17 @@ class Application:
             from .feishu.sdk_logging import configure_lark_sdk_logging
         configure_lark_sdk_logging()
         self.feishu_client = FeishuWSClient(message_callback=self.handle_message)
+        try:
+            try:
+                from utils.memory_tuning import trim_process_heap
+            except ImportError:
+                from .utils.memory_tuning import trim_process_heap
+            import gc
+
+            gc.collect()
+            trim_process_heap()
+        except Exception:
+            pass
         # No application resources need graceful cleanup until the client has
         # been constructed.  Keep the OS-default SIGTERM behavior during slow
         # third-party imports so a transient launchd replacement exits quietly

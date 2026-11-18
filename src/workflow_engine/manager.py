@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..engine_base import BaseEngineManager
-from .engine import WorkflowEngine
+
+if TYPE_CHECKING:
+    from .engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ class WorkflowEngineManager(BaseEngineManager["WorkflowEngine"]):
         model_name: Optional[str],
     ) -> WorkflowEngine:
         """Factory method — create a new WorkflowEngine instance."""
+        from .engine import WorkflowEngine
+
         return WorkflowEngine(
             chat_id=chat_id,
             root_path=root_path,
