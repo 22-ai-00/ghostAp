@@ -314,7 +314,9 @@ class Application:
             except ImportError:
                 from .utils.memory_tuning import trim_process_heap
             import gc
+            import linecache
 
+            linecache.clearcache()
             gc.collect()
             trim_process_heap()
         except Exception:
@@ -326,7 +328,7 @@ class Application:
         self._install_signal_handlers()
 
         logger.info("启动飞书长连接服务...")
-        logger.info("支持的功能: Smart路由 | 11后端编程与原生/命令 | Deep/Spec/Workflow引擎 | 数字员工")
+        logger.info("支持的功能: Smart路由 | 11后端编程与原生/命令 | Deep/Spec/Workflow引擎")
 
         try:
             self.feishu_client.start()

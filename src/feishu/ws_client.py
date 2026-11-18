@@ -974,10 +974,8 @@ class FeishuWSClient(WSManagedGroupsMixin):
 
         self._detach_scheduler_listeners()
 
-        # Ask every delegated execution surface to stop before destroying ACP
-        # sessions.  Employee runtime close waits for its Team executor; Team
-        # tasks are delegated to a separate bounded executor, so explicitly
-        # pause their sessions and observe that executor as well.
+        # Ask every delegated execution engine (Deep, Spec, Workflow) to stop
+        # before destroying ACP sessions.
         deep_resources = EngineResourceGroup("deep_engine", self._deep_engine_manager)
         spec_resources = EngineResourceGroup("spec_engine", self._spec_engine_manager)
         workflow_resources = EngineResourceGroup(
