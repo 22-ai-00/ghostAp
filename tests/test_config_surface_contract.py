@@ -65,6 +65,7 @@ _GHOSTAP_ENV_PREFIXES = (
 _RETIRED_SETTINGS_FIELDS = frozenset(
     {
         "employee_department_enabled",
+        "employee_group_context_retention_days",
         "engine_aux_prompt_timeout",
         "acp_permission_auto_approve",
         "acp_trusted_personal_ack",
@@ -131,6 +132,12 @@ def test_env_example_does_not_expose_dead_employee_department_switch() -> None:
 
 def test_retired_internal_tuning_fields_are_not_public_settings() -> None:
     leaked = _RETIRED_SETTINGS_FIELDS & Settings.model_fields.keys()
+    retired_prefixes = {
+        field
+        for field in Settings.model_fields
+        if field.startswith(("autonomous_", "employee_"))
+    }
+    leaked |= retired_prefixes
 
     assert leaked == set(), (
         "retired implementation knobs remain in Settings.model_fields: "

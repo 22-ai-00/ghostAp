@@ -345,36 +345,6 @@ class TestProgrammingExecutionWindowSettings:
             )
 
 
-class TestAutonomousTeamAndContextRetrySettings:
-    def test_defaults_are_typed_and_discoverable(self):
-        settings = Settings(_env_file=None)
-
-        assert settings.autonomous_context_retry_base_seconds == 1.0
-        assert settings.autonomous_context_retry_max_seconds == 30.0
-        assert settings.autonomous_team_step_timeout_seconds == 600.0
-
-    @pytest.mark.parametrize("value", [True, False, float("nan"), float("inf"), -1.0, 0.0])
-    @pytest.mark.parametrize(
-        "field",
-        [
-            "autonomous_context_retry_base_seconds",
-            "autonomous_context_retry_max_seconds",
-            "autonomous_team_step_timeout_seconds",
-        ],
-    )
-    def test_rejects_invalid_numeric_values(self, field, value):
-        with pytest.raises(Exception):
-            Settings(_env_file=None, **{field: value})
-
-    def test_context_retry_base_cannot_exceed_maximum(self):
-        with pytest.raises(Exception, match="context retry"):
-            Settings(
-                _env_file=None,
-                autonomous_context_retry_base_seconds=31.0,
-                autonomous_context_retry_max_seconds=30.0,
-            )
-
-
 class TestTaskSchedulerBoundedSettings:
     def test_defaults_are_positive_and_bounded(self):
         settings = Settings(_env_file=None)

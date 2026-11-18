@@ -48,7 +48,6 @@ def _build_real_ws_graph(tmp_path: Path, monkeypatch):
         default_working_dir=str(repo_dir),
         projects_dir=str(tmp_path / "projects"),
         projects_config_file=str(fake_home / ".ghostap" / "projects.json"),
-        autonomous_data_dir=str(tmp_path / "autonomous"),
     )
     deliveries: list[tuple[str, str, str]] = []
 

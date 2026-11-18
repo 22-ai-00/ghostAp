@@ -1,18 +1,14 @@
 """Settings — main application configuration model backed by pydantic-settings."""
 
-import base64
-import binascii
 import logging as _logging
 import os
 import shlex
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     AliasChoices,
     Field,
-    SecretStr,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -45,11 +41,6 @@ class Settings(BaseSettings):
         "enforced", "shadow", "legacy_allow_all"
     ] = "legacy_allow_all"
     admin_bootstrap_scope: Literal["any_chat", "p2p_only"] = "p2p_only"
-    employee_group_context_retention_days: int = Field(
-        default=30,
-        ge=1,
-        le=3650,
-    )
 
     coco_execution_timeout: int = Field(default=7200, gt=0)
     coco_session_timeout: int = 86400
@@ -466,197 +457,6 @@ class Settings(BaseSettings):
     # on plain comma-separated values; converted to frozenset in model_validator.
     # ------------------------------------------------------------------
     admin_user_ids: str = ""
-
-    # ------------------------------------------------------------------
-    # Employee Department persistence
-    # ------------------------------------------------------------------
-    autonomous_state_dir: str = "~/.ghostap/autonomy"
-    autonomous_journal_dir: str = "~/.ghostap/autonomy/journal"
-    autonomous_journal_hmac_key: SecretStr = SecretStr("")
-    # Team employee data-continuity ABI. Keep this root stable so existing
-    # employee workspaces remain discoverable across upgrades.
-    autonomous_employee_storage_base: str = "~/.ghostap/slock"
-    # Team employee credential continuity ABI. Credentials remain below the
-    # established employee storage root and must not be relocated implicitly.
-    autonomous_credential_dir: str = "~/.ghostap/slock/credentials"
-    autonomous_credential_keys: SecretStr = SecretStr("")
-    autonomous_credential_active_key_id: str = ""
-    autonomous_data_keys: SecretStr = SecretStr("")
-    autonomous_data_active_key_id: str = ""
-    autonomous_data_blob_dir: str = "~/.ghostap/autonomy/data-blobs"
-    autonomous_history_timezone: str = "UTC"
-    autonomous_history_max_range_days: int = Field(default=31, ge=1, le=366)
-    autonomous_history_page_size: int = Field(default=50, ge=1, le=200)
-    autonomous_thread_context_max_messages: int = Field(
-        default=200,
-        ge=1,
-        le=10_000,
-    )
-    autonomous_thread_context_max_chars: int = Field(
-        default=400_000,
-        ge=1,
-        le=5_000_000,
-    )
-    autonomous_group_context_max_messages: int = Field(
-        default=50,
-        ge=1,
-        le=500,
-    )
-    autonomous_context_max_tokens: int = Field(
-        default=128_000,
-        ge=1,
-        le=2_000_000,
-    )
-    autonomous_thread_context_page_size: int = Field(default=50, ge=1, le=50)
-    autonomous_group_context_page_size: int = Field(default=20, ge=1, le=50)
-    autonomous_context_fetch_timeout_seconds: float = Field(
-        default=30.0,
-        gt=0,
-        le=300,
-        allow_inf_nan=False,
-    )
-    autonomous_context_retry_base_seconds: float = Field(
-        default=1.0,
-        gt=0,
-        le=300,
-        allow_inf_nan=False,
-    )
-    autonomous_context_retry_max_seconds: float = Field(
-        default=30.0,
-        gt=0,
-        le=300,
-        allow_inf_nan=False,
-    )
-    autonomous_team_step_timeout_seconds: float = Field(
-        default=600.0,
-        gt=0,
-        le=3600,
-        allow_inf_nan=False,
-    )
-    autonomous_fire_grace_seconds: float = Field(
-        default=30.0,
-        gt=0,
-        le=300,
-        allow_inf_nan=False,
-    )
-    autonomous_context_max_pages: int = Field(default=200, ge=1, le=10_000)
-    autonomous_employee_ingress_ack_timeout_seconds: float = Field(
-        default=1.5,
-        gt=0,
-        lt=3.0,
-        allow_inf_nan=False,
-    )
-    autonomous_employee_ingress_blob_dir: str = (
-        "~/.ghostap/autonomy/ingress-blobs"
-    )
-    autonomous_employee_outbox_blob_dir: str = (
-        "~/.ghostap/autonomy/outbox-blobs"
-    )
-    autonomous_main_bot_warning_blob_dir: str = (
-        "~/.ghostap/autonomy/main-bot-warning-blobs"
-    )
-    autonomous_employee_attachment_staging_dir: str = (
-        "~/.ghostap/autonomy/employee-attachments"
-    )
-    autonomous_employee_system_prompt_token_reserve: int = Field(
-        default=4096,
-        ge=1,
-        le=1_000_000,
-    )
-    autonomous_employee_session_idle_ttl_seconds: float = Field(
-        default=900.0,
-        gt=0,
-        le=86_400,
-        allow_inf_nan=False,
-    )
-    autonomous_employee_traex_auth_home: str = "~/.trae"
-    autonomous_employee_queue_per_employee_limit: int = Field(default=8, ge=1, le=10_000)
-    autonomous_employee_queue_per_team_limit: int = Field(default=32, ge=1, le=100_000)
-    autonomous_employee_queue_global_limit: int = Field(default=128, ge=1, le=1_000_000)
-    autonomous_manager_acl: str = ""
-    autonomous_anchor_path: str = "~/.ghostap/autonomy/journal.anchor"
-    autonomous_visible_employee_limit: int = Field(default=8, ge=0)
-
-    @field_validator(
-        "autonomous_thread_context_max_messages",
-        "autonomous_thread_context_max_chars",
-        "autonomous_group_context_max_messages",
-        "autonomous_context_max_tokens",
-        "autonomous_thread_context_page_size",
-        "autonomous_group_context_page_size",
-        "autonomous_context_fetch_timeout_seconds",
-        "autonomous_context_retry_base_seconds",
-        "autonomous_context_retry_max_seconds",
-        "autonomous_team_step_timeout_seconds",
-        "autonomous_fire_grace_seconds",
-        "autonomous_context_max_pages",
-        "autonomous_employee_ingress_ack_timeout_seconds",
-        "autonomous_employee_queue_per_employee_limit",
-        "autonomous_employee_queue_per_team_limit",
-        "autonomous_employee_queue_global_limit",
-        "autonomous_employee_system_prompt_token_reserve",
-        mode="before",
-    )
-    @classmethod
-    def _reject_boolean_context_settings(cls, value: object) -> object:
-        if isinstance(value, bool):
-            raise ValueError("employee context/ingress numeric settings reject booleans")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_employee_queue_limit_order(self) -> "Settings":
-        if not (
-            self.autonomous_employee_queue_per_employee_limit
-            <= self.autonomous_employee_queue_per_team_limit
-            <= self.autonomous_employee_queue_global_limit
-        ):
-            raise ValueError("employee queue limits require per_employee <= per_team <= global")
-        return self
-
-    @model_validator(mode="after")
-    def _validate_context_retry_delay_order(self) -> "Settings":
-        if (
-            self.autonomous_context_retry_base_seconds
-            > self.autonomous_context_retry_max_seconds
-        ):
-            raise ValueError("context retry requires base seconds <= maximum seconds")
-        return self
-
-    @field_validator("autonomous_journal_hmac_key", mode="before")
-    @classmethod
-    def _validate_autonomous_journal_hmac_key(cls, value: object) -> SecretStr:
-        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
-        if raw in (None, ""):
-            return SecretStr("")
-        if not isinstance(raw, str):
-            raise ValueError("autonomous_journal_hmac_key must be base64 text")
-        try:
-            decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError(
-                "autonomous_journal_hmac_key must be valid base64"
-            ) from exc
-        if len(decoded) < 32:
-            raise ValueError(
-                "autonomous_journal_hmac_key must decode to at least 32 bytes"
-            )
-        return SecretStr(raw)
-
-    @field_validator("autonomous_anchor_path")
-    @classmethod
-    def _validate_autonomous_anchor_path(cls, value: str) -> str:
-        if not isinstance(value, str) or not value.strip() or "\x00" in value:
-            raise ValueError("autonomous_anchor_path must be a non-empty path")
-        return value
-
-    @field_validator("autonomous_history_timezone")
-    @classmethod
-    def _validate_autonomous_history_timezone(cls, value: str) -> str:
-        try:
-            ZoneInfo(value)
-        except (TypeError, ZoneInfoNotFoundError) as exc:
-            raise ValueError("autonomous_history_timezone must be a valid IANA timezone") from exc
-        return value
 
     # ------------------------------------------------------------------
     # 授权白名单（安全加固 A2）

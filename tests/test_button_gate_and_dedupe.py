@@ -64,7 +64,6 @@ def test_button_is_blocked_while_system_command_inflight(tmp_path):
         mock_settings.spec_circuit_breaker_threshold = 10
         mock_settings.spec_circuit_breaker_recovery = 5.0
         mock_settings.message_expire_seconds = 30
-        mock_settings.autonomous_visible_employee_limit = 0
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())
@@ -153,7 +152,6 @@ def test_system_gate_lookup_failure_acks_and_never_schedules_business_action(tmp
         mock_settings.spec_circuit_breaker_threshold = 10
         mock_settings.spec_circuit_breaker_recovery = 5.0
         mock_settings.message_expire_seconds = 30
-        mock_settings.autonomous_visible_employee_limit = 0
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())
@@ -203,7 +201,6 @@ def test_button_rapid_clicks_dedupe_same_state_and_accept_changed_state(tmp_path
         mock_settings.spec_circuit_breaker_threshold = 10
         mock_settings.spec_circuit_breaker_recovery = 5.0
         mock_settings.message_expire_seconds = 30
-        mock_settings.autonomous_visible_employee_limit = 0
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())

@@ -83,7 +83,6 @@ def test_exit_is_deferred_until_running_task_finishes(tmp_path):
         mock_settings.spec_circuit_breaker_threshold = 10
         mock_settings.spec_circuit_breaker_recovery = 5.0
         mock_settings.message_expire_seconds = 30
-        mock_settings.autonomous_visible_employee_limit = 0
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())
@@ -167,7 +166,6 @@ def test_exit_is_immediate_when_no_running_task(tmp_path):
         mock_settings.spec_circuit_breaker_threshold = 10
         mock_settings.spec_circuit_breaker_recovery = 5.0
         mock_settings.message_expire_seconds = 30
-        mock_settings.autonomous_visible_employee_limit = 0
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())

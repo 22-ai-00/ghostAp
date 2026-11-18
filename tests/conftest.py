@@ -312,25 +312,6 @@ def make_settings():
 
 
 
-@pytest.fixture(autouse=True)
-def _block_real_employee_storage(monkeypatch, tmp_path):
-    """Prevent tests from accidentally writing to the legacy default employee store."""
-
-    def _guarded_default():
-        raise RuntimeError(
-            "[conftest] Real default_employee_storage_base() called in tests! "
-            "Pass an explicit storage_base_path=str(tmp_path / \"employee\") to "
-            "ProjectedAgentRegistry/identity-backed tests."
-        )
-    try:
-        monkeypatch.setattr(
-            "src.autonomous.workforce.identity.default_employee_storage_base",
-            _guarded_default,
-        )
-    except Exception:
-        pass  # Module not yet imported — safe to skip
-
-
 # ---------------------------------------------------------------------------
 # lru_cache hygiene — clear module-level caches between tests.
 # MAINTAIN: when adding a new @lru_cache in src/, register its cache_clear here.
