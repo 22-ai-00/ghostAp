@@ -6,6 +6,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from src.acp.child_lifecycle import (
+    CHILD_GENERATION_ACTIONS,
+    KNOWN_CHILD_ACTIVITIES,
+    TERMINAL_CHILD_STATUSES,
+    TRANSIENT_CHILD_STATUSES,
+    ChildLifecycleEntry,
+    ChildObservationProvenance,
+    parse_child_tool_call,
+    reduce_child_entry,
+    strict_source_id,
+)
 from src.card.tool_display import (
     collect_subagent_opaque_ids,
     extract_agent_tool_name,
@@ -17,32 +28,20 @@ from src.card.tool_display import (
 
 AGENT_TOOL_TITLES = frozenset({"agent", "subagent", "task"})
 GENERIC_TASK_LABELS = frozenset({"", "agent", "subagent", "task", "子任务"})
-TERMINAL_AGENT_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_AGENT_STATUSES = TERMINAL_CHILD_STATUSES
 UNRESOLVED_AGENT_STATUS = "unresolved"
 UNRESOLVED_AGENT_PROGRESS = "未收到最终状态，主任务已结束"
 GENERIC_AGENT_FAILURE_DETAIL = "子任务执行失败"
 
-_PROVIDER_STATUS = {
-    "pendinginit": "running",
-    "pending_init": "running",
-    "pending": "running",
-    "running": "running",
-    "completed": "completed",
-    "cancelled": "cancelled",
-    "errored": "failed",
-    "failed": "failed",
-    "interrupted": "cancelled",
-    "shutdown": "completed",
-    "notfound": "failed",
-    "not_found": "failed",
-}
 _PROVIDER_PROGRESS = {
     "pendinginit": "准备中",
     "pending_init": "准备中",
     "pending": "准备中",
     "running": "执行中",
+    "in_progress": "执行中",
     "completed": "已完成",
     "cancelled": "已取消",
+    "canceled": "已取消",
     "errored": "执行失败",
     "failed": "执行失败",
     "interrupted": "已中断",
@@ -82,6 +81,11 @@ class ProjectedAgent:
     status: str
     progress: str
     model: str = ""
+    raw_status: str = ""
+    malformed: bool = False
+    provenance: ChildObservationProvenance = (
+        ChildObservationProvenance.COLLABORATION_SNAPSHOT
+    )
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,10 @@ class CollaborationProjection:
     starts_new_generation: bool
     authoritative_list_snapshot: bool
     failed_without_receiver: bool
+    call_id: str = ""
+    reopens_transient: bool = False
+    malformed: bool = False
+    container_malformed: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +107,8 @@ class ActivityProjection:
     status: str
     progress: str
     interrupted: bool
+    malformed: bool = False
+    reopens: bool = False
 
 
 def is_agent_task(tool_call: Any) -> bool:
@@ -213,89 +223,129 @@ def project_collaboration(acp_event: Any) -> CollaborationProjection | None:
     event_name = str(
         getattr(getattr(acp_event, "event_type", None), "name", "") or ""
     )
-    outer_status = str(getattr(tool_call, "status", "") or "").strip().casefold()
-    authoritative = (
-        event_name == "TOOL_CALL_DONE"
-        and collaboration_tool == "list_agents"
-        and outer_status == "completed"
-    )
-    starts_new_generation = (
-        event_name == "TOOL_CALL_DONE"
-        and collaboration_tool in {"spawn_agent", "followup_task"}
-        and outer_status == "completed"
-    )
-    states = {
-        str(item.get("source_id") or "").strip(): item
-        for item in getattr(tool_call, "subagent_states", ())
-        if isinstance(item, Mapping)
-        and str(item.get("source_id") or "").strip()
-    }
-    source_ids = [
-        str(value or "").strip()
-        for value in getattr(tool_call, "collaboration_receivers", ())
-        if str(value or "").strip()
-    ]
-    source_ids.extend(key for key in states if key not in source_ids)
+    parsed = parse_child_tool_call(tool_call, event_name=event_name)
     opaque_ids = collect_subagent_opaque_ids(tool_call)
     label = extract_agent_task_label(tool_call)
     model = str(getattr(tool_call, "collaboration_model", "") or "").strip()
     agents: list[ProjectedAgent] = []
-    for source_id in source_ids:
-        state = states.get(source_id, {})
-        raw_status = str(state.get("status") or "running").strip().lower()
-        status = _PROVIDER_STATUS.get(raw_status, "running")
-        default_progress = _PROVIDER_PROGRESS.get(raw_status, "执行中")
+    for obs in parsed.observations:
+        if obs.malformed or obs.status is None:
+            status = "malformed"
+            default_progress = "状态未知"
+        else:
+            status = obs.status
+            default_progress = _PROVIDER_PROGRESS.get(
+                obs.raw_status,
+                _PROVIDER_PROGRESS.get(status, "执行中"),
+            )
         message = sanitize_subagent_display_text(
-            state.get("message"),
+            obs.message,
             fallback="",
             max_chars=180,
             opaque_ids=opaque_ids,
         )
         if status in TERMINAL_AGENT_STATUSES and message in _TRANSIENT_PROGRESS:
             message = ""
-        agents.append(ProjectedAgent(
-            source_id=source_id,
-            label=label,
-            status=status,
-            progress=message or default_progress,
-            model=model,
-        ))
+        agents.append(
+            ProjectedAgent(
+                source_id=obs.source_id,
+                label=label,
+                status=status,
+                progress=message or default_progress,
+                model=model,
+                raw_status=obs.raw_status,
+                malformed=obs.malformed or obs.status is None,
+                provenance=obs.provenance,
+            )
+        )
     return CollaborationProjection(
         agents=tuple(agents),
-        starts_new_generation=starts_new_generation,
-        authoritative_list_snapshot=authoritative,
-        failed_without_receiver=not agents and outer_status == "failed",
+        starts_new_generation=parsed.starts_new_generation,
+        authoritative_list_snapshot=parsed.authoritative_list_snapshot,
+        failed_without_receiver=not agents and parsed.outer_status == "failed",
+        call_id=parsed.call_id,
+        reopens_transient=(
+            parsed.action in CHILD_GENERATION_ACTIONS or parsed.reopens_transient
+        ),
+        malformed=parsed.malformed,
+        container_malformed=parsed.container_malformed,
     )
 
 
 def project_activity(acp_event: Any) -> ActivityProjection | None:
     tool_call = getattr(acp_event, "tool_call", None)
-    source_id = str(
+    source_id = strict_source_id(
         getattr(tool_call, "subagent_source_id", None)
         or getattr(acp_event, "source_id", None)
-        or ""
-    ).strip()
-    activity = str(getattr(tool_call, "subagent_activity", "") or "").strip().lower()
+    )
+    raw_activity = getattr(tool_call, "subagent_activity", None)
+    activity = (
+        raw_activity.strip().casefold()
+        if isinstance(raw_activity, str)
+        else ""
+    )
     if tool_call is None or not source_id or not activity:
         return None
-    provider_status = str(getattr(tool_call, "status", "") or "").lower()
-    running, completed, failed = _ACTIVITY_PROGRESS.get(
-        activity,
-        ("动态已更新", "动态已更新", "动态已更新"),
+    if activity not in KNOWN_CHILD_ACTIVITIES:
+        return ActivityProjection(
+            source_id=source_id,
+            label=extract_agent_task_label(tool_call),
+            status="malformed",
+            progress="状态未知",
+            interrupted=False,
+            malformed=True,
+            reopens=False,
+        )
+    provider_status = str(getattr(tool_call, "status", "") or "").strip().casefold()
+    running, completed, failed = _ACTIVITY_PROGRESS[activity]
+    progress = (
+        completed
+        if provider_status == "completed"
+        else failed
+        if provider_status == "failed"
+        else running
     )
-    progress = completed if provider_status == "completed" else failed if provider_status == "failed" else running
     interrupted = activity == "interrupted" and provider_status == "completed"
+    reopens = activity in {"started", "interacted"} or (
+        activity == "interrupted" and not interrupted
+    )
     return ActivityProjection(
         source_id=source_id,
         label=extract_agent_task_label(tool_call),
         status="cancelled" if interrupted else "running",
         progress=progress,
         interrupted=interrupted,
+        malformed=False,
+        reopens=reopens,
     )
 
 
 def _next_sequence(summaries: Mapping[str, Mapping], parent_sequence: object) -> str:
     return f"{parent_sequence}.{chr(ord('a') + len(summaries))}"
+
+
+def _entry_from_summary(
+    source_id: str,
+    existing: Mapping[str, Any],
+) -> ChildLifecycleEntry | None:
+    if not existing:
+        return None
+    raw_status = str(existing.get("status") or "").strip().casefold()
+    malformed = bool(existing.get("malformed")) or (
+        bool(raw_status)
+        and raw_status not in TERMINAL_CHILD_STATUSES
+        and raw_status not in TRANSIENT_CHILD_STATUSES
+    )
+    status = None if malformed or not raw_status else raw_status
+    return ChildLifecycleEntry(
+        source_id=source_id,
+        status=status,
+        raw_status=raw_status,
+        generation=max(1, int(existing.get("generation") or 1)),
+        provenance=ChildObservationProvenance.COLLABORATION_SNAPSHOT,
+        malformed=malformed,
+        active_call_id="",
+    )
 
 
 def merge_collaboration_summaries(
@@ -308,18 +358,63 @@ def merge_collaboration_summaries(
     result = {key: dict(value) for key, value in summaries.items()}
     for agent in projection.agents:
         existing = result.get(agent.source_id, {})
-        existing_status = str(existing.get("status") or "").strip().lower()
-        if existing_status in TERMINAL_AGENT_STATUSES:
-            if projection.starts_new_generation:
-                pass
-            elif agent.status != existing_status:
-                if not (
-                    projection.authoritative_list_snapshot
-                    and agent.status in TERMINAL_AGENT_STATUSES
-                ):
+        prior_entry = _entry_from_summary(agent.source_id, existing)
+        prior_status = (
+            prior_entry.status if prior_entry is not None else ""
+        )
+        incoming_malformed = agent.malformed or projection.container_malformed
+        incoming_status = (
+            None
+            if incoming_malformed or agent.status == "malformed"
+            else agent.status
+        )
+        if (
+            prior_entry is not None
+            and not prior_entry.malformed
+            and prior_status in TERMINAL_AGENT_STATUSES
+            and not projection.starts_new_generation
+        ):
+            if incoming_status != prior_status and not (
+                projection.authoritative_list_snapshot
+                and incoming_status in TERMINAL_AGENT_STATUSES
+            ):
+                if incoming_status is not None:
                     continue
-            elif not agent.progress or agent.progress == str(existing.get("progress") or ""):
+            elif (
+                incoming_status == prior_status
+                and (
+                    not agent.progress
+                    or agent.progress == str(existing.get("progress") or "")
+                )
+            ):
                 continue
+
+        reopen = projection.starts_new_generation or (
+            projection.reopens_transient
+            and incoming_status in TRANSIENT_CHILD_STATUSES
+        )
+        next_entry = reduce_child_entry(
+            prior_entry,
+            source_id=agent.source_id,
+            status=incoming_status,
+            raw_status=agent.raw_status,
+            provenance=agent.provenance,
+            malformed=incoming_malformed,
+            reopen=reopen,
+            reopen_while_transient=projection.reopens_transient,
+            call_id=projection.call_id,
+            message=agent.progress,
+        )
+        next_status = (
+            "malformed"
+            if next_entry.malformed or next_entry.status is None
+            else next_entry.status
+        )
+        progress = (
+            "状态未知"
+            if next_status == "malformed"
+            else agent.progress
+        )
         label = str(existing.get("label") or agent.label).strip()
         if is_generic_task_label(label):
             label = "子任务"
@@ -327,10 +422,13 @@ def merge_collaboration_summaries(
             **existing,
             "label": label,
             "tool": str(existing.get("tool") or "子代理"),
-            "status": agent.status,
-            "progress": agent.progress,
+            "status": next_status,
+            "progress": progress,
+            "generation": next_entry.generation,
         }
-        if agent.status != "failed":
+        if next_entry.malformed:
+            summary["malformed"] = True
+        if next_status != "failed":
             summary.pop("error", None)
         summary.setdefault("sequence", _next_sequence(result, parent_sequence))
         model = agent.model or str(existing.get("model") or base_model).strip()
@@ -348,8 +446,38 @@ def merge_activity_summary(
     base_model: str = "",
 ) -> dict[str, dict]:
     existing = dict(summaries.get(projection.source_id, {}))
-    if str(existing.get("status") or "").strip().lower() in TERMINAL_AGENT_STATUSES:
+    prior_entry = _entry_from_summary(projection.source_id, existing)
+    incoming_status = (
+        None
+        if projection.malformed or projection.status == "malformed"
+        else projection.status
+    )
+    if (
+        prior_entry is not None
+        and not prior_entry.malformed
+        and prior_entry.status in TERMINAL_AGENT_STATUSES
+        and not projection.reopens
+        and not projection.interrupted
+        and not projection.malformed
+    ):
         return dict(summaries)
+
+    next_entry = reduce_child_entry(
+        prior_entry,
+        source_id=projection.source_id,
+        status=incoming_status,
+        raw_status=projection.status,
+        provenance=ChildObservationProvenance.SUBAGENT_ACTIVITY,
+        malformed=projection.malformed,
+        reopen=projection.reopens,
+        message=projection.progress,
+    )
+    next_status = (
+        "malformed"
+        if next_entry.malformed or next_entry.status is None
+        else next_entry.status
+    )
+    progress = "状态未知" if next_status == "malformed" else projection.progress
     label = str(existing.get("label") or projection.label).strip()
     if is_generic_task_label(label):
         label = "子任务"
@@ -357,9 +485,12 @@ def merge_activity_summary(
         **existing,
         "label": label,
         "tool": str(existing.get("tool") or "子代理"),
-        "status": projection.status,
-        "progress": projection.progress,
+        "status": next_status,
+        "progress": progress,
+        "generation": next_entry.generation,
     }
+    if next_entry.malformed:
+        summary["malformed"] = True
     summary.pop("error", None)
     summary.setdefault("sequence", _next_sequence(summaries, parent_sequence))
     if base_model:
@@ -445,7 +576,7 @@ def finalize_summaries(
     parent_is_terminal = terminal_status in TERMINAL_AGENT_STATUSES
     for source_id, existing in result.items():
         status = str(existing.get("status") or "").strip().lower()
-        if status in TERMINAL_AGENT_STATUSES:
+        if not existing.get("malformed") and status in TERMINAL_AGENT_STATUSES:
             fallback = _TERMINAL_PROGRESS.get(status)
             if fallback and existing.get("progress") in _TRANSIENT_PROGRESS:
                 existing["progress"] = fallback

@@ -7,22 +7,29 @@ from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
 
+from .child_lifecycle import (
+    CHILD_GENERATION_ACTIONS as _CHILD_GENERATION_ACTIONS,
+)
+from .child_lifecycle import (
+    KNOWN_CHILD_ACTIONS as _KNOWN_CHILD_ACTIONS,
+)
+from .child_lifecycle import (
+    KNOWN_CHILD_ACTIVITIES as _KNOWN_CHILD_ACTIVITIES,
+)
+from .child_lifecycle import (
+    KNOWN_CHILD_STATUSES,
+    TERMINAL_CHILD_STATUSES,
+    TRANSIENT_CHILD_STATUSES,
+    ChildLifecycleReducer,
+    ChildObservationProvenance,
+    child_action_key,
+    iter_receiver_items,
+    iter_state_items,
+    normalize_provider_child_status,
+    strict_source_id,
+)
 from .models import ToolCallInfo
 from .swarm_lifecycle import merge_swarm_tool_signal
-
-TRANSIENT_CHILD_STATUSES = frozenset({"pending", "running"})
-TERMINAL_CHILD_STATUSES = frozenset(
-    {"completed", "failed", "cancelled"}
-)
-KNOWN_CHILD_STATUSES = TRANSIENT_CHILD_STATUSES | TERMINAL_CHILD_STATUSES
-_CHILD_GENERATION_ACTIONS = frozenset({"followup_task", "spawn_agent"})
-_PASSIVE_CHILD_ACTIONS = frozenset(
-    {"interrupt_agent", "list_agents", "send_message", "wait_agent"}
-)
-_KNOWN_CHILD_ACTIONS = _CHILD_GENERATION_ACTIONS | _PASSIVE_CHILD_ACTIONS
-_KNOWN_CHILD_ACTIVITIES = frozenset(
-    {"interacted", "interrupted", "started"}
-)
 
 
 class AuthoritativeChildLifecycleProof:
@@ -33,8 +40,8 @@ class AuthoritativeChildLifecycleProof:
     """
 
     def __init__(self) -> None:
-        self._observed_sources: set[str] = set()
-        self._authoritative_statuses: dict[str, str] = {}
+        self._reducer = ChildLifecycleReducer()
+        self._latest_list_sources: set[str] = set()
         self._ambiguous = False
 
     def observe_event(self, event: object) -> None:
@@ -44,147 +51,73 @@ class AuthoritativeChildLifecycleProof:
         event_name = str(
             getattr(getattr(event, "event_type", None), "name", "") or ""
         )
-        outer_status = str(
-            getattr(tool_call, "status", "") or ""
-        ).strip().casefold()
-        action = _child_action(tool_call)
-        activity = str(
-            getattr(tool_call, "subagent_activity", "") or ""
-        ).strip().casefold()
-        receiver_items, receivers_malformed = _receiver_items(
-            getattr(tool_call, "collaboration_receivers", ())
-        )
-        receivers: set[str] = set()
-        for raw_receiver in receiver_items:
-            source_id = strict_source_id(raw_receiver)
-            if source_id is None:
-                receivers_malformed = True
-            else:
-                receivers.add(source_id)
-
-        states: dict[str, str] = {}
-        states_malformed = False
-        for item in _state_items(getattr(tool_call, "subagent_states", ())):
-            if not isinstance(item, Mapping):
-                states_malformed = True
-                continue
-            source_id = strict_source_id(item.get("source_id"))
-            status = strict_child_status(item.get("status"))
-            if source_id is None or status is None:
-                states_malformed = True
-                continue
-            prior = states.get(source_id)
-            if prior is not None and prior != status:
-                states_malformed = True
-                continue
-            states[source_id] = status
-
-        activity_source = strict_source_id(
-            getattr(tool_call, "subagent_source_id", None)
-        )
-        if activity and (
-            activity not in _KNOWN_CHILD_ACTIVITIES
-            or activity_source is None
-        ):
-            states_malformed = True
-
-        sources = {*receivers, *states}
-        if activity_source is not None:
-            sources.add(activity_source)
-        self._observed_sources.update(sources)
-
-        has_child_evidence = bool(
-            sources
-            or activity
-            or getattr(tool_call, "child_metadata_malformed", False)
-        )
-        known_activity_action = action.startswith("activity:")
+        parsed = self._reducer.apply(tool_call, event_name=event_name)
         if (
-            receivers_malformed
-            or states_malformed
-            or getattr(tool_call, "child_metadata_malformed", False) is not False
+            self._reducer.malformed
             or (
-                has_child_evidence
-                and action not in _KNOWN_CHILD_ACTIONS
-                and not known_activity_action
+                parsed.has_child_evidence
+                and parsed.action
+                and parsed.action not in _KNOWN_CHILD_ACTIONS
             )
         ):
             self._ambiguous = True
-            self._authoritative_statuses.clear()
-
-        starts_generation = (
-            event_name == "TOOL_CALL_DONE"
-            and outer_status == "completed"
-            and action in _CHILD_GENERATION_ACTIONS
-        )
-        if starts_generation or activity in _KNOWN_CHILD_ACTIVITIES:
-            for source_id in sources:
-                self._authoritative_statuses.pop(source_id, None)
-
-        if action != "list_agents" or event_name != "TOOL_CALL_DONE":
+            self._latest_list_sources.clear()
             return
-        if outer_status != "completed":
+
+        if parsed.starts_new_generation or parsed.activity in _KNOWN_CHILD_ACTIVITIES:
+            for source_id in {*parsed.receivers, *(obs.source_id for obs in parsed.observations)}:
+                self._latest_list_sources.discard(source_id)
+
+        if not parsed.authoritative_list_snapshot:
             return
-        if (
-            receivers_malformed
-            or states_malformed
-            or not states
-            or not receivers.issubset(states)
-        ):
+        raw_states, _ = iter_state_items(getattr(tool_call, "subagent_states", ()))
+        state_sources = {
+            obs.source_id
+            for obs in parsed.observations
+            if not obs.malformed
+            and obs.provenance is ChildObservationProvenance.AUTHORITATIVE_LIST
+            and any(
+                isinstance(item, Mapping)
+                and strict_source_id(item.get("source_id")) == obs.source_id
+                for item in raw_states
+            )
+        }
+        if not state_sources or not set(parsed.receivers).issubset(state_sources):
             self._ambiguous = True
-            self._authoritative_statuses.clear()
+            self._latest_list_sources.clear()
             return
-        self._authoritative_statuses = states
+        self._latest_list_sources = state_sources
 
     def all_observed_children_terminal(self) -> bool:
         """Whether the latest clean list snapshot covers all known children."""
-        if self._ambiguous or not self._observed_sources:
+        entries = self._reducer.entries
+        if self._ambiguous or self._reducer.malformed or not entries:
             return False
-        if not self._observed_sources.issubset(self._authoritative_statuses):
+        if not set(entries).issubset(self._latest_list_sources):
             return False
         return all(
-            self._authoritative_statuses[source_id]
-            in TERMINAL_CHILD_STATUSES
-            for source_id in self._observed_sources
+            entry.is_terminal
+            and entry.provenance is ChildObservationProvenance.AUTHORITATIVE_LIST
+            for entry in entries.values()
         )
-
-
-def strict_source_id(value: object) -> str | None:
-    """Return a validated provider child identity without coercing values."""
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip()
-    return normalized or None
 
 
 def strict_child_status(value: object) -> str | None:
     """Return a known lifecycle status; unknown provider values stay invalid."""
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().casefold()
-    return normalized if normalized in KNOWN_CHILD_STATUSES else None
+    return normalize_provider_child_status(value)
 
 
 def _state_items(raw_states: object) -> list[object]:
-    if raw_states is None:
-        return []
-    if isinstance(raw_states, (str, bytes, bytearray, Mapping)):
+    items, malformed = iter_state_items(raw_states)
+    if malformed:
         return [
             {"source_id": "", "status": "malformed", "message": ""}
         ]
-    if not isinstance(raw_states, Iterable):
-        return [
-            {"source_id": "", "status": "malformed", "message": ""}
-        ]
-    return list(raw_states)
+    return items
 
 
 def _receiver_items(raw_receivers: object) -> tuple[list[object], bool]:
-    if isinstance(raw_receivers, (str, bytes, bytearray, Mapping)):
-        return [], True
-    if not isinstance(raw_receivers, Iterable):
-        return [], True
-    return list(raw_receivers), False
+    return iter_receiver_items(raw_receivers)
 
 
 def _snapshot_has_malformed_child_metadata(tool_call: ToolCallInfo) -> bool:
@@ -217,20 +150,7 @@ def _snapshot_has_malformed_child_metadata(tool_call: ToolCallInfo) -> bool:
 
 
 def _child_action(tool_call: ToolCallInfo) -> str:
-    collaboration_tool = tool_call.collaboration_tool
-    if isinstance(collaboration_tool, str) and collaboration_tool.strip():
-        return collaboration_tool.strip().casefold()
-    title = tool_call.title
-    if isinstance(title, str):
-        normalized_title = title.strip().casefold()
-        if normalized_title in _KNOWN_CHILD_ACTIONS:
-            return normalized_title
-    activity = tool_call.subagent_activity
-    if isinstance(activity, str):
-        normalized_activity = activity.strip().casefold()
-        if normalized_activity in _KNOWN_CHILD_ACTIVITIES:
-            return f"activity:{normalized_activity}"
-    return ""
+    return child_action_key(tool_call)
 
 
 def _generation_action(tool_call: ToolCallInfo) -> str:

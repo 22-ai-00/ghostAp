@@ -1810,3 +1810,113 @@ def test_end_turn_requires_tool_calls_to_be_terminal(
     assessment = classify_prompt_result(result)
 
     assert assessment.outcome is expected
+
+
+def test_programming_card_and_outcome_share_shutdown_reopen_and_malformed_semantics() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-shared-reducer")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="list-shutdown",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    collaboration_receivers=("child-shutdown",),
+                    subagent_states=(
+                        {"source_id": "child-shutdown", "status": "shutdown"},
+                    ),
+                ),
+            )
+        )
+        assert parent.state is not None
+        assert parent.state.metadata.subagents[0]["status"] == "cancelled"
+        assert parent.state.metadata.subagents[0]["progress"] == "已完成并停止"
+
+        # Transient activity reopens a completed child on the card too.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="list-reopen-1",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    collaboration_receivers=("child-reopen",),
+                    subagent_states=(
+                        {"source_id": "child-reopen", "status": "completed"},
+                    ),
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="act-reopen",
+                    title="Interact",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id="child-reopen",
+                    subagent_activity="interacted",
+                ),
+            )
+        )
+        reopen_summary = next(
+            s
+            for s in parent.state.metadata.subagents
+            if s["progress"] == "已与主 Agent 交互"
+        )
+        assert reopen_summary["status"] == "running"
+        assert reopen_summary["generation"] == 2
+
+        # Sticky malformed status stays malformed even if completed follows.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="list-bad",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    collaboration_receivers=("child-bad",),
+                    subagent_states=(
+                        {"source_id": "child-bad", "status": "future-state"},
+                    ),
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="list-clean-after-bad",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    collaboration_receivers=("child-bad",),
+                    subagent_states=(
+                        {"source_id": "child-bad", "status": "completed"},
+                    ),
+                ),
+            )
+        )
+        bad_summary = parent.state.metadata.subagents[-1]
+        assert bad_summary["status"] == "malformed"
+        assert bad_summary["malformed"] is True
+
+        programming.finish()
+        final_subagents = parent.state.metadata.subagents
+        assert final_subagents[0]["status"] == "cancelled"
+        assert final_subagents[1]["status"] == "unresolved"
+        assert final_subagents[2]["status"] == "unresolved"
+    finally:
+        programming.abort()

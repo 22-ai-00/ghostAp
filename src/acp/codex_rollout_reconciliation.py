@@ -23,6 +23,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .child_lifecycle import (
+    KNOWN_CHILD_ACTIVITIES as _SUBAGENT_ACTIVITY_KINDS,
+)
+from .child_lifecycle import (
+    TERMINAL_CHILD_STATUSES as _TERMINAL_STATUSES,
+)
+from .child_lifecycle import (
+    normalize_provider_child_status,
+)
 from .collaboration import merge_tool_call_sequence
 from .models import PromptResult, ToolCallInfo
 from .outcome import has_transient_child_lifecycle
@@ -45,10 +54,6 @@ _ROOT_AGENT_PATH = "/root"
 _AGENT_PATH_RE = re.compile(
     r"/root(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}){1,8}"
 )
-_SUBAGENT_ACTIVITY_KINDS = frozenset(
-    {"started", "interacted", "interrupted"}
-)
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _TRANSIENT_OUTER_STATUSES = frozenset(
     {"pending", "in_progress", "running"}
 )
@@ -59,19 +64,6 @@ _KNOWN_COLLAB_SPAWN_FAILURES = frozenset(
         "collab spawn failed: agent thread limit reached",
     }
 )
-_STATUS_MAP = {
-    "pending": "pending",
-    "pendinginit": "pending",
-    "running": "running",
-    "completed": "completed",
-    "failed": "failed",
-    "errored": "failed",
-    "notfound": "failed",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
-    "interrupted": "cancelled",
-    "shutdown": "cancelled",
-}
 
 
 def _event_timestamp(value: object) -> float | None:
@@ -452,9 +444,7 @@ def _normalize_agent_status(value: object) -> str | None:
         if len(value) != 1:
             return None
         raw_status = next(iter(value))
-    if not isinstance(raw_status, str):
-        return None
-    return _STATUS_MAP.get(raw_status.strip().casefold())
+    return normalize_provider_child_status(raw_status)
 
 
 def _latest_list_agents_output(

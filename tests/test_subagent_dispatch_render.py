@@ -1,3 +1,5 @@
+from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+from src.card.events.projector import merge_collaboration_summaries, project_collaboration
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import _render_atoms_to_elements
 from src.card.render.tools import build_subagent_dispatch_atom, render_subagent_dispatch_panel
@@ -132,3 +134,36 @@ def test_build_subagent_dispatch_atom_renders_through_registry():
     assert len(elements) == 1
     assert elements[0]["border"]["color"] == "orange"
     assert "并行子任务" in elements[0]["header"]["title"]["content"]
+
+
+def test_projected_shutdown_and_malformed_states_render_truthfully():
+    event = ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_DONE,
+        tool_call=ToolCallInfo(
+            id="list-projected",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            collaboration_receivers=("child-shutdown", "child-bad"),
+            subagent_states=(
+                {"source_id": "child-shutdown", "status": "shutdown"},
+                {"source_id": "child-bad", "status": "future-state"},
+            ),
+        ),
+    )
+    projection = project_collaboration(event)
+    assert projection is not None
+    summaries = merge_collaboration_summaries({}, projection, parent_sequence=1)
+
+    panel = render_subagent_dispatch_panel(list(summaries.values()))
+
+    assert panel is not None
+    title = panel["header"]["title"]["content"]
+    content = panel["elements"][0]["content"]
+    assert "取消 1" in title
+    assert "未知 1" in title
+    assert "**已取消**" in content
+    assert "结果：已完成并停止" in content
+    assert "**状态未知**" in content
+    assert "**已完成**" not in content
