@@ -105,7 +105,7 @@ def card_event_from_acp(
                 if preserve_tool_content
                 else sanitize_tool_event_content(
                     tc.content if tc else "",
-                    fallback=tc.title if tc else "",
+                    fallback="",
                 )
             )
             return CardEvent(type=CardEventType.TOOL_DELTA, payload={
@@ -116,14 +116,6 @@ def card_event_from_acp(
         case AET.TOOL_CALL_DONE:
             tc = acp_event.tool_call
             summary = tc.title if tc else ""
-            output = (
-                _full_tool_payload(tc)
-                if preserve_tool_content
-                else sanitize_tool_event_content(
-                    tc.content if tc else "",
-                    fallback=summary,
-                )
-            )
             status = tc.status if tc else "completed"
             if status == "failed":
                 if preserve_tool_content:
@@ -141,6 +133,14 @@ def card_event_from_acp(
                     "tool_name": summary,
                     "error": output,
                 })
+            output = (
+                _full_tool_payload(tc)
+                if preserve_tool_content
+                else sanitize_tool_event_content(
+                    tc.content if tc else "",
+                    fallback=summary,
+                )
+            )
             return CardEvent(type=CardEventType.TOOL_DONE, payload={
                 "block_id": tc.id if tc else "",
                 "tool_output": output,

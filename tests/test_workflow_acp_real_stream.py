@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from acp.schema import ToolCallProgress, ToolCallStart
@@ -324,3 +325,81 @@ def test_real_in_progress_update_without_start_materializes_active_tool_block() 
     assert output_tail in tools[0].content
     assert secret not in tools[0].content
     assert "<redacted>" in tools[0].content
+
+
+def test_real_acp_multi_progress_snapshots_replace_and_stay_idempotent() -> None:
+    raw_input = {"command": "printf ABC"}
+    full_sink = _StateSink()
+    compact_sink = _StateSink()
+    full_bridge = ACPStreamBridge(full_sink, preserve_tool_content=True)
+    compact_bridge = ACPStreamBridge(compact_sink)
+
+    def on_event(event: ACPEvent) -> None:
+        full_bridge.on_event(event)
+        compact_bridge.on_event(event)
+
+    client = GhostAPClient(
+        on_event=on_event,
+        capture_full_tool_content=True,
+    )
+
+    asyncio.run(client.session_update("session", _tool_start(raw_input)))
+    version_after_start = full_sink.state.version
+    compact_version_after_start = compact_sink.state.version
+
+    # Empty or raw_input-echo progress before real output must not pollute content.
+    asyncio.run(
+        client.session_update(
+            "session",
+            _tool_progress(status="in_progress", raw_input=raw_input, raw_output=None),
+        )
+    )
+    asyncio.run(
+        client.session_update(
+            "session",
+            _tool_progress(status="in_progress", raw_input=None, raw_output=None),
+        )
+    )
+    assert full_sink.state.version == version_after_start
+    assert compact_sink.state.version == compact_version_after_start
+    assert _tool_blocks(full_sink)[0].content == ""
+    assert _tool_blocks(compact_sink)[0].content == ""
+
+    # Cumulative snapshots replace instead of concatenating ("A" -> "AB" -> "ABC").
+    for snap in ("A", "AB", "ABC"):
+        asyncio.run(
+            client.session_update(
+                "session",
+                _tool_progress(
+                    status="in_progress",
+                    raw_input=raw_input,
+                    raw_output={"stdout": snap},
+                ),
+            )
+        )
+
+    assert json.loads(_tool_blocks(full_sink)[0].content) == {"stdout": "ABC"}
+    assert _tool_blocks(compact_sink)[0].content == "ABC"
+
+    # Replayed identical snapshot, raw_input echo, and empty progress are no-ops.
+    version_before_noop = full_sink.state.version
+    compact_version_before_noop = compact_sink.state.version
+    for raw_in, raw_out in (
+        (raw_input, {"stdout": "ABC"}),
+        (raw_input, None),
+        (None, None),
+    ):
+        asyncio.run(
+            client.session_update(
+                "session",
+                _tool_progress(
+                    status="in_progress",
+                    raw_input=raw_in,
+                    raw_output=raw_out,
+                ),
+            )
+        )
+    assert full_sink.state.version == version_before_noop
+    assert compact_sink.state.version == compact_version_before_noop
+    assert json.loads(_tool_blocks(full_sink)[0].content) == {"stdout": "ABC"}
+    assert _tool_blocks(compact_sink)[0].content == "ABC"

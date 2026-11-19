@@ -134,27 +134,42 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
 
         case CardEventType.TOOL_DELTA:
             block_id = event.payload.get("block_id", "")
-            content = event.payload.get("content", "")
+            raw_content = event.payload.get("content", "")
+            content = "" if raw_content is None else str(raw_content)
             # O(1) lookup via block_index
             idx = state.block_index.get(block_id)
             if idx is not None and idx < len(state.blocks) and state.blocks[idx].kind == "tool_call":
                 b = state.blocks[idx]
-                combined_content = b.content + content
-                changes = {"content": combined_content}
-                if _is_task_tool_name(b.tool_name) and _is_helpful_task_summary(combined_content):
-                    changes["tool_summary"] = str(combined_content).strip()
-                updated = replace(b, **changes)
+                # ACP ToolCallProgress payloads carry cumulative snapshots, not deltas;
+                # ignore empty frames and raw_input echoes so existing progress is kept.
+                if not content or content == b.tool_input:
+                    next_content = b.content
+                else:
+                    next_content = content
+                next_summary = b.tool_summary
+                if _is_task_tool_name(b.tool_name) and _is_helpful_task_summary(next_content):
+                    next_summary = str(next_content).strip()
+                if next_content == b.content and next_summary == b.tool_summary:
+                    return state
+                updated = replace(b, content=next_content, tool_summary=next_summary)
                 blocks = state.blocks[:idx] + (updated,) + state.blocks[idx + 1:]
                 return replace(state, blocks=blocks)
             if block_id:
                 # A reconnect may resume with ToolCallProgress before the
                 # corresponding start frame is replayed. Materialize the
                 # observed active invocation so its progress remains visible.
+                tool_name = event.payload.get("tool_name", "") or "工具"
+                tool_summary = (
+                    str(content).strip()
+                    if _is_task_tool_name(tool_name) and _is_helpful_task_summary(content)
+                    else ""
+                )
                 active = ToolBlock(
                     block_id=block_id,
                     status="active",
-                    tool_name=event.payload.get("tool_name", "") or "工具",
+                    tool_name=tool_name,
                     content=content,
+                    tool_summary=tool_summary,
                     is_latest_active=True,
                 )
                 blocks = _replace_tool_blocks(

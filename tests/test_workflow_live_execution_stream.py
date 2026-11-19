@@ -1333,3 +1333,135 @@ def test_workflow_renderer_caches_finished_agent_cards_and_isolates_mutations() 
     )
     assert second_done_card == first_done_expected
     assert isinstance(second_done_card["_workflow_page_key"], tuple)
+
+
+def test_tool_delta_uses_snapshot_semantics_and_idempotency(tmp_path) -> None:
+    state = reduce_card_state(
+        None,
+        CardEvent.tool_started("t1", "bash", '{"command": "echo hi"}'),
+    )
+    v_start = state.version
+
+    # Empty and raw_input-echo deltas before output are no-ops.
+    assert reduce_card_state(state, CardEvent.tool_delta("t1", "")) is state
+    assert (
+        reduce_card_state(state, CardEvent.tool_delta("t1", '{"command": "echo hi"}'))
+        is state
+    )
+    assert state.version == v_start
+
+    # Cumulative text snapshots replace rather than concatenate.
+    for snap in ("A", "AB", "ABC"):
+        state = reduce_card_state(state, CardEvent.tool_delta("t1", snap))
+    assert state.blocks[0].content == "ABC"
+
+    # JSON snapshots remain valid JSON rather than concatenated fragments.
+    state = reduce_card_state(state, CardEvent.tool_delta("t1", '{"step": 1}'))
+    state = reduce_card_state(
+        state, CardEvent.tool_delta("t1", '{"step": 2, "done": true}')
+    )
+    assert json.loads(state.blocks[0].content) == {"step": 2, "done": True}
+
+    # Duplicate, empty, and tool_input-echo frames preserve content without version bump.
+    v_json = state.version
+    assert (
+        reduce_card_state(
+            state, CardEvent.tool_delta("t1", '{"step": 2, "done": true}')
+        )
+        is state
+    )
+    assert reduce_card_state(state, CardEvent.tool_delta("t1", "")) is state
+    assert (
+        reduce_card_state(state, CardEvent.tool_delta("t1", '{"command": "echo hi"}'))
+        is state
+    )
+    assert state.version == v_json
+
+    # Task tool updates tool_summary on helpful snapshots and is idempotent on repeats.
+    task_state = reduce_card_state(
+        None,
+        CardEvent.tool_started("task-1", "task", '{"description": "audit"}'),
+    )
+    assert (
+        reduce_card_state(
+            task_state, CardEvent.tool_delta("task-1", '{"description": "audit"}')
+        )
+        is task_state
+    )
+    task_state = reduce_card_state(task_state, CardEvent.tool_delta("task-1", "step 1"))
+    assert task_state.blocks[0].content == "step 1"
+    assert task_state.blocks[0].tool_summary == "step 1"
+    task_state = reduce_card_state(task_state, CardEvent.tool_delta("task-1", "step 1-2"))
+    assert task_state.blocks[0].content == "step 1-2"
+    assert task_state.blocks[0].tool_summary == "step 1-2"
+    assert reduce_card_state(task_state, CardEvent.tool_delta("task-1", "step 1-2")) is task_state
+
+    # End-to-end executor -> WorkflowStateManager preserves latest snapshot only.
+    events = [
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="snap-tool",
+                title="bash",
+                kind="execute",
+                status="in_progress",
+                content="echo hi",
+            ),
+        ),
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="snap-tool",
+                title="bash",
+                kind="execute",
+                status="in_progress",
+                content="A",
+            ),
+        ),
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="snap-tool",
+                title="bash",
+                kind="execute",
+                status="in_progress",
+                content="AB",
+            ),
+        ),
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="snap-tool",
+                title="bash",
+                kind="execute",
+                status="in_progress",
+                content="ABC",
+            ),
+        ),
+    ]
+    project = WorkflowProject(name="snapshot-wf", status=WorkflowStatus.RUNNING)
+    manager = WorkflowStateManager(project)
+    label = manager.on_agent_started("snap-agent", "codex", "build", agent_id="A1")
+    executor = AgentExecutor(
+        cwd=str(tmp_path),
+        cancel_event=threading.Event(),
+        on_card_event=lambda event_label, event: manager.record_agent_card_event(
+            event_label,
+            event,
+        ),
+    )
+    try:
+        with patch(
+            "src.agent_session.factory.create_engine_session",
+            return_value=_EventSession(events),
+        ):
+            result = executor.execute(
+                AgentCallParams(prompt="work", tool="codex", label=label)
+            )
+    finally:
+        executor.shutdown(wait=True)
+
+    assert result.error is None
+    blocks = manager.snapshot().phases[0].agents[0].execution_blocks
+    assert len(blocks) == 1
+    assert blocks[0].content == "ABC"
