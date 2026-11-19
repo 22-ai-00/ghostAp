@@ -9,11 +9,22 @@ from src.card.hooks import _MAX_CONSECUTIVE_TIMEOUTS, _HookExecutorManager
 class TestHookExecutorManagerBasic:
     """Basic executor manager operations."""
 
+    def test_lazy_executor_not_created_before_submit(self):
+        """Executor stays None until the first submit()."""
+        mgr = _HookExecutorManager()
+        assert mgr._executor is None
+        assert mgr._terminal_executor is None
+        mgr.shutdown()
+
     def test_submit_executes_callable(self):
         """submit() runs the callable in the thread pool."""
         mgr = _HookExecutorManager()
-        result = mgr.submit(lambda: 42)
-        assert result.result(timeout=5) == 42
+        try:
+            result = mgr.submit(lambda: 42)
+            assert result is not None
+            assert result.result(timeout=5) == 42
+        finally:
+            mgr.shutdown()
 
     def test_record_success_resets_counter(self):
         """record_success() resets consecutive timeout counter."""
@@ -29,74 +40,98 @@ class TestHookExecutorTimeout:
     def test_single_timeout_does_not_rebuild(self):
         """A single timeout increments counter but doesn't rebuild."""
         mgr = _HookExecutorManager()
-        original_executor = mgr._executor
+        try:
+            mgr.submit(lambda: None).result(timeout=5)
+            original_executor = mgr._executor
+            assert original_executor is not None
 
-        mgr.record_timeout()
-
-        assert mgr._consecutive_timeouts == 1
-        assert mgr._executor is original_executor
-
-    def test_max_timeouts_triggers_rebuild(self):
-        """Reaching _MAX_CONSECUTIVE_TIMEOUTS rebuilds the executor."""
-        mgr = _HookExecutorManager()
-        original_executor = mgr._executor
-
-        for _ in range(_MAX_CONSECUTIVE_TIMEOUTS):
             mgr.record_timeout()
 
-        # Executor should have been rebuilt
-        assert mgr._executor is not original_executor
-        # Counter should be reset
-        assert mgr._consecutive_timeouts == 0
-        # Cleanup
-        mgr._executor.shutdown(wait=False)
+            assert mgr._consecutive_timeouts == 1
+            assert mgr._executor is original_executor
+        finally:
+            mgr.shutdown()
+
+    def test_max_timeouts_triggers_rebuild(self):
+        """Reaching _MAX_CONSECUTIVE_TIMEOUTS rebuilds the executor and semaphore."""
+        mgr = _HookExecutorManager()
+        try:
+            mgr.submit(lambda: None).result(timeout=5)
+            original_gen = mgr._generation
+            original_executor = mgr._executor
+            assert original_gen is not None
+            assert original_executor is not None
+
+            for _ in range(_MAX_CONSECUTIVE_TIMEOUTS):
+                mgr.record_timeout()
+
+            # Executor and generation semaphore should have been rebuilt
+            assert mgr._executor is not None
+            assert mgr._executor is not original_executor
+            assert mgr._generation is not original_gen
+            assert mgr._semaphore is not original_gen.semaphore
+            # Counter should be reset
+            assert mgr._consecutive_timeouts == 0
+        finally:
+            mgr.shutdown()
 
     def test_rebuild_shuts_down_old_executor(self):
         """Old executor is shut down (non-blocking) after rebuild."""
         mgr = _HookExecutorManager()
-        old_executor = mgr._executor
+        try:
+            mgr.submit(lambda: None).result(timeout=5)
+            old_executor = mgr._executor
+            assert old_executor is not None
 
-        with patch.object(old_executor, 'shutdown') as mock_shutdown:
-            for _ in range(_MAX_CONSECUTIVE_TIMEOUTS):
-                mgr.record_timeout()
-            mock_shutdown.assert_called_once_with(wait=False)
-
-        mgr._executor.shutdown(wait=False)
+            with patch.object(old_executor, 'shutdown') as mock_shutdown:
+                for _ in range(_MAX_CONSECUTIVE_TIMEOUTS):
+                    mgr.record_timeout()
+                mock_shutdown.assert_called_once_with(wait=False)
+        finally:
+            mgr.shutdown()
 
     def test_success_after_timeout_resets_counter(self):
         """A success after a timeout resets the counter, preventing rebuild."""
         mgr = _HookExecutorManager()
-        original_executor = mgr._executor
+        try:
+            mgr.submit(lambda: None).result(timeout=5)
+            original_executor = mgr._executor
+            assert original_executor is not None
 
-        mgr.record_timeout()
-        assert mgr._consecutive_timeouts == 1
+            mgr.record_timeout()
+            assert mgr._consecutive_timeouts == 1
 
-        mgr.record_success()
-        assert mgr._consecutive_timeouts == 0
+            mgr.record_success()
+            assert mgr._consecutive_timeouts == 0
 
-        # Another timeout shouldn't rebuild yet
-        mgr.record_timeout()
-        assert mgr._executor is original_executor
+            # Another timeout shouldn't rebuild yet
+            mgr.record_timeout()
+            assert mgr._executor is original_executor
+        finally:
+            mgr.shutdown()
 
     def test_thread_safety_of_record_timeout(self):
         """Concurrent record_timeout calls don't corrupt state."""
         mgr = _HookExecutorManager()
-        num_threads = 10
+        try:
+            mgr.submit(lambda: None).result(timeout=5)
+            num_threads = 10
 
-        def record_many():
-            for _ in range(5):
-                mgr.record_timeout()
-                mgr.record_success()
+            def record_many():
+                for _ in range(5):
+                    mgr.record_timeout()
+                    mgr.record_success()
 
-        threads = [threading.Thread(target=record_many) for _ in range(num_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            threads = [threading.Thread(target=record_many) for _ in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-        # Should not crash and counter should be valid
-        assert mgr._consecutive_timeouts >= 0
-        mgr._executor.shutdown(wait=False)
+            # Should not crash and counter should be valid
+            assert mgr._consecutive_timeouts >= 0
+        finally:
+            mgr.shutdown()
 
 
 class TestHookTimeoutEndToEnd:
@@ -181,11 +216,16 @@ class TestHookExecutorTwoPhaseShutdown:
         from unittest.mock import patch
 
         mgr = _HookExecutorManager()
+        mgr.submit(lambda: None).result(timeout=5)
         original_executor = mgr._executor
+        assert original_executor is not None
 
         # Make shutdown call raise
         def mock_shutdown(wait=False, cancel_futures=True):
             raise RuntimeError("simulated interpreter shutdown")
 
-        with patch.object(original_executor, 'shutdown', side_effect=mock_shutdown):
-            mgr.shutdown()  # Should not raise
+        try:
+            with patch.object(original_executor, 'shutdown', side_effect=mock_shutdown):
+                mgr.shutdown()  # Should not raise
+        finally:
+            original_executor.shutdown(wait=False)
