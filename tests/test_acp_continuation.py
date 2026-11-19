@@ -1553,3 +1553,277 @@ def test_background_tool_continuation_is_bounded_and_fails_closed() -> None:
     assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
     assert execution.assessment.incomplete_outer_tool_calls == 1
     assert "未进入终态" in execution.assessment.detail
+
+
+def test_merge_prompt_results_preserves_terminal_text_and_provenance_on_empty_followup() -> None:
+    from src.acp.continuation import merge_prompt_results
+    from src.acp.execution_windows import _merge_executions
+    from src.acp.models import TerminalOutputProvenance
+
+    previous = PromptResult(
+        stop_reason="end_turn",
+        text="上一轮主结论",
+        terminal_text="上一轮主结论",
+        terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+        terminal_text_tracked=True,
+    )
+    empty_followup = PromptResult(
+        stop_reason="end_turn",
+        text="",
+        terminal_text="",
+        terminal_text_provenance=TerminalOutputProvenance.NONE.value,
+        terminal_text_tracked=True,
+    )
+    merged = merge_prompt_results(previous, empty_followup)
+    assert merged.text == "上一轮主结论"
+    assert merged.terminal_text == "上一轮主结论"
+    assert (
+        merged.terminal_text_provenance
+        == TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+    )
+    assert merged.terminal_text_tracked is True
+
+    # Execution window merge delegates to the same terminal preservation rule.
+    prev_exec = acp.PromptContinuationResult(
+        result=previous,
+        assessment=classify_prompt_result(previous),
+        automatic_continuations=0,
+        entered_finalization=True,
+    )
+    curr_exec = acp.PromptContinuationResult(
+        result=empty_followup,
+        assessment=classify_prompt_result(empty_followup),
+        automatic_continuations=0,
+        entered_finalization=False,
+    )
+    merged_exec = _merge_executions(prev_exec, curr_exec, execution_windows=2)
+    assert merged_exec.result.text == "上一轮主结论"
+    assert merged_exec.result.terminal_text == "上一轮主结论"
+    assert (
+        merged_exec.result.terminal_text_provenance
+        == TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+    )
+
+    # A new main terminal segment in a follow-up turn supersedes the previous one.
+    new_followup = PromptResult(
+        stop_reason="end_turn",
+        text="续做新结论",
+        terminal_text="续做新结论",
+        terminal_text_provenance=TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value,
+        terminal_text_tracked=True,
+    )
+    merged_new = merge_prompt_results(previous, new_followup)
+    assert merged_new.terminal_text == "续做新结论"
+    assert (
+        merged_new.terminal_text_provenance
+        == TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+    )
+
+
+def test_child_reconciliation_preserves_terminal_text_and_provenance_around_enrichment() -> None:
+    from src.acp.models import TerminalOutputProvenance
+
+    runner = _runner()
+    first_result = _with_child_state(
+        PromptResult(
+            stop_reason="end_turn",
+            text="业务终答",
+            terminal_text="业务终答",
+            terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+            terminal_text_tracked=True,
+        ),
+        "running",
+        tool_id="list-before-rec",
+    )
+    reconciled_result = _with_child_state(
+        PromptResult(
+            stop_reason="end_turn",
+            text="对账完成",
+            terminal_text="对账完成",
+            terminal_text_provenance=TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value,
+            terminal_text_tracked=True,
+        ),
+        "running",
+        tool_id="list-mid-rec",
+    )
+
+    class _ReconcilingEnrichSession(_FakeSession):
+        def enrich_child_reconciliation_result(
+            self,
+            result: PromptResult,
+            *,
+            started_at: float,
+            ended_at: float,
+            logical_task_started_at: float,
+            on_event: Callable[[ACPEvent], None] | None = None,
+        ) -> PromptResult:
+            del started_at, ended_at, logical_task_started_at, on_event
+            return PromptResult(
+                stop_reason=result.stop_reason,
+                text="富化覆写文本",
+                terminal_text="富化覆写终答",
+                terminal_text_provenance=TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value,
+                tool_calls=[
+                    ToolCallInfo(
+                        id="rollout-list-agents",
+                        title="list_agents",
+                        kind="other",
+                        status="completed",
+                        collaboration_tool="list_agents",
+                        subagent_states=({"source_id": "reviewer", "status": "completed"},),
+                    )
+                ],
+            )
+
+    execution = runner(
+        _ReconcilingEnrichSession(first_result, reconciled_result),
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.result.text == "业务终答"
+    assert execution.result.terminal_text == "业务终答"
+    assert (
+        execution.result.terminal_text_provenance
+        == TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+    )
+
+
+def test_acp_prompt_once_tracks_main_provenance_and_ignores_subagent_pollution(
+    tmp_path,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from src.acp.models import (
+        TerminalOutputProvenance,
+        resolve_prompt_terminal_output,
+    )
+    from src.acp.session import ACPSession
+
+    async def _run_events(events: list[ACPEvent]) -> PromptResult:
+        session = ACPSession(agent_cmd="codex", agent_args=[], cwd=str(tmp_path))
+
+        class _Conn:
+            async def prompt(self, **_kwargs):
+                for ev in events:
+                    session._dispatch_event(ev)
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = _Conn()
+        session._session_id = "sess-provenance"
+        return await session.prompt("work")
+
+    # 1) Subagent chunks & subagent final_answer do not pollute main_final_segment.
+    seg_result = asyncio.run(
+        _run_events(
+            [
+                ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="前段说明"),
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_START,
+                    tool_call=ToolCallInfo(
+                        id="t1", title="read", kind="read", status="in_progress"
+                    ),
+                ),
+                ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="思考前段"),
+                ACPEvent(event_type=ACPEventType.THOUGHT_CHUNK, text="internal thought"),
+                ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="计划前段"),
+                ACPEvent(
+                    event_type=ACPEventType.PLAN_UPDATE,
+                    plan=PlanInfo(entries=[PlanEntryInfo(content="done", status="completed")]),
+                ),
+                ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="主最终分段"),
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="子代理输出",
+                    source_id="child-1",
+                    message_id="child-msg",
+                    codex_message_phase="final_answer",
+                ),
+                ACPEvent(
+                    event_type=ACPEventType.THOUGHT_CHUNK,
+                    text="child thought",
+                    source_id="child-1",
+                ),
+            ]
+        )
+    )
+    assert "子代理输出" in seg_result.text
+    assert seg_result.terminal_text == "主最终分段"
+    assert (
+        seg_result.terminal_text_provenance
+        == TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+    )
+    assert seg_result.terminal_text_tracked is True
+    assert resolve_prompt_terminal_output(seg_result) == (
+        "主最终分段",
+        TerminalOutputProvenance.MAIN_FINAL_SEGMENT,
+    )
+
+    # 2) Main final_answer phase outranks later commentary segment.
+    phase_result = asyncio.run(
+        _run_events(
+            [
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="过程说明",
+                    message_id="m-comm-1",
+                    codex_message_phase="commentary",
+                ),
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="真正",
+                    message_id="m-final",
+                    codex_message_phase="final_answer",
+                ),
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="终答",
+                    message_id="m-final",
+                    codex_message_phase="final_answer",
+                ),
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_START,
+                    tool_call=ToolCallInfo(
+                        id="t2", title="list_agents", kind="other", status="in_progress"
+                    ),
+                ),
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="对账尾文",
+                    message_id="m-comm-2",
+                    codex_message_phase="commentary",
+                ),
+            ]
+        )
+    )
+    assert phase_result.terminal_text == "真正终答"
+    assert (
+        phase_result.terminal_text_provenance
+        == TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+    )
+
+    # 3) Subagent-only stream never promotes result.text to unstreamed_response.
+    subagent_only = asyncio.run(
+        _run_events(
+            [
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="仅子代理文本",
+                    source_id="child-only",
+                )
+            ]
+        )
+    )
+    assert subagent_only.text == "仅子代理文本"
+    assert subagent_only.terminal_text == ""
+    assert (
+        subagent_only.terminal_text_provenance
+        == TerminalOutputProvenance.NONE.value
+    )
+    assert subagent_only.terminal_text_tracked is True
+    assert resolve_prompt_terminal_output(subagent_only) == (
+        "",
+        TerminalOutputProvenance.NONE,
+    )

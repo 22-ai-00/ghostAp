@@ -404,3 +404,72 @@ def test_continuation_checks_swarm_final_text_instead_of_interim_question() -> N
     assert merged.swarm_completed is True
     assert merged.swarm_final_text == "全部任务已完成。"
     assert _requests_explicit_user_input(merged) is False
+
+
+def test_swarm_tracker_ignores_non_main_source_events() -> None:
+    tracker = SwarmLifecycleTracker(done_text_settle_s=0.1, turn_gap_reset_s=0.1)
+    tracker.observe_event(
+        _tool_event(
+            ACPEventType.TOOL_CALL_DONE,
+            call_id="c_add",
+            title="swarm",
+            status="completed",
+            swarm_signal=SwarmToolSignal(tool="swarm", action="add", added_members=("worker-1",)),
+        ),
+        1.0,
+    )
+    tracker.on_prompt_response_returned(1.05)
+    tracker.observe_event(
+        _tool_event(
+            ACPEventType.TOOL_CALL_DONE,
+            call_id="c_done",
+            title="post_message",
+            status="completed",
+            swarm_signal=SwarmToolSignal(tool="post_message", is_done_post=True),
+        ),
+        2.0,
+    )
+    tracker.observe_event(_text_event("主协调者终答"), 2.01)
+    activity_before_child = tracker.last_activity_monotonic
+
+    # Subagent TEXT_CHUNK and TOOL_CALL_* must not pollute final_turn_text,
+    # erase has_text_since_last_tool, open child tool IDs, or extend settle timer.
+    assert tracker.observe_event(
+        ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="子代理噪声",
+            source_id="child-subagent-1",
+        ),
+        2.05,
+    ) is False
+    assert tracker.observe_event(
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            source_id="child-subagent-1",
+            tool_call=ToolCallInfo(
+                id="child-tool-1",
+                title="read_file",
+                kind="read",
+                status="in_progress",
+            ),
+        ),
+        2.08,
+    ) is False
+    assert is_swarm_working_event(
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id="child-subagent-1",
+            tool_call=ToolCallInfo(
+                id="child-swarm-call",
+                title="swarm",
+                kind="other",
+                status="completed",
+                swarm_signal=SwarmToolSignal(tool="swarm", action="add", added_members=("helper",)),
+            ),
+        )
+    ) is False
+
+    assert tracker.final_turn_text == "主协调者终答"
+    assert tracker.has_text_since_last_tool is True
+    assert tracker.last_activity_monotonic == activity_before_child
+    assert tracker.evaluate_wait(2.12) == (False, None)

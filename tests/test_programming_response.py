@@ -1651,3 +1651,656 @@ def test_reconciliation_timeout_retirement_cannot_repersist_snapshot(
     handler._retire_finalization_session.assert_called_once()
     handler._update_snapshot_on_project.assert_not_called()
     assert handler._clear_snapshot_for_session.call_count >= 2
+
+
+def test_resolve_prompt_terminal_output_priority_and_provenance() -> None:
+    from src.acp.models import (
+        TerminalOutputProvenance,
+        resolve_prompt_terminal_output,
+    )
+
+    assert resolve_prompt_terminal_output(None) == (
+        "",
+        TerminalOutputProvenance.NONE,
+    )
+    assert resolve_prompt_terminal_output(
+        PromptResult(
+            stop_reason="end_turn",
+            text="full transcript",
+            terminal_text="final phase",
+            terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+            swarm_completed=True,
+            swarm_final_text="swarm final",
+        )
+    ) == ("swarm final", TerminalOutputProvenance.SWARM_FINAL_TURN)
+    assert resolve_prompt_terminal_output(
+        PromptResult(
+            stop_reason="end_turn",
+            text="full transcript",
+            terminal_text="final phase",
+            terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+        )
+    ) == ("final phase", TerminalOutputProvenance.FINAL_ANSWER_PHASE)
+    assert resolve_prompt_terminal_output(
+        PromptResult(
+            stop_reason="end_turn",
+            text="legacy unstreamed",
+        )
+    ) == ("legacy unstreamed", TerminalOutputProvenance.UNSTREAMED_RESPONSE)
+    assert resolve_prompt_terminal_output(
+        PromptResult(
+            stop_reason="end_turn",
+            text="subagent-only noise",
+            terminal_text="",
+            terminal_text_provenance=TerminalOutputProvenance.NONE.value,
+            terminal_text_tracked=True,
+        )
+    ) == ("", TerminalOutputProvenance.NONE)
+
+
+def test_codex_cli_parses_agent_message_phase_id_and_terminal_provenance() -> None:
+    from src.acp.models import TerminalOutputProvenance
+    from src.agent_session.codex_cli import CodexCLIConfig, SyncCodexCLISession
+
+    stdout_lines = [
+        '{"type":"thread.started","thread_id":"thread-cli-1"}\n',
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "msg-commentary",
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "text": "正在分析...",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "cmd-1", "type": "command_execution"},
+            }
+        )
+        + "\n",
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "msg-final",
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "text": "最终修复已完成。",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "msg-trailing",
+                    "type": "agent_message",
+                    "phase": "untrusted_custom",
+                    "text": "收尾备注",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+    ]
+    proc = MagicMock()
+    proc.stdout = iter(stdout_lines)
+    proc.stderr = MagicMock()
+    proc.stderr.read.return_value = ""
+    proc.returncode = 0
+    proc.poll.return_value = 0
+    proc.wait.return_value = None
+    proc.pid = 4321
+
+    session = SyncCodexCLISession(
+        cwd="/tmp",
+        config=CodexCLIConfig(command="codex-w", add_dir=False),
+    )
+    events: list[ACPEvent] = []
+    with (
+        patch("src.agent_session.codex_cli.shutil.which", return_value="/usr/bin/codex-w"),
+        patch("src.utils.env.build_clean_env", return_value={}),
+        patch("src.agent_session.codex_cli.subprocess.Popen", return_value=proc),
+    ):
+        result = session.send_prompt("fix bug", on_event=events.append)
+
+    assert [(e.message_id, e.codex_message_phase, e.text) for e in events] == [
+        ("msg-commentary", "commentary", "正在分析..."),
+        ("msg-final", "final_answer", "最终修复已完成。"),
+        ("msg-trailing", None, "收尾备注"),
+    ]
+    assert result.terminal_text == "最终修复已完成。"
+    assert (
+        result.terminal_text_provenance
+        == TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+    )
+    assert result.terminal_text_tracked is True
+
+    # Without final_answer phase, non-agent items split into main_final_segment.
+    seg_lines = [
+        '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"段一"}}\n',
+        '{"type":"item.completed","item":{"id":"t1","type":"command_execution"}}\n',
+        '{"type":"item.completed","item":{"id":"m2","type":"agent_message","text":"段二结论"}}\n',
+    ]
+    proc2 = MagicMock()
+    proc2.stdout = iter(seg_lines)
+    proc2.stderr = MagicMock()
+    proc2.stderr.read.return_value = ""
+    proc2.returncode = 0
+    proc2.poll.return_value = 0
+    proc2.wait.return_value = None
+    proc2.pid = 4322
+    with (
+        patch("src.agent_session.codex_cli.shutil.which", return_value="/usr/bin/codex-w"),
+        patch("src.utils.env.build_clean_env", return_value={}),
+        patch("src.agent_session.codex_cli.subprocess.Popen", return_value=proc2),
+    ):
+        seg_result = session.send_prompt("segment check")
+    assert seg_result.terminal_text == "段二结论"
+    assert (
+        seg_result.terminal_text_provenance
+        == TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+    )
+
+
+def _real_prog_session():
+    from src.card.delivery.engine import CardDelivery
+    from src.card.programming_adapter import (
+        ProgrammingCardSession,
+        build_programming_metadata,
+    )
+    from src.card.session import CardSession
+    from src.card.session.config import SessionConfig
+
+    class _Client:
+        def __init__(self) -> None:
+            self.created = 0
+
+        def create_card(self, *_args, **_kwargs):
+            self.created += 1
+            return f"msg-{self.created}", f"card-{self.created}"
+
+        def update_card(self, *_args, **_kwargs):
+            return None
+
+        def update_element(self, *_args, **_kwargs):
+            return None
+
+    card_client = _Client()
+    meta = build_programming_metadata("codex")
+    card_session = CardSession(
+        chat_id="chat-1",
+        config=SessionConfig(metadata=meta, reply_to="msg-1", sync_delivery=True),
+        delivery=CardDelivery(card_client),
+        session_id="prog-resp-real",
+    )
+    return card_session, ProgrammingCardSession(card_session, base_metadata=meta)
+
+
+def test_execute_programming_response_promotes_unstreamed_and_high_authority_over_commentary() -> None:
+    from src.acp.models import TerminalOutputProvenance
+    from src.card.state.models import TextBlock
+
+    # 1) Streamed commentary followed by unstreamed PromptResult.text (e.g. CLI
+    # timeout suffix or unstreamed final result) must call set_result_conclusion_fallback
+    # even when streamed_response is non-empty.
+    for outcome_case, result_obj in (
+        (
+            "completed_unstreamed",
+            PromptResult(
+                stop_reason="end_turn",
+                text="未流式终答内容",
+            ),
+        ),
+        (
+            "timeout_suffix",
+            PromptResult(
+                stop_reason="timeout",
+                text="先流式过程文本\n❌ Codex 执行超时",
+            ),
+        ),
+        (
+            "swarm_final_turn",
+            PromptResult(
+                stop_reason="end_turn",
+                text="先流式过程文本\nSwarm 汇总结论",
+                swarm_used=True,
+                swarm_completed=True,
+                swarm_final_text="Swarm 汇总结论",
+                terminal_text="Swarm 汇总结论",
+                terminal_text_provenance=TerminalOutputProvenance.SWARM_FINAL_TURN.value,
+                terminal_text_tracked=True,
+            ),
+        ),
+        (
+            "final_answer_phase_from_result",
+            PromptResult(
+                stop_reason="end_turn",
+                text="先流式过程文本\nPhase 终答",
+                terminal_text="Phase 终答",
+                terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+                terminal_text_tracked=True,
+            ),
+        ),
+    ):
+        handler = _make_handler()
+        handler.ctx.channel_client_factory = MagicMock(return_value=object())
+        project = MagicMock()
+        project.project_id = "p1"
+        project.root_path = "/tmp/p1"
+        card_session, prog_session = _real_prog_session()
+        prog_session.start()
+
+        class _Session:
+            session_id = f"sess-{outcome_case}"
+            message_count = 1
+            _force_dead = False
+
+            def send_prompt(self, _text, on_event=None, **_kwargs):
+                if on_event is not None:
+                    on_event(
+                        ACPEvent(
+                            event_type=ACPEventType.TEXT_CHUNK,
+                            text="先流式过程文本",
+                        )
+                    )
+                return result_obj
+
+        try:
+            handler._execute_programming_response(
+                f"msg-{outcome_case}",
+                "chat-1",
+                "run task",
+                _Session(),
+                project,
+                "/tmp/p1",
+                "/tmp/p1",
+                prog_session=prog_session,
+            )
+            assert card_session.state is not None
+            final_block = next(
+                (
+                    block.content
+                    for block in card_session.state.blocks
+                    if isinstance(block, TextBlock) and block.block_id == "_final_answer"
+                ),
+                None,
+            )
+            if outcome_case == "completed_unstreamed":
+                assert final_block == "未流式终答内容"
+            elif outcome_case == "timeout_suffix":
+                assert final_block == "先流式过程文本\n❌ Codex 执行超时"
+                assert card_session.state.terminal == "failed"
+            elif outcome_case == "swarm_final_turn":
+                assert final_block == "Swarm 汇总结论"
+            else:
+                assert final_block == "Phase 终答"
+        finally:
+            prog_session.abort()
+
+
+def test_execute_programming_response_never_leaks_subagent_text_in_streaming_or_non_streaming() -> None:
+    from src.acp.models import TerminalOutputProvenance
+    from src.card.state.models import TextBlock
+
+    # Case A: Streaming with clean main conclusion + subagent-polluted result.text
+    handler = _make_handler()
+    project = MagicMock()
+    project.project_id = "p-subagent"
+    project.root_path = "/tmp/p-subagent"
+    card_session, prog_session = _real_prog_session()
+    prog_session.start()
+
+    class _PollutedMainSession:
+        session_id = "sess-polluted"
+        message_count = 1
+        _force_dead = False
+
+        def send_prompt(self, _text, on_event=None, **_kwargs):
+            if on_event is not None:
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="主 Agent 干净结论",
+                    )
+                )
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="子代理噪声文本",
+                        source_id="child-worker",
+                    )
+                )
+            return PromptResult(
+                stop_reason="end_turn",
+                text="主 Agent 干净结论\n子代理噪声文本",
+                terminal_text="主 Agent 干净结论",
+                terminal_text_provenance=TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value,
+                terminal_text_tracked=True,
+            )
+
+    try:
+        handler._execute_programming_response(
+            "msg-clean-main",
+            "chat-1",
+            "run task",
+            _PollutedMainSession(),
+            project,
+            "/tmp/p-subagent",
+            "/tmp/p-subagent",
+            prog_session=prog_session,
+        )
+        assistant_msg = next(
+            call.kwargs["conversation"]["content"]
+            for call in handler.context_manager.update_context.call_args_list
+            if call.kwargs["conversation"]["role"] == "assistant"
+        )
+        assert assistant_msg == "主 Agent 干净结论"
+        assert "子代理噪声文本" not in assistant_msg
+        assert not any(
+            isinstance(block, TextBlock) and block.block_id == "_final_answer"
+            for block in card_session.state.blocks
+        )
+    finally:
+        prog_session.abort()
+
+    # Case B: Subagent-only stream (main emitted nothing) in streaming & non-streaming
+    for is_streaming in (True, False):
+        handler2 = _make_handler()
+        handler2.reply_text = MagicMock()
+        card_session2, prog_session2 = (
+            _real_prog_session() if is_streaming else (None, None)
+        )
+        if prog_session2 is not None:
+            prog_session2.start()
+
+        class _SubagentOnlySession:
+            session_id = "sess-subagent-only"
+            message_count = 1
+            _force_dead = False
+
+            def send_prompt(self, _text, on_event=None, **_kwargs):
+                if on_event is not None:
+                    on_event(
+                        ACPEvent(
+                            event_type=ACPEventType.TEXT_CHUNK,
+                            text="子代理内部输出",
+                            source_id="child-only",
+                        )
+                    )
+                return PromptResult(
+                    stop_reason="end_turn",
+                    text="子代理内部输出",
+                    terminal_text="",
+                    terminal_text_provenance=TerminalOutputProvenance.NONE.value,
+                    terminal_text_tracked=True,
+                )
+
+        try:
+            project2 = MagicMock()
+            project2.project_id = "p-sub-only"
+            project2.root_path = "/tmp/p-sub-only"
+            handler2._execute_programming_response(
+                "msg-sub-only",
+                "chat-1",
+                "run task",
+                _SubagentOnlySession(),
+                project2,
+                "/tmp/p-sub-only",
+                "/tmp/p-sub-only",
+                prog_session=prog_session2,
+            )
+            if is_streaming:
+                assert prog_session2.get_final_text() == ""
+                assert prog_session2.get_conclusion_text() == ""
+                assert not any(
+                    isinstance(block, TextBlock) and block.block_id == "_final_answer"
+                    for block in card_session2.state.blocks
+                )
+                assistant_msg2 = next(
+                    call.kwargs["conversation"]["content"]
+                    for call in handler2.context_manager.update_context.call_args_list
+                    if call.kwargs["conversation"]["role"] == "assistant"
+                )
+                assert "子代理内部输出" not in assistant_msg2
+                assert assistant_msg2 == "✅ 执行完成"
+            else:
+                replied = handler2.reply_text.call_args.args[1]
+                assert "子代理内部输出" not in replied
+                assert "执行完成" in replied
+        finally:
+            if prog_session2 is not None:
+                prog_session2.abort()
+
+    # Case C: Non-streaming fallback prefers main terminal_text over polluted result.text
+    handler3 = _make_handler()
+    handler3.reply_text = MagicMock()
+
+    class _NonStreamingMainSession:
+        session_id = "sess-nonstream-main"
+        message_count = 1
+        _force_dead = False
+
+        def send_prompt(self, _text, on_event=None, **_kwargs):
+            if on_event is not None:
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="非流式主结论",
+                    )
+                )
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="非流式子代理噪声",
+                        source_id="child-ns",
+                    )
+                )
+            return PromptResult(
+                stop_reason="end_turn",
+                text="非流式主结论非流式子代理噪声",
+                terminal_text="非流式主结论",
+                terminal_text_provenance=TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value,
+                terminal_text_tracked=True,
+            )
+
+    handler3._execute_programming_response(
+        "msg-nonstream-main",
+        "chat-1",
+        "run task",
+        _NonStreamingMainSession(),
+        None,
+        "/tmp",
+        "/tmp",
+        prog_session=None,
+    )
+    replied3 = handler3.reply_text.call_args.args[1]
+    assert "非流式主结论" in replied3
+    assert "非流式子代理噪声" not in replied3
+
+
+def test_execute_programming_response_already_streamed_claude_cli_does_not_duplicate_final_block() -> None:
+    from src.card.state.models import TextBlock
+
+    handler = _make_handler()
+    card_session, prog_session = _real_prog_session()
+    prog_session.start()
+
+    class _StreamedClaudeCLISession:
+        session_id = "sess-claude-cli"
+        message_count = 1
+        _force_dead = False
+
+        def send_prompt(self, _text, on_event=None, **_kwargs):
+            if on_event is not None:
+                on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="line 1\n"))
+                on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="line 2\n"))
+            return PromptResult(
+                stop_reason="end_turn",
+                text="line 1\nline 2",
+            )
+
+    try:
+        handler._execute_programming_response(
+            "msg-claude-cli",
+            "chat-1",
+            "run task",
+            _StreamedClaudeCLISession(),
+            None,
+            "/tmp",
+            "/tmp",
+            prog_session=prog_session,
+        )
+        assert not any(
+            isinstance(block, TextBlock) and block.block_id == "_final_answer"
+            for block in card_session.state.blocks
+        )
+    finally:
+        prog_session.abort()
+
+
+def test_execute_programming_response_tier1_locked_conclusion_outranks_prompt_result() -> None:
+    from src.acp.models import TerminalOutputProvenance
+    from src.card.state.models import TextBlock
+
+    # 1) Frozen reconciliation fallback outranks any trailing PromptResult text.
+    handler = _make_handler()
+    project = MagicMock()
+    project.project_id = "p-tier1"
+    project.root_path = "/tmp/p-tier1"
+    card_session, prog_session = _real_prog_session()
+    prog_session.start()
+
+    first = PromptResult(
+        stop_reason="end_turn",
+        text="原始业务结论",
+        tool_calls=[
+            ToolCallInfo(
+                id="list-1",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=({"source_id": "reviewer", "status": "running"},),
+            )
+        ],
+    )
+    reconciled = PromptResult(
+        stop_reason="end_turn",
+        text="对账完成状态",
+        terminal_text="对账完成状态",
+        terminal_text_provenance=TerminalOutputProvenance.FINAL_ANSWER_PHASE.value,
+        terminal_text_tracked=True,
+        tool_calls=[
+            ToolCallInfo(
+                id="list-2",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=({"source_id": "reviewer", "status": "completed"},),
+            )
+        ],
+    )
+
+    class _ReconciliationTurnSession:
+        session_id = "sess-tier1-frozen"
+        message_count = 1
+        _force_dead = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send_prompt(self, _text, on_event=None, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                if on_event is not None:
+                    on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="原始业务结论"))
+                return first
+            if on_event is not None:
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="对账完成状态",
+                        message_id="rec-msg",
+                        codex_message_phase="commentary",
+                    )
+                )
+            return reconciled
+
+    try:
+        handler._execute_programming_response(
+            "msg-tier1-frozen",
+            "chat-1",
+            "finish task",
+            _ReconciliationTurnSession(),
+            project,
+            "/tmp/p-tier1",
+            "/tmp/p-tier1",
+            prog_session=prog_session,
+        )
+        final_block = next(
+            block.content
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock) and block.block_id == "_final_answer"
+        )
+        assert final_block == "原始业务结论"
+        assistant_msg = next(
+            call.kwargs["conversation"]["content"]
+            for call in handler.context_manager.update_context.call_args_list
+            if call.kwargs["conversation"]["role"] == "assistant"
+        )
+        assert assistant_msg == "原始业务结论"
+    finally:
+        prog_session.abort()
+
+    # 2) Captured main final_answer phase on prog_session outranks unstreamed PromptResult.text.
+    handler2 = _make_handler()
+    card_session2, prog_session2 = _real_prog_session()
+    prog_session2.start()
+
+    class _TrustedPhaseSession:
+        session_id = "sess-tier1-phase"
+        message_count = 1
+        _force_dead = False
+
+        def send_prompt(self, _text, on_event=None, **_kwargs):
+            if on_event is not None:
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TEXT_CHUNK,
+                        text="已捕获终答",
+                        message_id="m-trusted",
+                        codex_message_phase="final_answer",
+                    )
+                )
+            return PromptResult(
+                stop_reason="end_turn",
+                text="不应覆盖的可选文本",
+            )
+
+    try:
+        handler2._execute_programming_response(
+            "msg-tier1-phase",
+            "chat-1",
+            "finish task",
+            _TrustedPhaseSession(),
+            None,
+            "/tmp",
+            "/tmp",
+            prog_session=prog_session2,
+        )
+        final_block2 = next(
+            block.content
+            for block in card_session2.state.blocks
+            if isinstance(block, TextBlock) and block.block_id == "_final_answer"
+        )
+        assert final_block2 == "已捕获终答"
+    finally:
+        prog_session2.abort()

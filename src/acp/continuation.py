@@ -13,7 +13,13 @@ from .finalization import (
     _primary_timeout_with_cleanup_reserve,
     run_prompt_with_finalization,
 )
-from .models import ACPEvent, PromptResult, ToolCallInfo
+from .models import (
+    ACPEvent,
+    PromptResult,
+    TerminalOutputProvenance,
+    ToolCallInfo,
+    resolve_prompt_terminal_output,
+)
 from .outcome import (
     PromptAssessment,
     PromptOutcome,
@@ -135,11 +141,11 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
 
 
 def _requests_explicit_user_input(result: PromptResult) -> bool:
-    if (
-        getattr(result, "swarm_completed", False) is True
-        and str(getattr(result, "swarm_final_text", "") or "").strip()
-    ):
-        raw_text = result.swarm_final_text
+    terminal_text, provenance = resolve_prompt_terminal_output(result)
+    if provenance is not TerminalOutputProvenance.NONE:
+        raw_text = terminal_text
+    elif getattr(result, "terminal_text_tracked", False) is True:
+        raw_text = ""
     else:
         raw_text = result.text
     text = str(raw_text or "").strip().casefold()
@@ -290,8 +296,46 @@ def merge_prompt_results(
         output_tokens = (previous.output_tokens or 0) + (
             current.output_tokens or 0
         )
+    merged_text = current.text if str(current.text or "").strip() else previous.text
+    current_terminal = str(getattr(current, "terminal_text", "") or "")
+    previous_terminal = str(getattr(previous, "terminal_text", "") or "")
+    current_swarm_final = str(getattr(current, "swarm_final_text", "") or "")
+    if getattr(current, "swarm_completed", False) is True and current_swarm_final.strip():
+        merged_terminal_text = current_swarm_final.strip()
+        merged_provenance = TerminalOutputProvenance.SWARM_FINAL_TURN.value
+        merged_tracked = bool(getattr(current, "terminal_text_tracked", False))
+    elif current_terminal.strip():
+        merged_terminal_text = current_terminal
+        merged_provenance = str(
+            getattr(current, "terminal_text_provenance", "")
+            or TerminalOutputProvenance.NONE.value
+        )
+        merged_tracked = bool(getattr(current, "terminal_text_tracked", False))
+    elif previous_terminal.strip():
+        merged_terminal_text = previous_terminal
+        merged_provenance = str(
+            getattr(previous, "terminal_text_provenance", "")
+            or TerminalOutputProvenance.NONE.value
+        )
+        merged_tracked = bool(
+            getattr(previous, "terminal_text_tracked", False)
+            or getattr(current, "terminal_text_tracked", False)
+        )
+    else:
+        merged_terminal_text = ""
+        merged_provenance = TerminalOutputProvenance.NONE.value
+        if str(current.text or "").strip() and not getattr(
+            current, "terminal_text_tracked", False
+        ):
+            merged_tracked = False
+        else:
+            merged_tracked = bool(
+                getattr(previous, "terminal_text_tracked", False)
+                or getattr(current, "terminal_text_tracked", False)
+            )
     return replace(
         current,
+        text=merged_text,
         tool_calls=_merge_tool_calls(
             previous.tool_calls,
             current.tool_calls,
@@ -315,9 +359,12 @@ def merge_prompt_results(
             )
         ),
         swarm_final_text=(
-            str(getattr(current, "swarm_final_text", "") or "")
+            current_swarm_final
             or str(getattr(previous, "swarm_final_text", "") or "")
         ),
+        terminal_text=merged_terminal_text,
+        terminal_text_provenance=merged_provenance,
+        terminal_text_tracked=merged_tracked,
     )
 
 
@@ -554,6 +601,19 @@ def run_prompt_with_continuation(
             _notify_continuation_start(on_child_reconciliation_start)
         preserved_reconciliation_plan = result.plan
         preserved_reconciliation_text = result.text
+        preserved_reconciliation_terminal_text = result.terminal_text
+        preserved_reconciliation_terminal_provenance = (
+            result.terminal_text_provenance
+        )
+        preserved_reconciliation_terminal_tracked = getattr(
+            result, "terminal_text_tracked", False
+        )
+        preserved_reconciliation_swarm_final_text = getattr(
+            result, "swarm_final_text", ""
+        )
+        preserved_reconciliation_swarm_completed = bool(
+            getattr(result, "swarm_completed", False)
+        )
         reconciliation_on_event = (
             _reconciliation_status_callback(on_event)
             if is_child_reconciliation
@@ -625,6 +685,11 @@ def run_prompt_with_continuation(
                 result,
                 plan=preserved_reconciliation_plan,
                 text=preserved_reconciliation_text,
+                terminal_text=preserved_reconciliation_terminal_text,
+                terminal_text_provenance=preserved_reconciliation_terminal_provenance,
+                terminal_text_tracked=preserved_reconciliation_terminal_tracked,
+                swarm_final_text=preserved_reconciliation_swarm_final_text,
+                swarm_completed=preserved_reconciliation_swarm_completed,
             )
         if (
             reconciliation_started_at is not None
@@ -651,6 +716,11 @@ def run_prompt_with_continuation(
                                 result,
                                 plan=preserved_reconciliation_plan,
                                 text=preserved_reconciliation_text,
+                                terminal_text=preserved_reconciliation_terminal_text,
+                                terminal_text_provenance=preserved_reconciliation_terminal_provenance,
+                                terminal_text_tracked=preserved_reconciliation_terminal_tracked,
+                                swarm_final_text=preserved_reconciliation_swarm_final_text,
+                                swarm_completed=preserved_reconciliation_swarm_completed,
                             )
                 except Exception:
                     logger.warning(

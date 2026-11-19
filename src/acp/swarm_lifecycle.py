@@ -354,8 +354,19 @@ def _signal_from_tool_call(tool_call: object) -> SwarmToolSignal | None:
     return parse_swarm_tool_signal(title, None, content)
 
 
+def _is_main_source(event: ACPEvent) -> bool:
+    raw = getattr(event, "source_id", None)
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return raw.strip() in ("", "main")
+    return False
+
+
 def is_swarm_working_event(event: ACPEvent) -> bool:
     """Return True when an ACP event indicates active Swarm background execution."""
+    if not _is_main_source(event):
+        return False
     tool_call = getattr(event, "tool_call", None)
     if tool_call is None:
         return False
@@ -489,6 +500,15 @@ class SwarmLifecycleTracker:
 
     def observe_event(self, event: ACPEvent, now_monotonic: float) -> bool:
         """Consume one ACPEvent and return True when Swarm lifecycle state changed."""
+        event_type = getattr(event, "event_type", None)
+        if not _is_main_source(event) and event_type in {
+            ACPEventType.TEXT_CHUNK,
+            ACPEventType.TOOL_CALL_START,
+            ACPEventType.TOOL_CALL_UPDATE,
+            ACPEventType.TOOL_CALL_DONE,
+        }:
+            return False
+
         prev_active = self.active
         prev_done = self.done_posted
         prev_waiting = self.awaiting_next_turn_wakeup
@@ -499,7 +519,6 @@ class SwarmLifecycleTracker:
         self._maybe_reset_burst(now_monotonic)
         self.last_activity_monotonic = now_monotonic
 
-        event_type = getattr(event, "event_type", None)
         if event_type is ACPEventType.TEXT_CHUNK:
             chunk = getattr(event, "text", None) or ""
             if chunk:

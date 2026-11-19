@@ -1377,6 +1377,14 @@ class ProgrammingCardSession:
             # position there without creating a visible process/card block.
             self._record_main_text(f"_trusted_final_answer:{message_id}", text)
 
+    def has_trusted_final_answer(self) -> bool:
+        """Return whether a main-source final_answer phase message was captured."""
+        return self._has_trusted_final_answer()
+
+    def has_result_conclusion_fallback(self) -> bool:
+        """Return whether an authoritative conclusion fallback is already locked."""
+        return self._has_result_conclusion_fallback()
+
     def _has_trusted_final_answer(self) -> bool:
         with self._flush_lock:
             return bool(
@@ -1389,7 +1397,7 @@ class ProgrammingCardSession:
             return bool(self._result_conclusion_fallback.strip())
 
     def _is_main_source(self, source_key: str) -> bool:
-        return source_key == "main" or source_key not in self._agent_summaries
+        return source_key == "main"
 
     # ---- Internal flush mechanism ----
 

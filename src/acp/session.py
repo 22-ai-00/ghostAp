@@ -39,6 +39,7 @@ from .models import (
     ACPSessionState,
     ACPUsageInfo,
     PromptResult,
+    TerminalOutputProvenance,
 )
 from .native_commands import build_acp_prompt_texts
 from .outcome import _tool_incompleteness_details, has_transient_child_lifecycle
@@ -1063,6 +1064,23 @@ class ACPSession:
         result = PromptResult(stop_reason="")
         last_event_monotonic = [time.monotonic()]
         image_snapshot: object = {}
+        final_answer_by_msg: dict[str, list[str]] = {}
+        main_segments: list[str] = []
+        current_main_segment: list[str] = []
+
+        def _is_main_source(source_id: object) -> bool:
+            if source_id is None:
+                return True
+            if isinstance(source_id, str):
+                return source_id.strip() in ("", "main")
+            return False
+
+        def _split_main_segment() -> None:
+            if current_main_segment:
+                segment = "".join(current_main_segment)
+                current_main_segment.clear()
+                if segment.strip():
+                    main_segments.append(segment)
         should_replay_deferred_children = (
             replay_deferred_child_events or await_child_quiescence
         )
@@ -1153,13 +1171,39 @@ class ACPSession:
                     accepted = True
                     last_event_monotonic[0] = time.monotonic()
                     try:
+                        is_main_source = _is_main_source(getattr(ev, "source_id", None))
                         if ev.event_type == ACPEventType.TEXT_CHUNK:
-                            result.add_text(ev.text or "")
+                            chunk_text = ev.text or ""
+                            result.add_text(chunk_text)
+                            if is_main_source and chunk_text:
+                                current_main_segment.append(chunk_text)
+                                if (
+                                    getattr(ev, "codex_message_phase", None)
+                                    == "final_answer"
+                                ):
+                                    raw_msg_id = getattr(ev, "message_id", None)
+                                    msg_key = (
+                                        raw_msg_id.strip()
+                                        if isinstance(raw_msg_id, str)
+                                        and raw_msg_id.strip()
+                                        else ""
+                                    )
+                                    final_answer_by_msg.setdefault(msg_key, []).append(
+                                        chunk_text
+                                    )
+                        elif ev.event_type == ACPEventType.THOUGHT_CHUNK:
+                            if is_main_source:
+                                _split_main_segment()
                         elif ev.event_type in (
                             ACPEventType.TOOL_CALL_START,
                             ACPEventType.TOOL_CALL_UPDATE,
                             ACPEventType.TOOL_CALL_DONE,
                         ):
+                            if (
+                                ev.event_type == ACPEventType.TOOL_CALL_START
+                                and is_main_source
+                            ):
+                                _split_main_segment()
                             if ev.tool_call:
                                 collected_tool_call_snapshots.append(
                                     ev.tool_call
@@ -1170,6 +1214,8 @@ class ACPSession:
                         elif ev.event_type == ACPEventType.IMAGE_CHUNK and ev.image:
                             emitted_image_ids.add(ev.image.image_id)
                         elif ev.event_type == ACPEventType.PLAN_UPDATE:
+                            if is_main_source:
+                                _split_main_segment()
                             result.set_plan(ev.plan)
                         if codex_child_monitor is not None and ev.tool_call:
                             codex_child_monitor.observe_tool_call(ev.tool_call)
@@ -1471,6 +1517,38 @@ class ACPSession:
                 and result.stop_reason.strip().casefold() == "end_turn"
             )
             result.swarm_final_text = swarm_tracker.final_turn_text.strip()
+
+        with self._handler_lock:
+            _split_main_segment()
+            final_answer_text = ""
+            for chunks in reversed(list(final_answer_by_msg.values())):
+                candidate = "".join(chunks).strip()
+                if candidate:
+                    final_answer_text = candidate
+                    break
+            main_final_segment = (
+                main_segments[-1].strip() if main_segments else ""
+            )
+
+        result.terminal_text_tracked = True
+        if result.swarm_completed and result.swarm_final_text.strip():
+            result.terminal_text = result.swarm_final_text.strip()
+            result.terminal_text_provenance = (
+                TerminalOutputProvenance.SWARM_FINAL_TURN.value
+            )
+        elif final_answer_text:
+            result.terminal_text = final_answer_text
+            result.terminal_text_provenance = (
+                TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+            )
+        elif main_final_segment:
+            result.terminal_text = main_final_segment
+            result.terminal_text_provenance = (
+                TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+            )
+        else:
+            result.terminal_text = ""
+            result.terminal_text_provenance = TerminalOutputProvenance.NONE.value
         # Best-effort: attach local tool results (execute/read/write/permission) produced during this prompt.
         try:
             store = ACPHistoryStore()

@@ -1901,3 +1901,75 @@ def test_end_to_end_cot_stream_partial_seal_never_replays_sealed_2048_events(
         sink.abort()
     finally:
         programming.abort()
+
+
+def test_early_subagent_chunks_before_summary_never_enter_main_transcript() -> None:
+    sink = _ProcessSink()
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        assert programming._is_main_source("main") is True
+        assert programming._is_main_source("early-subagent-thread") is False
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="主 Agent 结论",
+            )
+        )
+        # Subagent emits TEXT_CHUNK before any collaboration summary exists.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="子代理早期输出绝不能混入主结论",
+                source_id="early-subagent-thread",
+            )
+        )
+        programming._flush_now()
+
+        assert programming.get_final_text() == "主 Agent 结论"
+        assert programming.get_conclusion_text() == "主 Agent 结论"
+
+        programming.finish()
+        assert card_session.state is not None
+        final_answer = next(
+            block.content
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock) and block.block_id == "_final_answer"
+        )
+        assert final_answer == "主 Agent 结论"
+        assert "子代理早期输出" not in final_answer
+    finally:
+        programming.abort()
+
+
+def test_public_conclusion_lock_helpers_reflect_trusted_and_frozen_state() -> None:
+    _, _card_session, programming = _programming_session()
+
+    try:
+        programming.start()
+        assert programming.has_trusted_final_answer() is False
+        assert programming.has_result_conclusion_fallback() is False
+
+        programming.on_event(
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="一轮结论")
+        )
+        programming.freeze_result_conclusion_fallback()
+        assert programming.has_result_conclusion_fallback() is True
+
+        programming.begin_continuation_turn()
+        assert programming.has_result_conclusion_fallback() is False
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="可信终答",
+                message_id="m-final",
+                codex_message_phase="final_answer",
+            )
+        )
+        assert programming.has_trusted_final_answer() is True
+    finally:
+        programming.abort()

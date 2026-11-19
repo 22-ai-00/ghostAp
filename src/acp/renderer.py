@@ -52,16 +52,26 @@ class ACPEventRenderer:
         self._todo_content: str = ""  # Latest TodoWrite rendered content
         self._thought_chunks: list[str] = []  # Accumulated thought text for structured rendering
 
+    @staticmethod
+    def _is_main_source(event: ACPEvent) -> bool:
+        raw = getattr(event, "source_id", None)
+        if raw is None:
+            return True
+        if isinstance(raw, str):
+            return raw.strip() in ("", "main")
+        return False
+
     def _ingest_event(self, event: ACPEvent) -> None:
         """Pure state mutation — update internal state from an ACP event."""
+        is_main = self._is_main_source(event)
         match event.event_type:
             case ACPEventType.TEXT_CHUNK:
-                if event.text:
+                if event.text and is_main:
                     self._text_chunks.append(event.text)
                     self._text_content += event.text
 
             case ACPEventType.THOUGHT_CHUNK:
-                if event.text:
+                if event.text and is_main:
                     self._thought_chunks.append(event.text)
 
             case ACPEventType.TOOL_CALL_START:

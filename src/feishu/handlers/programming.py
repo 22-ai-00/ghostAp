@@ -184,6 +184,21 @@ def _append_execution_notice(text: str, notice: str) -> str:
     return f"{content}\n\n{notice}" if content else notice
 
 
+def _was_already_streamed_on_main(
+    terminal_text: str,
+    streamed_response: str,
+) -> bool:
+    """Return whether unstreamed-looking result text merely mirrors main stream."""
+    norm_terminal = " ".join(str(terminal_text or "").split())
+    norm_streamed = " ".join(str(streamed_response or "").split())
+    if not norm_terminal or not norm_streamed:
+        return False
+    return (
+        norm_terminal == norm_streamed
+        or norm_streamed.endswith(norm_terminal)
+    )
+
+
 def _configured_finalization_reserve(settings: object) -> int:
     raw = getattr(settings, "programming_finalization_reserve_s", 0)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -1741,7 +1756,11 @@ class ProgrammingModeHandler(BaseHandler):
     ) -> None:
         """Run one automatic ACP task, independent of its output transport."""
         from ...acp import ACPEventRenderer
-        from ...acp.models import ACPEventType
+        from ...acp.models import (
+            ACPEventType,
+            TerminalOutputProvenance,
+            resolve_prompt_terminal_output,
+        )
         from ...acp.native_commands import parse_slash_command
         from ...acp.outcome import PromptOutcome
         from ...acp.swarm_lifecycle import is_swarm_working_event
@@ -1991,17 +2010,67 @@ class ProgrammingModeHandler(BaseHandler):
                 and assessment.incomplete_tool_calls > 0
             ):
                 _log_final_unresolved_tool_trace(self.mode_name, assessment)
+            terminal_text, terminal_provenance = resolve_prompt_terminal_output(
+                result
+            )
             result_text = (getattr(result, "text", None) or "").strip()
             streamed_response = (
                 prog_session.get_final_text()
                 if prog_session is not None
                 else renderer.get_final_content()
             )
-            response_text = (
-                streamed_response or result_text
-                if prog_session is not None
-                else result_text or streamed_response
-            )
+            if prog_session is not None:
+                has_trusted_fn = getattr(
+                    prog_session, "has_trusted_final_answer", None
+                )
+                has_fallback_fn = getattr(
+                    prog_session, "has_result_conclusion_fallback", None
+                )
+                has_locked_conclusion = (
+                    (callable(has_trusted_fn) and has_trusted_fn() is True)
+                    or (callable(has_fallback_fn) and has_fallback_fn() is True)
+                )
+                high_authority_result = bool(
+                    terminal_text
+                    and (
+                        terminal_provenance
+                        in {
+                            TerminalOutputProvenance.SWARM_FINAL_TURN,
+                            TerminalOutputProvenance.FINAL_ANSWER_PHASE,
+                        }
+                        or (
+                            terminal_provenance
+                            is TerminalOutputProvenance.UNSTREAMED_RESPONSE
+                            and not _was_already_streamed_on_main(
+                                terminal_text,
+                                streamed_response,
+                            )
+                        )
+                    )
+                )
+                if has_locked_conclusion:
+                    response_text = (
+                        prog_session.get_conclusion_text().strip()
+                        or streamed_response
+                    )
+                elif high_authority_result:
+                    prog_session.set_result_conclusion_fallback(terminal_text)
+                    response_text = terminal_text
+                else:
+                    conclusion_text = prog_session.get_conclusion_text().strip()
+                    if conclusion_text:
+                        response_text = conclusion_text
+                    elif (
+                        terminal_provenance is not TerminalOutputProvenance.NONE
+                        and terminal_text
+                    ):
+                        response_text = terminal_text
+                    else:
+                        response_text = streamed_response
+            else:
+                has_locked_conclusion = False
+                high_authority_result = False
+                response_text = terminal_text or streamed_response
             if prompt_outcome is PromptOutcome.COMPLETED:
                 parsed_native = parse_slash_command((text or "").splitlines()[0] if text else "")
                 native_summary = ""
@@ -2021,20 +2090,27 @@ class ProgrammingModeHandler(BaseHandler):
                     if usage_info is not None and getattr(usage_info, "size", 0) > 0:
                         pct = int(round((usage_info.used / usage_info.size) * 100))
                         native_summary += f" · 上下文 {usage_info.used:,}/{usage_info.size:,} ({pct}%)"
-                summary_text = result_text or native_summary
-                if (
-                    prog_session is not None
-                    and summary_text
-                    and not streamed_response
-                ):
-                    prog_session.set_result_conclusion_fallback(summary_text)
-                if (
-                    prog_session is not None
-                    and not streamed_response
-                    and summary_text
-                    and not prog_session.get_conclusion_text().strip()
-                ):
-                    prog_session.on_text(summary_text)
+                if prog_session is not None:
+                    if high_authority_result:
+                        if (
+                            not streamed_response
+                            and not prog_session.get_conclusion_text().strip()
+                        ):
+                            prog_session.on_text(terminal_text)
+                    elif not has_locked_conclusion:
+                        summary_text = (
+                            terminal_text
+                            if terminal_provenance is not TerminalOutputProvenance.NONE
+                            else ""
+                        ) or native_summary
+                        if summary_text and not streamed_response:
+                            prog_session.set_result_conclusion_fallback(summary_text)
+                        if (
+                            not streamed_response
+                            and summary_text
+                            and not prog_session.get_conclusion_text().strip()
+                        ):
+                            prog_session.on_text(summary_text)
                 final_response = response_text or native_summary or UI_TEXT["mode_exec_complete"]
                 if prog_session is not None:
                     if reconciled_stale_children:
@@ -2098,7 +2174,12 @@ class ProgrammingModeHandler(BaseHandler):
                 error=get_error_detail(e)
             )
             final_response = _append_execution_notice(
-                prog_session.get_final_text() if prog_session is not None else renderer.get_final_content(),
+                (
+                    prog_session.get_conclusion_text().strip()
+                    or prog_session.get_final_text()
+                )
+                if prog_session is not None
+                else renderer.get_final_content(),
                 terminal_notice,
             )
             log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
@@ -2128,7 +2209,12 @@ class ProgrammingModeHandler(BaseHandler):
                 error=get_error_detail(e)
             )
             final_response = _append_execution_notice(
-                prog_session.get_final_text() if prog_session is not None else renderer.get_final_content(),
+                (
+                    prog_session.get_conclusion_text().strip()
+                    or prog_session.get_final_text()
+                )
+                if prog_session is not None
+                else renderer.get_final_content(),
                 terminal_notice,
             )
             log_exception(logger, f"{self.mode_name} ACP执行异常", e)

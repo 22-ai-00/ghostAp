@@ -15,7 +15,12 @@ from ..acp.model_selection import (
     CODEX_DEFAULT_MODEL_TOKEN,
     split_codex_model_selection,
 )
-from ..acp.models import ACPEvent, ACPEventType, PromptResult
+from ..acp.models import (
+    ACPEvent,
+    ACPEventType,
+    PromptResult,
+    TerminalOutputProvenance,
+)
 from .cli_base import _BaseCLISession, _CLIModuleHooks
 from .process_cleanup import terminate_and_reap_process_tree
 
@@ -85,6 +90,55 @@ class SyncCodexCLISession(_BaseCLISession):
             config or CodexCLIConfig(),
             model_name=model_name,
         )
+        self._turn_final_answer_by_id: dict[str, list[str]] = {}
+        self._turn_segments: list[str] = []
+        self._turn_current_segment: list[str] = []
+
+    def _reset_turn_terminal_tracking(self) -> None:
+        self._turn_final_answer_by_id.clear()
+        self._turn_segments.clear()
+        self._turn_current_segment.clear()
+
+    def _split_turn_segment(self) -> None:
+        if self._turn_current_segment:
+            segment = "".join(self._turn_current_segment)
+            self._turn_current_segment.clear()
+            if segment.strip():
+                self._turn_segments.append(segment)
+
+    def _consume_turn_terminal_tracking(self) -> tuple[str, str]:
+        self._split_turn_segment()
+        final_answer_text = ""
+        for chunks in reversed(list(self._turn_final_answer_by_id.values())):
+            candidate = "".join(chunks).strip()
+            if candidate:
+                final_answer_text = candidate
+                break
+        main_final_segment = (
+            self._turn_segments[-1].strip() if self._turn_segments else ""
+        )
+        self._reset_turn_terminal_tracking()
+        return final_answer_text, main_final_segment
+
+    def _send_prompt_once(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        timeout: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
+        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
+    ) -> PromptResult:
+        self._reset_turn_terminal_tracking()
+        try:
+            return super()._send_prompt_once(
+                text,
+                on_event=on_event,
+                timeout=timeout,
+                idle_timeout=idle_timeout,
+                activity_predicate=activity_predicate,
+            )
+        finally:
+            self._reset_turn_terminal_tracking()
 
     def _module_hooks(self) -> _CLIModuleHooks:
         return _CLIModuleHooks(
@@ -153,6 +207,7 @@ class SyncCodexCLISession(_BaseCLISession):
             payload,
             output_chunks,
             lambda chunk: emit(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=chunk)),
+            emit_event=emit,
         )
 
     def _handle_process_exit(
@@ -166,6 +221,9 @@ class SyncCodexCLISession(_BaseCLISession):
         on_event: Optional[Callable[[ACPEvent], None]],
     ) -> PromptResult:
         del state
+        final_answer_text, main_final_segment = (
+            self._consume_turn_terminal_tracking()
+        )
         if not backend_error and rc != 0:
             backend_error = err or f"codex exec 退出码 {rc}"
         output = out
@@ -175,17 +233,63 @@ class SyncCodexCLISession(_BaseCLISession):
                 output = (output + "\n" + detail).strip("\n")
                 if on_event:
                     on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="\n" + detail))
+            if final_answer_text:
+                terminal_text = final_answer_text
+                provenance = TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+                tracked = True
+            elif detail:
+                terminal_text = (
+                    f"{main_final_segment}\n{detail}".strip()
+                    if main_final_segment
+                    else detail.strip()
+                )
+                provenance = (
+                    TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+                    if on_event
+                    else TerminalOutputProvenance.UNSTREAMED_RESPONSE.value
+                )
+                tracked = bool(on_event)
+            elif main_final_segment:
+                terminal_text = main_final_segment
+                provenance = TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+                tracked = True
+            else:
+                terminal_text = ""
+                provenance = TerminalOutputProvenance.NONE.value
+                tracked = True
             self.is_resumed = bool(self.session_id)
-            return PromptResult(stop_reason="failed", text=output)
+            return PromptResult(
+                stop_reason="failed",
+                text=output,
+                terminal_text=terminal_text,
+                terminal_text_provenance=provenance,
+                terminal_text_tracked=tracked,
+            )
 
+        if final_answer_text:
+            terminal_text = final_answer_text
+            provenance = TerminalOutputProvenance.FINAL_ANSWER_PHASE.value
+        elif main_final_segment:
+            terminal_text = main_final_segment
+            provenance = TerminalOutputProvenance.MAIN_FINAL_SEGMENT.value
+        else:
+            terminal_text = ""
+            provenance = TerminalOutputProvenance.NONE.value
         self.is_resumed = bool(self.session_id)
-        return PromptResult(stop_reason="end_turn", text=output)
+        return PromptResult(
+            stop_reason="end_turn",
+            text=output,
+            terminal_text=terminal_text,
+            terminal_text_provenance=provenance,
+            terminal_text_tracked=True,
+        )
 
     def _consume_event(
         self,
         payload: str,
         assistant_chunks: list[str],
         emit_text: Callable[[str], None],
+        emit_event: Optional[Callable[[ACPEvent], None]] = None,
     ) -> str:
         """Parse one ``--json`` JSONL event.
 
@@ -210,17 +314,54 @@ class SyncCodexCLISession(_BaseCLISession):
                 logger.warning("[CodexCLI] backend error: %s", message)
             return message
 
-        if event_type != "item.completed":
+        if event_type in {"item.started", "item.completed"}:
+            item = event.get("item") or {}
+            if not isinstance(item, dict):
+                return ""
+            item_type = str(item.get("type") or "")
+            if item_type != "agent_message":
+                self._split_turn_segment()
+                return ""
+            if event_type != "item.completed":
+                return ""
+        else:
             return ""
 
-        item = event.get("item") or {}
-        if str(item.get("type") or "") != "agent_message":
-            return ""
         text = str(item.get("text") or "")
         if not text:
             return ""
+        raw_id = item.get("id")
+        if raw_id is None:
+            raw_id = item.get("message_id")
+        message_id = (
+            raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else None
+        )
+        raw_phase = item.get("phase")
+        normalized_phase = (
+            raw_phase.strip().casefold() if isinstance(raw_phase, str) else ""
+        )
+        codex_message_phase = (
+            normalized_phase
+            if normalized_phase in {"commentary", "final_answer"}
+            else None
+        )
+        self._turn_current_segment.append(text)
+        if codex_message_phase == "final_answer":
+            self._turn_final_answer_by_id.setdefault(message_id or "", []).append(
+                text
+            )
         assistant_chunks.append(text)
-        emit_text(text)
+        if emit_event is not None:
+            emit_event(
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text=text,
+                    message_id=message_id,
+                    codex_message_phase=codex_message_phase,
+                )
+            )
+        else:
+            emit_text(text)
         return ""
 
     @staticmethod

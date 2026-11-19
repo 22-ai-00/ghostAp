@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Optional
 
 
@@ -199,6 +199,16 @@ class ACPUsageInfo:
     cost_currency: str | None = None
 
 
+class TerminalOutputProvenance(StrEnum):
+    """Authority provenance for a PromptResult's terminal conclusion text."""
+
+    NONE = "none"
+    FINAL_ANSWER_PHASE = "final_answer_phase"
+    SWARM_FINAL_TURN = "swarm_final_turn"
+    UNSTREAMED_RESPONSE = "unstreamed_response"
+    MAIN_FINAL_SEGMENT = "main_final_segment"
+
+
 @dataclass
 class PromptResult:
     """Result of a prompt sent via ACP."""
@@ -217,6 +227,9 @@ class PromptResult:
     swarm_used: bool = False
     swarm_completed: bool = False
     swarm_final_text: str = ""
+    terminal_text: str = ""
+    terminal_text_provenance: str = TerminalOutputProvenance.NONE.value
+    terminal_text_tracked: bool = False
 
     # ---- aggregation helpers ----
     def add_text(self, chunk: str) -> None:
@@ -258,3 +271,46 @@ class PromptResult:
                 p = data.get("path")
                 if p:
                     self.modified_files.add(p)
+
+
+def resolve_prompt_terminal_output(
+    result: PromptResult | None,
+) -> tuple[str, TerminalOutputProvenance]:
+    """Resolve the authoritative terminal conclusion text and its provenance.
+
+    Priority order:
+      1. ``swarm_final_turn`` from a completed AGY Swarm coordinator run
+      2. Explicit ``PromptResult.terminal_text`` paired with its provenance
+      3. Untracked legacy/unstreamed ``PromptResult.text`` as ``unstreamed_response``
+         (suppressed when ``terminal_text_tracked`` confirms only non-main output arrived)
+    """
+    if result is None:
+        return "", TerminalOutputProvenance.NONE
+
+    swarm_final = str(getattr(result, "swarm_final_text", "") or "").strip()
+    if getattr(result, "swarm_completed", False) is True and swarm_final:
+        return swarm_final, TerminalOutputProvenance.SWARM_FINAL_TURN
+
+    raw_provenance = str(
+        getattr(result, "terminal_text_provenance", "")
+        or TerminalOutputProvenance.NONE.value
+    ).strip()
+    try:
+        provenance = TerminalOutputProvenance(raw_provenance)
+    except ValueError:
+        provenance = TerminalOutputProvenance.NONE
+
+    terminal_text = str(getattr(result, "terminal_text", "") or "").strip()
+    if terminal_text:
+        if provenance is TerminalOutputProvenance.NONE:
+            return terminal_text, TerminalOutputProvenance.MAIN_FINAL_SEGMENT
+        return terminal_text, provenance
+
+    if getattr(result, "terminal_text_tracked", False) is True:
+        return "", TerminalOutputProvenance.NONE
+
+    legacy_text = str(getattr(result, "text", "") or "").strip()
+    if legacy_text:
+        return legacy_text, TerminalOutputProvenance.UNSTREAMED_RESPONSE
+
+    return "", TerminalOutputProvenance.NONE
