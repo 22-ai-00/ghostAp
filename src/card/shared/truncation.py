@@ -161,17 +161,13 @@ def _rewrite_markdown_tables_as_code(text: str, *, rewrite: bool) -> tuple[str, 
 
     while i < len(lines):
         line = lines[i]
-        fence_match = _FENCE_LINE_RE.match(line)
-        if fence_match:
-            fence = fence_match.group("fence")
-            if not open_fence:
-                open_fence = fence
-            elif (
-                fence[0] == open_fence[0]
-                and len(fence) >= len(open_fence)
-                and not fence_match.group("tail").strip()
-            ):
-                open_fence = ""
+        next_fence = advance_markdown_fence(open_fence, line)
+        if next_fence != open_fence:
+            open_fence = next_fence
+            out.append(line)
+            i += 1
+            continue
+        if open_fence:
             out.append(line)
             i += 1
             continue
@@ -364,6 +360,15 @@ def _safe_count_nodes(card_content: str) -> int | str:
         return "unknown"
 
 
+def is_markdown_fence_line(raw_line: str) -> bool:
+    """Return True when *raw_line* is a CommonMark fence opener or closer."""
+    match = _FENCE_LINE_RE.match(raw_line)
+    if not match:
+        return False
+    fence = match.group("fence")
+    return not (fence[0] == "`" and "`" in match.group("tail"))
+
+
 def advance_markdown_fence(open_fence: str, raw_line: str) -> str:
     """Advance one CommonMark-style fenced-code delimiter state."""
     match = _FENCE_LINE_RE.match(raw_line)
@@ -372,6 +377,10 @@ def advance_markdown_fence(open_fence: str, raw_line: str) -> str:
 
     fence = match.group("fence")
     if not open_fence:
+        # CommonMark: backtick fence info strings cannot contain backticks,
+        # so lines like ```` ```inline``` ```` are inline code, not openers.
+        if fence[0] == "`" and "`" in match.group("tail"):
+            return open_fence
         return fence
 
     closes_current = (

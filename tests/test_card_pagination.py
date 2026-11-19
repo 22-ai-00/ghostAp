@@ -3,7 +3,12 @@
 from src.card.render.atoms import RenderAtom, estimate_atom_size
 from src.card.render.budget import RenderBudget
 from src.card.render.layout import SectionLayout, paginate_layout
-from src.card.render.pagination import split_atom, stabilize_markdown_split
+from src.card.render.pagination import (
+    _try_split_by_chars,
+    split_atom,
+    stabilize_markdown_split,
+)
+from src.card.shared.truncation import advance_markdown_fence, open_markdown_fence
 
 
 def _paginate_body(atoms: list[RenderAtom], budget: RenderBudget) -> list[list[RenderAtom]]:
@@ -198,3 +203,73 @@ class TestPaginateAtoms:
         pages = _paginate_body([], budget)
 
         assert pages == [[]]
+
+    def test_advance_markdown_fence_treats_backticks_in_tail_as_inline_code(self) -> None:
+        assert advance_markdown_fence("", "```inline```") == ""
+        assert advance_markdown_fence(None, "```inline```") is None  # type: ignore[arg-type]
+        assert advance_markdown_fence("", "````code`tail") == ""
+        assert advance_markdown_fence("", "````python") == "````"
+        assert advance_markdown_fence("", "~~~tilde~info") == "~~~"
+        assert open_markdown_fence("```inline```\nplain line") == ""
+        assert open_markdown_fence("```inline```\n````python\ncode") == "````"
+
+    def test_try_split_by_chars_never_splits_delimiter_runs_or_fence_lines(self) -> None:
+        for delim in ("````", "~~~~"):
+            content = ("a" * 40) + delim + ("b" * 200)
+            atom = RenderAtom(kind="text", content=content, splittable=True, node_count=1)
+            # 42 chars * 3 + 100 overhead = 226 bytes -> raw binary search lands inside delim.
+            parts = _try_split_by_chars(atom, content, remaining_bytes=226)
+            assert parts is not None
+            assert parts[0].content == "a" * 40
+            assert parts[1].content.startswith(delim)
+
+        fence_content = "prefix\n````python\n" + ("x" * 400) + "\n````"
+        fence_atom = RenderAtom(kind="text", content=fence_content, splittable=True, node_count=1)
+        # "prefix\n````py" (13 chars) + "\n````" (5) = 18 -> 18*3 + 100 = 154 bytes.
+        # Raw char split would land inside "````python"; backing up leaves "prefix\n".
+        parts = _try_split_by_chars(fence_atom, fence_content, remaining_bytes=160)
+        assert parts is not None
+        assert parts[0].content == "prefix\n"
+        assert parts[1].content.startswith("````python\n")
+
+        # When backing up before an opening fence at index 0 leaves empty prefix, return None
+        # (both when split lands inside the fence line and right after its newline).
+        head_fence = "````python\n" + ("x" * 400) + "\n````"
+        head_atom = RenderAtom(kind="text", content=head_fence, splittable=True, node_count=1)
+        assert _try_split_by_chars(head_atom, head_fence, remaining_bytes=138) is None
+        assert _try_split_by_chars(head_atom, head_fence, remaining_bytes=145) is None
+
+    def test_paginate_layout_preserves_dynamic_fence_across_new_page_and_splits(self) -> None:
+        first_atom = RenderAtom(
+            kind="text",
+            content="Z" * 1100,
+            splittable=False,
+            node_count=1,
+        )
+        first_atom.byte_size = estimate_atom_size(first_atom)
+
+        fenced_payload = "`````python\n" + ("x" * 3000) + "\n`````"
+        fenced_atom = RenderAtom(
+            kind="tool_panel",
+            block_id="tool-dyn",
+            content=fenced_payload,
+            splittable=True,
+            node_count=4,
+            structural_overhead=900,
+        )
+        fenced_atom.byte_size = estimate_atom_size(fenced_atom)
+
+        # Page 0 has too little room left for the 5-backtick opener + body, so
+        # paginate_layout starts page 1 cleanly and splits across pages 1..N.
+        pages = _paginate_body([first_atom, fenced_atom], RenderBudget(byte_budget=4000))
+        assert len(pages) >= 3
+        assert len(pages[0]) == 1
+        assert pages[0][0].content == "Z" * 1100
+
+        fenced_pages = [atom.content for page in pages[1:] for atom in page]
+        assert fenced_pages[0].startswith("`````python\n")
+        assert fenced_pages[0].endswith("\n`````")
+        assert fenced_pages[1].startswith("`````\n")
+        assert fenced_pages[-1].endswith("\n`````")
+        assert all(open_markdown_fence(part) == "" for part in fenced_pages)
+        assert "".join(fenced_pages).count("x") == 3000

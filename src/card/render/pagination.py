@@ -6,6 +6,7 @@ import json
 
 from src.card.render.atoms import RenderAtom, estimate_atom_size
 from src.card.shared.truncation import (
+    is_markdown_fence_line,
     last_unclosed_inline_code_tick,
     open_markdown_fence,
 )
@@ -92,6 +93,44 @@ def _try_split_by_separator(
     return None
 
 
+def _safe_char_split_point(content: str, split_point: int) -> int:
+    """Back up a char split so it never bisects fence lines or backtick/tilde runs."""
+    while split_point > 0:
+        if (
+            split_point < len(content)
+            and content[split_point - 1] in {"`", "~"}
+            and content[split_point] == content[split_point - 1]
+        ):
+            delim = content[split_point - 1]
+            while split_point > 0 and content[split_point - 1] == delim:
+                split_point -= 1
+            continue
+
+        line_start = content.rfind("\n", 0, split_point) + 1
+        line_end = content.find("\n", split_point)
+        if line_end < 0:
+            line_end = len(content)
+        if line_start < split_point <= line_end and (
+            split_point < len(content) or line_end == len(content)
+        ):
+            raw_line = content[line_start:line_end].rstrip("\r")
+            if is_markdown_fence_line(raw_line):
+                split_point = line_start
+                continue
+
+        if content[split_point - 1] == "\n":
+            prev_line_start = content.rfind("\n", 0, split_point - 1) + 1
+            if (
+                not open_markdown_fence(content[:prev_line_start])
+                and open_markdown_fence(content[:split_point])
+            ):
+                split_point = prev_line_start
+                continue
+
+        break
+    return split_point
+
+
 def _try_split_by_chars(
     atom: RenderAtom,
     content: str,
@@ -117,13 +156,20 @@ def _try_split_by_chars(
         else:
             high = split_point - 1
 
+    best_split = _safe_char_split_point(content, best_split)
     if best_split <= 0:
         return None
-    return _make_split_atoms(
+    parts = _make_split_atoms(
         atom,
         content[:best_split],
         content[best_split:],
     )
+    if (
+        parts[0].byte_size > remaining_bytes
+        or len(parts[1].content) >= len(content)
+    ):
+        return None
+    return parts
 
 
 def _make_split_atoms(

@@ -13,8 +13,9 @@ from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 from src.card.events import CardEvent, CardEventType
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
+from src.card.render.tools import render_tool_detail
 from src.card.schema import require_card_json_2
-from src.card.shared.truncation import count_tagged_nodes
+from src.card.shared.truncation import count_tagged_nodes, open_markdown_fence
 from src.card.state.models import (
     CardMetadata,
     CardState,
@@ -1465,3 +1466,80 @@ def test_tool_delta_uses_snapshot_semantics_and_idempotency(tmp_path) -> None:
     blocks = manager.snapshot().phases[0].agents[0].execution_blocks
     assert len(blocks) == 1
     assert blocks[0].content == "ABC"
+
+
+def test_full_tool_payloads_use_dynamic_fences_across_sections_and_pages() -> None:
+    embedded_input = "echo dynamic\nINPUT_BEFORE\n```python\nprint('in')\n```\nINPUT_AFTER"
+    embedded_progress = "PROGRESS_BEFORE\n````markdown\nprogress\n````\nPROGRESS_AFTER"
+    head = "OUTPUT_HEAD\n```sh\necho 1\n```\n"
+    middle = "\n````json\n{\"mid\": true}\n````\n"
+    tail = "\nOUTPUT_TAIL"
+    embedded_output = head + ("a" * 28000) + middle + ("b" * 28000) + tail
+
+    bash_block = ContentBlock(
+        kind="tool_call",
+        block_id="bash-dyn",
+        tool_name="bash",
+        tool_input=embedded_input,
+        content=embedded_progress,
+        tool_output=embedded_output,
+        status="completed",
+    )
+    generic_block = ContentBlock(
+        kind="tool_call",
+        block_id="generic-dyn",
+        tool_name="read_file",
+        tool_input="GENERIC_IN\n```\ncode\n```",
+        content="GENERIC_PROG\n````\nprog\n````",
+        tool_output="GENERIC_OUT\n````\nout\n````",
+        status="completed",
+    )
+
+    bash_detail = render_tool_detail(
+        bash_block, truncate_output=False, compact=False, include_updates=True
+    )
+    generic_detail = render_tool_detail(
+        generic_block, truncate_output=False, compact=False, include_updates=True
+    )
+    assert "````bash\n" in bash_detail
+    assert "`````\n" in bash_detail
+    assert "````json\n" in generic_detail
+    assert "`````\n" in generic_detail
+    assert open_markdown_fence(bash_detail) == ""
+    assert open_markdown_fence(generic_detail) == ""
+
+    state = CardState(
+        metadata=CardMetadata(
+            project_name="wf",
+            tool_name="codex",
+            programming_text_sections=True,
+            full_execution_blocks=True,
+        ),
+        header=HeaderState(title="dynamic-fences"),
+        blocks=(bash_block, generic_block),
+    )
+
+    cards = [page.to_feishu_json() for page in render_card(state, RenderBudget())]
+    assert len(cards) >= 3
+    assert all(_card_size(card) <= 27 * 1024 for card in cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in cards)
+
+    panels = _tagged_nodes(cards, "collapsible_panel")
+    assert len(panels) >= 3
+    for panel in panels:
+        panel_md = panel["elements"][0]["content"]
+        assert open_markdown_fence(panel_md) == ""
+
+    rendered = _all_text(cards)
+    for marker in (
+        "INPUT_BEFORE",
+        "INPUT_AFTER",
+        "PROGRESS_BEFORE",
+        "PROGRESS_AFTER",
+        "OUTPUT_HEAD",
+        "OUTPUT_TAIL",
+        "GENERIC_IN",
+        "GENERIC_PROG",
+        "GENERIC_OUT",
+    ):
+        assert rendered.count(marker) == 1

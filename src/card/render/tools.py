@@ -509,6 +509,42 @@ def render_tool_detail(
     )
 
 
+def _fenced_code_block(content: str, info: str = "") -> str:
+    """Wrap content in a backtick fence longer than any embedded backtick run."""
+    text = str(content or "")
+    max_run = max(
+        (len(match.group(0)) for match in re.finditer(r"`+", text)),
+        default=0,
+    )
+    fence = "`" * max(3, max_run + 1)
+    lang = str(info or "").strip()
+    opener = f"{fence}{lang}" if lang else fence
+    return f"{opener}\n{text}\n{fence}"
+
+
+def _render_fenced_tool_detail(
+    tool_input: str,
+    tool_output: str,
+    output_empty: bool = False,
+    *,
+    input_label: str,
+    input_info: str,
+    output_label: str,
+    tool_updates: str = "",
+    truncate_output: bool = True,
+) -> str:
+    """Render tool input, optional live progress, and output with safe fences."""
+    parts = [f"{input_label}\n{_fenced_code_block(tool_input, input_info)}"]
+    if tool_updates and tool_updates != tool_output:
+        parts.append(
+            f"{UI_TEXT['tool_label_progress']}\n{_fenced_code_block(tool_updates)}"
+        )
+    if not output_empty:
+        output = _truncate_output(tool_output) if truncate_output else tool_output
+        parts.append(f"{output_label}\n{_fenced_code_block(output)}")
+    return "\n".join(parts)
+
+
 def _render_bash_detail(
     tool_input: str,
     tool_output: str,
@@ -518,15 +554,16 @@ def _render_bash_detail(
     truncate_output: bool = True,
 ) -> str:
     """Render bash-specific detail."""
-    parts = [f"{UI_TEXT['tool_label_command']}\n```bash\n{tool_input}\n```"]
-    if tool_updates and tool_updates != tool_output:
-        parts.append(
-            f"{UI_TEXT['tool_label_progress']}\n```\n{tool_updates}\n```"
-        )
-    if not output_empty:
-        output = _truncate_output(tool_output) if truncate_output else tool_output
-        parts.append(f"{UI_TEXT['tool_label_result']}\n```\n{output}\n```")
-    return "\n".join(parts)
+    return _render_fenced_tool_detail(
+        tool_input,
+        tool_output,
+        output_empty,
+        input_label=UI_TEXT["tool_label_command"],
+        input_info="bash",
+        output_label=UI_TEXT["tool_label_result"],
+        tool_updates=tool_updates,
+        truncate_output=truncate_output,
+    )
 
 
 def _render_compact_detail(tool_input: str) -> str:
@@ -554,15 +591,16 @@ def _render_generic_detail(
     truncate_output: bool = True,
 ) -> str:
     """Render generic tool detail."""
-    parts = [f"{UI_TEXT['tool_label_input']}\n```json\n{tool_input}\n```"]
-    if tool_updates and tool_updates != tool_output:
-        parts.append(
-            f"{UI_TEXT['tool_label_progress']}\n```\n{tool_updates}\n```"
-        )
-    if not output_empty:
-        output = _truncate_output(tool_output) if truncate_output else tool_output
-        parts.append(f"{UI_TEXT['tool_label_output']}\n```\n{output}\n```")
-    return "\n".join(parts)
+    return _render_fenced_tool_detail(
+        tool_input,
+        tool_output,
+        output_empty,
+        input_label=UI_TEXT["tool_label_input"],
+        input_info="json",
+        output_label=UI_TEXT["tool_label_output"],
+        tool_updates=tool_updates,
+        truncate_output=truncate_output,
+    )
 
 
 # ---------------------------------------------------------------------------
