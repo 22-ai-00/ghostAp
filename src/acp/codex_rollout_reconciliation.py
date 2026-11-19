@@ -12,10 +12,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +36,12 @@ _ROLLOUT_SETTLE_INTERVAL_S = 0.02
 CODEX_CHILD_LIFECYCLE_POLL_INTERVAL_S = 0.1
 _CHILD_TURN_BOUNDARY_SLACK_S = 1.0
 _MAX_TRACKED_CHILDREN = 200
+_MAX_AGENT_DEPTH = 8
+_MAX_INDEXED_ROOTS = 16
+_MAX_INDEXED_DIRS_PER_ROOT = 2048
+_MAX_INDEXED_FILES_PER_ROOT = 20_000
+_HOT_DIR_SETTLE_NS = 50_000_000
 _ROOT_AGENT_PATH = "/root"
-_DIRECT_AGENT_PATH_RE = re.compile(
-    r"/root/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
-)
 _AGENT_PATH_RE = re.compile(
     r"/root(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}){1,8}"
 )
@@ -141,6 +147,256 @@ def _session_matches(path: Path, session_id: str, cwd: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _DirRolloutIndex:
+    sig: tuple[int, int]
+    scanned_at_ns: int
+    by_tail: dict[str, tuple[str, ...]]
+    file_count: int
+
+
+@dataclass
+class _RootRolloutIndex:
+    dirs: OrderedDict[tuple[str, str, str], _DirRolloutIndex] = field(
+        default_factory=OrderedDict
+    )
+    total_files: int = 0
+
+
+_ROLLOUT_INDEX: OrderedDict[Path, _RootRolloutIndex] = OrderedDict()
+_ROLLOUT_INDEX_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+
+
+def _uuidv7_partition_rel_dirs(
+    session_id: str,
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Return candidate YYYY/MM/DD partitions across UTC and local +-1d."""
+    try:
+        parsed = uuid.UUID(session_id)
+    except ValueError:
+        return None
+    if parsed.version != 7:
+        return None
+    timestamp_s = (parsed.int >> 80) / 1000.0
+    try:
+        utc_dt = datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+        local_dt = utc_dt.astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
+    seen: dict[tuple[str, str, str], None] = {}
+    for base_dt in (utc_dt, local_dt):
+        base_date = base_dt.date()
+        for day_offset in (-1, 0, 1):
+            try:
+                target_date = base_date + timedelta(days=day_offset)
+            except OverflowError:
+                continue
+            seen.setdefault(
+                (
+                    f"{target_date.year:04d}",
+                    f"{target_date.month:02d}",
+                    f"{target_date.day:02d}",
+                ),
+                None,
+            )
+    return tuple(seen) or None
+
+
+def _iter_digit_subdirs(parent: Path, width: int) -> list[tuple[str, Path]]:
+    items: list[tuple[str, Path]] = []
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                name = entry.name
+                if len(name) != width or not name.isdigit():
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                items.append((name, Path(entry.path)))
+    except OSError:
+        return []
+    return items
+
+
+def _list_partition_keys(
+    resolved_root: Path,
+) -> tuple[tuple[str, str, str], ...]:
+    keys: list[tuple[str, str, str]] = []
+    for year, year_path in _iter_digit_subdirs(resolved_root, 4):
+        for month, month_path in _iter_digit_subdirs(year_path, 2):
+            for day, _day_path in _iter_digit_subdirs(month_path, 2):
+                keys.append((year, month, day))
+    return tuple(keys)
+
+
+def _scan_partition_dir(day_dir: Path) -> _DirRolloutIndex | None:
+    try:
+        st = os.stat(day_dir, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    buckets: dict[str, list[str]] = {}
+    file_count = 0
+    try:
+        with os.scandir(day_dir) as it:
+            for entry in it:
+                name = entry.name
+                # Minimum valid "rollout--<16-char-id>.jsonl" is 31 chars.
+                if (
+                    len(name) < 31
+                    or not name.startswith("rollout-")
+                    or not name.endswith(".jsonl")
+                ):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_file(
+                        follow_symlinks=False
+                    ):
+                        continue
+                except OSError:
+                    continue
+                buckets.setdefault(name[-22:-6], []).append(name)
+                file_count += 1
+    except OSError:
+        return None
+    return _DirRolloutIndex(
+        sig=(st.st_mtime_ns, st.st_ino),
+        scanned_at_ns=time.time_ns(),
+        by_tail={tail: tuple(names) for tail, names in buckets.items()},
+        file_count=file_count,
+    )
+
+
+def _evict_partition_dir(
+    resolved_root: Path, day_key: tuple[str, str, str]
+) -> None:
+    with _ROLLOUT_INDEX_LOCK:
+        root_idx = _ROLLOUT_INDEX.get(resolved_root)
+        if root_idx is None:
+            return
+        removed = root_idx.dirs.pop(day_key, None)
+        if removed is not None:
+            root_idx.total_files = max(
+                0, root_idx.total_files - removed.file_count
+            )
+
+
+def _store_partition_dir(
+    resolved_root: Path,
+    day_key: tuple[str, str, str],
+    scanned: _DirRolloutIndex,
+) -> None:
+    with _ROLLOUT_INDEX_LOCK:
+        root_idx = _ROLLOUT_INDEX.get(resolved_root)
+        if root_idx is None:
+            while len(_ROLLOUT_INDEX) >= _MAX_INDEXED_ROOTS:
+                _ROLLOUT_INDEX.popitem(last=False)
+            root_idx = _RootRolloutIndex()
+            _ROLLOUT_INDEX[resolved_root] = root_idx
+        else:
+            _ROLLOUT_INDEX.move_to_end(resolved_root)
+        old = root_idx.dirs.pop(day_key, None)
+        if old is not None:
+            root_idx.total_files = max(0, root_idx.total_files - old.file_count)
+        if scanned.file_count > _MAX_INDEXED_FILES_PER_ROOT:
+            return
+        while root_idx.dirs and (
+            len(root_idx.dirs) >= _MAX_INDEXED_DIRS_PER_ROOT
+            or root_idx.total_files + scanned.file_count
+            > _MAX_INDEXED_FILES_PER_ROOT
+        ):
+            _, evicted = root_idx.dirs.popitem(last=False)
+            root_idx.total_files = max(
+                0, root_idx.total_files - evicted.file_count
+            )
+        root_idx.dirs[day_key] = scanned
+        root_idx.total_files += scanned.file_count
+
+
+def _lookup_in_partition_dir(
+    resolved_root: Path,
+    day_key: tuple[str, str, str],
+    session_id: str,
+) -> list[Path]:
+    year_dir = resolved_root / day_key[0]
+    month_dir = year_dir / day_key[1]
+    day_dir = month_dir / day_key[2]
+    try:
+        if (
+            year_dir.is_symlink()
+            or month_dir.is_symlink()
+            or day_dir.is_symlink()
+        ):
+            _evict_partition_dir(resolved_root, day_key)
+            return []
+        st = os.stat(day_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode):
+            _evict_partition_dir(resolved_root, day_key)
+            return []
+        resolved_day = day_dir.resolve(strict=True)
+        if not resolved_day.is_relative_to(resolved_root):
+            _evict_partition_dir(resolved_root, day_key)
+            return []
+    except OSError:
+        _evict_partition_dir(resolved_root, day_key)
+        return []
+
+    dir_sig = (st.st_mtime_ns, st.st_ino)
+    tail16 = session_id[-16:]
+    suffix = f"-{session_id}.jsonl"
+    min_len = 8 + len(suffix)
+
+    for attempt in range(2):
+        cached_names: tuple[str, ...] | None = None
+        if attempt == 0:
+            with _ROLLOUT_INDEX_LOCK:
+                root_idx = _ROLLOUT_INDEX.get(resolved_root)
+                if root_idx is not None:
+                    _ROLLOUT_INDEX.move_to_end(resolved_root)
+                    entry = root_idx.dirs.get(day_key)
+                    if entry is not None and entry.sig == dir_sig:
+                        root_idx.dirs.move_to_end(day_key)
+                        matched = entry.by_tail.get(tail16)
+                        if (
+                            matched is not None
+                            or abs(entry.scanned_at_ns - st.st_mtime_ns)
+                            >= _HOT_DIR_SETTLE_NS
+                        ):
+                            cached_names = matched or ()
+        if cached_names is None:
+            scanned = _scan_partition_dir(day_dir)
+            if scanned is None:
+                _evict_partition_dir(resolved_root, day_key)
+                return []
+            _store_partition_dir(resolved_root, day_key, scanned)
+            cached_names = scanned.by_tail.get(tail16, ())
+
+        found: list[Path] = []
+        stale = False
+        for name in cached_names:
+            if len(name) < min_len or not name.endswith(suffix):
+                continue
+            candidate = day_dir / name
+            try:
+                resolved = candidate.resolve(strict=True)
+                if candidate.is_symlink() or not resolved.is_relative_to(
+                    resolved_root
+                ):
+                    continue
+            except OSError:
+                stale = True
+                continue
+            found.append(resolved)
+        if not stale:
+            return found
+        _evict_partition_dir(resolved_root, day_key)
+    return []
+
+
 def _rollout_candidates(
     *,
     session_id: str,
@@ -156,20 +412,18 @@ def _rollout_candidates(
     root = home / "sessions"
     try:
         resolved_root = root.resolve(strict=True)
-        candidates = list(root.rglob(f"rollout-*-{session_id}.jsonl"))
     except OSError:
         return set()
+
+    partition_keys = _uuidv7_partition_rel_dirs(session_id)
+    if partition_keys is None:
+        partition_keys = _list_partition_keys(resolved_root)
+
     matches: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve(strict=True)
-            if candidate.is_symlink() or not resolved.is_relative_to(
-                resolved_root
-            ):
-                continue
-        except OSError:
-            continue
-        matches.add(resolved)
+    for day_key in partition_keys:
+        matches.update(
+            _lookup_in_partition_dir(resolved_root, day_key, session_id)
+        )
     return matches
 
 
@@ -543,16 +797,18 @@ def _result_child_sources(
 def _parent_activity_paths(
     path: Path,
     *,
-    target_sources: frozenset[str],
+    owner_agent_path: str = _ROOT_AGENT_PATH,
+    target_sources: frozenset[str] | None = None,
     started_at: float,
     ended_at: float,
 ) -> tuple[dict[str, str], bool, bool]:
-    """Read unique direct-child identities from one bounded parent tail."""
+    """Read unique descendant-child identities from one bounded parent tail."""
+    del target_sources  # Closure wave validation checks full coverage across files.
     if ended_at < started_at:
         return {}, True, False
+    owner_prefix = f"{owner_agent_path}/"
     source_to_path: dict[str, str] = {}
     path_to_source: dict[str, str] = {}
-    saw_target = False
     lines, complete = _read_bounded_lines(path, tail=True)
     if not complete:
         return {}, False, True
@@ -587,16 +843,20 @@ def _parent_activity_paths(
             not isinstance(raw_source, str)
             or _SESSION_ID_RE.fullmatch(raw_source.strip()) is None
             or not isinstance(raw_agent_path, str)
-            or _DIRECT_AGENT_PATH_RE.fullmatch(raw_agent_path.strip()) is None
             or not isinstance(raw_kind, str)
             or raw_kind.strip().casefold() not in _SUBAGENT_ACTIVITY_KINDS
         ):
             return {}, True, False
         source = raw_source.strip()
         agent_path = raw_agent_path.strip()
-        if source not in target_sources:
+        if (
+            agent_path != _ROOT_AGENT_PATH
+            and _AGENT_PATH_RE.fullmatch(agent_path) is None
+        ):
             return {}, True, False
-        saw_target = True
+        # Ignore sibling/ancestor/self activities recorded in this rollout.
+        if not agent_path.startswith(owner_prefix):
+            continue
         if (
             source in source_to_path
             and source_to_path[source] != agent_path
@@ -605,10 +865,13 @@ def _parent_activity_paths(
             and path_to_source[agent_path] != source
         ):
             return {}, True, False
+        if (
+            source not in source_to_path
+            and len(source_to_path) >= _MAX_TRACKED_CHILDREN
+        ):
+            return {}, True, False
         source_to_path[source] = agent_path
         path_to_source[agent_path] = source
-    if saw_target and set(source_to_path) != set(target_sources):
-        return {}, True, False
     return source_to_path, False, False
 
 
@@ -680,6 +943,57 @@ def _child_identity_matches(
         isinstance(recorded_path, str)
         and recorded_path.strip() == expected_agent_path
     )
+
+
+def _nested_child_meta_path(
+    path: Path,
+    *,
+    parent_session_id: str,
+    child_thread_id: str,
+    cwd: str,
+    known_thread_paths: Mapping[str, str],
+    invalid_sources: set[str],
+) -> str | None:
+    """Resolve an explicit nested child path from verified session_meta."""
+    payload = _session_meta_payload(path)
+    if payload is None:
+        return None
+    raw_cwd = payload.get("cwd")
+    if (
+        payload.get("id") != child_thread_id
+        or payload.get("session_id") != parent_session_id
+        or not isinstance(raw_cwd, str)
+        or os.path.realpath(raw_cwd) != os.path.realpath(cwd)
+        or not _is_subagent_session_meta(payload)
+    ):
+        return None
+    raw_path = payload.get("agent_path")
+    if not isinstance(raw_path, str):
+        return None
+    recorded_path = raw_path.strip()
+    if _AGENT_PATH_RE.fullmatch(recorded_path) is None:
+        return None
+    expected_parent_path = recorded_path.rpartition("/")[0]
+    # Depth-1 direct children must be anchored by ACP or root rollout activity.
+    if expected_parent_path == _ROOT_AGENT_PATH:
+        return None
+    parent_thread_id = payload.get("parent_thread_id")
+    if (
+        not isinstance(parent_thread_id, str)
+        or parent_thread_id == parent_session_id
+        or parent_thread_id in invalid_sources
+        or known_thread_paths.get(parent_thread_id) != expected_parent_path
+    ):
+        return None
+    return recorded_path
+
+
+def _file_stat_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
 
 
 @dataclass(frozen=True)
@@ -773,6 +1087,7 @@ class CodexChildLifecycleMonitor:
         self._cwd = cwd
         self._logical_task_started_at = logical_task_started_at
         self._codex_home = codex_home
+        self._observed_sources: set[str] = set()
         self._source_to_path: dict[str, str] = {}
         self._path_to_source: dict[str, str] = {}
         self._rollout_by_source: dict[str, Path] = {}
@@ -781,90 +1096,360 @@ class CodexChildLifecycleMonitor:
         self._last_fingerprint: tuple[tuple[str, str, str], ...] | None = None
         self._saw_rollout_candidate = False
         self._identity_ambiguous = False
+        self._activity_ambiguous = False
+        self._retryable_activity_read = False
+        self._root_rollout: Path | None = None
+        self._root_rollout_next_lookup_at = 0.0
+        self._root_activity_sources: dict[str, str] = {}
+        self._activity_scan_stats: dict[str, tuple[int, int]] = {}
 
     @property
     def saw_rollout_candidate(self) -> bool:
         return self._saw_rollout_candidate
 
-    def observe_tool_call(self, tool_call: object) -> None:
-        raw_source = getattr(tool_call, "subagent_source_id", None)
-        raw_path = getattr(tool_call, "subagent_path", None)
-        if raw_source in (None, "") and raw_path in (None, ""):
-            return
+    @property
+    def activity_ambiguous(self) -> bool:
+        return self._activity_ambiguous
+
+    @property
+    def retryable_activity_read(self) -> bool:
+        return self._retryable_activity_read
+
+    @property
+    def resolved_path_to_source(self) -> dict[str, str]:
+        return dict(self._path_to_source)
+
+    def set_root_rollout(self, rollout: Path | None) -> None:
+        self._root_rollout = rollout
+        self._root_rollout_next_lookup_at = float("inf")
+
+    def _register_identity(
+        self,
+        source: str,
+        agent_path: str,
+        *,
+        from_activity: bool = True,
+    ) -> bool:
+        """Register a validated 1-to-1 source_id <-> agent_path mapping."""
+        if (
+            _SESSION_ID_RE.fullmatch(source) is None
+            or _AGENT_PATH_RE.fullmatch(agent_path) is None
+            or source == self._parent_session_id
+        ):
+            if from_activity:
+                self._activity_ambiguous = True
+            self._identity_ambiguous = True
+            return False
+        existing = self._source_to_path.get(source)
+        if existing is not None and existing != agent_path:
+            if from_activity:
+                self._activity_ambiguous = True
+            self._identity_ambiguous = True
+            return False
+        existing_source = self._path_to_source.get(agent_path)
+        if existing_source is not None and existing_source != source:
+            if from_activity:
+                self._activity_ambiguous = True
+            self._identity_ambiguous = True
+            return False
+        if (
+            source not in self._source_to_path
+            and len(self._source_to_path) >= _MAX_TRACKED_CHILDREN
+        ):
+            if from_activity:
+                self._activity_ambiguous = True
+            self._identity_ambiguous = True
+            return False
+        if source in self._source_to_path:
+            return False
+        self._source_to_path[source] = agent_path
+        self._path_to_source[agent_path] = source
+        return True
+
+    def _record_observed_source(self, raw_source: object) -> str | None:
         if (
             not isinstance(raw_source, str)
             or _SESSION_ID_RE.fullmatch(raw_source.strip()) is None
         ):
             self._identity_ambiguous = True
-            return
+            return None
         source = raw_source.strip()
-        if raw_path in (None, ""):
-            return
+        if source == self._parent_session_id:
+            self._identity_ambiguous = True
+            return None
         if (
-            not isinstance(raw_path, str)
-            or _AGENT_PATH_RE.fullmatch(raw_path.strip()) is None
-            or source == self._parent_session_id
+            source not in self._observed_sources
+            and len(self._observed_sources) >= _MAX_TRACKED_CHILDREN
         ):
             self._identity_ambiguous = True
-            return
-        agent_path = raw_path.strip()
-        existing = self._source_to_path.get(source)
-        if existing is not None and existing != agent_path:
-            self._identity_ambiguous = True
-            return
-        existing_source = self._path_to_source.get(agent_path)
-        if existing_source is not None and existing_source != source:
-            self._identity_ambiguous = True
-            return
-        if (
-            source not in self._source_to_path
-            and len(self._source_to_path) >= _MAX_TRACKED_CHILDREN
+            return None
+        self._observed_sources.add(source)
+        return source
+
+    def observe_tool_call(self, tool_call: object) -> None:
+        raw_source = getattr(tool_call, "subagent_source_id", None)
+        raw_path = getattr(tool_call, "subagent_path", None)
+        if raw_source not in (None, "") or raw_path not in (None, ""):
+            source = self._record_observed_source(raw_source)
+            if source is None:
+                return
+            if raw_path not in (None, ""):
+                if not isinstance(raw_path, str):
+                    self._identity_ambiguous = True
+                    return
+                self._register_identity(
+                    source,
+                    raw_path.strip(),
+                    from_activity=False,
+                )
+                if self._identity_ambiguous:
+                    return
+
+        for raw_container in (
+            getattr(tool_call, "collaboration_receivers", ()),
+            getattr(tool_call, "subagent_states", ()),
         ):
-            self._identity_ambiguous = True
-            return
-        self._source_to_path[source] = agent_path
-        self._path_to_source[agent_path] = source
+            if raw_container is None:
+                continue
+            if isinstance(
+                raw_container,
+                (str, bytes, bytearray, Mapping),
+            ) or not isinstance(raw_container, Iterable):
+                self._identity_ambiguous = True
+                return
+            for item in raw_container:
+                val = item.get("source_id") if isinstance(item, Mapping) else item
+                if self._record_observed_source(val) is None:
+                    return
 
     def observe_result(self, result: PromptResult) -> None:
         for tool_call in result.tool_calls:
             self.observe_tool_call(tool_call)
 
-    def _locate_rollouts(self) -> None:
-        known_thread_paths = {
-            self._parent_session_id: _ROOT_AGENT_PATH,
-            **self._source_to_path,
-        }
-        now = time.monotonic()
-        for source_id, agent_path in self._source_to_path.items():
-            if (
-                source_id in self._rollout_by_source
-                or source_id in self._invalid_sources
-                or now < self._next_lookup_at.get(source_id, 0.0)
-            ):
+    def _scan_activity_file(
+        self,
+        *,
+        owner_id: str,
+        owner_path: str,
+        rollout_path: Path,
+        observed_until: float,
+    ) -> dict[str, str] | None:
+        stat_sig = _file_stat_sig(rollout_path)
+        if (
+            stat_sig is not None
+            and stat_sig == self._activity_scan_stats.get(owner_id)
+        ):
+            return None
+        activities, ambiguous, retryable = _parent_activity_paths(
+            rollout_path,
+            owner_agent_path=owner_path,
+            started_at=self._logical_task_started_at,
+            ended_at=observed_until,
+        )
+        if retryable:
+            self._retryable_activity_read = True
+            return None
+        if ambiguous:
+            self._activity_ambiguous = True
+            self._identity_ambiguous = True
+            return None
+        if stat_sig is not None:
+            self._activity_scan_stats[owner_id] = stat_sig
+        return activities
+
+    def _validate_known_rollout(
+        self,
+        source_id: str,
+        agent_path: str,
+        *,
+        known_thread_paths: Mapping[str, str],
+        now: float,
+        force_lookup: bool,
+    ) -> bool:
+        if (
+            source_id in self._rollout_by_source
+            or source_id in self._invalid_sources
+            or (
+                not force_lookup
+                and now < self._next_lookup_at.get(source_id, 0.0)
+            )
+        ):
+            return False
+        expected_parent_path = agent_path.rpartition("/")[0]
+        if (
+            expected_parent_path != _ROOT_AGENT_PATH
+            and expected_parent_path not in self._path_to_source
+        ):
+            return False
+        candidates = _rollout_candidates(
+            session_id=source_id,
+            codex_home=self._codex_home,
+        )
+        if not candidates:
+            self._next_lookup_at[source_id] = now + 0.25
+            return False
+        self._saw_rollout_candidate = True
+        if len(candidates) != 1:
+            self._invalid_sources.add(source_id)
+            return False
+        candidate = next(iter(candidates))
+        if not _child_identity_matches(
+            candidate,
+            parent_session_id=self._parent_session_id,
+            child_thread_id=source_id,
+            cwd=self._cwd,
+            expected_agent_path=agent_path,
+            known_thread_paths=known_thread_paths,
+        ):
+            self._invalid_sources.add(source_id)
+            return False
+        self._rollout_by_source[source_id] = candidate
+        return True
+
+    def _has_unaccounted_root_activity(self) -> bool:
+        if not self._root_activity_sources:
+            return False
+        target_paths = [
+            self._source_to_path[src]
+            for src in self._observed_sources
+            if src in self._source_to_path
+        ]
+        for src, path in self._root_activity_sources.items():
+            if src in self._observed_sources:
                 continue
-            candidates = _rollout_candidates(
-                session_id=source_id,
+            prefix = f"{path}/"
+            if any(target_path.startswith(prefix) for target_path in target_paths):
+                continue
+            return True
+        return False
+
+    def _locate_rollouts(
+        self,
+        *,
+        observed_until: float | None = None,
+        force_lookup: bool = False,
+    ) -> None:
+        until = time.time() if observed_until is None else observed_until
+        now = time.monotonic()
+        self._retryable_activity_read = False
+
+        if (
+            self._root_rollout is None
+            and (self._observed_sources - set(self._source_to_path))
+            and (force_lookup or now >= self._root_rollout_next_lookup_at)
+        ):
+            found_root = _find_rollout(
+                session_id=self._parent_session_id,
+                cwd=self._cwd,
                 codex_home=self._codex_home,
             )
-            if not candidates:
-                self._next_lookup_at[source_id] = now + 0.25
-                continue
-            self._saw_rollout_candidate = True
-            if len(candidates) != 1:
-                self._invalid_sources.add(source_id)
-                continue
-            candidate = next(iter(candidates))
-            if not _child_identity_matches(
-                candidate,
-                parent_session_id=self._parent_session_id,
-                child_thread_id=source_id,
-                cwd=self._cwd,
-                expected_agent_path=agent_path,
-                known_thread_paths=known_thread_paths,
-            ):
-                self._invalid_sources.add(source_id)
-                continue
-            self._rollout_by_source[source_id] = candidate
+            if found_root is not None:
+                self._root_rollout = found_root
+            else:
+                self._root_rollout_next_lookup_at = now + 0.25
+
+        if self._root_rollout is not None:
+            root_activities = self._scan_activity_file(
+                owner_id=self._parent_session_id,
+                owner_path=_ROOT_AGENT_PATH,
+                rollout_path=self._root_rollout,
+                observed_until=until,
+            )
+            if self._retryable_activity_read or self._activity_ambiguous:
+                return
+            if root_activities is not None:
+                self._root_activity_sources = dict(root_activities)
+                for src, agent_path in root_activities.items():
+                    self._register_identity(src, agent_path)
+                    if self._activity_ambiguous:
+                        return
+
+        for _ in range(_MAX_AGENT_DEPTH + 1):
+            progressed = False
+            known_thread_paths = {
+                self._parent_session_id: _ROOT_AGENT_PATH,
+                **self._source_to_path,
+            }
+            for source_id, agent_path in list(self._source_to_path.items()):
+                if self._validate_known_rollout(
+                    source_id,
+                    agent_path,
+                    known_thread_paths=known_thread_paths,
+                    now=now,
+                    force_lookup=force_lookup,
+                ):
+                    progressed = True
+
+            for owner_id, owner_rollout in list(self._rollout_by_source.items()):
+                owner_path = self._source_to_path.get(owner_id)
+                if (
+                    owner_path is None
+                    or owner_path.count("/") - 1 >= _MAX_AGENT_DEPTH
+                ):
+                    continue
+                child_activities = self._scan_activity_file(
+                    owner_id=owner_id,
+                    owner_path=owner_path,
+                    rollout_path=owner_rollout,
+                    observed_until=until,
+                )
+                if self._retryable_activity_read or self._activity_ambiguous:
+                    return
+                if child_activities:
+                    for child_id, child_path in child_activities.items():
+                        if self._register_identity(child_id, child_path):
+                            progressed = True
+                        if self._activity_ambiguous:
+                            return
+
+            unresolved = sorted(
+                self._observed_sources - set(self._source_to_path)
+            )
+            if unresolved:
+                known_thread_paths = {
+                    self._parent_session_id: _ROOT_AGENT_PATH,
+                    **self._source_to_path,
+                }
+                for source_id in unresolved:
+                    if (
+                        source_id in self._invalid_sources
+                        or (
+                            not force_lookup
+                            and now < self._next_lookup_at.get(source_id, 0.0)
+                        )
+                    ):
+                        continue
+                    candidates = _rollout_candidates(
+                        session_id=source_id,
+                        codex_home=self._codex_home,
+                    )
+                    if not candidates:
+                        self._next_lookup_at[source_id] = now + 0.25
+                        continue
+                    self._saw_rollout_candidate = True
+                    if len(candidates) != 1:
+                        self._invalid_sources.add(source_id)
+                        continue
+                    candidate = next(iter(candidates))
+                    recorded_path = _nested_child_meta_path(
+                        candidate,
+                        parent_session_id=self._parent_session_id,
+                        child_thread_id=source_id,
+                        cwd=self._cwd,
+                        known_thread_paths=known_thread_paths,
+                        invalid_sources=self._invalid_sources,
+                    )
+                    if recorded_path is None:
+                        continue
+                    if self._register_identity(source_id, recorded_path):
+                        progressed = True
+                    if self._activity_ambiguous:
+                        return
+                    self._rollout_by_source[source_id] = candidate
+                    progressed = True
+
+            if self._invalid_sources or not progressed:
+                break
 
     def poll(
         self,
@@ -873,14 +1458,37 @@ class CodexChildLifecycleMonitor:
         require_all_terminal: bool = False,
         emit_unchanged: bool = False,
     ) -> ToolCallInfo | None:
-        if self._identity_ambiguous or not self._source_to_path:
+        if self._identity_ambiguous or (
+            not self._source_to_path and not self._observed_sources
+        ):
             return None
-        self._locate_rollouts()
-        if self._invalid_sources:
-            return None
-        observations: list[tuple[str, _ChildTurnObservation]] = []
         observed_until = time.time() if ended_at is None else ended_at
+        self._locate_rollouts(
+            observed_until=observed_until,
+            force_lookup=require_all_terminal,
+        )
+        if (
+            self._invalid_sources
+            or self._activity_ambiguous
+            or self._retryable_activity_read
+        ):
+            return None
+        if not self._source_to_path:
+            return None
+        if require_all_terminal and (
+            self._has_unaccounted_root_activity()
+            or not self._observed_sources.issubset(self._source_to_path)
+        ):
+            return None
+        tracked_sources = (
+            self._observed_sources
+            if self._observed_sources
+            else set(self._source_to_path)
+        )
+        observations: list[tuple[str, _ChildTurnObservation]] = []
         for source_id in self._source_to_path:
+            if source_id not in tracked_sources:
+                continue
             rollout = self._rollout_by_source.get(source_id)
             if rollout is None:
                 continue
@@ -894,7 +1502,7 @@ class CodexChildLifecycleMonitor:
         if not observations:
             return None
         if require_all_terminal and (
-            len(observations) != len(self._source_to_path)
+            len(observations) != len(tracked_sources)
             or any(
                 observation.status not in _TERMINAL_STATUSES
                 for _, observation in observations
@@ -928,14 +1536,38 @@ class CodexChildLifecycleMonitor:
         )
 
 
+def _merge_path_to_source(
+    base: Mapping[str, str] | None,
+    extra: Mapping[str, str],
+) -> dict[str, str] | None:
+    path_to_source: dict[str, str] = {}
+    source_to_path: dict[str, str] = {}
+    for source_map in (base or {}, extra):
+        for agent_path, source_id in source_map.items():
+            existing_src = path_to_source.get(agent_path)
+            if existing_src is not None and existing_src != source_id:
+                return None
+            existing_path = source_to_path.get(source_id)
+            if existing_path is not None and existing_path != agent_path:
+                return None
+            path_to_source[agent_path] = source_id
+            source_to_path[source_id] = agent_path
+    return path_to_source or None
+
+
 def _build_evidence(
     result: PromptResult,
     *,
     call_id: str,
     agents: list[Mapping[str, Any]],
+    path_to_source: Mapping[str, str] | None = None,
 ) -> ToolCallInfo | None:
-    path_to_source = _path_to_source(result)
-    if path_to_source is None:
+    resolved_path_to_source = (
+        dict(path_to_source)
+        if path_to_source is not None
+        else _path_to_source(result)
+    )
+    if not resolved_path_to_source:
         return None
     observed: dict[str, str] = {}
     seen_names: set[str] = set()
@@ -954,7 +1586,7 @@ def _build_evidence(
         if name == _ROOT_AGENT_PATH:
             root_count += 1
             continue
-        if name in path_to_source:
+        if name in resolved_path_to_source:
             if status not in _TERMINAL_STATUSES:
                 return None
             observed[name] = status
@@ -962,9 +1594,9 @@ def _build_evidence(
         return None
     if root_count != 1:
         return None
-    if set(observed) != set(path_to_source):
+    if set(observed) != set(resolved_path_to_source):
         return None
-    ordered_paths = tuple(path_to_source)
+    ordered_paths = tuple(resolved_path_to_source)
     return ToolCallInfo(
         id=f"rollout-list-agents:{call_id}",
         title="list_agents",
@@ -972,11 +1604,11 @@ def _build_evidence(
         status="completed",
         collaboration_tool="list_agents",
         collaboration_receivers=tuple(
-            path_to_source[path] for path in ordered_paths
+            resolved_path_to_source[path] for path in ordered_paths
         ),
         subagent_states=tuple(
             {
-                "source_id": path_to_source[path],
+                "source_id": resolved_path_to_source[path],
                 "status": observed[path],
                 "message": "",
             }
@@ -996,6 +1628,9 @@ def enrich_codex_reconciliation_result(
     codex_home: str | None = None,
 ) -> tuple[PromptResult, ToolCallInfo | None]:
     """Add authoritative child-turn evidence, then use parent fallback."""
+    target_sources, malformed_sources = _result_child_sources(result)
+    if malformed_sources:
+        return result, None
     monitor = CodexChildLifecycleMonitor(
         parent_session_id=session_id,
         cwd=cwd,
@@ -1012,45 +1647,7 @@ def enrich_codex_reconciliation_result(
         cwd=cwd,
         codex_home=codex_home,
     )
-    if rollout is not None:
-        target_sources, malformed_sources = _result_child_sources(result)
-        if malformed_sources:
-            return result, None
-        identity_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
-        while True:
-            (
-                source_to_path,
-                identity_ambiguous,
-                retryable_identity_read,
-            ) = _parent_activity_paths(
-                rollout,
-                target_sources=target_sources,
-                started_at=(
-                    started_at
-                    if logical_task_started_at is None
-                    else logical_task_started_at
-                ),
-                ended_at=ended_at,
-            )
-            if not retryable_identity_read:
-                break
-            if time.monotonic() >= identity_deadline:
-                return result, None
-            time.sleep(_ROLLOUT_SETTLE_INTERVAL_S)
-        if identity_ambiguous:
-            return result, None
-        for source, agent_path in source_to_path.items():
-            monitor.observe_tool_call(
-                ToolCallInfo(
-                    id=f"rollout-parent-activity:{source}",
-                    title="sub_agent_activity",
-                    kind="other",
-                    status="completed",
-                    subagent_source_id=source,
-                    subagent_path=agent_path,
-                    subagent_activity="interacted",
-                )
-            )
+    monitor.set_root_rollout(rollout)
     settle_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
     while True:
         child_evidence = monitor.poll(
@@ -1068,12 +1665,34 @@ def enrich_codex_reconciliation_result(
                 ),
                 child_evidence,
             )
+        if monitor.activity_ambiguous:
+            return result, None
+        if (
+            monitor._identity_ambiguous
+            and not monitor.retryable_activity_read
+        ):
+            break
         if time.monotonic() >= settle_deadline:
             break
         time.sleep(_ROLLOUT_SETTLE_INTERVAL_S)
-    if monitor.saw_rollout_candidate:
+    if (
+        monitor.saw_rollout_candidate
+        or monitor.activity_ambiguous
+        or monitor.retryable_activity_read
+        or monitor._has_unaccounted_root_activity()
+    ):
         return result, None
     if rollout is None:
+        return result, None
+    merged_path_to_source = _merge_path_to_source(
+        _path_to_source(result),
+        monitor.resolved_path_to_source,
+    )
+    if merged_path_to_source is None:
+        return result, None
+    if target_sources and not target_sources.issubset(
+        set(merged_path_to_source.values())
+    ):
         return result, None
     settle_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
     latest = None
@@ -1089,7 +1708,12 @@ def enrich_codex_reconciliation_result(
     if latest is None:
         return result, None
     call_id, agents = latest
-    evidence = _build_evidence(result, call_id=call_id, agents=agents)
+    evidence = _build_evidence(
+        result,
+        call_id=call_id,
+        agents=agents,
+        path_to_source=merged_path_to_source,
+    )
     if evidence is None:
         return result, None
     return (

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2097,3 +2099,653 @@ def test_authoritative_turn_start_cannot_close_with_unidentified_terminal(
 
     assert observation is not None
     assert observation.status == "running"
+
+
+def _make_uuidv7(iso_utc: str, *, node_seq: int = 1) -> str:
+    ms = int(_timestamp(iso_utc) * 1000)
+    raw = ((ms & 0xFFFFFFFFFFFF) << 80) | (0x7 << 76) | (0x2 << 62) | (node_seq & ((1 << 62) - 1))
+    return str(uuid.UUID(int=raw))
+
+
+def _write_rollout_at(
+    root: Path,
+    *,
+    yyyy: str,
+    mm: str,
+    dd: str,
+    session_id: str,
+    cwd: Path,
+    activities: list[dict[str, object]] | None = None,
+    output_agents: list[dict] | None = None,
+) -> Path:
+    path = (
+        root
+        / "sessions"
+        / yyyy
+        / mm
+        / dd
+        / f"rollout-{yyyy}-{mm}-{dd}T00-00-00-{session_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events: list[dict[str, object]] = [
+        {
+            "timestamp": f"{yyyy}-{mm}-{dd}T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": str(cwd)},
+        },
+        *[
+            {
+                "timestamp": str(activity["timestamp"]),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "event_id": f"activity-{index}",
+                    "occurred_at_ms": int(
+                        _timestamp(str(activity["timestamp"])) * 1000
+                    ),
+                    "agent_thread_id": activity["source_id"],
+                    "agent_path": activity["agent_path"],
+                    "kind": activity.get("kind", "interacted"),
+                },
+            }
+            for index, activity in enumerate(activities or [])
+        ],
+    ]
+    if output_agents is not None:
+        events.extend(
+            [
+                {
+                    "timestamp": "2026-08-08T09:26:54.695Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "list_agents",
+                        "namespace": "collaboration",
+                        "arguments": "{}",
+                        "call_id": "call-list-agents",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-08T09:26:54.809Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-list-agents",
+                        "output": json.dumps({"agents": output_agents}),
+                    },
+                },
+            ]
+        )
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_nested_child_rollout(
+    root: Path,
+    *,
+    parent_session_id: str,
+    child_thread_id: str,
+    recorded_parent_id: str,
+    cwd: Path,
+    agent_path: str | None,
+    lifecycle: list[tuple[str, str, str | None]],
+    activities: list[dict[str, object]] | None = None,
+) -> Path:
+    path = (
+        root
+        / "sessions"
+        / "2026"
+        / "08"
+        / "08"
+        / f"rollout-2026-08-08T09-00-00-{child_thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, object] = {
+        "id": child_thread_id,
+        "session_id": parent_session_id,
+        "parent_thread_id": recorded_parent_id,
+        "cwd": str(cwd),
+        "thread_source": "subagent",
+    }
+    if agent_path is not None:
+        meta["agent_path"] = agent_path
+    events: list[dict[str, object]] = [
+        {
+            "timestamp": "2026-08-08T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": meta,
+        },
+        *[
+            {
+                "timestamp": str(activity["timestamp"]),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "event_id": f"activity-{index}",
+                    "occurred_at_ms": int(
+                        _timestamp(str(activity["timestamp"])) * 1000
+                    ),
+                    "agent_thread_id": activity["source_id"],
+                    "agent_path": activity["agent_path"],
+                    "kind": activity.get("kind", "interacted"),
+                },
+            }
+            for index, activity in enumerate(activities or [])
+        ],
+        *[
+            {
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": (
+                    {"type": event_type, "turn_id": turn_id}
+                    if turn_id is not None
+                    else {"type": event_type}
+                ),
+            }
+            for timestamp, event_type, turn_id in lifecycle
+        ],
+    ]
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("utc_ts", "folder"),
+    [
+        ("2026-08-08T23:45:00.000Z", ("2026", "08", "09")),
+        ("2026-08-09T00:15:00.000Z", ("2026", "08", "08")),
+    ],
+)
+def test_uuidv7_partition_lookup_handles_utc_local_boundary_without_full_scan(
+    tmp_path: Path,
+    monkeypatch,
+    utc_ts: str,
+    folder: tuple[str, str, str],
+) -> None:
+    session_id = _make_uuidv7(utc_ts, node_seq=7)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    target = _write_rollout_at(
+        codex_home,
+        yyyy=folder[0],
+        mm=folder[1],
+        dd=folder[2],
+        session_id=session_id,
+        cwd=cwd,
+    )
+    unrelated_dirs = [
+        ("2025", "01", "01"),
+        ("2026", "08", "05"),
+    ]
+    unrelated_files: list[Path] = []
+    for yyyy, mm, dd in unrelated_dirs:
+        unrelated = (
+            codex_home
+            / "sessions"
+            / yyyy
+            / mm
+            / dd
+            / f"rollout-{yyyy}-{mm}-{dd}T00-00-00-unrelated-session-0001.jsonl"
+        )
+        unrelated.parent.mkdir(parents=True, exist_ok=True)
+        unrelated.write_bytes(b"\xff\xfe{not-valid-utf8-or-json\n")
+        unrelated_files.append(unrelated)
+
+    scandir_targets: list[Path] = []
+    real_scandir = os.scandir
+
+    def tracked_scandir(path="."):
+        scandir_targets.append(Path(path))
+        return real_scandir(path)
+
+    opened_paths: list[Path] = []
+    real_open = Path.open
+
+    def tracked_open(self, *args, **kwargs):
+        opened_paths.append(self)
+        return real_open(self, *args, **kwargs)
+
+    def fail_rglob(self, pattern):
+        raise AssertionError(f"unexpected full-tree rglob({pattern!r}) on {self}")
+
+    monkeypatch.setattr(reconciliation.os, "scandir", tracked_scandir)
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    found = reconciliation._find_rollout(
+        session_id=session_id,
+        cwd=str(cwd),
+        codex_home=str(codex_home),
+    )
+    assert found == target.resolve()
+    assert not any(
+        p.resolve() in {
+            (codex_home / "sessions").resolve(),
+            *(d.parent.resolve() for d in unrelated_files),
+        }
+        for p in scandir_targets
+    )
+    assert all(p.resolve() not in {u.resolve() for u in unrelated_files} for p in opened_paths)
+
+    # Second lookup hits directory index cache without re-scanning target dir.
+    scandir_targets.clear()
+    found_again = reconciliation._find_rollout(
+        session_id=session_id,
+        cwd=str(cwd),
+        codex_home=str(codex_home),
+    )
+    assert found_again == target.resolve()
+    assert target.parent.resolve() not in {p.resolve() for p in scandir_targets}
+
+
+def test_uuidv7_overflow_timestamp_falls_back_safely_without_raising(
+    tmp_path: Path,
+) -> None:
+    # 48-bit max timestamp (year > 9999) overflows datetime.fromtimestamp
+    raw = (0xFFFFFFFFFFFF << 80) | (0x7 << 76) | (0x2 << 62) | 1
+    overflow_id = str(uuid.UUID(int=raw))
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    target = _write_rollout_at(
+        codex_home,
+        yyyy="2026",
+        mm="08",
+        dd="08",
+        session_id=overflow_id,
+        cwd=cwd,
+    )
+
+    assert reconciliation._uuidv7_partition_rel_dirs(overflow_id) is None
+    assert reconciliation._find_rollout(
+        session_id=overflow_id,
+        cwd=str(cwd),
+        codex_home=str(codex_home),
+    ) == target.resolve()
+
+
+def test_uuidv7_cross_date_duplicate_fails_closed(tmp_path: Path) -> None:
+    session_id = _make_uuidv7("2026-08-08T23:50:00.000Z", node_seq=99)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout_at(
+        codex_home,
+        yyyy="2026",
+        mm="08",
+        dd="08",
+        session_id=session_id,
+        cwd=cwd,
+    )
+    _write_rollout_at(
+        codex_home,
+        yyyy="2026",
+        mm="08",
+        dd="09",
+        session_id=session_id,
+        cwd=cwd,
+    )
+
+    candidates = reconciliation._rollout_candidates(
+        session_id=session_id,
+        codex_home=str(codex_home),
+    )
+    assert len(candidates) == 2
+    assert reconciliation._find_rollout(
+        session_id=session_id,
+        cwd=str(cwd),
+        codex_home=str(codex_home),
+    ) is None
+
+
+def test_nested_child_closure_discovers_paths_when_acp_lacks_nested_path(
+    tmp_path: Path,
+) -> None:
+    parent_id = _make_uuidv7("2026-08-08T09:00:00.000Z", node_seq=1)
+    direct_id = _make_uuidv7("2026-08-08T09:01:00.000Z", node_seq=2)
+    nested_id = _make_uuidv7("2026-08-08T09:02:00.000Z", node_seq=3)
+    deep_id = _make_uuidv7("2026-08-08T09:03:00.000Z", node_seq=4)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+
+    _write_rollout_at(
+        codex_home,
+        yyyy="2026",
+        mm="08",
+        dd="08",
+        session_id=parent_id,
+        cwd=cwd,
+        activities=[
+            {
+                "timestamp": "2026-08-08T09:26:54.050Z",
+                "source_id": direct_id,
+                "agent_path": "/root/reviewer",
+                "kind": "started",
+            }
+        ],
+    )
+    terminal = [
+        ("2026-08-08T09:26:54.100Z", "task_started", "turn-1"),
+        ("2026-08-08T09:26:55.100Z", "task_complete", "turn-1"),
+    ]
+    # Direct child's rollout has nested sub_agent_activity plus sibling & self noise.
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=direct_id,
+        recorded_parent_id=parent_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        activities=[
+            {
+                "timestamp": "2026-08-08T09:26:54.120Z",
+                "source_id": direct_id,
+                "agent_path": "/root/reviewer",
+                "kind": "interacted",
+            },
+            {
+                "timestamp": "2026-08-08T09:26:54.130Z",
+                "source_id": _make_uuidv7("2026-08-08T09:04:00.000Z", node_seq=5),
+                "agent_path": "/root/unrelated_sibling",
+                "kind": "interacted",
+            },
+            {
+                "timestamp": "2026-08-08T09:26:54.150Z",
+                "source_id": nested_id,
+                "agent_path": "/root/reviewer/nested",
+                "kind": "started",
+            },
+        ],
+        lifecycle=terminal,
+    )
+    # Nested child has no sub_agent_activity for deep_id; deep_id relies on session_meta.
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=nested_id,
+        recorded_parent_id=direct_id,
+        cwd=cwd,
+        agent_path="/root/reviewer/nested",
+        lifecycle=terminal,
+    )
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=deep_id,
+        recorded_parent_id=nested_id,
+        cwd=cwd,
+        agent_path="/root/reviewer/nested/deep",
+        lifecycle=terminal,
+    )
+
+    # ACP result knows the thread IDs but omits subagent_path on all of them.
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id=f"stale-{cid}",
+                title="spawn_agent",
+                kind="other",
+                status="completed",
+                subagent_source_id=cid,
+                subagent_activity="started",
+                subagent_states=(
+                    {"source_id": cid, "status": "running", "message": ""},
+                ),
+            )
+            for cid in (direct_id, nested_id, deep_id)
+        ],
+    )
+
+    enriched, evidence = enrich_codex_reconciliation_result(
+        original,
+        session_id=parent_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert evidence is not None
+    assert {
+        (state["source_id"], state["status"])
+        for state in evidence.subagent_states
+    } == {
+        (direct_id, "completed"),
+        (nested_id, "completed"),
+        (deep_id, "completed"),
+    }
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.COMPLETED
+
+
+def test_nested_child_closure_handles_intermediate_activity_and_list_agents_fallback(
+    tmp_path: Path,
+) -> None:
+    parent_id = _make_uuidv7("2026-08-08T09:10:00.000Z", node_seq=10)
+    direct_id = _make_uuidv7("2026-08-08T09:11:00.000Z", node_seq=11)
+    nested_id = _make_uuidv7("2026-08-08T09:12:00.000Z", node_seq=12)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+
+    # Part 1: No child rollouts on disk -> list_agents fallback leverages nested closure paths.
+    _write_rollout_at(
+        codex_home,
+        yyyy="2026",
+        mm="08",
+        dd="08",
+        session_id=parent_id,
+        cwd=cwd,
+        activities=[
+            {
+                "timestamp": "2026-08-08T09:26:54.050Z",
+                "source_id": direct_id,
+                "agent_path": "/root/reviewer",
+                "kind": "started",
+            },
+            {
+                "timestamp": "2026-08-08T09:26:54.060Z",
+                "source_id": nested_id,
+                "agent_path": "/root/reviewer/nested",
+                "kind": "started",
+            },
+        ],
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {"agent_name": "/root/reviewer", "agent_status": "completed"},
+            {"agent_name": "/root/reviewer/nested", "agent_status": "completed"},
+        ],
+    )
+    fallback_result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-stale",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(direct_id, nested_id),
+                subagent_states=(
+                    {"source_id": direct_id, "status": "running", "message": ""},
+                    {"source_id": nested_id, "status": "running", "message": ""},
+                ),
+            )
+        ],
+    )
+    enriched_fb, evidence_fb = enrich_codex_reconciliation_result(
+        fallback_result,
+        session_id=parent_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+    assert evidence_fb is not None
+    assert evidence_fb.id.startswith("rollout-list-agents:")
+    assert classify_prompt_result(enriched_fb).outcome is PromptOutcome.COMPLETED
+
+    # Part 2: Intermediate parent only in root rollout, monitor tracks nested_id only.
+    terminal = [
+        ("2026-08-08T09:26:54.100Z", "task_started", "turn-1"),
+        ("2026-08-08T09:26:55.100Z", "task_complete", "turn-1"),
+    ]
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=direct_id,
+        recorded_parent_id=parent_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=terminal,
+    )
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=nested_id,
+        recorded_parent_id=direct_id,
+        cwd=cwd,
+        agent_path="/root/reviewer/nested",
+        lifecycle=terminal,
+    )
+    nested_only = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="nested-only",
+                title="wait",
+                kind="other",
+                status="completed",
+                collaboration_receivers=(nested_id,),
+                subagent_states=(
+                    {"source_id": nested_id, "status": "running", "message": ""},
+                ),
+            )
+        ],
+    )
+    enriched_nested, evidence_nested = enrich_codex_reconciliation_result(
+        nested_only,
+        session_id=parent_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+    assert evidence_nested is not None
+    assert evidence_nested.subagent_states == (
+        {"source_id": nested_id, "status": "completed", "message": ""},
+    )
+    assert classify_prompt_result(enriched_nested).outcome is PromptOutcome.COMPLETED
+
+
+def test_monitor_discovers_nested_child_without_acp_path_and_rejects_depth_overflow(
+    tmp_path: Path,
+) -> None:
+    parent_id = _make_uuidv7("2026-08-08T09:20:00.000Z", node_seq=20)
+    direct_id = _make_uuidv7("2026-08-08T09:21:00.000Z", node_seq=21)
+    nested_id = _make_uuidv7("2026-08-08T09:22:00.000Z", node_seq=22)
+    too_deep_id = _make_uuidv7("2026-08-08T09:23:00.000Z", node_seq=23)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    terminal = [
+        ("2026-08-08T09:26:54.100Z", "task_started", "turn-1"),
+        ("2026-08-08T09:26:55.100Z", "task_complete", "turn-1"),
+    ]
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=direct_id,
+        recorded_parent_id=parent_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=terminal,
+    )
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=nested_id,
+        recorded_parent_id=direct_id,
+        cwd=cwd,
+        agent_path="/root/reviewer/nested",
+        lifecycle=terminal,
+    )
+
+    monitor = reconciliation.CodexChildLifecycleMonitor(
+        parent_session_id=parent_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        codex_home=str(codex_home),
+    )
+    monitor.observe_tool_call(
+        ToolCallInfo(
+            id="spawn-direct",
+            title="spawn_agent",
+            kind="other",
+            status="completed",
+            subagent_source_id=direct_id,
+            subagent_path="/root/reviewer",
+            subagent_activity="started",
+        )
+    )
+    monitor.observe_tool_call(
+        ToolCallInfo(
+            id="wait-nested",
+            title="wait",
+            kind="other",
+            status="completed",
+            collaboration_receivers=(nested_id,),
+            subagent_states=(
+                {"source_id": nested_id, "status": "running", "message": ""},
+            ),
+        )
+    )
+    evidence = monitor.poll(
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        require_all_terminal=True,
+        emit_unchanged=True,
+    )
+    assert evidence is not None
+    assert {
+        (state["source_id"], state["status"])
+        for state in evidence.subagent_states
+    } == {(direct_id, "completed"), (nested_id, "completed")}
+
+    # Depth 9 path exceeds _AGENT_PATH_RE limit (<= 8 segments) and stays unresolved.
+    _write_nested_child_rollout(
+        codex_home,
+        parent_session_id=parent_id,
+        child_thread_id=too_deep_id,
+        recorded_parent_id=nested_id,
+        cwd=cwd,
+        agent_path="/root/1/2/3/4/5/6/7/8/9",
+        lifecycle=terminal,
+    )
+    monitor.observe_tool_call(
+        ToolCallInfo(
+            id="wait-too-deep",
+            title="wait",
+            kind="other",
+            status="completed",
+            collaboration_receivers=(too_deep_id,),
+        )
+    )
+    assert (
+        monitor.poll(
+            ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+            require_all_terminal=True,
+            emit_unchanged=True,
+        )
+        is None
+    )
