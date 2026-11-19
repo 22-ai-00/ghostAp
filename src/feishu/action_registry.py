@@ -57,7 +57,12 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
 
         actions[f"enter_{mode}"] = _show_model_selector
         # Compatibility for cards rendered before the shared exit action.
-        actions[f"exit_{mode}"] = handlers[mode].handle_card_exit
+        mode_handler = handlers.get(mode)
+        actions[f"exit_{mode}"] = (
+            mode_handler.handle_card_exit
+            if mode_handler is not None and hasattr(mode_handler, "handle_card_exit")
+            else (lambda mid, cid, pid, val: system.exit_current_mode(mid, cid, _resolve_project(client, pid, cid)))
+        )
 
     # Project
     actions[action_ids.SHOW_STATUS] = (
@@ -89,7 +94,7 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
                 project.project_name,
                 auto_enter_coco=True,
                 coco_handler=base,
-                claude_handler=handlers["claude"],
+                claude_handler=handlers.get("claude"),
             )
         else:
             base.reply_text(mid, UI_TEXT["lock_project_not_found_hint"])

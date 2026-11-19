@@ -42,19 +42,6 @@ class HandlerContext:
     api_client_factory: Callable[[], "lark.Client"]
     message_callback: Callable[[str, str, str, Optional[str]], None]
 
-    # Session managers (ACP-based)
-    coco_manager: "ACPSessionManager"
-    claude_manager: "ACPSessionManager"
-    claude_w_manager: "ACPSessionManager"
-    aiden_manager: "ACPSessionManager"
-    codex_manager: "ACPSessionManager"
-    codex_w_manager: "ACPSessionManager"
-    gemini_manager: "ACPSessionManager"
-    traex_manager: "ACPSessionManager"
-    grok_manager: "ACPSessionManager"
-    dsh_manager: "ACPSessionManager"
-    agy_manager: "ACPSessionManager"
-
     # Core services
     intent_recognizer: "IntentRecognizer"
     scheduler: "TaskScheduler"
@@ -71,6 +58,19 @@ class HandlerContext:
 
     # Lazy-initialized singletons
     image_handler_factory: Callable[[], "FeishuImageHandler"]
+
+    # Session managers (ACP/CLI-based; synced with `managers` in __post_init__)
+    coco_manager: Optional["ACPSessionManager"] = None
+    claude_manager: Optional["ACPSessionManager"] = None
+    claude_w_manager: Optional["ACPSessionManager"] = None
+    aiden_manager: Optional["ACPSessionManager"] = None
+    codex_manager: Optional["ACPSessionManager"] = None
+    codex_w_manager: Optional["ACPSessionManager"] = None
+    gemini_manager: Optional["ACPSessionManager"] = None
+    traex_manager: Optional["ACPSessionManager"] = None
+    grok_manager: Optional["ACPSessionManager"] = None
+    dsh_manager: Optional["ACPSessionManager"] = None
+    agy_manager: Optional["ACPSessionManager"] = None
 
     # Shared mutable state
     working_dirs: dict[str, str] = field(default_factory=dict)
@@ -98,3 +98,22 @@ class HandlerContext:
     managed_group_receiving_bot_ref: str = ""
     managed_group_bot_rotation: Optional[Callable[[str], tuple[int, int]]] = None
     slash_permission_provider: Optional[Callable[[], Any]] = None
+
+    def __post_init__(self) -> None:
+        from ..mode.backends import ALL_BACKEND_METAS
+
+        for spec in ALL_BACKEND_METAS:
+            attr = spec.manager_attr
+            field_val = getattr(self, attr, None)
+            dict_val = self.managers.get(spec.mode_key)
+            if field_val is None and dict_val is not None:
+                setattr(self, attr, dict_val)
+            elif field_val is not None and dict_val is None:
+                self.managers[spec.mode_key] = field_val
+
+    def get_manager(self, mode_key: str) -> Optional["ACPSessionManager"]:
+        """Return the session manager for *mode_key*, checking attribute then registry."""
+        mgr = getattr(self, f"{mode_key}_manager", None)
+        if mgr is not None:
+            return mgr
+        return self.managers.get(mode_key)

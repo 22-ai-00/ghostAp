@@ -2,42 +2,12 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
-
-class InteractionMode(Enum):
-    """交互模式枚举。"""
-
-    SMART = "smart"
-    COCO = "coco"
-    CLAUDE = "claude"
-    CLAUDE_W = "claude_w"
-    AIDEN = "aiden"
-    CODEX = "codex"
-    CODEX_W = "codex_w"
-    GEMINI = "gemini"
-    TRAEX = "traex"
-    GROK = "grok"
-    DSH = "dsh"
-    AGY = "agy"
-    SHELL = "shell"
-
+from .backends import ALL_BACKEND_METAS, InteractionMode
 
 PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
-    {
-        InteractionMode.COCO,
-        InteractionMode.CLAUDE,
-        InteractionMode.CLAUDE_W,
-        InteractionMode.AIDEN,
-        InteractionMode.CODEX,
-        InteractionMode.CODEX_W,
-        InteractionMode.GEMINI,
-        InteractionMode.TRAEX,
-        InteractionMode.GROK,
-        InteractionMode.DSH,
-        InteractionMode.AGY,
-    }
+    spec.interaction_mode for spec in ALL_BACKEND_METAS
 )
 PROGRAMMING_MODE_VALUES: frozenset[str] = frozenset(
     mode.value for mode in PROGRAMMING_MODES
@@ -46,17 +16,10 @@ PROGRAMMING_MODE_VALUES: frozenset[str] = frozenset(
 
 _MODE_DISPLAY_NAMES: dict[InteractionMode, str] = {
     InteractionMode.SMART: "🧠 智能模式",
-    InteractionMode.COCO: "🤖 Coco 编程模式",
-    InteractionMode.CLAUDE: "🔮 Claude 编程模式",
-    InteractionMode.CLAUDE_W: "🪄 Claude-W 编程模式",
-    InteractionMode.AIDEN: "🎯 Aiden 编程模式",
-    InteractionMode.CODEX: "⚡ Codex 编程模式",
-    InteractionMode.CODEX_W: "🌩️ Codex-W 编程模式",
-    InteractionMode.GEMINI: "✨ Gemini 编程模式",
-    InteractionMode.TRAEX: "🚀 Traex 编程模式",
-    InteractionMode.GROK: "🌌 Grok 编程模式",
-    InteractionMode.DSH: "🧭 DSH 编程模式",
-    InteractionMode.AGY: "🪐 AGY 编程模式",
+    **{
+        spec.interaction_mode: spec.mode_display_name
+        for spec in ALL_BACKEND_METAS
+    },
     InteractionMode.SHELL: "💻 Shell 模式",
 }
 

@@ -4,6 +4,7 @@ from .base import BaseHandler
 from .deep import DeepHandler
 from .diagnostics import DiagnosticsHandler
 from .programming import (
+    PROGRAMMING_HANDLER_TYPES,
     AGYModeHandler,
     AidenModeHandler,
     ClaudeModeHandler,
@@ -24,6 +25,7 @@ from .workflow import WorkflowHandler
 
 __all__ = [
     "BaseHandler",
+    "PROGRAMMING_HANDLER_TYPES",
     "ProgrammingModeHandler",
     "CocoModeHandler",
     "ClaudeModeHandler",

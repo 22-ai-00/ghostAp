@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, Optional
 
+from ..mode.backends import ALL_BACKEND_METAS
 from ..utils.lock_order import LockLevel, ordered_lock
 
 # Sentinel returned by add_chat_id() when the chat cannot be added
@@ -199,17 +200,8 @@ class ProjectContext:
 
     # ── Mode name → (mode_flag_attr, snapshot_attr) mapping ──
     _MODE_ATTRS: ClassVar[dict[str, tuple[str, str]]] = {
-        "coco": ("coco_mode", "coco_session_snapshot"),
-        "claude": ("claude_mode", "claude_session_snapshot"),
-        "claude_w": ("claude_w_mode", "claude_w_session_snapshot"),
-        "aiden": ("aiden_mode", "aiden_session_snapshot"),
-        "codex": ("codex_mode", "codex_session_snapshot"),
-        "codex_w": ("codex_w_mode", "codex_w_session_snapshot"),
-        "gemini": ("gemini_mode", "gemini_session_snapshot"),
-        "traex": ("traex_mode", "traex_session_snapshot"),
-        "grok": ("grok_mode", "grok_session_snapshot"),
-        "dsh": ("dsh_mode", "dsh_session_snapshot"),
-        "agy": ("agy_mode", "agy_session_snapshot"),
+        spec.mode_key: (spec.project_mode_attr, spec.project_snapshot_attr)
+        for spec in ALL_BACKEND_METAS
     }
 
     def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):

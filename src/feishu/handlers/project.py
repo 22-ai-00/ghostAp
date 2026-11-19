@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
@@ -100,7 +101,16 @@ class ProjectHandler(BaseHandler):
         if current_mode not in PROGRAMMING_MODES:
             return
         mode_key = current_mode.value
-        manager = getattr(self.ctx, f"{mode_key}_manager", None)
+        ctx = self.ctx
+        manager = None
+        if hasattr(type(ctx), "get_manager") or "get_manager" in getattr(ctx, "__dict__", {}):
+            manager = ctx.get_manager(mode_key)
+        if manager is None:
+            managers = getattr(ctx, "__dict__", {}).get("managers") if hasattr(ctx, "__dict__") else None
+            if isinstance(managers, Mapping):
+                manager = managers.get(mode_key)
+        if manager is None:
+            manager = getattr(ctx, f"{mode_key}_manager", None)
         if manager is None or not hasattr(manager, "get_session"):
             return
         session = manager.get_session(chat_id, project_id=pid)

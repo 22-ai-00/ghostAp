@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from ..mode import InteractionMode
+from ..mode.backends import BACKEND_SPEC_BY_KEY, BACKEND_SPEC_BY_MODE, InteractionMode
 
 
 @dataclass(frozen=True)
@@ -30,37 +30,22 @@ def resolve_engine_identity(
     acp_model_name: Optional[str] = None,
 ) -> EngineIdentity:
     """Resolve engine identity from interaction mode and optional project hints."""
-    if mode == InteractionMode.CLAUDE:
-        return EngineIdentity(engine_name="Claude", agent_type="claude", model_name=None, transport="cli")
-
-    if mode == InteractionMode.AIDEN:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "aiden" else None
-        return EngineIdentity(engine_name="Aiden", agent_type="aiden", model_name=model, transport="acp")
-
-    if mode == InteractionMode.CODEX:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "codex" else None
-        return EngineIdentity(engine_name="Codex", agent_type="codex", model_name=model, transport="acp")
-
-    if mode == InteractionMode.GEMINI:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "gemini" else None
-        return EngineIdentity(engine_name="Gemini", agent_type="gemini", model_name=model, transport="acp")
-
-    if mode == InteractionMode.TRAEX:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "traex" else None
-        return EngineIdentity(engine_name="Traex", agent_type="traex", model_name=model, transport="acp")
-
-    if mode == InteractionMode.GROK:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "grok" else None
-        return EngineIdentity(engine_name="Grok", agent_type="grok", model_name=model, transport="acp")
-
-    if mode == InteractionMode.DSH:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "dsh" else None
-        return EngineIdentity(engine_name="DSH", agent_type="dsh", model_name=model, transport="acp")
-
-    if mode == InteractionMode.AGY:
-        model = acp_model_name if (acp_tool_name or "").strip().lower() == "agy" else None
-        return EngineIdentity(engine_name="AGY", agent_type="agy", model_name=model, transport="acp")
-
     # SMART / COCO / SHELL default to Coco engine for orchestrators
-    model = acp_model_name if (acp_tool_name or "").strip().lower() == "coco" else None
-    return EngineIdentity(engine_name="Coco", agent_type="coco", model_name=model, transport="acp")
+    spec = BACKEND_SPEC_BY_MODE.get(mode) or BACKEND_SPEC_BY_KEY["coco"]
+    if spec.mode_key == "claude":
+        return EngineIdentity(
+            engine_name=spec.display_name,
+            agent_type=spec.mode_key,
+            model_name=None,
+            transport=spec.transport,
+        )
+
+    normalized_tool = (acp_tool_name or "").strip().lower()
+    accepted_tools = {spec.mode_key, spec.cli_name.lower()}
+    model = acp_model_name if normalized_tool in accepted_tools else None
+    return EngineIdentity(
+        engine_name=spec.display_name,
+        agent_type=spec.mode_key,
+        model_name=model,
+        transport=spec.transport,
+    )

@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from ..agent_session import EphemeralReviewSession
 from ..engine_base import PerspectiveReview, ReviewPerspective, ReviewResult
 from ..grill_me import COMPLETION_CONTROL_GRILL_ME_PROTOCOL, SPEC_REVIEW_GRILL_ME_PROTOCOL
+from ..mode.backends import ALL_BACKEND_METAS
 from ..utils.errors import classify_timeout, get_error_detail
 from ..utils.review_diagnostics import normalize_review_diagnostics
 from .models import (
@@ -780,7 +781,7 @@ def _build_result(outcomes, cycle, completion_enabled):
 
 
 def _annotate(result, assignments, ctx):
-    names = {"coco": "Coco", "codex": "Codex", "aiden": "Aiden", "claude": "Claude", "gemini": "Gemini", "traex": "Traex", "grok": "Grok", "dsh": "DSH", "agy": "AGY"}
+    names = {spec.mode_key: spec.display_name for spec in ALL_BACKEND_METAS}
     agent = str(ctx.agent_type or "coco")
     default = f"{names.get(agent.lower(), agent.title())} / {ctx.model_name or '默认模型'}"
     for review in result.reviews:

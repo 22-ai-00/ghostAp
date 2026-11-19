@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
-from ..mode import PROGRAMMING_MODES, InteractionMode
+from ..mode.backends import ALL_BACKEND_METAS
 
 
 class CompletionLabel(str, Enum):
@@ -110,6 +110,44 @@ def _action(
     )
 
 
+_EXIT_COMMAND_ALIASES: tuple[str, ...] = (
+    "/quit",
+    *(
+        alias
+        for spec in ALL_BACKEND_METAS
+        if spec.legacy_exit_mode in {"dedicated_intent", "shared_exit_alias"}
+        for alias in (f"/end_{spec.mode_key}", f"/exit_{spec.mode_key}")
+    ),
+)
+
+
+def _programming_entry_actions() -> tuple[ProductAction, ...]:
+    return tuple(
+        _action(
+            spec.slash_command,
+            (
+                f"进入 {spec.display_name} 编程模式"
+                if spec.visible_in_tools_list
+                else f"进入 {spec.display_name} 桥接模式"
+            ),
+            aliases=(spec.enter_alias_command,),
+            enters_programming_mode=True,
+            programming_mode_id=spec.mode_key,
+            protects_from_auto_activation=True,
+            slash_discoverable=spec.visible_in_tools_list,
+        )
+        for spec in ALL_BACKEND_METAS
+    )
+
+
+def _info_actions() -> tuple[ProductAction, ...]:
+    return tuple(
+        _action(spec.info_command, f"查看 {spec.display_name} 会话与模型信息")
+        for spec in ALL_BACKEND_METAS
+        if spec.supports_info_command
+    )
+
+
 # This is the pre-catalog main Slash registration, moved here verbatim.  The
 # Feishu registration module only projects this tuple; it owns no command list.
 _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
@@ -117,17 +155,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/menu", "打开 GhostAP 快捷操作菜单"),
     _action("/tools", "查看可用的 AI 编程工具"),
     _action("/tools_status", "查看 AI 编程工具状态"),
-    _action("/coco", "进入 Coco 编程模式", aliases=("/enter_coco",), enters_programming_mode=True, programming_mode_id="coco", protects_from_auto_activation=True),
-    _action("/claude", "进入 Claude 编程模式", aliases=("/enter_claude",), enters_programming_mode=True, programming_mode_id="claude", protects_from_auto_activation=True),
-    _action("/claude-w", "进入 Claude-W 桥接模式", aliases=("/enter_claude_w",), enters_programming_mode=True, programming_mode_id="claude_w", protects_from_auto_activation=True, slash_discoverable=False),
-    _action("/aiden", "进入 Aiden 编程模式", aliases=("/enter_aiden",), enters_programming_mode=True, programming_mode_id="aiden", protects_from_auto_activation=True),
-    _action("/codex", "进入 Codex 编程模式", aliases=("/enter_codex",), enters_programming_mode=True, programming_mode_id="codex", protects_from_auto_activation=True),
-    _action("/codex-w", "进入 Codex-W 桥接模式", aliases=("/enter_codex_w",), enters_programming_mode=True, programming_mode_id="codex_w", protects_from_auto_activation=True, slash_discoverable=False),
-    _action("/gemini", "进入 Gemini 编程模式", aliases=("/enter_gemini",), enters_programming_mode=True, programming_mode_id="gemini", protects_from_auto_activation=True),
-    _action("/traex", "进入 Traex 编程模式", aliases=("/enter_traex",), enters_programming_mode=True, programming_mode_id="traex", protects_from_auto_activation=True),
-    _action("/grok", "进入 Grok 编程模式", aliases=("/enter_grok",), enters_programming_mode=True, programming_mode_id="grok", protects_from_auto_activation=True),
-    _action("/dsh", "进入 DSH 编程模式", aliases=("/enter_dsh",), enters_programming_mode=True, programming_mode_id="dsh", protects_from_auto_activation=True),
-    _action("/agy", "进入 AGY 编程模式", aliases=("/enter_agy",), enters_programming_mode=True, programming_mode_id="agy", protects_from_auto_activation=True),
+    *_programming_entry_actions(),
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
     _action("/cmds", "查看当前工具原生命令与 Skills", "/cmds [工具]", aliases=("/commands", "/tool_cmds"), protects_from_auto_activation=True),
     _action("/info", "查看当前会话或工作区详情", protects_from_auto_activation=True, slash_discoverable=False),
@@ -136,18 +164,10 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/clear", "清空当前会话上下文（保留当前工具与模型）", aliases=("/reset",), protects_from_auto_activation=True),
     _action("/sh", "在当前项目目录直接执行 Shell 命令", "/sh <命令>", aliases=("/shell",), protects_from_auto_activation=True, slash_discoverable=False),
     _action("/ask", "向指定工具发起一次性零副作用咨询", "/ask <工具> <问题>", protects_from_auto_activation=True, slash_discoverable=False),
-    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_claude_w", "/exit_claude_w", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_codex_w", "/exit_codex_w", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok")),
+    _action("/exit", "退出当前编程模式", aliases=_EXIT_COMMAND_ALIASES),
     _action("/btw", "在当前编程会话中提出旁路问题", "/btw <问题>"),
     _action("/coco_status", "查看 Coco 会话状态"),
-    _action("/coco_info", "查看 Coco 会话与模型信息"),
-    _action("/claude_info", "查看 Claude 会话与模型信息"),
-    _action("/aiden_info", "查看 Aiden 会话与模型信息"),
-    _action("/codex_info", "查看 Codex 会话与模型信息"),
-    _action("/gemini_info", "查看 Gemini 会话与模型信息"),
-    _action("/traex_info", "查看 Traex 会话与模型信息"),
-    _action("/grok_info", "查看 Grok 会话与模型信息"),
-    _action("/dsh_info", "查看 DSH 会话与模型信息"),
-    _action("/agy_info", "查看 AGY 会话与模型信息"),
+    *_info_actions(),
     _action("/projects", "查看项目面板"),
     _action("/new", "创建项目", "/new <名称> [目录]"),
     _action("/new-chat", "创建或绑定项目群", "/new-chat <名称> [后缀] [目录]"),
@@ -194,8 +214,7 @@ HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     # tool introspection / low-level ACP
     "/tools", "/tools_status", "/acp", "/btw", "/sh", "/ask", "/info",
     "/coco_status",
-    "/coco_info", "/claude_info", "/aiden_info", "/codex_info",
-    "/gemini_info", "/traex_info", "/grok_info", "/dsh_info", "/agy_info",
+    *(spec.info_command for spec in ALL_BACKEND_METAS if spec.supports_info_command),
     # project administration (board stays reachable via cards)
     "/new-chat", "/close", "/tasks", "/diff", "/trace",
     "/lock", "/unlock", "/setadmin",
@@ -206,8 +225,8 @@ HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     "/spec_export", "/spec_save", "/spec_guide", "/stop_spec",
     # Workflow auxiliaries
     "/wf_status", "/wf_help", "/stop_wf",
-    # hidden local CLI bridge — type it explicitly, never advertised
-    "/claude-w",
+    # hidden local CLI bridges — type explicitly, never advertised
+    *(spec.slash_command for spec in ALL_BACKEND_METAS if not spec.visible_in_tools_list),
 })
 
 PUBLIC_ACTIONS: tuple[ProductAction, ...] = tuple(
@@ -274,9 +293,7 @@ _EXECUTION_LANE_DESCRIPTORS: tuple[ExecutionLaneDescriptor, ...] = (
         "Direct 编程",
         CompletionLabel.MATURE,
         RuntimeHealth.AVAILABLE,
-        tuple(
-            mode.value.replace("_", "-") for mode in InteractionMode if mode in PROGRAMMING_MODES
-        ),
+        tuple(spec.cli_name for spec in ALL_BACKEND_METAS),
     ),
     ExecutionLaneDescriptor(ExecutionLane.DEEP, "deep", "Deep", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
     ExecutionLaneDescriptor(ExecutionLane.SPEC, "spec", "Spec", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),

@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 from ..config import get_settings
 from ..mode import PROGRAMMING_MODE_VALUES
+from ..mode.backends import ALL_BACKEND_METAS, get_backend_meta
 
 logger = logging.getLogger(__name__)
 
@@ -132,38 +133,43 @@ class IntentMatcher:
         return None
 
 
+def _build_backend_intent_map() -> dict[str, IntentType]:
+    mapping: dict[str, IntentType] = {}
+    for spec in ALL_BACKEND_METAS:
+        mapping[f"enter_{spec.mode_key}"] = IntentType(f"enter_{spec.mode_key}")
+        if spec.legacy_exit_mode == "dedicated_intent":
+            mapping[f"exit_{spec.mode_key}"] = IntentType(f"exit_{spec.mode_key}")
+        mapping[f"{spec.mode_key}_message"] = IntentType(f"{spec.mode_key}_message")
+    return mapping
+
+
+def _build_backend_exact_commands() -> dict[str, tuple[IntentType, str]]:
+    commands: dict[str, tuple[IntentType, str]] = {}
+    for spec in ALL_BACKEND_METAS:
+        enter_intent = IntentType(f"enter_{spec.mode_key}")
+        enter_desc = (
+            f"进入 {spec.display_name} 编程模式"
+            if spec.visible_in_tools_list
+            else f"进入 {spec.display_name} 桥接模式"
+        )
+        commands[spec.slash_command] = (enter_intent, enter_desc)
+        commands[spec.enter_alias_command] = (enter_intent, enter_desc)
+        if spec.legacy_exit_mode == "dedicated_intent":
+            exit_intent = IntentType(f"exit_{spec.mode_key}")
+            exit_desc = f"退出 {spec.display_name} 编程模式"
+            commands[f"/end_{spec.mode_key}"] = (exit_intent, exit_desc)
+            commands[f"/exit_{spec.mode_key}"] = (exit_intent, exit_desc)
+        elif spec.legacy_exit_mode == "shared_exit_alias":
+            exit_desc = f"退出 {spec.display_name} 桥接模式"
+            commands[f"/end_{spec.mode_key}"] = (IntentType.EXIT_MODE, exit_desc)
+            commands[f"/exit_{spec.mode_key}"] = (IntentType.EXIT_MODE, exit_desc)
+    return commands
+
+
 class IntentRecognizer:
     INTENT_MAP = {
-        "enter_coco": IntentType.ENTER_COCO,
-        "exit_coco": IntentType.EXIT_COCO,
-        "enter_claude": IntentType.ENTER_CLAUDE,
-        "exit_claude": IntentType.EXIT_CLAUDE,
-        "enter_claude_w": IntentType.ENTER_CLAUDE_W,
-        "claude_w_message": IntentType.CLAUDE_W_MESSAGE,
-        "enter_aiden": IntentType.ENTER_AIDEN,
-        "exit_aiden": IntentType.EXIT_AIDEN,
-        "enter_codex": IntentType.ENTER_CODEX,
-        "exit_codex": IntentType.EXIT_CODEX,
-        "enter_codex_w": IntentType.ENTER_CODEX_W,
-        "enter_gemini": IntentType.ENTER_GEMINI,
-        "exit_gemini": IntentType.EXIT_GEMINI,
-        "enter_traex": IntentType.ENTER_TRAEX,
-        "exit_traex": IntentType.EXIT_TRAEX,
-        "enter_grok": IntentType.ENTER_GROK,
-        "exit_grok": IntentType.EXIT_GROK,
-        "enter_dsh": IntentType.ENTER_DSH,
-        "enter_agy": IntentType.ENTER_AGY,
+        **_build_backend_intent_map(),
         "exit_mode": IntentType.EXIT_MODE,
-        "coco_message": IntentType.COCO_MESSAGE,
-        "claude_message": IntentType.CLAUDE_MESSAGE,
-        "aiden_message": IntentType.AIDEN_MESSAGE,
-        "codex_message": IntentType.CODEX_MESSAGE,
-        "codex_w_message": IntentType.CODEX_W_MESSAGE,
-        "gemini_message": IntentType.GEMINI_MESSAGE,
-        "traex_message": IntentType.TRAEX_MESSAGE,
-        "grok_message": IntentType.GROK_MESSAGE,
-        "dsh_message": IntentType.DSH_MESSAGE,
-        "agy_message": IntentType.AGY_MESSAGE,
         "change_dir": IntentType.CHANGE_DIR,
         "shell": IntentType.SHELL_COMMAND,
         "create_project": IntentType.CREATE_PROJECT,
@@ -187,48 +193,9 @@ class IntentRecognizer:
     }
 
     EXACT_COMMANDS = {
-        "/coco": (IntentType.ENTER_COCO, "进入 Coco 编程模式"),
-        "/enter_coco": (IntentType.ENTER_COCO, "进入 Coco 编程模式"),
-        "/end_coco": (IntentType.EXIT_COCO, "退出 Coco 编程模式"),
-        "/exit_coco": (IntentType.EXIT_COCO, "退出 Coco 编程模式"),
-        "/claude": (IntentType.ENTER_CLAUDE, "进入 Claude 编程模式"),
-        "/enter_claude": (IntentType.ENTER_CLAUDE, "进入 Claude 编程模式"),
-        "/claude-w": (IntentType.ENTER_CLAUDE_W, "进入 Claude-W 桥接模式"),
-        "/enter_claude_w": (IntentType.ENTER_CLAUDE_W, "进入 Claude-W 桥接模式"),
-        "/end_claude": (IntentType.EXIT_CLAUDE, "退出 Claude 编程模式"),
-        "/exit_claude": (IntentType.EXIT_CLAUDE, "退出 Claude 编程模式"),
-        "/aiden": (IntentType.ENTER_AIDEN, "进入 Aiden 编程模式"),
-        "/enter_aiden": (IntentType.ENTER_AIDEN, "进入 Aiden 编程模式"),
-        "/end_aiden": (IntentType.EXIT_AIDEN, "退出 Aiden 编程模式"),
-        "/exit_aiden": (IntentType.EXIT_AIDEN, "退出 Aiden 编程模式"),
-        "/codex": (IntentType.ENTER_CODEX, "进入 Codex 编程模式"),
-        "/enter_codex": (IntentType.ENTER_CODEX, "进入 Codex 编程模式"),
-        "/end_codex": (IntentType.EXIT_CODEX, "退出 Codex 编程模式"),
-        "/exit_codex": (IntentType.EXIT_CODEX, "退出 Codex 编程模式"),
-        "/codex-w": (IntentType.ENTER_CODEX_W, "进入 Codex-W 桥接模式"),
-        "/enter_codex_w": (IntentType.ENTER_CODEX_W, "进入 Codex-W 桥接模式"),
-        "/gemini": (IntentType.ENTER_GEMINI, "进入 Gemini 编程模式"),
-        "/enter_gemini": (IntentType.ENTER_GEMINI, "进入 Gemini 编程模式"),
-        "/end_gemini": (IntentType.EXIT_GEMINI, "退出 Gemini 编程模式"),
-        "/exit_gemini": (IntentType.EXIT_GEMINI, "退出 Gemini 编程模式"),
-        "/traex": (IntentType.ENTER_TRAEX, "进入 Traex 编程模式"),
-        "/enter_traex": (IntentType.ENTER_TRAEX, "进入 Traex 编程模式"),
-        "/end_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
-        "/exit_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
-        "/grok": (IntentType.ENTER_GROK, "进入 Grok 编程模式"),
-        "/enter_grok": (IntentType.ENTER_GROK, "进入 Grok 编程模式"),
-        "/end_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
-        "/exit_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
-        "/dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
-        "/enter_dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
-        "/agy": (IntentType.ENTER_AGY, "进入 AGY 编程模式"),
-        "/enter_agy": (IntentType.ENTER_AGY, "进入 AGY 编程模式"),
+        **_build_backend_exact_commands(),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
-        "/end_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
-        "/exit_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
-        "/end_codex_w": (IntentType.EXIT_MODE, "退出 Codex-W 桥接模式"),
-        "/exit_codex_w": (IntentType.EXIT_MODE, "退出 Codex-W 桥接模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
         "/switch": (IntentType.SWITCH_PROJECT, "切换项目（打开项目看板）"),
         "/project": (IntentType.PROJECT_STATUS, "查看当前项目"),
@@ -412,17 +379,29 @@ class IntentRecognizer:
 
     EXIT_MODE_KEYWORDS = {"退出模式", "退出编程模式"}
 
-    _ENTER_TOOL_RULES: tuple[tuple[str, IntentType, str, tuple[str, ...]], ...] = (
-        ("coco", IntentType.ENTER_COCO, "Coco", ("进入编程模式", "编程模式", "开始编程", "进入coco", "coco模式")),
-        ("claude", IntentType.ENTER_CLAUDE, "Claude", ("进入claude模式", "claude模式", "进入claude", "使用claude")),
-        ("aiden", IntentType.ENTER_AIDEN, "Aiden", ("进入aiden模式", "aiden模式", "进入aiden", "使用aiden")),
-        ("codex", IntentType.ENTER_CODEX, "Codex", ("进入codex模式", "codex模式", "进入codex", "使用codex")),
-        ("gemini", IntentType.ENTER_GEMINI, "Gemini", ("进入gemini模式", "gemini模式", "进入gemini", "使用gemini")),
-        ("traex", IntentType.ENTER_TRAEX, "Traex", ("进入traex模式", "traex模式", "进入traex", "使用traex")),
-        ("grok", IntentType.ENTER_GROK, "Grok", ("进入grok模式", "grok模式", "进入grok", "使用grok")),
-        ("dsh", IntentType.ENTER_DSH, "DSH", ("进入dsh模式", "dsh模式", "进入dsh", "使用dsh")),
-        ("agy", IntentType.ENTER_AGY, "AGY", ("进入agy模式", "agy模式", "进入agy", "使用agy")),
+    _ENTER_TOOL_RULES: tuple[tuple[str, IntentType, str, tuple[str, ...]], ...] = tuple(
+        (
+            spec.mode_key,
+            IntentType(f"enter_{spec.mode_key}"),
+            spec.display_name,
+            spec.nl_enter_keywords,
+        )
+        for spec in ALL_BACKEND_METAS
+        if spec.nl_enter_keywords
     )
+    _INFO_COMMANDS: dict[str, tuple[IntentType, str]] = {
+        spec.info_command: (IntentType(f"{spec.mode_key}_message"), spec.display_name)
+        for spec in ALL_BACKEND_METAS
+        if spec.supports_info_command
+    }
+    _FALLBACK_INTENT_MAP: dict[str, IntentType] = {
+        spec.mode_key: IntentType(f"{spec.mode_key}_message")
+        for spec in ALL_BACKEND_METAS
+    }
+    _TOOL_INTENT_MAP: dict[str, IntentType] = {
+        spec.mode_key: IntentType(f"enter_{spec.mode_key}")
+        for spec in ALL_BACKEND_METAS
+    }
 
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
 
@@ -708,18 +687,8 @@ class IntentRecognizer:
 
     def _match_info_commands(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        info_commands = {
-            "/claude_info": (IntentType.CLAUDE_MESSAGE, "Claude"),
-            "/aiden_info": (IntentType.AIDEN_MESSAGE, "Aiden"),
-            "/codex_info": (IntentType.CODEX_MESSAGE, "Codex"),
-            "/gemini_info": (IntentType.GEMINI_MESSAGE, "Gemini"),
-            "/traex_info": (IntentType.TRAEX_MESSAGE, "Traex"),
-            "/grok_info": (IntentType.GROK_MESSAGE, "Grok"),
-            "/dsh_info": (IntentType.DSH_MESSAGE, "DSH"),
-            "/agy_info": (IntentType.AGY_MESSAGE, "AGY"),
-        }
-        if text_lower in info_commands:
-            intent, name = info_commands[text_lower]
+        if text_lower in self._INFO_COMMANDS:
+            intent, name = self._INFO_COMMANDS[text_lower]
             return IntentResult.single(
                 intent=intent,
                 confidence=1.0,
@@ -864,30 +833,7 @@ class IntentRecognizer:
         return cls._looks_like_shell_token(first_word, text_lower)
 
     def _get_fallback_intent(self, current_mode: str) -> IntentType:
-        if current_mode == "coco":
-            return IntentType.COCO_MESSAGE
-        elif current_mode == "claude":
-            return IntentType.CLAUDE_MESSAGE
-        elif current_mode == "claude_w":
-            return IntentType.CLAUDE_W_MESSAGE
-        elif current_mode == "aiden":
-            return IntentType.AIDEN_MESSAGE
-        elif current_mode == "codex":
-            return IntentType.CODEX_MESSAGE
-        elif current_mode == "codex_w":
-            return IntentType.CODEX_W_MESSAGE
-        elif current_mode == "gemini":
-            return IntentType.GEMINI_MESSAGE
-        elif current_mode == "traex":
-            return IntentType.TRAEX_MESSAGE
-        elif current_mode == "grok":
-            return IntentType.GROK_MESSAGE
-        elif current_mode == "dsh":
-            return IntentType.DSH_MESSAGE
-        elif current_mode == "agy":
-            return IntentType.AGY_MESSAGE
-        else:
-            return IntentType.SHELL_COMMAND
+        return self._FALLBACK_INTENT_MAP.get(current_mode, IntentType.SHELL_COMMAND)
 
     def recognize(self, text: str, current_mode: str = "smart") -> IntentResult:
         quick_result = self._quick_match(text, current_mode)
@@ -897,18 +843,10 @@ class IntentRecognizer:
         # Default ACP tool: forward unmatched SMART mode messages to configured tool
         default_tool = self.settings.default_acp_tool
         if default_tool and current_mode == "smart":
-            _TOOL_INTENT_MAP = {
-                "coco": IntentType.ENTER_COCO,
-                "claude": IntentType.ENTER_CLAUDE,
-                "aiden": IntentType.ENTER_AIDEN,
-                "codex": IntentType.ENTER_CODEX,
-                "gemini": IntentType.ENTER_GEMINI,
-                "traex": IntentType.ENTER_TRAEX,
-                "grok": IntentType.ENTER_GROK,
-                "dsh": IntentType.ENTER_DSH,
-                "agy": IntentType.ENTER_AGY,
-            }
-            intent = _TOOL_INTENT_MAP.get(default_tool.lower())
+            spec = get_backend_meta(default_tool)
+            intent = self._TOOL_INTENT_MAP.get(
+                spec.mode_key if spec is not None else default_tool.lower()
+            )
             if intent:
                 return IntentResult.single(
                     intent=intent,

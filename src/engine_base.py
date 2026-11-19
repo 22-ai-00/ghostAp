@@ -381,27 +381,21 @@ class BaseEngineManager(Generic[T]):
                 yield engine
 
     def _resolve_identity(self, engine_name: str) -> tuple[str, str, Optional[str]]:
-        from .mode import InteractionMode
-        normalized = (engine_name or "").strip().lower()
-        if normalized.startswith("claude"):
-            mode = InteractionMode.CLAUDE
-        elif normalized.startswith("aiden"):
-            mode = InteractionMode.AIDEN
-        elif normalized.startswith("codex"):
-            mode = InteractionMode.CODEX
-        elif normalized.startswith("gemini"):
-            mode = InteractionMode.GEMINI
-        elif normalized.startswith("traex"):
-            mode = InteractionMode.TRAEX
-        elif normalized.startswith("grok"):
-            mode = InteractionMode.GROK
-        elif normalized.startswith("dsh"):
-            mode = InteractionMode.DSH
-        elif normalized.startswith("agy"):
-            mode = InteractionMode.AGY
-        else:
-            mode = InteractionMode.COCO
+        from .mode.backends import ALL_BACKEND_METAS, InteractionMode, get_backend_meta
 
+        normalized = (engine_name or "").strip().lower()
+        spec = get_backend_meta(normalized)
+        if spec is None and normalized:
+            for candidate in sorted(
+                ALL_BACKEND_METAS,
+                key=lambda s: max(len(s.mode_key), len(s.cli_name)),
+                reverse=True,
+            ):
+                if normalized.startswith(candidate.mode_key) or normalized.startswith(candidate.cli_name):
+                    spec = candidate
+                    break
+
+        mode = spec.interaction_mode if spec is not None else InteractionMode.COCO
         identity = resolve_engine_identity(mode=mode)
         return identity.engine_name, identity.agent_type, identity.model_name
 

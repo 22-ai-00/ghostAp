@@ -61,6 +61,7 @@ from ..config import IngressAccessMode, get_settings
 from ..config.env_file_store import AtomicEnvFileStore
 from ..deep_engine import DeepEngineManager, ProgressReporter
 from ..mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES
+from ..mode.backends import ALL_BACKEND_METAS
 from ..project import (
     MessageLinker,
     MessageProjectMapper,
@@ -101,22 +102,12 @@ from .card_callback_contract import (
 from .emoji import EmojiReaction
 from .handler_context import HandlerContext
 from .handlers import (
-    AGYModeHandler,
-    AidenModeHandler,
-    ClaudeModeHandler,
-    ClaudeWModeHandler,
-    CocoModeHandler,
-    CodexModeHandler,
-    CodexWModeHandler,
+    PROGRAMMING_HANDLER_TYPES,
     DeepHandler,
     DiagnosticsHandler,
-    DSHModeHandler,
-    GeminiModeHandler,
-    GrokModeHandler,
     ProjectHandler,
     SpecHandler,
     SystemHandler,
-    TraexModeHandler,
     WorkflowHandler,
 )
 from .image_handler import FeishuImageHandler
@@ -459,28 +450,15 @@ class FeishuWSClient(WSManagedGroupsMixin):
         # 避免在构造函数中直接依赖具体 Telemetry/Service 实现。
         idle_health_cfg = build_idle_health_config_for_manager()
 
-        manager_timeouts = {
-            "coco": self.settings.coco_session_timeout,
-            "claude": self.settings.claude_session_timeout,
-            "claude_w": self.settings.claude_session_timeout,
-            "aiden": self.settings.coco_session_timeout,
-            "codex": self.settings.coco_session_timeout,
-            "codex_w": self.settings.coco_session_timeout,
-            "gemini": self.settings.coco_session_timeout,
-            "traex": self.settings.coco_session_timeout,
-            "grok": self.settings.coco_session_timeout,
-            "dsh": self.settings.coco_session_timeout,
-            "agy": self.settings.coco_session_timeout,
-        }
         acp_managers = {
-            name: ACPSessionManager(
-                name,
-                session_timeout=session_timeout,
+            spec.mode_key: ACPSessionManager(
+                spec.mode_key,
+                session_timeout=getattr(self.settings, spec.session_timeout_attr),
                 keepalive_interval=self.settings.acp_keepalive_interval,
                 idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
                 idle_health_config=idle_health_cfg,
             )
-            for name, session_timeout in manager_timeouts.items()
+            for spec in ALL_BACKEND_METAS
         }
         self._intent_recognizer = IntentRecognizer()
         self._message_cache = MessageCache(
@@ -592,17 +570,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
             settings=self.settings,
             api_client_factory=self._get_api_client,
             message_callback=self.message_callback,
-            coco_manager=acp_managers["coco"],
-            claude_manager=acp_managers["claude"],
-            claude_w_manager=acp_managers["claude_w"],
-            aiden_manager=acp_managers["aiden"],
-            codex_manager=acp_managers["codex"],
-            codex_w_manager=acp_managers["codex_w"],
-            gemini_manager=acp_managers["gemini"],
-            traex_manager=acp_managers["traex"],
-            grok_manager=acp_managers["grok"],
-            dsh_manager=acp_managers["dsh"],
-            agy_manager=acp_managers["agy"],
+            managers=acp_managers,
             intent_recognizer=self._intent_recognizer,
             scheduler=self._scheduler,
             project_manager=self._project_manager,
@@ -641,17 +609,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
         )
 
         handler_types = {
-            "coco": CocoModeHandler,
-            "claude": ClaudeModeHandler,
-            "claude_w": ClaudeWModeHandler,
-            "aiden": AidenModeHandler,
-            "codex": CodexModeHandler,
-            "codex_w": CodexWModeHandler,
-            "gemini": GeminiModeHandler,
-            "traex": TraexModeHandler,
-            "grok": GrokModeHandler,
-            "dsh": DSHModeHandler,
-            "agy": AGYModeHandler,
+            **PROGRAMMING_HANDLER_TYPES,
             "deep": DeepHandler,
             "spec": SpecHandler,
             "project": ProjectHandler,
@@ -660,7 +618,6 @@ class FeishuWSClient(WSManagedGroupsMixin):
             "workflow": WorkflowHandler,
         }
         handlers = {name: cls(self._handler_ctx) for name, cls in handler_types.items()}
-        self._handler_ctx.managers.update(acp_managers)
         self._handler_ctx.handlers.update(handlers)
         system_handler = handlers["system"]
 

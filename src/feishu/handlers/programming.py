@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -21,6 +21,7 @@ from ...acp.manager import ACPSessionManager
 from ...card.actions import dispatch as card_action_ids
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, InteractionMode
+from ...mode.backends import ALL_BACKEND_METAS, BACKEND_SPEC_BY_MODE
 from ...project import ContextSourceMode
 from ...utils.errors import get_error_detail, log_exception
 from ..emoji import EmojiReaction
@@ -432,18 +433,9 @@ class ProgrammingModeHandler(BaseHandler):
     is_coco: bool = False
     thinking_text: str = ""
 
-    _PROGRAMMING_MODE_KEYS = (
-        (InteractionMode.COCO, "is_coco_mode", "coco"),
-        (InteractionMode.CLAUDE, "is_claude_mode", "claude"),
-        (InteractionMode.CLAUDE_W, "is_claude_w_mode", "claude_w"),
-        (InteractionMode.AIDEN, "is_aiden_mode", "aiden"),
-        (InteractionMode.CODEX, "is_codex_mode", "codex"),
-        (InteractionMode.CODEX_W, "is_codex_w_mode", "codex_w"),
-        (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
-        (InteractionMode.TRAEX, "is_traex_mode", "traex"),
-        (InteractionMode.GROK, "is_grok_mode", "grok"),
-        (InteractionMode.DSH, "is_dsh_mode", "dsh"),
-        (InteractionMode.AGY, "is_agy_mode", "agy"),
+    _PROGRAMMING_MODE_KEYS = tuple(
+        (spec.interaction_mode, spec.is_mode_predicate_name, spec.mode_key)
+        for spec in ALL_BACKEND_METAS
     )
 
     def __init__(self, ctx):
@@ -586,7 +578,17 @@ class ProgrammingModeHandler(BaseHandler):
     # Config-driven default implementations (subclass may override)
     # ------------------------------------------------------------------
     def _get_session_manager(self) -> ACPSessionManager:
-        return getattr(self.ctx, f"{self.mode_key}_manager")
+        ctx = self.ctx
+        if hasattr(type(ctx), "get_manager") or "get_manager" in getattr(ctx, "__dict__", {}):
+            mgr = ctx.get_manager(self.mode_key)
+            if mgr is not None:
+                return mgr
+        managers = getattr(ctx, "__dict__", {}).get("managers") if hasattr(ctx, "__dict__") else None
+        if isinstance(managers, Mapping):
+            mgr = managers.get(self.mode_key)
+            if mgr is not None:
+                return mgr
+        return getattr(ctx, f"{self.mode_key}_manager")
 
     def _replace_timed_out_session(
         self,
@@ -2505,92 +2507,92 @@ class ProgrammingModeHandler(BaseHandler):
         self.exit_mode(message_id, chat_id, project=project)
 
 # ======================================================================
-# Concrete subclasses (declarative spec-driven bindings)
+# Concrete subclasses (SSOT spec-driven bindings & auto-registration)
 # ======================================================================
 
 
-@dataclass(frozen=True, slots=True)
-class _ProgrammingBackendSpec:
-    mode_name: str
-    mode_emoji: str
-    interaction_mode: InteractionMode
-    context_source: ContextSourceMode
-    is_coco: bool = False
-    uses_claude_cli: bool = False
+PROGRAMMING_HANDLER_TYPES: dict[str, type[ProgrammingModeHandler]] = {}
 
 
-def _bind_programming_backend(spec: _ProgrammingBackendSpec):
-    """Attach canonical mode metadata and transport traits to a handler class."""
+def _bind_programming_backend(
+    interaction_mode: InteractionMode,
+    *,
+    context_source: ContextSourceMode | None = None,
+):
+    """Attach canonical SSOT backend metadata and register the handler class."""
+    spec = BACKEND_SPEC_BY_MODE[interaction_mode]
+    resolved_source = context_source or ContextSourceMode(spec.mode_key)
 
     def _decorator(cls: type[ProgrammingModeHandler]) -> type[ProgrammingModeHandler]:
-        cls.mode_name = spec.mode_name
+        cls.mode_name = spec.display_name
         cls.mode_emoji = spec.mode_emoji
         cls.interaction_mode = spec.interaction_mode
-        cls.mode_key = spec.interaction_mode.value
-        cls.context_source = spec.context_source
+        cls.mode_key = spec.mode_key
+        cls.context_source = resolved_source
         cls.thinking_text = UI_TEXT["mode_thinking_msg"].format(
             emoji=spec.mode_emoji,
-            name=spec.mode_name,
+            name=spec.display_name,
         )
         if spec.is_coco:
             cls.is_coco = True
         if spec.uses_claude_cli:
             cls._uses_claude_cli = lambda self: True
+        PROGRAMMING_HANDLER_TYPES[spec.mode_key] = cls
         return cls
 
     return _decorator
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Coco", "🤖", InteractionMode.COCO, ContextSourceMode.COCO, is_coco=True))
+@_bind_programming_backend(InteractionMode.COCO)
 class CocoModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Claude", "🔮", InteractionMode.CLAUDE, ContextSourceMode.CLAUDE, uses_claude_cli=True))
+@_bind_programming_backend(InteractionMode.CLAUDE)
 class ClaudeModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Claude-W", "🪄", InteractionMode.CLAUDE_W, ContextSourceMode.CLAUDE_W))
+@_bind_programming_backend(InteractionMode.CLAUDE_W)
 class ClaudeWModeHandler(ClaudeModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Aiden", "🎯", InteractionMode.AIDEN, ContextSourceMode.AIDEN))
+@_bind_programming_backend(InteractionMode.AIDEN)
 class AidenModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Codex", "⚡", InteractionMode.CODEX, ContextSourceMode.CODEX))
+@_bind_programming_backend(InteractionMode.CODEX)
 class CodexModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Codex-W", "🌩️", InteractionMode.CODEX_W, ContextSourceMode.CODEX_W))
+@_bind_programming_backend(InteractionMode.CODEX_W)
 class CodexWModeHandler(CodexModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Gemini", "✨", InteractionMode.GEMINI, ContextSourceMode.GEMINI))
+@_bind_programming_backend(InteractionMode.GEMINI)
 class GeminiModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Traex", "🚀", InteractionMode.TRAEX, ContextSourceMode.TRAEX))
+@_bind_programming_backend(InteractionMode.TRAEX)
 class TraexModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("Grok", "🌌", InteractionMode.GROK, ContextSourceMode.GROK))
+@_bind_programming_backend(InteractionMode.GROK)
 class GrokModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("DSH", "🧭", InteractionMode.DSH, ContextSourceMode.DSH))
+@_bind_programming_backend(InteractionMode.DSH)
 class DSHModeHandler(ProgrammingModeHandler):
     pass
 
 
-@_bind_programming_backend(_ProgrammingBackendSpec("AGY", "🪐", InteractionMode.AGY, ContextSourceMode.AGY))
+@_bind_programming_backend(InteractionMode.AGY)
 class AGYModeHandler(ProgrammingModeHandler):
     pass

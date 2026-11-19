@@ -6,6 +6,7 @@ import logging
 import sys
 from typing import TYPE_CHECKING, Any, Optional
 
+from ...mode.backends import BACKEND_META_BY_KEY
 from ...tasking import TaskStatus
 from ...utils.errors import safe_error_message
 
@@ -289,25 +290,12 @@ class ACPActivationMixin:
         """Activate ACP mode synchronously or enqueue background activation task."""
         target_project = project or self.project_manager.get_active_project(chat_id)
 
-        _TOOL_HANDLER_MAP = (
-            "coco",
-            "claude",
-            "claude_w",
-            "aiden",
-            "codex",
-            "codex_w",
-            "gemini",
-            "traex",
-            "grok",
-            "dsh",
-            "agy",
+        handler = (
+            self.get_handler(tool_name)
+            if tool_name in BACKEND_META_BY_KEY
+            else None
         )
-        for _tool in _TOOL_HANDLER_MAP:
-            if tool_name != _tool:
-                continue
-            handler = self.get_handler(_tool)
-            if not handler:
-                break
+        if handler:
             # Persistent programming mode intentionally outlives an ACP transport.
             # Probe the exact direct/topic coordinate instead of inferring liveness
             # from that persistent flag.  A missing session takes the ordinary
@@ -374,12 +362,12 @@ class ACPActivationMixin:
                 live_session is not None
                 and model_name is not None
             ):
-                if _tool == "traex":
+                if tool_name == "traex":
                     backend_model_name = model_name
                 else:
                     from ...acp.providers import normalize_acp_model_name
 
-                    backend_model_name = normalize_acp_model_name(_tool, model_name)
+                    backend_model_name = normalize_acp_model_name(tool_name, model_name)
                 active_model_name = str(
                     getattr(live_session, "_model_name", "") or ""
                 ).strip()
@@ -968,7 +956,8 @@ class ACPActivationMixin:
         if not tool or (not use_default_model and not model):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_model_prompt"])
             return
-        if tool in {"claude", "claude_w"} and model:
+        _tool_spec = BACKEND_META_BY_KEY.get(tool)
+        if _tool_spec is not None and _tool_spec.uses_claude_cli and model:
             from ...acp.claude_capabilities import (
                 is_1m_variant,
                 model_supports_1m,
@@ -1555,7 +1544,8 @@ class ACPActivationMixin:
                 _system_module().UI_TEXT["system_acp_unknown_model"].format(model=model_name),
             )
             return
-        if tool_name in {"claude", "claude_w"} and model_name:
+        _tool_spec = BACKEND_META_BY_KEY.get(tool_name)
+        if _tool_spec is not None and _tool_spec.uses_claude_cli and model_name:
             from ...acp.claude_capabilities import (
                 is_1m_variant,
                 model_supports_1m,

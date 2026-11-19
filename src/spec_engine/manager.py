@@ -4,15 +4,14 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from ..engine_base import BaseEngineManager
+from ..mode import PROGRAMMING_MODE_VALUES
 
 if TYPE_CHECKING:
     from .engine import SpecEngine
 
 logger = logging.getLogger(__name__)
 
-_KNOWN_SPEC_BACKENDS = frozenset(
-    {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"}
-)
+_KNOWN_SPEC_BACKENDS = PROGRAMMING_MODE_VALUES
 
 
 class SpecEngineManager(BaseEngineManager["SpecEngine"]):

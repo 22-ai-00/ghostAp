@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from ..config import get_settings
+from ..mode.backends import ALL_BACKEND_METAS
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
 from .agy_selection import (
@@ -78,23 +79,11 @@ def __getattr__(name: str):
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-_TOOLS = (
-    "coco",
-    "claude",
-    "claude_w",
-    "aiden",
-    "codex",
-    "codex_w",
-    "gemini",
-    "traex",
-    "grok",
-    "dsh",
-    "agy",
-)
+_TOOLS = tuple(spec.mode_key for spec in ALL_BACKEND_METAS)
 # Tools hidden from auto-discovered listings (e.g. /tools panel) but still
 # fully routable when invoked explicitly — see the hidden /claude-w and
 # /codex-w bridge commands.
-_HIDDEN_TOOLS = frozenset({"claude_w", "codex_w"})
+_HIDDEN_TOOLS = frozenset(spec.mode_key for spec in ALL_BACKEND_METAS if not spec.visible_in_tools_list)
 _PROBE_TTL = 1800.0
 _CODEX_PROBE_TTL = 1800.0
 _NEGATIVE_TTL = 300.0

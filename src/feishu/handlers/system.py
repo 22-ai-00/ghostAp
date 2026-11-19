@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...card.backend_meta import VISIBLE_BACKEND_METAS, get_backend_meta
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
+from ...mode.backends import ALL_BACKEND_METAS
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.lock_order import LockLevel, ordered_rlock
 from ..emoji import EmojiReaction
@@ -89,20 +91,10 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     # the obsolete process-local command surface.
     _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()
     _DIRECT_TOOL_COMMAND_TO_MODE: dict[str, str] = {
-        "/coco": "coco",
-        "/claude": "claude",
-        "/claude-w": "claude_w",
-        "/aiden": "aiden",
-        "/codex": "codex",
-        "/codex-w": "codex_w",
-        "/gemini": "gemini",
-        "/traex": "traex",
-        "/grok": "grok",
-        "/dsh": "dsh",
-        "/agy": "agy",
+        spec.slash_command: spec.mode_key for spec in ALL_BACKEND_METAS
     }
-    _INFO_COMMAND_MODES: tuple[str, ...] = (
-        "coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy",
+    _INFO_COMMAND_MODES: tuple[str, ...] = tuple(
+        spec.mode_key for spec in ALL_BACKEND_METAS if spec.supports_info_command
     )
     _EXACT_ONLY_CONTROL_COMMANDS: frozenset[str] = frozenset(
         {
@@ -611,47 +603,32 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     # ------------------------------------------------------------------
     # Command predicates
     # ------------------------------------------------------------------
-    @staticmethod
-    def is_exit_command(text: str) -> bool:
-        text_lower = text.lower().strip()
-        exit_commands = {
+    _LEGACY_EXIT_COMMANDS: frozenset[str] = frozenset(
+        {
             "/exit",
             "/quit",
-            "/end_coco",
-            "/exit_coco",
-            "/end_claude",
-            "/exit_claude",
-            "/end_claude_w",
-            "/exit_claude_w",
-            "/end_aiden",
-            "/exit_aiden",
-            "/end_codex",
-            "/exit_codex",
-            "/end_codex_w",
-            "/exit_codex_w",
-            "/end_gemini",
-            "/exit_gemini",
-            "/end_traex",
-            "/exit_traex",
-            "/end_grok",
-            "/exit_grok",
+            *(
+                cmd
+                for spec in ALL_BACKEND_METAS
+                if spec.legacy_exit_mode in {"dedicated_intent", "shared_exit_alias"}
+                for cmd in (f"/end_{spec.mode_key}", f"/exit_{spec.mode_key}")
+            ),
         }
-        exit_keywords = {
-            "退出模式",
-            "退出编程模式",
-            "退出编程",
-            "结束编程",
-            "退出claude",
-            "退出coco",
-            "退出aiden",
-            "退出grok",
-            "退出codex",
-            "退出gemini",
-            "退出traex",
-        }
-        if text_lower in exit_commands:
+    )
+    _LEGACY_EXIT_KEYWORDS: tuple[str, ...] = (
+        "退出模式",
+        "退出编程模式",
+        "退出编程",
+        "结束编程",
+        *(f"退出{spec.mode_key}" for spec in ALL_BACKEND_METAS),
+    )
+
+    @classmethod
+    def is_exit_command(cls, text: str) -> bool:
+        text_lower = text.lower().strip()
+        if text_lower in cls._LEGACY_EXIT_COMMANDS:
             return True
-        return any(kw in text_lower for kw in exit_keywords) or any(
+        return any(kw in text_lower for kw in cls._LEGACY_EXIT_KEYWORDS) or any(
             f"退出{mode}" in text_lower for mode in PROGRAMMING_MODE_VALUES
         )
 
@@ -1519,6 +1496,19 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         msg_type, card = SystemBuilder.build_tools_list_card(tools, project)
         self.reply_interactive_card(message_id, card, msg_type=msg_type)
 
+    def _lookup_session_manager(self, mode_key: str):
+        ctx = self.ctx
+        if hasattr(type(ctx), "get_manager") or "get_manager" in getattr(ctx, "__dict__", {}):
+            mgr = ctx.get_manager(mode_key)
+            if mgr is not None:
+                return mgr
+        managers = getattr(ctx, "__dict__", {}).get("managers") if hasattr(ctx, "__dict__") else None
+        if isinstance(managers, Mapping):
+            mgr = managers.get(mode_key)
+            if mgr is not None:
+                return mgr
+        return getattr(ctx, f"{mode_key}_manager", None)
+
     def show_tools_status(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show detailed status of all tools with availability and session info."""
         # Define tool metadata from unified SSOT
@@ -1526,7 +1516,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             {
                 "name": meta.mode_key,
                 "emoji": meta.emoji,
-                "manager": getattr(self.ctx, f"{meta.mode_key}_manager", None),
+                "manager": self._lookup_session_manager(meta.mode_key),
             }
             for meta in VISIBLE_BACKEND_METAS
         ]

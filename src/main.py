@@ -293,9 +293,13 @@ class Application:
         try:
             if getattr(self.settings, "acp_model_preheat_on_startup", False):
                 from .acp.helper import kickoff_acp_model_preheat
+                try:
+                    from mode.backends import VISIBLE_BACKEND_METAS
+                except ImportError:
+                    from .mode.backends import VISIBLE_BACKEND_METAS
 
                 kickoff_acp_model_preheat(
-                    ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"],
+                    [spec.mode_key for spec in VISIBLE_BACKEND_METAS],
                     cwd=os.getcwd(),
                 )
         except Exception:
