@@ -1,12 +1,23 @@
 import asyncio
+import inspect
 import logging
 import threading
 import time
+from enum import Enum
 from typing import Optional
 
 from ..utils.errors import get_error_detail
 
 logger = logging.getLogger(__name__)
+
+
+class WSDisconnectOutcome(str, Enum):
+    """Structured outcome of attempting to disconnect the Feishu WebSocket."""
+
+    DISCONNECTED = "disconnected"
+    NO_CONNECTION = "no_connection"
+    TIMED_OUT = "timed_out"
+    FAILED = "failed"
 
 class WSHealthMonitor:
     """Watchdog for Feishu WebSocket connection health."""
@@ -78,25 +89,47 @@ class WSHealthMonitor:
 
         return max(configured_timeout, ping_interval * 2 + grace_seconds)
 
-    def _trigger_disconnect(self, *, reason: str) -> bool:
+    def _trigger_disconnect_outcome(self, *, reason: str) -> WSDisconnectOutcome:
         client = getattr(self._client_instance, "_client", None)
         if client is None or getattr(client, "_conn", None) is None:
-            return False
+            return WSDisconnectOutcome.NO_CONNECTION
 
+        fut = None
+        coro = None
         try:
             from lark_channel.ws import client as lark_ws_client_impl
 
             loop = getattr(lark_ws_client_impl, "loop", None)
             if loop is None or loop.is_closed() or not loop.is_running():
                 logger.debug("跳过触发 WS 断连 (%s): SDK event loop 未运行", reason)
-                return False
-            fut = asyncio.run_coroutine_threadsafe(client._disconnect(), loop)
-            fut.result(timeout=5)
+                return WSDisconnectOutcome.NO_CONNECTION
+            coro = client._disconnect()
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            coro = None
+            disconnected = fut.result(timeout=5)
+            if disconnected is False:
+                if getattr(client, "_conn", None) is None:
+                    return WSDisconnectOutcome.NO_CONNECTION
+                logger.warning("飞书长连接断开未完成: reason=%s result=False", reason)
+                return WSDisconnectOutcome.FAILED
             logger.warning("飞书长连接 watchdog 已触发重连: %s", reason)
-            return True
+            return WSDisconnectOutcome.DISCONNECTED
+        except TimeoutError:
+            if fut is not None:
+                fut.cancel()
+            logger.warning("飞书长连接 watchdog 触发断连超时: reason=%s timeout=5s", reason)
+            return WSDisconnectOutcome.TIMED_OUT
         except Exception as e:
+            if coro is not None and inspect.iscoroutine(coro):
+                coro.close()
+            if fut is not None and not fut.done():
+                fut.cancel()
             logger.warning("飞书长连接 watchdog 触发重连失败: reason=%s err=%s", reason, get_error_detail(e))
-            return False
+            return WSDisconnectOutcome.FAILED
+
+    def _trigger_disconnect(self, *, reason: str) -> bool:
+        outcome = self._trigger_disconnect_outcome(reason=reason)
+        return outcome is WSDisconnectOutcome.DISCONNECTED
 
     def check_health_once(self, now: Optional[float] = None) -> bool:
         client = getattr(self._client_instance, "_client", None)
@@ -159,7 +192,16 @@ class WSHealthMonitor:
             self._watchdog_thread.join(timeout=2)
         self._watchdog_thread = None
 
+    def disconnect_with_outcome(self, *, reason: str = "application shutdown") -> WSDisconnectOutcome:
+        """Stop primary WebSocket intake and return the structured disconnect outcome."""
+
+        return self._trigger_disconnect_outcome(reason=reason)
+
     def disconnect(self) -> bool:
         """Stop primary WebSocket intake before application task draining."""
 
-        return self._trigger_disconnect(reason="application shutdown")
+        outcome = self.disconnect_with_outcome(reason="application shutdown")
+        return outcome in {
+            WSDisconnectOutcome.DISCONNECTED,
+            WSDisconnectOutcome.NO_CONNECTION,
+        }

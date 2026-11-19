@@ -130,7 +130,7 @@ from .ws_card_action_handler import (
     classify_card_action_error,
 )
 from .ws_event_router import MessageIngressGuard, WSErrorAction, classify_ws_error
-from .ws_health import WSHealthMonitor
+from .ws_health import WSDisconnectOutcome, WSHealthMonitor
 from .ws_managed_groups import WSManagedGroupsMixin
 from .ws_resource_manager import EngineResourceGroup
 
@@ -861,14 +861,52 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 self._message_ingress_binding_cv.wait(timeout=remaining)
             return True
 
+    def _disconnect_primary_ws_intake(self) -> tuple[bool, WSDisconnectOutcome]:
+        """Disconnect the primary WS client and classify whether intake quiesced."""
+        monitor = self._ws_health_monitor
+        disconnect_with_outcome = getattr(monitor, "disconnect_with_outcome", None)
+        if callable(disconnect_with_outcome):
+            try:
+                outcome = disconnect_with_outcome()
+                if isinstance(outcome, WSDisconnectOutcome):
+                    return (
+                        outcome in {
+                            WSDisconnectOutcome.DISCONNECTED,
+                            WSDisconnectOutcome.NO_CONNECTION,
+                        },
+                        outcome,
+                    )
+            except Exception:
+                logger.debug("failed to disconnect primary WS intake", exc_info=True)
+                return False, WSDisconnectOutcome.FAILED
+        try:
+            quiesced = bool(monitor.disconnect())
+            outcome = (
+                WSDisconnectOutcome.DISCONNECTED
+                if quiesced
+                else WSDisconnectOutcome.FAILED
+            )
+            return quiesced, outcome
+        except Exception:
+            logger.debug("failed to disconnect primary WS intake", exc_info=True)
+            return False, WSDisconnectOutcome.FAILED
+
     def close(self) -> bool:
         """Fence intake, drain work, then clean up dependencies.
 
-        ``False`` means a worker or card delivery did not drain within the
-        bounded shutdown budget. In that case shared dependencies are left
-        intact for the still-running callback and the process-level caller must
-        not tear down lock managers underneath it.
+        ``False`` means a worker, WS disconnect, or card delivery did not drain
+        within the bounded shutdown budget. In that case shared dependencies
+        are left intact for the still-running callback and retry ``close()``,
+        and the process-level caller must not tear down lock managers
+        underneath it.
         """
+        scheduler = getattr(self, "_scheduler", None)
+        in_cb = getattr(scheduler, "is_in_completion_callback", None)
+        if callable(in_cb) and in_cb() is True:
+            raise RuntimeError(
+                "FeishuWSClient.close() cannot be called from a scheduler completion callback"
+            )
+
         self._closed = True
         slash_wakeup = getattr(self, "_slash_command_sync_wakeup", None)
         if slash_wakeup is not None:
@@ -882,10 +920,9 @@ class FeishuWSClient(WSManagedGroupsMixin):
 
         # Stop external intake before fencing the in-process scheduler.  This
         # prevents a reconnect callback from admitting fresh work during drain.
-        try:
-            self._ws_health_monitor.disconnect()
-        except Exception:
-            logger.debug("failed to disconnect primary WS intake", exc_info=True)
+        ws_intake_quiesced, ws_disconnect_outcome = (
+            self._disconnect_primary_ws_intake()
+        )
         try:
             if self._channel_client is not None:
                 self._channel_client.stop()
@@ -1010,6 +1047,18 @@ class FeishuWSClient(WSManagedGroupsMixin):
                 logger.debug("failed to stop scheduler dispatcher", exc_info=True)
             return False
 
+        if not ws_intake_quiesced:
+            logger.error(
+                "primary WS disconnect did not quiesce (outcome=%s); "
+                "preserving shared dependencies for retry",
+                ws_disconnect_outcome.value,
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
+
         from ..card.delivery.registry import delivery_registry
 
         # ``shutdown_all`` fences, drains, and shuts down every registered
@@ -1083,6 +1132,7 @@ class FeishuWSClient(WSManagedGroupsMixin):
             _repo_sd()
         except Exception:
             logger.debug("RepoLockManager shutdown in close() skipped", exc_info=True)
+        self._client = None
         return True
 
 

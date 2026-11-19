@@ -620,3 +620,86 @@ def test_engine_resource_group_stops_running_engines_and_cleans_manager():
     assert running.stopped is True
     assert stopped.stopped is False
     assert manager.cleaned is True
+
+
+def test_ws_health_disconnect_outcomes(monkeypatch) -> None:
+    """B083: distinguish NO_CONNECTION, DISCONNECTED, TIMED_OUT, and FAILED."""
+    from unittest.mock import MagicMock
+
+    from src.feishu.ws_health import WSDisconnectOutcome, WSHealthMonitor
+
+    holder = SimpleNamespace(_client=None)
+    monitor = WSHealthMonitor(holder, SimpleNamespace())
+
+    # 1. No client / no _conn -> NO_CONNECTION
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.NO_CONNECTION
+    assert monitor.disconnect() is True
+    assert monitor._trigger_disconnect(reason="test") is False
+
+    holder._client = SimpleNamespace(_conn=None)
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.NO_CONNECTION
+    assert monitor.disconnect() is True
+
+    # 2. Active connection + running loop -> DISCONNECTED
+    running_loop = SimpleNamespace(is_closed=lambda: False, is_running=lambda: True)
+    monkeypatch.setattr("lark_channel.ws.client.loop", running_loop)
+
+    def fake_coro():
+        async def _noop():
+            return True
+
+        return _noop()
+
+    holder._client = SimpleNamespace(_conn=object(), _disconnect=fake_coro)
+    ok_future = MagicMock()
+    ok_future.result.return_value = True
+
+    def _run_ok(coro, loop):
+        coro.close()
+        assert loop is running_loop
+        return ok_future
+
+    monkeypatch.setattr("src.feishu.ws_health.asyncio.run_coroutine_threadsafe", _run_ok)
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.DISCONNECTED
+    assert monitor.disconnect() is True
+    assert monitor._trigger_disconnect(reason="test") is True
+
+    # 3. 5s wait timeout -> TIMED_OUT and cancels future
+    timeout_future = MagicMock()
+    timeout_future.result.side_effect = TimeoutError("5s elapsed")
+
+    def _run_timeout(coro, _loop):
+        coro.close()
+        return timeout_future
+
+    monkeypatch.setattr("src.feishu.ws_health.asyncio.run_coroutine_threadsafe", _run_timeout)
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.TIMED_OUT
+    timeout_future.cancel.assert_called_once_with()
+    assert monitor.disconnect() is False
+    assert monitor._trigger_disconnect(reason="test") is False
+
+    # 4. _disconnect returns False with _conn still set -> FAILED; cleared -> NO_CONNECTION
+    false_future = MagicMock()
+    false_future.result.return_value = False
+    monkeypatch.setattr(
+        "src.feishu.ws_health.asyncio.run_coroutine_threadsafe",
+        lambda coro, _loop: (coro.close(), false_future)[1],
+    )
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.FAILED
+    assert monitor.disconnect() is False
+
+    holder._client = SimpleNamespace(_conn=None, _disconnect=fake_coro)
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.NO_CONNECTION
+
+    # 5. Exception during disconnect -> FAILED
+    holder._client = SimpleNamespace(_conn=object(), _disconnect=fake_coro)
+    err_future = MagicMock()
+    err_future.result.side_effect = RuntimeError("socket error")
+    err_future.done.return_value = True
+    monkeypatch.setattr(
+        "src.feishu.ws_health.asyncio.run_coroutine_threadsafe",
+        lambda coro, _loop: (coro.close(), err_future)[1],
+    )
+    assert monitor.disconnect_with_outcome() is WSDisconnectOutcome.FAILED
+    assert monitor.disconnect() is False
+    assert monitor._trigger_disconnect(reason="test") is False

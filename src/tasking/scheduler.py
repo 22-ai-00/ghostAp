@@ -761,7 +761,8 @@ class TaskScheduler:
             event_dispatcher = self._event_dispatcher
             completion_dispatcher = self._completion_dispatcher
             self._cv.notify_all()
-        if wait or shutdown_executor:
+        current_thread = threading.current_thread()
+        if (wait or shutdown_executor) and dispatcher is not current_thread:
             dispatcher.join(timeout=2)
         if shutdown_executor:
             for executor in (self._executor, self._system_executor):
@@ -769,9 +770,9 @@ class TaskScheduler:
                     executor.shutdown(wait=False, cancel_futures=True)
                 except Exception:
                     logger.debug("failed to shutdown executor", exc_info=True)
-        if wait and self._event_dispatch_stopping:
+        if wait and self._event_dispatch_stopping and event_dispatcher is not current_thread:
             event_dispatcher.join(timeout=2)
-        if wait and self._completion_dispatch_stopping:
+        if wait and self._completion_dispatch_stopping and completion_dispatcher is not current_thread:
             completion_dispatcher.join(timeout=2)
 
     def fence_admission(self) -> None:
@@ -835,16 +836,24 @@ class TaskScheduler:
                 self._cv.wait(timeout=remaining)
             return True
 
+    def _is_in_completion_callback_unlocked(self) -> bool:
+        return (
+            getattr(self._completion_callback_local, "depth", 0) > 0
+            or threading.current_thread() is self._completion_dispatcher
+        )
+
+    def is_in_completion_callback(self) -> bool:
+        """Return whether the calling thread is currently running a completion callback."""
+        with self._cv:
+            return self._is_in_completion_callback_unlocked()
+
     def wait_for_completion_callbacks(self, timeout: float) -> bool:
         """Wait for queued and in-flight task completion callbacks to finish."""
 
         if timeout < 0:
             raise ValueError("timeout must be >= 0")
         with self._cv:
-            if (
-                getattr(self._completion_callback_local, "depth", 0) > 0
-                or threading.current_thread() is self._completion_dispatcher
-            ):
+            if self._is_in_completion_callback_unlocked():
                 return self._completion_callbacks_pending == 0
             deadline = time.monotonic() + timeout
             while self._completion_callbacks_pending:
