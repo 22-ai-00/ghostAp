@@ -28,6 +28,7 @@ from .models import (
     RoleSuggestion,
 )
 from .retry_status import RetryEvent, RetryStatus
+from .session_utils import SpecTotalTimeoutError, finite_positive_float
 
 logger = logging.getLogger(__name__)
 COMPLETION_ROLE = "completion_control"
@@ -41,15 +42,27 @@ class _ReviewCancelled(RuntimeError):
 class ReviewExecutionContext:
     """Track active review sessions so shutdown can cancel them immediately."""
 
-    def __init__(self, *, cancel_event: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        sla_deadline: float | None = None,
+    ) -> None:
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._active_sessions: set[Any] = set()
         self._cancelled = False
         self._cancel_event = cancel_event
+        self.sla_deadline = sla_deadline
 
-    def reset(self, *, is_running: bool = True) -> None:
+    def reset(
+        self,
+        *,
+        is_running: bool = True,
+        sla_deadline: float | None = None,
+    ) -> None:
         with self._lock:
             self._cancelled = not is_running
+            self.sla_deadline = sla_deadline
 
     def register_session(self, session: Any) -> bool:
         """Register an active session; return False if stop was already signalled."""
@@ -394,6 +407,20 @@ def _candidates(ctx: ReviewContext, primary: ReviewAgentBinding | None) -> list[
     return result
 
 
+def _clamp_sla_budget(requested: float, sla_deadline: float | None, *, phase: str = "review") -> float:
+    if sla_deadline is None:
+        return max(0.05, float(requested))
+    remaining = sla_deadline - time.monotonic()
+    if remaining <= 0:
+        raise SpecTotalTimeoutError(f"Spec 总超时 ({phase})")
+    return max(0.05, min(float(requested), remaining))
+
+
+def _check_sla_expired(sla_deadline: float | None, *, phase: str = "review") -> None:
+    if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+        raise SpecTotalTimeoutError(f"Spec 总超时 ({phase})")
+
+
 def _run_prompt(
     ctx,
     role,
@@ -404,16 +431,30 @@ def _run_prompt(
     *,
     execution_context: ReviewExecutionContext | None = None,
 ) -> str:
+    sla_deadline = getattr(execution_context, "sla_deadline", None)
+    _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
     if callable(ctx.send_prompt_with_retry_fn) and ctx.session is None and not ctx.review_agents:
-        response = ctx.send_prompt_with_retry_fn(prompt, on_event=on_event, timeout=timeout)
+        clamped_timeout = _clamp_sla_budget(timeout, sla_deadline, phase=f"review:{role.role_id}")
+        response = ctx.send_prompt_with_retry_fn(prompt, on_event=on_event, timeout=clamped_timeout)
         return str(getattr(response, "text", response) or "")
     last_error = None
-    startup_timeout = float(getattr(ctx.settings, "spec_review_startup_timeout", 30) or 30)
+    startup_cap = finite_positive_float(getattr(ctx.settings, "spec_review_startup_timeout", 30), 30.0)
     for agent, model in _candidates(ctx, binding):
         for attempt in range(STARTUP_RETRIES + 1):
+            _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             if ctx.cancel_event and ctx.cancel_event.is_set():
                 raise _ReviewCancelled("cancelled")
-            session = EphemeralReviewSession(agent, getattr(ctx.artifacts, "cwd", "") or ".", model, startup_timeout=startup_timeout)
+            attempt_startup = (
+                _clamp_sla_budget(startup_cap, sla_deadline, phase=f"review:{role.role_id}")
+                if sla_deadline is not None
+                else startup_cap
+            )
+            attempt_timeout = (
+                _clamp_sla_budget(timeout, sla_deadline, phase=f"review:{role.role_id}")
+                if sla_deadline is not None
+                else float(timeout)
+            )
+            session = EphemeralReviewSession(agent, getattr(ctx.artifacts, "cwd", "") or ".", model, startup_timeout=attempt_startup)
             try:
                 with session as active:
                     tracked = (
@@ -428,31 +469,43 @@ def _run_prompt(
                                 cancel_fn(wait=False)
                             except TypeError:
                                 cancel_fn()
+                        _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                         raise _ReviewCancelled("cancelled")
                     try:
-                        response = active.send_prompt(prompt, on_event=on_event, timeout=timeout)
+                        response = active.send_prompt(prompt, on_event=on_event, timeout=attempt_timeout)
                         return str(getattr(response, "text", response) or "")
                     finally:
                         if execution_context is not None:
                             execution_context.unregister_session(tracked)
+            except SpecTotalTimeoutError:
+                raise
             except _ReviewCancelled:
+                _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                 raise
             except Exception as exc:
+                _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                 if ctx.cancel_event and ctx.cancel_event.is_set():
                     raise _ReviewCancelled("cancelled") from exc
                 last_error = exc
                 try:
                     exc.startup_failed = not session.session_started  # type: ignore[attr-defined]
                     exc.startup_elapsed_s = session.startup_elapsed_s  # type: ignore[attr-defined]
-                    exc.startup_timeout_s = startup_timeout  # type: ignore[attr-defined]
+                    exc.startup_timeout_s = attempt_startup  # type: ignore[attr-defined]
                 except Exception:
                     pass
                 if not session.session_started and attempt < STARTUP_RETRIES:
-                    delay = min(2 ** attempt, 4)
+                    delay = float(min(2 ** attempt, 4))
+                    if sla_deadline is not None:
+                        remaining = sla_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise SpecTotalTimeoutError(f"Spec 总超时 (review:{role.role_id})") from exc
+                        delay = min(delay, remaining)
                     if ctx.cancel_event and ctx.cancel_event.wait(delay):
+                        _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                         raise _ReviewCancelled("cancelled") from exc
                     if not ctx.cancel_event:
                         time.sleep(delay)
+                    _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                     continue
                 logger.warning("[SpecReview:%s] %s/%s failed, trying fallback", role.role_id, agent, model or "default")
                 break
@@ -474,27 +527,37 @@ def _run_role(
     *,
     execution_context: ReviewExecutionContext | None = None,
 ) -> RoleReviewOutcome:
-    timeout = float(getattr(ctx.settings, "spec_review_timeout", 240) or 240)
-    timeout *= float((getattr(ctx.settings, "spec_review_role_timeout_multipliers", None) or {}).get(role.role_id, 1))
+    sla_deadline = getattr(execution_context, "sla_deadline", None)
+    base_timeout = finite_positive_float(getattr(ctx.settings, "spec_review_timeout", 240), 240.0)
+    multiplier_map = getattr(ctx.settings, "spec_review_role_timeout_multipliers", None)
+    multiplier = float(multiplier_map.get(role.role_id, 1)) if isinstance(multiplier_map, dict) else 1.0
+    role_timeout = base_timeout * multiplier
     retries = max(0, int(getattr(ctx.settings, "spec_review_retry_max_attempts", 2) or 0))
     prompt = _build_prompt(role, ctx.artifacts)
     last_outcome = None
     last_error = None
     for attempt in range(retries + 1):
+        _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
         if ctx.cancel_event and ctx.cancel_event.is_set():
             return _failure(role, "审查已取消", "cancelled")
         chunks: list[str] = []
 
         def on_event(event):
+            _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             if ctx.cancel_event and ctx.cancel_event.is_set():
                 raise _ReviewCancelled("cancelled")
             if getattr(event, "text", None):
                 chunks.append(str(event.text))
 
+        attempt_timeout = (
+            _clamp_sla_budget(role_timeout, sla_deadline, phase=f"review:{role.role_id}")
+            if sla_deadline is not None
+            else role_timeout
+        )
         try:
             runner = ctx.prompt_runner_factory(role) if ctx.prompt_runner_factory else None
             raw = (
-                runner(prompt, on_event, timeout)
+                runner(prompt, on_event, attempt_timeout)
                 if runner
                 else _run_prompt(
                     ctx,
@@ -502,10 +565,11 @@ def _run_role(
                     binding,
                     prompt,
                     on_event,
-                    timeout,
+                    attempt_timeout,
                     execution_context=execution_context,
                 )
             )
+            _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             if ctx.cancel_event and ctx.cancel_event.is_set():
                 return _failure(role, "审查已取消", "cancelled")
             last_outcome = _parse(role, str(raw or "") or "".join(chunks), ctx.artifacts)
@@ -515,23 +579,33 @@ def _run_role(
                 return last_outcome
             last_error = None
             prompt += "\n上次格式无效。只返回字段齐全的合法 JSON 对象。"
+        except SpecTotalTimeoutError:
+            raise
         except _ReviewCancelled:
+            _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             return _failure(role, "审查已取消", "cancelled")
         except Exception as exc:
+            _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             if ctx.cancel_event and ctx.cancel_event.is_set():
                 return _failure(role, "审查已取消", "cancelled")
             last_error = exc
         if attempt < retries:
-            delay = 0 if last_outcome else min(
-                float(getattr(ctx.settings, "spec_review_retry_base_delay", 2) or 2) * (2 ** attempt),
-                float(getattr(ctx.settings, "spec_review_retry_max_delay", 30) or 30),
-            )
+            base_delay = finite_positive_float(getattr(ctx.settings, "spec_review_retry_base_delay", 2), 2.0)
+            max_delay = finite_positive_float(getattr(ctx.settings, "spec_review_retry_max_delay", 30), 30.0)
+            delay = 0.0 if last_outcome else min(base_delay * (2 ** attempt), max_delay)
+            if sla_deadline is not None:
+                remaining = sla_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SpecTotalTimeoutError(f"Spec 总超时 (review:{role.role_id})")
+                delay = min(delay, remaining)
             if delay:
                 _retry_event(ctx, RetryStatus.WAITING, attempt + 1, retries, delay)
                 if ctx.cancel_event and ctx.cancel_event.wait(delay):
+                    _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
                     return _failure(role, "审查已取消", "cancelled")
                 if not ctx.cancel_event:
                     time.sleep(delay)
+                _check_sla_expired(sla_deadline, phase=f"review:{role.role_id}")
             _retry_event(ctx, RetryStatus.EXECUTING, attempt + 1, retries)
     _retry_event(ctx, RetryStatus.EXHAUSTED, retries, retries)
     if last_outcome:
@@ -568,9 +642,13 @@ def _run_roles(
     *,
     execution_context: ReviewExecutionContext | None = None,
 ):
+    sla_deadline = getattr(execution_context, "sla_deadline", None)
+    _check_sla_expired(sla_deadline, phase="review")
     limit = min(len(roles), max(1, int(getattr(ctx.settings, "spec_review_max_parallel", 3) or 3)))
     outcomes = []
-    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="spec-review-") as pool:
+    pool = ThreadPoolExecutor(max_workers=limit, thread_name_prefix="spec-review-")
+    sla_timed_out = False
+    try:
         futures = {
             pool.submit(
                 _run_role,
@@ -581,12 +659,36 @@ def _run_roles(
             ): role
             for role in roles
         }
-        for future in as_completed(futures):
-            role = futures[future]
-            try:
-                outcomes.append(future.result())
-            except Exception as exc:
-                outcomes.append(_failure(role, f"{role.display_name}异常失败", get_error_detail(exc)))
+        wait_timeout = (
+            max(0.0, sla_deadline - time.monotonic())
+            if sla_deadline is not None
+            else None
+        )
+        try:
+            for future in as_completed(futures, timeout=wait_timeout):
+                role = futures[future]
+                try:
+                    outcomes.append(future.result())
+                except SpecTotalTimeoutError:
+                    sla_timed_out = True
+                    raise
+                except Exception as exc:
+                    _check_sla_expired(sla_deadline, phase="review")
+                    outcomes.append(_failure(role, f"{role.display_name}异常失败", get_error_detail(exc)))
+        except TimeoutError as exc:
+            sla_timed_out = True
+            raise SpecTotalTimeoutError("Spec 总超时 (review)") from exc
+    except SpecTotalTimeoutError:
+        sla_timed_out = True
+        if execution_context is not None:
+            execution_context.cancel_active_sessions()
+        if ctx.cancel_event is not None:
+            ctx.cancel_event.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if not sla_timed_out:
+            pool.shutdown(wait=True)
     order = {role.role_id: index for index, role in enumerate(roles)}
     return sorted(outcomes, key=lambda item: order.get(item.role_id, len(order)))
 
@@ -713,9 +815,16 @@ def conduct_review(
     ctx: ReviewContext,
     *,
     execution_context: ReviewExecutionContext | None = None,
+    sla_deadline: float | None = None,
 ) -> AdaptiveReviewResult:
     """Run role planning, parallel review, parsing, aggregation and retry automatically."""
-    exec_ctx = execution_context or ReviewExecutionContext(cancel_event=ctx.cancel_event)
+    exec_ctx = execution_context or ReviewExecutionContext(
+        cancel_event=ctx.cancel_event,
+        sla_deadline=sla_deadline,
+    )
+    if sla_deadline is not None:
+        exec_ctx.sla_deadline = sla_deadline
+    _check_sla_expired(exec_ctx.sla_deadline, phase="review")
     started = time.monotonic()
     completion = bool(getattr(ctx.settings, "spec_completion_gate_enabled", True))
     if ctx.artifacts is None:
@@ -775,13 +884,18 @@ class ReviewOrchestrator:
     def execution_context(self) -> ReviewExecutionContext:
         return self._execution_context
 
-    def reset_cancel_event(self, *, is_running: bool) -> bool:
+    def reset_cancel_event(
+        self,
+        *,
+        is_running: bool,
+        sla_deadline: float | None = None,
+    ) -> bool:
         self._cancel_event.clear()
         if not is_running:
             self._cancel_event.set()
-            self._execution_context.reset(is_running=False)
+            self._execution_context.reset(is_running=False, sla_deadline=sla_deadline)
             return False
-        self._execution_context.reset(is_running=True)
+        self._execution_context.reset(is_running=True, sla_deadline=sla_deadline)
         return True
 
     def cancel_active_sessions(self) -> int:

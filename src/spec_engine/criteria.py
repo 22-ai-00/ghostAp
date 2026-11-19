@@ -2,12 +2,14 @@
 
 import logging
 import re
-from typing import Callable
+import time
+from typing import Callable, Optional
 
 from ..acp import ACPEvent, ACPEventType
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy
 from .artifacts import CRITERIA_PATTERNS as _CRITERIA_PATTERNS
+from .session_utils import SpecTotalTimeoutError, finite_positive_float
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 def run_objective_verify(
     verify_command: str,
     cwd: str,
-    timeout: int = 300,
+    timeout: float = 300,
     chat_id: str = "",
 ) -> tuple[bool, str]:
     """Execute verify_command directly, returning ``(passed, output)``."""
@@ -24,7 +26,13 @@ def run_objective_verify(
     try:
         from ..command_executor import CommandExecutor
         executor = CommandExecutor()
-        result = executor.execute(verify_command, cwd=cwd, interactive=False, chat_id=chat_id)
+        result = executor.execute(
+            verify_command,
+            cwd=cwd,
+            interactive=False,
+            chat_id=chat_id,
+            timeout=timeout,
+        )
         output = result.stdout
         if result.stderr:
             output = f"{output}\n{result.stderr}".strip()
@@ -43,7 +51,10 @@ def evaluate_criteria(
     settings,
     *,
     cached_verify: tuple[bool | None, str] | None = None,
+    sla_deadline: Optional[float] = None,
 ) -> dict:
+    if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+        raise SpecTotalTimeoutError("Spec 总超时 (criteria_evaluation)")
     if not session:
         return {"all_satisfied": False, "verify_passed": False, "verify_output": ""}
 
@@ -63,12 +74,25 @@ CRITERIA_2: FAIL
             if event.event_type == ACPEventType.TEXT_CHUNK and event.text:
                 eval_text.append(event.text)
 
-        eval_timeout = getattr(settings, "engine_eval_prompt_timeout", 60) if settings else 60
+        eval_cap = finite_positive_float(
+            getattr(settings, "engine_eval_prompt_timeout", 60) if settings else 60,
+            60.0,
+        )
+        if sla_deadline is not None:
+            remaining = sla_deadline - time.monotonic()
+            if remaining <= 0:
+                raise SpecTotalTimeoutError("Spec 总超时 (criteria_evaluation)")
+            eval_timeout: float = max(0.05, min(eval_cap, remaining))
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0, total_timeout=eval_timeout)
+        else:
+            eval_timeout = eval_cap
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0)
+
         send_prompt_fn(
             eval_prompt,
             on_event=on_eval_event,
             timeout=eval_timeout,
-            retry_policy=RetryPolicy(max_retries=1, retry_delay=2.0),
+            retry_policy=retry_policy,
         )
         full_text = "".join(eval_text).upper()
 
@@ -105,11 +129,24 @@ CRITERIA_2: FAIL
                 verify_passed = cv_passed if cv_passed is not None else True
                 verify_output = cv_output
             else:
+                verify_cap = finite_positive_float(
+                    getattr(settings, "spec_objective_verify_timeout", 300),
+                    300.0,
+                )
+                if sla_deadline is not None:
+                    remaining = sla_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SpecTotalTimeoutError("Spec 总超时 (objective_verify)")
+                    verify_timeout: float = max(0.05, min(verify_cap, remaining))
+                else:
+                    verify_timeout = verify_cap
                 verify_passed, verify_output = run_objective_verify(
                     project.verify_command,
                     cwd=getattr(project, "root_path", ""),
-                    timeout=int(getattr(settings, "spec_objective_verify_timeout", 300)),
+                    timeout=verify_timeout,
                 )
+                if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+                    raise SpecTotalTimeoutError("Spec 总超时 (objective_verify)")
             if not verify_passed:
                 logger.info(
                     "[Spec] objective verify FAILED — overriding all_satisfied=True to False. "
@@ -123,6 +160,10 @@ CRITERIA_2: FAIL
             "verify_output": verify_output,
         }
 
+    except SpecTotalTimeoutError:
+        raise
     except Exception as e:
+        if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+            raise SpecTotalTimeoutError("Spec 总超时 (criteria_evaluation)") from e
         logger.debug("[Spec] 验收标准评估失败: %s", get_error_detail(e))
         return {"all_satisfied": False, "verify_passed": False, "verify_output": ""}

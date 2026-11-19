@@ -80,8 +80,10 @@ class CommandExecutor:
         interactive: bool = True,
         chat_id: Optional[str] = None,
         env_overrides: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
     ) -> CommandExecutionResult:
         del chat_id
+        effective_timeout = self.settings.command_timeout if timeout is None else timeout
         try:
             command = self._sanitize_command_for_noninteractive(command)
             env = os.environ.copy()
@@ -106,7 +108,7 @@ class CommandExecutor:
                 shell=False,
                 capture_output=True,
                 text=True,
-                timeout=self.settings.command_timeout,
+                timeout=effective_timeout,
                 cwd=cwd,
                 env=env,
             )
@@ -147,7 +149,7 @@ class CommandExecutor:
                 stdout="",
                 stderr="",
                 return_code=-1,
-                error_message=f"命令执行超时（{self.settings.command_timeout}秒）",
+                error_message=f"命令执行超时（{effective_timeout}秒）",
             )
         except Exception as exc:
             return CommandExecutionResult(

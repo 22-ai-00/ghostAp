@@ -1,6 +1,8 @@
 """Session-related utility functions for Spec Engine."""
 
+import inspect
 import logging
+import math
 from typing import Callable, Optional
 
 from ..acp import ACPEvent
@@ -13,12 +15,37 @@ from ..utils.retry import RetryPolicy
 logger = logging.getLogger(__name__)
 
 
+class SpecTotalTimeoutError(TimeoutError):
+    """Raised when SpecEngine's monotonic total SLA deadline expires."""
+
+
+def finite_positive_float(value: object, default: float) -> float:
+    """Return a finite positive float or *default* (ignoring bool/MagicMock)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    num = float(value)
+    if not math.isfinite(num) or num <= 0:
+        return default
+    return num
+
+
+def accepts_kwarg(fn: Callable, name: str) -> bool:
+    """Return True if *fn* accepts keyword argument *name* or **kwargs."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def send_prompt_with_retry(
     session,
     prompt: str,
     *,
     on_event: Optional[Callable[[ACPEvent], None]] = None,
-    timeout: Optional[int] = None,
+    timeout: Optional[float] = None,
     retry_policy: Optional[RetryPolicy] = None,
     before_retry: Optional[Callable[[int, Exception], None]] = None,
     total_timeout: Optional[float] = None,
@@ -28,14 +55,15 @@ def send_prompt_with_retry(
 
     sender = getattr(session, "send_prompt_with_retry", None)
     if callable(sender):
-        return sender(
-            prompt,
-            on_event=on_event,
-            timeout=timeout,
-            retry_policy=retry_policy,
-            before_retry=before_retry,
-            total_timeout=total_timeout,
-        )
+        kwargs: dict[str, object] = {
+            "on_event": on_event,
+            "timeout": timeout,
+            "retry_policy": retry_policy,
+            "before_retry": before_retry,
+        }
+        if total_timeout is not None and accepts_kwarg(sender, "total_timeout"):
+            kwargs["total_timeout"] = total_timeout
+        return sender(prompt, **kwargs)
 
     fallback_sender = getattr(session, "send_prompt", None)
     if not callable(fallback_sender):
@@ -55,6 +83,7 @@ def try_switch_model(
     on_rate_limit: Optional[Callable[[int], None]],
     close_session_fn: Callable,
     callbacks,
+    startup_timeout: Optional[float] = None,
 ) -> tuple[bool, Optional[str], Optional[str], list[str], object]:
     if run_state != EngineRunState.RUNNING:
         return False, current_model, None, models_tried, None
@@ -88,12 +117,15 @@ def try_switch_model(
     new_current_model = new_model
 
     close_session_fn()
-    new_session = create_engine_session(
-        agent_type=agent_type,
-        cwd=root_path,
-        on_rate_limit=on_rate_limit,
-        model_name=new_current_model or model_name,
-    )
+    session_kwargs: dict[str, object] = {
+        "agent_type": agent_type,
+        "cwd": root_path,
+        "on_rate_limit": on_rate_limit,
+        "model_name": new_current_model or model_name,
+    }
+    if startup_timeout is not None and accepts_kwarg(create_engine_session, "startup_timeout"):
+        session_kwargs["startup_timeout"] = startup_timeout
+    new_session = create_engine_session(**session_kwargs)
 
     logger.info("[Spec] 模型切换: %s -> %s", old_model, new_model)
     if callbacks.on_model_switch:
@@ -110,16 +142,20 @@ def recreate_session_best_effort(
     current_model: Optional[str],
     model_name: Optional[str],
     close_session_fn: Callable,
+    startup_timeout: Optional[float] = None,
 ) -> object:
     logger.info("[Spec] 正在重建 ACP Session...")
     close_session_fn()
     try:
-        new_session = create_engine_session(
-            agent_type=agent_type,
-            cwd=root_path,
-            on_rate_limit=on_rate_limit,
-            model_name=current_model or model_name,
-        )
+        session_kwargs: dict[str, object] = {
+            "agent_type": agent_type,
+            "cwd": root_path,
+            "on_rate_limit": on_rate_limit,
+            "model_name": current_model or model_name,
+        }
+        if startup_timeout is not None and accepts_kwarg(create_engine_session, "startup_timeout"):
+            session_kwargs["startup_timeout"] = startup_timeout
+        new_session = create_engine_session(**session_kwargs)
         logger.info("[Spec] ACP Session 重建成功")
         return new_session
     except Exception as e:

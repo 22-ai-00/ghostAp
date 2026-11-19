@@ -124,7 +124,16 @@ from .review import (
     validate_completion_gate_outcomes,
 )
 from .session_utils import (
+    SpecTotalTimeoutError,
+)
+from .session_utils import (
+    accepts_kwarg as _accepts_kwarg,
+)
+from .session_utils import (
     build_runtime_context as _build_runtime_context,
+)
+from .session_utils import (
+    finite_positive_float as _finite_positive_float,
 )
 from .session_utils import (
     initialize_model_context as _initialize_model_context,
@@ -144,6 +153,8 @@ from .session_utils import (
 from .storage import state_path_candidates as _state_path_candidates
 from .tracker import PhaseTracker
 from .validation import SpecInput
+
+_SpecTotalTimeoutError = SpecTotalTimeoutError
 
 
 def _normalized_expert_role_name(role: str) -> str:
@@ -217,6 +228,7 @@ class SpecEngine(BaseEngine):
         self._review_agent_pool: list[ReviewAgentBinding] = []
         self._last_verify_passed: bool | None = None
         self._last_verify_output: str = ""
+        self._sla_deadline: float | None = None
 
     def _wrap_callbacks(self, callbacks: SpecEngineCallbacks) -> SpecEngineCallbacks:
         def _wrap(fn: Optional[Callable[..., None]], name: str) -> Optional[Callable[..., None]]:
@@ -290,12 +302,64 @@ class SpecEngine(BaseEngine):
         self._review_agent_pool = normalize_review_agents(runtime.get("review_agents"))
 
 
+    @property
+    def sla_deadline(self) -> float | None:
+        """Monotonic deadline for the active Spec execution run, if any."""
+        return self._sla_deadline
+
+    def _remaining_sla(self, sla_deadline: Optional[float] = None) -> Optional[float]:
+        deadline = self._sla_deadline if sla_deadline is None else sla_deadline
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
+
+    def _require_sla_remaining(
+        self,
+        sla_deadline: Optional[float] = None,
+        *,
+        phase: str = "",
+    ) -> Optional[float]:
+        remaining = self._remaining_sla(sla_deadline)
+        if remaining is not None and remaining <= 0:
+            where = f" ({phase})" if phase else ""
+            raise _SpecTotalTimeoutError(
+                f"Spec execution exceeded SPEC_EXECUTION_TIMEOUT total SLA{where}"
+            )
+        return remaining
+
+    def _clamped_budget(
+        self,
+        cap_seconds: float,
+        sla_deadline: Optional[float] = None,
+        *,
+        phase: str = "",
+    ) -> float:
+        budget = max(0.05, _finite_positive_float(cap_seconds, 0.05))
+        remaining = self._require_sla_remaining(sla_deadline, phase=phase)
+        if remaining is not None:
+            return max(0.05, min(budget, remaining))
+        return budget
+
+    def _call_create_session(self, *, startup_timeout: Optional[float] = None):
+        kwargs: dict[str, object] = {
+            "agent_type": self._agent_type,
+            "cwd": self.root_path,
+            "on_rate_limit": self._on_rate_limit,
+            "model_name": self._model_name,
+        }
+        if startup_timeout is not None and _accepts_kwarg(
+            self._create_session_fn,
+            "startup_timeout",
+        ):
+            kwargs["startup_timeout"] = startup_timeout
+        return self._create_session_fn(**kwargs)
+
     def _send_prompt_with_retry(
         self,
         prompt: str,
         *,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
         retry_policy: Optional[RetryPolicy] = None,
         before_retry: Optional[Callable[[int, Exception], None]] = None,
         total_timeout: Optional[float] = None,
@@ -379,6 +443,12 @@ class SpecEngine(BaseEngine):
         initialize: bool = False,
     ) -> None:
         """Open one session, drive the canonical loop, and commit one terminal state."""
+        total_timeout = _finite_positive_float(
+            getattr(self.settings, "spec_execution_timeout", 600),
+            600.0,
+        )
+        sla_deadline = time.monotonic() + total_timeout
+        self._sla_deadline = sla_deadline
         try:
             if initialize:
                 self._initialize_model_context()
@@ -390,19 +460,24 @@ class SpecEngine(BaseEngine):
                 if callbacks.on_analyzing_done:
                     callbacks.on_analyzing_done(self._project)
 
-            self._close_session_safely()
-            self._session = self._create_session_fn(
-                agent_type=self._agent_type,
-                cwd=self.root_path,
-                on_rate_limit=self._on_rate_limit,
-                model_name=self._model_name,
+            acp_startup = _finite_positive_float(
+                getattr(self.settings, "acp_startup_timeout", 30),
+                30.0,
             )
+            startup_timeout = self._clamped_budget(
+                acp_startup,
+                sla_deadline,
+                phase="session_startup",
+            )
+            self._close_session_safely()
+            self._session = self._call_create_session(startup_timeout=startup_timeout)
             reason = self._run_cycle_loop(
                 start_cycle=start_cycle,
                 max_cycles=max_cycles,
                 callbacks=callbacks,
-                timeout=self.settings.spec_execution_timeout,
+                timeout=total_timeout,
                 first_raw_input=first_raw_input,
+                sla_deadline=sla_deadline,
             )
         except TimeoutError as exc:
             self._finalize_execution(
@@ -419,6 +494,8 @@ class SpecEngine(BaseEngine):
             self._finalize_execution(
                 reason=reason, max_cycles=max_cycles, callbacks=callbacks,
             )
+        finally:
+            self._sla_deadline = None
 
 
     def execute(
@@ -497,7 +574,7 @@ class SpecEngine(BaseEngine):
         phase: SpecPhase,
         prompt: str,
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
         _depth: int = 0,
     ) -> str:
         """Execute a single phase: send prompt, collect output, return text."""
@@ -509,10 +586,15 @@ class SpecEngine(BaseEngine):
         if not self._session:
             raise RuntimeError(f"Spec session is None before phase {phase.value} (cycle={cycle_num}), session may have failed to initialize or rebuild")
 
+        phase_budget = self._clamped_budget(timeout, phase=phase.value)
+
         if callbacks.on_phase_start:
             callbacks.on_phase_start(cycle_num, phase)
 
         def _before_retry(attempt: int, error: Exception):
+            remaining = self._remaining_sla()
+            if remaining is not None and remaining <= 0:
+                return
             if attempt > 0:
                 self._recreate_session_best_effort()
             if callbacks.on_phase_retry:
@@ -522,7 +604,8 @@ class SpecEngine(BaseEngine):
         retry_policy = RetryPolicy(
             max_retries=self.settings.spec_max_retries,
             retry_delay=self._retry_policy.retry_delay,
-            backoff_multiplier=self._retry_policy.backoff_multiplier
+            backoff_multiplier=self._retry_policy.backoff_multiplier,
+            total_timeout=phase_budget,
         )
 
         try:
@@ -542,9 +625,10 @@ class SpecEngine(BaseEngine):
             self._send_prompt_with_retry(
                 prompt,
                 on_event=on_event,
-                timeout=timeout,
+                timeout=phase_budget,
                 retry_policy=retry_policy,
                 before_retry=_before_retry,
+                total_timeout=phase_budget,
             )
             if self._run_state != EngineRunState.RUNNING:
                 raise RuntimeError("Spec execution stopped")
@@ -565,6 +649,9 @@ class SpecEngine(BaseEngine):
 
             return output
 
+        except _SpecTotalTimeoutError:
+            raise
+
         except Exception as e:
             last_error = get_error_detail(e)
             # 停止态下（例如服务关闭触发 cancel），phase 异常通常是 session cancel 或进程退出导致，
@@ -577,12 +664,26 @@ class SpecEngine(BaseEngine):
                 logger.info("[Spec] Phase %s 中断（引擎停止中）: %s", phase.value, reason)
                 raise
 
+            if self._run_state == EngineRunState.RUNNING:
+                remaining = self._remaining_sla()
+                if remaining is not None and remaining <= 0:
+                    raise _SpecTotalTimeoutError(
+                        f"Spec execution exceeded SPEC_EXECUTION_TIMEOUT total SLA during phase {phase.value}"
+                    ) from e
+
             if self._try_switch_model(callbacks):
                 if _depth >= 3:
                     raise RuntimeError(
                         f"Phase {phase.value} 模型切换递归超限 (depth={_depth})，停止重试"
                     ) from e
-                return self._run_phase(cycle_num, phase, prompt, callbacks, timeout, _depth=_depth + 1)
+                return self._run_phase(
+                    cycle_num,
+                    phase,
+                    prompt,
+                    callbacks,
+                    self._clamped_budget(timeout, phase=phase.value),
+                    _depth=_depth + 1,
+                )
 
             err_preview = last_error or ""
             with contextlib.suppress(Exception):  # intentional: defensive string truncation
@@ -593,31 +694,62 @@ class SpecEngine(BaseEngine):
             raise RuntimeError(f"Phase {phase.value} 失败: {last_error}") from e
 
     def _try_switch_model(self, callbacks) -> bool:
-        switched, new_current, _, self._models_tried, new_session = _try_switch_model(
-            agent_type=self._agent_type,
-            run_state=self._run_state,
-            models_tried=self._models_tried,
-            current_model=self._current_model,
-            root_path=self.root_path,
-            model_name=self._model_name,
-            on_rate_limit=getattr(self, "_on_rate_limit", None),
-            close_session_fn=self._close_session_safely,
-            callbacks=callbacks,
-        )
+        startup_timeout: Optional[float] = None
+        if self._sla_deadline is not None:
+            acp_startup = _finite_positive_float(
+                getattr(self.settings, "acp_startup_timeout", 30),
+                30.0,
+            )
+            startup_timeout = self._clamped_budget(
+                acp_startup,
+                self._sla_deadline,
+                phase="model_switch",
+            )
+        kwargs: dict[str, object] = {
+            "agent_type": self._agent_type,
+            "run_state": self._run_state,
+            "models_tried": self._models_tried,
+            "current_model": self._current_model,
+            "root_path": self.root_path,
+            "model_name": self._model_name,
+            "on_rate_limit": getattr(self, "_on_rate_limit", None),
+            "close_session_fn": self._close_session_safely,
+            "callbacks": callbacks,
+        }
+        if startup_timeout is not None and _accepts_kwarg(_try_switch_model, "startup_timeout"):
+            kwargs["startup_timeout"] = startup_timeout
+        switched, new_current, _, self._models_tried, new_session = _try_switch_model(**kwargs)
         if switched:
             self._current_model = new_current
             self._session = new_session
         return switched
 
     def _recreate_session_best_effort(self) -> None:
-        new_session = _recreate_session_best_effort(
-            agent_type=self._agent_type,
-            root_path=self.root_path,
-            on_rate_limit=getattr(self, "_on_rate_limit", None),
-            current_model=self._current_model,
-            model_name=self._model_name,
-            close_session_fn=self._close_session_safely,
-        )
+        startup_timeout: Optional[float] = None
+        if self._sla_deadline is not None:
+            acp_startup = _finite_positive_float(
+                getattr(self.settings, "acp_startup_timeout", 30),
+                30.0,
+            )
+            startup_timeout = self._clamped_budget(
+                acp_startup,
+                self._sla_deadline,
+                phase="session_recreate",
+            )
+        kwargs: dict[str, object] = {
+            "agent_type": self._agent_type,
+            "root_path": self.root_path,
+            "on_rate_limit": getattr(self, "_on_rate_limit", None),
+            "current_model": self._current_model,
+            "model_name": self._model_name,
+            "close_session_fn": self._close_session_safely,
+        }
+        if startup_timeout is not None and _accepts_kwarg(
+            _recreate_session_best_effort,
+            "startup_timeout",
+        ):
+            kwargs["startup_timeout"] = startup_timeout
+        new_session = _recreate_session_best_effort(**kwargs)
         if new_session is not None:
             self._session = new_session
 
@@ -642,8 +774,9 @@ class SpecEngine(BaseEngine):
         start_cycle: int,
         max_cycles: int,
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
         first_raw_input: Optional[str] = None,
+        sla_deadline: Optional[float] = None,
     ) -> str:
         """Execute spec cycles. Modifies ``self._project`` in-place.
 
@@ -655,6 +788,12 @@ class SpecEngine(BaseEngine):
         - stopped: engine stopped without a cycle (edge)
         """
         termination: str = "max_cycles"
+
+        prev_sla_deadline = self._sla_deadline
+        effective_deadline = sla_deadline if sla_deadline is not None else prev_sla_deadline
+        if effective_deadline is None:
+            effective_deadline = time.monotonic() + _finite_positive_float(timeout, 600.0)
+        self._sla_deadline = effective_deadline
 
         policy = ContinuationPolicy(
             max_cycles=max_cycles,
@@ -669,98 +808,129 @@ class SpecEngine(BaseEngine):
         consecutive_failures = 0
         max_consecutive = getattr(self.settings, "spec_max_consecutive_failures", 3)
 
-        for cycle_num in range(start_cycle, max_cycles + 1):
-            if self._run_state != EngineRunState.RUNNING:
-                termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
-                break
-
-            cycle = SpecCycle(cycle_number=cycle_num)
-
-            if callbacks.on_cycle_start:
-                callbacks.on_cycle_start(cycle_num, max_cycles)
-
-            try:
-                work_item = _pick_next_work_item(self._project, cycle_num)
-                spec_input = self._prepare_cycle_input(
-                    cycle_num, start_cycle, first_raw_input, work_item,
-                )
-
-                # --- SPEC → PLAN → TASK → BUILD → REVIEW ---
-                # Per-phase timeout multipliers: BUILD needs more time for
-                # code execution; SPEC/PLAN/TASK are fast analysis phases.
-                _phase_timeout = {
-                    "spec": int(timeout * 0.6),
-                    "plan": int(timeout * 0.6),
-                    "task": int(timeout * 0.5),
-                    "build": int(timeout * 2.5),
-                    "review": int(timeout * 0.8),
-                }
-
-                spec_output = self._run_spec_phase(
-                    cycle_num, cycle, spec_input, work_item, callbacks, _phase_timeout["spec"],
-                )
-                plan_output = self._run_plan_phase(
-                    cycle_num, cycle, spec_output, callbacks, _phase_timeout["plan"],
-                )
-                self._run_task_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["task"])
-                self._run_build_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["build"])
+        try:
+            for cycle_num in range(start_cycle, max_cycles + 1):
                 if self._run_state != EngineRunState.RUNNING:
-                    cycle.fail()
-                    self._record_cycle(cycle, cycle_num, persist=True)
                     termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
                     break
 
-                # Pre-review objective verify (results fed to completion_control)
-                self._last_verify_passed = None
-                self._last_verify_output = ""
-                if (
-                    self._project
-                    and self._project.verify_command
-                    and getattr(self.settings, "spec_objective_verify_enabled", True)
-                ):
-                    from .criteria import run_objective_verify
-                    self._last_verify_passed, self._last_verify_output = run_objective_verify(
-                        self._project.verify_command,
-                        cwd=self.root_path,
-                        timeout=int(getattr(self.settings, "spec_objective_verify_timeout", 300)),
+                self._require_sla_remaining(effective_deadline, phase="cycle_start")
+
+                cycle = SpecCycle(cycle_number=cycle_num)
+
+                if callbacks.on_cycle_start:
+                    callbacks.on_cycle_start(cycle_num, max_cycles)
+
+                try:
+                    work_item = _pick_next_work_item(self._project, cycle_num)
+                    spec_input = self._prepare_cycle_input(
+                        cycle_num, start_cycle, first_raw_input, work_item,
                     )
 
-                if self._run_state != EngineRunState.RUNNING:
-                    cycle.fail()
-                    self._record_cycle(cycle, cycle_num, persist=True)
-                    termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
-                    break
-
-                review_passed = self._run_review_phase(cycle_num, cycle, callbacks)
-                if self._run_state != EngineRunState.RUNNING:
-                    cycle.fail()
-                    self._record_cycle(cycle, cycle_num, persist=True)
-                    termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
-                    break
-                cycle.complete()
-
-            except Exception as cycle_exc:
-                should_break, new_termination, consecutive_failures = (
-                    self._handle_cycle_exception(
-                        cycle, cycle_num, cycle_exc,
-                        consecutive_failures, max_consecutive,
+                    # --- SPEC → PLAN → TASK → BUILD → REVIEW ---
+                    # Per-phase timeout multipliers: keep float precision (avoid
+                    # int(1 * 0.5) == 0 infinite timeout) and clamp each phase
+                    # against the monotonic total SLA.
+                    spec_timeout = self._clamped_budget(
+                        float(timeout) * 0.6, effective_deadline, phase="spec",
                     )
+                    spec_output = self._run_spec_phase(
+                        cycle_num, cycle, spec_input, work_item, callbacks, spec_timeout,
+                    )
+                    plan_timeout = self._clamped_budget(
+                        float(timeout) * 0.6, effective_deadline, phase="plan",
+                    )
+                    plan_output = self._run_plan_phase(
+                        cycle_num, cycle, spec_output, callbacks, plan_timeout,
+                    )
+                    task_timeout = self._clamped_budget(
+                        float(timeout) * 0.5, effective_deadline, phase="task",
+                    )
+                    self._run_task_phase(cycle_num, cycle, plan_output, callbacks, task_timeout)
+                    build_timeout = self._clamped_budget(
+                        float(timeout) * 1.0, effective_deadline, phase="build",
+                    )
+                    self._run_build_phase(cycle_num, cycle, plan_output, callbacks, build_timeout)
+                    if self._run_state != EngineRunState.RUNNING:
+                        cycle.fail()
+                        self._record_cycle(cycle, cycle_num, persist=True)
+                        termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                        break
+
+                    # Pre-review objective verify (results fed to completion_control)
+                    self._last_verify_passed = None
+                    self._last_verify_output = ""
+                    if (
+                        self._project
+                        and self._project.verify_command
+                        and getattr(self.settings, "spec_objective_verify_enabled", True)
+                    ):
+                        from .criteria import run_objective_verify
+                        verify_cap = _finite_positive_float(
+                            getattr(self.settings, "spec_objective_verify_timeout", 300),
+                            300.0,
+                        )
+                        verify_timeout = self._clamped_budget(
+                            verify_cap, effective_deadline, phase="objective_verify",
+                        )
+                        self._last_verify_passed, self._last_verify_output = run_objective_verify(
+                            self._project.verify_command,
+                            cwd=self.root_path,
+                            timeout=verify_timeout,
+                        )
+                        self._require_sla_remaining(effective_deadline, phase="objective_verify")
+
+                    if self._run_state != EngineRunState.RUNNING:
+                        cycle.fail()
+                        self._record_cycle(cycle, cycle_num, persist=True)
+                        termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                        break
+
+                    self._require_sla_remaining(effective_deadline, phase="review")
+                    review_passed = self._run_review_phase(cycle_num, cycle, callbacks)
+                    if self._run_state != EngineRunState.RUNNING:
+                        cycle.fail()
+                        self._record_cycle(cycle, cycle_num, persist=True)
+                        termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                        break
+                    cycle.complete()
+
+                except _SpecTotalTimeoutError:
+                    cycle.fail()
+                    self._record_cycle(cycle, cycle_num, persist=True)
+                    raise
+                except Exception as cycle_exc:
+                    if self._run_state == EngineRunState.RUNNING:
+                        remaining = self._remaining_sla(effective_deadline)
+                        if remaining is not None and remaining <= 0:
+                            cycle.fail()
+                            self._record_cycle(cycle, cycle_num, persist=True)
+                            raise _SpecTotalTimeoutError(
+                                f"Spec execution exceeded SPEC_EXECUTION_TIMEOUT total SLA in cycle {cycle_num}"
+                            ) from cycle_exc
+                    should_break, new_termination, consecutive_failures = (
+                        self._handle_cycle_exception(
+                            cycle, cycle_num, cycle_exc,
+                            consecutive_failures, max_consecutive,
+                        )
+                    )
+                    if should_break:
+                        termination = new_termination
+                        break
+                    continue
+
+                # ---- Cycle completed successfully ----
+                consecutive_failures = 0
+                should_stop, stop_reason = self._finalize_successful_cycle(
+                    cycle_num, cycle, max_cycles, review_passed, callbacks, policy,
                 )
-                if should_break:
-                    termination = new_termination
+                if should_stop:
+                    termination = stop_reason
                     break
-                continue
 
-            # ---- Cycle completed successfully ----
-            consecutive_failures = 0
-            should_stop, stop_reason = self._finalize_successful_cycle(
-                cycle_num, cycle, max_cycles, review_passed, callbacks, policy,
-            )
-            if should_stop:
-                termination = stop_reason
-                break
-
-        return termination
+            return termination
+        finally:
+            self._sla_deadline = prev_sla_deadline
 
     # ------------------------------------------------------------------
     # Cycle-loop helper methods (extracted from _run_cycle_loop)
@@ -814,7 +984,7 @@ class SpecEngine(BaseEngine):
         spec_input: str,
         work_item: Optional[SpecWorkItem],
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
     ) -> str:
         """Execute the SPEC phase and return spec output text."""
         cycle.phase = SpecPhase.SPEC
@@ -825,7 +995,7 @@ class SpecEngine(BaseEngine):
                 SpecPhase.SPEC,
                 prompt,
                 replace(callbacks, on_phase_done=None),
-                timeout,
+                self._clamped_budget(timeout, phase=SpecPhase.SPEC.value),
             )
 
         loaded_directly = bool(work_item and work_item.spec_path and _should_load_spec_directly(work_item))
@@ -889,7 +1059,7 @@ class SpecEngine(BaseEngine):
         cycle: SpecCycle,
         spec_output: str,
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
     ) -> str:
         """Execute the PLAN phase and return plan output text."""
         cycle.phase = SpecPhase.PLAN
@@ -911,7 +1081,7 @@ class SpecEngine(BaseEngine):
         cycle: SpecCycle,
         plan_output: str,
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
     ) -> None:
         """Execute the TASK phase. Populates ``cycle.tasks``."""
         cycle.phase = SpecPhase.TASK
@@ -937,7 +1107,7 @@ class SpecEngine(BaseEngine):
         cycle: SpecCycle,
         plan_output: str,
         callbacks: SpecEngineCallbacks,
-        timeout: int,
+        timeout: float,
     ) -> None:
         """Execute the BUILD phase."""
         cycle.phase = SpecPhase.BUILD
@@ -1204,6 +1374,9 @@ class SpecEngine(BaseEngine):
             logger.info("[Spec:%s] backlog stuck 终止, 循环 %d 轮", self._project.name, cycle_num)
             return True, "backlog_stuck"
 
+        if cycle_num < max_cycles and self._sla_deadline is not None:
+            self._require_sla_remaining(self._sla_deadline, phase="between_cycles")
+
         if self.settings.spec_rebuild_session_between_cycles:
             logger.info(
                 "[Spec:%s] 循环 %d 结束, 重建 Session 以压缩对话上下文",
@@ -1275,28 +1448,40 @@ class SpecEngine(BaseEngine):
         all_satisfied: bool = False,
         backlog_pending: int = 0,
     ) -> list[dict]:
-        return _discover_optimization_questions(
-            project=self._project,
-            session=self._session,
-            send_prompt_fn=self._send_prompt_with_retry,
-            last_review=self._last_review,
-            cycle_num=cycle_num,
-            settings=self.settings,
-            all_satisfied=all_satisfied,
-            backlog_pending=backlog_pending,
-            min_cycles=max(1, self.settings.spec_min_cycles),
-        )
+        kwargs: dict[str, object] = {
+            "project": self._project,
+            "session": self._session,
+            "send_prompt_fn": self._send_prompt_with_retry,
+            "last_review": self._last_review,
+            "cycle_num": cycle_num,
+            "settings": self.settings,
+            "all_satisfied": all_satisfied,
+            "backlog_pending": backlog_pending,
+            "min_cycles": max(1, self.settings.spec_min_cycles),
+        }
+        if self._sla_deadline is not None and _accepts_kwarg(
+            _discover_optimization_questions,
+            "sla_deadline",
+        ):
+            kwargs["sla_deadline"] = self._sla_deadline
+        return _discover_optimization_questions(**kwargs)
 
     def _generate_specs_from_discovery(self, cycle_num: int, discovery: list[dict]) -> list:
-        return _generate_specs_from_discovery(
-            project=self._project,
-            session=self._session,
-            send_prompt_fn=self._send_prompt_with_retry,
-            root_path=self.root_path,
-            settings=self.settings,
-            cycle_num=cycle_num,
-            discovery=discovery,
-        )
+        kwargs: dict[str, object] = {
+            "project": self._project,
+            "session": self._session,
+            "send_prompt_fn": self._send_prompt_with_retry,
+            "root_path": self.root_path,
+            "settings": self.settings,
+            "cycle_num": cycle_num,
+            "discovery": discovery,
+        }
+        if self._sla_deadline is not None and _accepts_kwarg(
+            _generate_specs_from_discovery,
+            "sla_deadline",
+        ):
+            kwargs["sla_deadline"] = self._sla_deadline
+        return _generate_specs_from_discovery(**kwargs)
 
     # ------------------------------------------------------------------
     # Persistence helpers (state + artifacts)
@@ -1311,20 +1496,28 @@ class SpecEngine(BaseEngine):
         cached = None
         if self._last_verify_passed is not None:
             cached = (self._last_verify_passed, self._last_verify_output)
-        return _evaluate_criteria_impl(
-            session=self._session,
-            criteria=criteria,
-            cycle=cycle,
-            project=self._project,
-            send_prompt_fn=self._send_prompt_with_retry,
-            settings=self.settings,
-            cached_verify=cached,
-        )
+        kwargs: dict[str, object] = {
+            "session": self._session,
+            "criteria": criteria,
+            "cycle": cycle,
+            "project": self._project,
+            "send_prompt_fn": self._send_prompt_with_retry,
+            "settings": self.settings,
+            "cached_verify": cached,
+        }
+        if self._sla_deadline is not None and _accepts_kwarg(
+            _evaluate_criteria_impl,
+            "sla_deadline",
+        ):
+            kwargs["sla_deadline"] = self._sla_deadline
+        return _evaluate_criteria_impl(**kwargs)
 
     # ------------------------------------------------------------------
     # Review (reuses shared parsing infrastructure)
     # ------------------------------------------------------------------
     def _conduct_review(self, cycle: int, callbacks: SpecEngineCallbacks, cycle_obj=None) -> ReviewResult:
+        self._require_sla_remaining(self._sla_deadline, phase="review")
+
         # When cycle_obj is provided and parallel pipeline is enabled, collect artifacts.
         artifacts = None
         if cycle_obj is not None:
@@ -1342,7 +1535,16 @@ class SpecEngine(BaseEngine):
 
         with self._lock:
             is_running = self._run_state == EngineRunState.RUNNING
-        self._review_orchestrator.reset_cancel_event(is_running=is_running)
+        self._review_orchestrator.reset_cancel_event(
+            is_running=is_running,
+            sla_deadline=self._sla_deadline,
+        )
+
+        review_kwargs: dict[str, object] = {
+            "execution_context": self._review_orchestrator.execution_context,
+        }
+        if _accepts_kwarg(conduct_review, "sla_deadline"):
+            review_kwargs["sla_deadline"] = self._sla_deadline
 
         return conduct_review(
             ReviewContext(
@@ -1364,7 +1566,7 @@ class SpecEngine(BaseEngine):
                 cancel_event=self._review_orchestrator.cancel_event,
                 review_agents=list(self._review_agent_pool),
             ),
-            execution_context=self._review_orchestrator.execution_context,
+            **review_kwargs,
         )
 
     def _consume_guidance(self) -> str:

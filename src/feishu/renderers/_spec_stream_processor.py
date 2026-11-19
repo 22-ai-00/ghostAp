@@ -8,6 +8,8 @@ an explicit state class. All mutable state that was previously captured via
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ...acp import ACPEventType
@@ -118,10 +120,29 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._build_tool_ids: set[str] = set()
         self._build_heartbeat: BuildHeartbeat | None = None
 
+        def _resolve_rollover_ttl_seconds() -> float:
+            default_ttl = float(renderer.settings.spec_execution_timeout)
+            try:
+                manager = getattr(getattr(renderer, "ctx", None), "spec_engine_manager", None)
+                getter = getattr(manager, "get", None)
+                engine = getter(chat_id, project_root_path) if callable(getter) else None
+                deadline = getattr(engine, "sla_deadline", None)
+                if deadline is None:
+                    deadline = getattr(engine, "_sla_deadline", None)
+                if (
+                    isinstance(deadline, (int, float))
+                    and not isinstance(deadline, bool)
+                    and math.isfinite(deadline)
+                ):
+                    return max(1.0, float(deadline) - time.monotonic())
+            except Exception:
+                logger.debug("Failed to resolve remaining Spec SLA for rollover TTL", exc_info=True)
+            return default_ttl
+
         def session_factory(next_metadata):
             return renderer.create_session(
                 chat_id, message_id, next_metadata, hooks=hooks, budget=budget,
-                ttl_seconds=float(renderer.settings.spec_execution_timeout),
+                ttl_seconds=_resolve_rollover_ttl_seconds(),
             )
 
         self._rotator = SpecCardSession(

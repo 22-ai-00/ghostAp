@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 import uuid
 from typing import Callable, Optional
 
@@ -10,6 +11,7 @@ from ..utils.errors import get_error_detail
 from .artifacts import extract_json_blob, validate_spec_artifact_dict
 from .models import SpecProject, SpecWorkItem, SpecWorkItemStatus
 from .persistence import persist_generated_spec_file, read_text_file_best_effort
+from .session_utils import SpecTotalTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,10 @@ def discover_optimization_questions(
     all_satisfied: bool = False,
     backlog_pending: int = 0,
     min_cycles: int = 2,
+    sla_deadline: Optional[float] = None,
 ) -> list[dict]:
+    if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+        raise SpecTotalTimeoutError("Spec 总超时 (discovery)")
     if not session or not project:
         return []
 
@@ -139,11 +144,20 @@ def discover_optimization_questions(
 
     from ..utils.retry import RetryPolicy
     try:
+        if sla_deadline is not None:
+            remaining = sla_deadline - time.monotonic()
+            if remaining <= 0:
+                raise SpecTotalTimeoutError("Spec 总超时 (discovery)")
+            disc_timeout: float = max(0.05, min(120.0, remaining))
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0, total_timeout=disc_timeout)
+        else:
+            disc_timeout = 120.0
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0)
         send_prompt_fn(
             prompt,
             on_event=on_event,
-            timeout=120,
-            retry_policy=RetryPolicy(max_retries=1, retry_delay=2.0),
+            timeout=disc_timeout,
+            retry_policy=retry_policy,
         )
         raw = "".join(chunks)
         blob = extract_json_blob(raw)
@@ -166,7 +180,11 @@ def discover_optimization_questions(
                 )
             if cleaned:
                 return cleaned[: settings.spec_discovery_max_questions]
+    except SpecTotalTimeoutError:
+        raise
     except Exception as e:
+        if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+            raise SpecTotalTimeoutError("Spec 总超时 (discovery)") from e
         logger.debug("[Spec] 问题发现机制失败: %s", get_error_detail(e))
 
     if settings.spec_discovery_force_nonempty and project:
@@ -198,7 +216,10 @@ def generate_specs_from_discovery(
     settings,
     cycle_num: int,
     discovery: list[dict],
+    sla_deadline: Optional[float] = None,
 ) -> list[SpecWorkItem]:
+    if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+        raise SpecTotalTimeoutError("Spec 总超时 (spec_generation)")
     if not project:
         return []
     if not discovery:
@@ -252,11 +273,20 @@ def generate_specs_from_discovery(
     items: list[SpecWorkItem] = []
     from ..utils.retry import RetryPolicy
     try:
+        if sla_deadline is not None:
+            remaining = sla_deadline - time.monotonic()
+            if remaining <= 0:
+                raise SpecTotalTimeoutError("Spec 总超时 (spec_generation)")
+            gen_timeout: float = max(0.05, min(180.0, remaining))
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0, total_timeout=gen_timeout)
+        else:
+            gen_timeout = 180.0
+            retry_policy = RetryPolicy(max_retries=1, retry_delay=2.0)
         send_prompt_fn(
             prompt,
             on_event=on_event,
-            timeout=180,
-            retry_policy=RetryPolicy(max_retries=1, retry_delay=2.0),
+            timeout=gen_timeout,
+            retry_policy=retry_policy,
         )
         raw = "".join(chunks)
         blob = extract_json_blob(raw)
@@ -289,7 +319,11 @@ def generate_specs_from_discovery(
                 )
             )
 
+    except SpecTotalTimeoutError:
+        raise
     except Exception as e:
+        if sla_deadline is not None and (sla_deadline - time.monotonic()) <= 0:
+            raise SpecTotalTimeoutError("Spec 总超时 (spec_generation)") from e
         logger.debug("[Spec] spec 生成失败: %s", get_error_detail(e))
 
     if not items and settings.spec_discovery_force_nonempty:
