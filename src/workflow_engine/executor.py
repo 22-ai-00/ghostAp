@@ -181,6 +181,7 @@ class AgentExecutor:
         ] = None,
         on_attempt: Optional[Callable[[str, int], None]] = None,
         on_card_event: Optional[Callable[[str, "CardEvent"], None]] = None,
+        image_uploader: Optional[Callable[[Any], Optional[str]]] = None,
     ) -> None:
         self.cwd = cwd
         self.cancel_event = cancel_event
@@ -189,6 +190,7 @@ class AgentExecutor:
         self.on_attempt = on_attempt
         self.on_subagent_update = on_subagent_update
         self.on_card_event = on_card_event
+        self.image_uploader = image_uploader
         pool_size = max(1, min(int(max_workers), HARD_MAX_CONCURRENT))
         self._session_pool: concurrent.futures.ThreadPoolExecutor | None = (
             concurrent.futures.ThreadPoolExecutor(
@@ -239,6 +241,7 @@ class AgentExecutor:
             "workflow_agent_idle_timeout_s",
             AGENT_IDLE_TIMEOUT_S,
         )
+        run_image_uploader = self._run_image_uploader()
 
         for attempt in range(MAX_RETRIES + 1):
             session = None
@@ -283,6 +286,7 @@ class AgentExecutor:
                         deadline_monotonic,
                     ),
                     idle_timeout_s,
+                    image_uploader=run_image_uploader,
                 )
                 total_tokens += self._record_tokens(tokens)
                 if self._cancelled(cancel_event):
@@ -318,6 +322,7 @@ class AgentExecutor:
                                 deadline_monotonic,
                             ),
                             idle_timeout_s,
+                            image_uploader=run_image_uploader,
                         )
                         total_tokens += self._record_tokens(tokens)
                         valid, parsed = self._validate_schema(output, params.output_schema)
@@ -427,6 +432,29 @@ class AgentExecutor:
                 return None, "Session creation returned no session", False
             return session, None, False
 
+    def _run_image_uploader(self) -> Optional[Callable[[Any], Optional[str]]]:
+        """Cache image_id -> image_key within one execute() run across retries."""
+        base_uploader = self.image_uploader
+        if base_uploader is None:
+            return None
+        uploaded_keys: dict[str, str] = {}
+        upload_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+
+        def cached_uploader(image: Any) -> Optional[str]:
+            image_id = str(getattr(image, "image_id", "") or "")
+            if image_id:
+                with upload_lock:
+                    cached_key = uploaded_keys.get(image_id)
+                if cached_key:
+                    return cached_key
+            image_key = base_uploader(image)
+            if image_id and image_key:
+                with upload_lock:
+                    return uploaded_keys.setdefault(image_id, str(image_key))
+            return image_key
+
+        return cached_uploader
+
     def _send_prompt(
         self,
         session: Any,
@@ -434,11 +462,12 @@ class AgentExecutor:
         label: str,
         timeout_s: float,
         idle_timeout_s: int,
+        image_uploader: Optional[Callable[[Any], Optional[str]]] = None,
     ) -> tuple[str, int, str | None]:
         # ACP providers may retain and invoke an ``on_event`` callback after
         # ``send_prompt`` returns. Keep each semantic turn isolated so schema
         # repair and outer retries cannot append to a prior turn's blocks.
-        on_event = self._event_callback(label)
+        on_event = self._event_callback(label, image_uploader=image_uploader)
         kwargs: dict[str, Any] = {"on_event": on_event, "timeout": timeout_s}
         if idle_timeout_s > 0:
             kwargs["idle_timeout"] = float(idle_timeout_s)
@@ -459,7 +488,12 @@ class AgentExecutor:
             self.on_token_usage(tokens)
         return tokens
 
-    def _event_callback(self, label: str) -> Callable[[Any], None] | None:
+    def _event_callback(
+        self,
+        label: str,
+        *,
+        image_uploader: Optional[Callable[[Any], Optional[str]]] = None,
+    ) -> Callable[[Any], None] | None:
         if not label or (
             not self.on_activity
             and not self.on_subagent_update
@@ -525,6 +559,7 @@ class AgentExecutor:
             card_bridge = ACPStreamBridge(
                 _DispatchTarget(),
                 preserve_tool_content=True,
+                image_uploader=image_uploader or self.image_uploader,
             )
 
         callback_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock

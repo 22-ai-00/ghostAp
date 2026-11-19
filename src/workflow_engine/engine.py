@@ -179,6 +179,7 @@ class WorkflowEngineCallbacks:
     # subscribers cannot accidentally leak intermediate results into the main
     # agent chat context. Only final results are delivered via on_done.
     on_agent_done: Optional[Callable[[str, dict], None]] = None  # (label, meta_dict)
+    image_uploader: Optional[Callable[[Any], Optional[str]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +745,7 @@ class WorkflowEngine(BaseEngine):
                 on_attempt=self._handle_agent_attempt,
                 on_subagent_update=self._handle_agent_subagent_update,
                 on_card_event=self._handle_agent_card_event,
+                image_uploader=run_callbacks.image_uploader,
             )
             self._state_manager = WorkflowStateManager(project)
             self._renderer_wf = WorkflowProgressRenderer(project)

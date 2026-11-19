@@ -2824,4 +2824,5 @@ class WorkflowExecutionMixin:
             on_agent_start=on_agent_start,
             on_agent_event=on_agent_event,
             on_agent_done=on_agent_done,
+            image_uploader=getattr(self, "upload_acp_image", None),
         )

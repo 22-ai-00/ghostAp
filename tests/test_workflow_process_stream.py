@@ -97,6 +97,28 @@ def test_process_stream_namespaces_agent_events_and_closes_once() -> None:
     assert not stream.active
 
 
+def test_process_stream_skips_non_cot_events_without_failing_sink() -> None:
+    sink = _Sink()
+    stream = WorkflowProcessStream(sink)
+
+    assert stream.agent_started("worker", "codex")
+    assert stream.emit("worker", CardEvent.image_added("img-1", "img_key_1", "plot.png"))
+    assert stream.emit("worker", CardEvent.image_failed("img-2", "broken.png"))
+    assert stream.emit(
+        "worker",
+        CardEvent(
+            type=CardEventType.TASK_LIST_UPDATED,
+            payload={"tasks": [{"task_id": "t1", "name": "step", "status": "in_progress"}]},
+        ),
+    )
+    assert stream.active
+    assert not sink.aborted
+    assert all(
+        e.type not in {CardEventType.IMAGE_ADDED, CardEventType.IMAGE_FAILED, CardEventType.TASK_LIST_UPDATED}
+        for e in sink.events
+    )
+
+
 def test_process_stream_failure_aborts_and_stays_in_card_fallback() -> None:
     sink = _Sink()
     stream = WorkflowProcessStream(sink)

@@ -6,13 +6,27 @@ import json
 import logging
 import threading
 
-from src.card.events import CardEvent
+from src.card.events import CardEvent, CardEventType
 from src.card.protocols import ProcessEventSink
 
 logger = logging.getLogger(__name__)
 
 _SEGMENT_MAX_EVENTS = 2_048
 _SEGMENT_MAX_BYTES = 2 * 1024 * 1024
+_COT_PROCESS_EVENT_TYPES = frozenset(
+    {
+        CardEventType.TEXT_STARTED,
+        CardEventType.TEXT_DELTA,
+        CardEventType.TEXT_DONE,
+        CardEventType.REASONING_STARTED,
+        CardEventType.REASONING_DELTA,
+        CardEventType.REASONING_DONE,
+        CardEventType.TOOL_STARTED,
+        CardEventType.TOOL_DELTA,
+        CardEventType.TOOL_DONE,
+        CardEventType.TOOL_FAILED,
+    }
+)
 
 
 class WorkflowProcessStream:
@@ -67,6 +81,8 @@ class WorkflowProcessStream:
         with self._lock:
             if not self._ensure_started_locked():
                 return False
+            if event.type not in _COT_PROCESS_EVENT_TYPES:
+                return True
             block_id = event.payload.get("block_id")
             if isinstance(block_id, str) and block_id:
                 event = CardEvent(

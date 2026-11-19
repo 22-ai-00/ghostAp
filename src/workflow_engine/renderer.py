@@ -37,7 +37,11 @@ from src.card.tool_display import (
     sanitize_full_tool_event_value,
     sanitize_tool_failure_detail,
 )
-from src.utils.text import format_duration, format_elapsed_clock
+from src.utils.text import (
+    format_duration,
+    format_elapsed_clock,
+    sanitize_single_line_label,
+)
 
 from .errors import _strip_internal_details
 from .models import (
@@ -832,6 +836,67 @@ def _block_cache_token(block: Any) -> Any:
         )
 
 
+def _render_image_block_element(block: Any) -> dict[str, Any]:
+    """Render one ImageBlock as a Feishu img element or non-fatal placeholder."""
+    image_key = str(getattr(block, "image_key", "") or "").strip()
+    status = str(getattr(block, "status", "completed") or "").strip().lower()
+    if image_key and status != "failed":
+        alt = sanitize_single_line_label(
+            getattr(block, "alt", ""),
+            fallback="任务图片",
+            max_chars=120,
+        )
+        safe_alt = _safe_dynamic_text(alt, limit=120, one_line=True) or "任务图片"
+        return {
+            "tag": "img",
+            "img_key": image_key,
+            "alt": {"tag": "plain_text", "content": safe_alt},
+        }
+    return {
+        "tag": "markdown",
+        "content": "🖼️ 图片产物暂时无法展示；文本结果与本地文件不受影响。",
+        "text_size": "notation",
+    }
+
+
+def _render_project_image_elements(project: WorkflowProject) -> list[dict[str, Any]]:
+    """Collect image elements from direct-call execution blocks for status cards."""
+    image_elements: list[dict[str, Any]] = []
+    for agent in _ordered_direct_agents(project):
+        raw_blocks = list(getattr(agent, "execution_blocks", ()) or ())
+        for raw in raw_blocks:
+            block = _execution_content_block(raw)
+            if block is None or getattr(block, "kind", None) != "image":
+                continue
+            image_elements.append(_render_image_block_element(block))
+    if not image_elements:
+        return []
+    return [_md_element("**图片产物**"), *image_elements]
+
+
+def _append_fitting_image_elements(
+    header: dict[str, Any],
+    base_elements: list[dict[str, Any]],
+    image_elements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Append as many image elements as fit within _WORKFLOW_FRAGMENT_MAX_BYTES."""
+    if not image_elements:
+        return base_elements
+    fitted = [*base_elements, _hr_element(), image_elements[0]]
+    for elem in image_elements[1:]:
+        trial = [*fitted, elem]
+        encoded = json.dumps({"header": header, "elements": trial}, ensure_ascii=False).encode(
+            "utf-8", errors="surrogatepass"
+        )
+        if len(encoded) > _WORKFLOW_FRAGMENT_MAX_BYTES:
+            break
+        fitted = trial
+    encoded_fitted = json.dumps({"header": header, "elements": fitted}, ensure_ascii=False).encode(
+        "utf-8", errors="surrogatepass"
+    )
+    return fitted if len(encoded_fitted) <= _WORKFLOW_FRAGMENT_MAX_BYTES else base_elements
+
+
 def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, Any]]:
     """Render one ordinary-format, losslessly paginated stream per direct call."""
     cards: list[dict[str, Any]] = []
@@ -1049,6 +1114,11 @@ class WorkflowProgressRenderer:
         # -- Phase tree --
         for idx, phase in enumerate(self._project.phases):
             elements.extend(self._render_phase_section(idx, phase))
+
+        image_elements = _render_project_image_elements(self._project)
+        if image_elements:
+            elements.append(_hr_element())
+            elements.extend(image_elements)
 
         # -- Token usage section (informational, no budget limit) --
         elements.append(_hr_element())
@@ -1984,6 +2054,11 @@ def render_completion_card(
     elements.append(_hr_element())
     elements.extend(_render_result_brief_elements(brief))
 
+    image_elements = _render_project_image_elements(project)
+    if image_elements:
+        elements.append(_hr_element())
+        elements.extend(image_elements)
+
     if project.phases:
         elements.append(_hr_element())
         elements.append(
@@ -2047,6 +2122,9 @@ def render_completion_card(
         minimal_elements.append(
             _md_element(f"\u274c **错误**: {_escape_md(safe_project_err)}")
         )
+    minimal_elements = _append_fitting_image_elements(
+        header, minimal_elements, image_elements
+    )
     _card_text_for_agent_output(minimal_elements, _AGENT_OUTPUT_FORBIDDEN_MARKERS)
     return {"header": header, "elements": minimal_elements}
 
