@@ -16,51 +16,9 @@
 
 | ID | 日期 | Gap 描述 | Severity | 来源 | 状态 | 解决 Commit |
 |----|------|----------|----------|------|------|-------------|
-| B091 | 2026-10-05 | 近期日志有 3682 条 card hook executor 背压警告（24 slots occupied），同期间任务仍成功完成，尚无任务失败因果证据。需定位具体慢 hook、等待持锁和线程资源生命周期，增加脱敏 hook 名称/耗时观测及持续运行验证，不把投递旁路拥塞误报为任务失败。 | Medium | 飞书任务中断诊断 | Open | — |
-| B090 | 2026-09-14 | 活跃 Spec 运行期间 SIGTERM，scheduler 十秒 drain 超时后仍有阶段回调，Python executor 已关闭而触发 cannot schedule new futures after shutdown；restart.sh 三十秒宽限后只能强停。需梳理引擎取消、状态保存、scheduler drain 和 callback executor 生命周期，补活跃 Spec 停机回归；本次新服务已正常就绪，不代表旧任务续跑。 | Medium | Spec 优化部署重启日志 | Open | — |
 | B049 | 2026-07-16 | Feishu API 硬超时后 daemon SDK worker 无法取消；本地删除 binding 后，迟到 PATCH 可能越过新代际远端写入。需设计 request generation/远端见证并做故障注入。 | Medium | Deep 卡片顺序分页审计 | Open | — |
-| B051 | 2026-07-16 | 员工 Contact/Context/群历史 SDK 调用缺少 endpoint、员工 app、message_id、平台错误码与分段耗时关联；异常目前多被压缩为 false/unknown，现场只能结合 Journal 推断。需补脱敏结构化观测。 | Medium | Team 员工延迟日志审计 | Open | — |
-| B054 | 2026-07-22 | `lark-channel-sdk==1.2.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()`，产生上游 `DeprecationWarning`；关注 SDK 升级并在上游修复后移除兼容记录，不使用过滤器掩盖。 | Low | 普通编程 Channel 迁移 | Open | — |
-
+| B054 | 2026-07-22 | `lark-channel-sdk==1.2.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()`，产生上游 `DeprecationWarning`；2026-11-19 实测 PyPI `lark-channel-sdk==1.4.0` wheel 仍在 `lark_channel/ws/pb/google/protobuf/internal/well_known_types.py:91` 调用 `datetime.datetime.utcfromtimestamp(0)`，故保持锁定 `1.2.0` 且不使用过滤器掩盖，待上游移除后再升级。 | Low | 普通编程 Channel 迁移 | Open | — |
 | B061 | 2026-08-07 | 单窗口耗尽后现已安全退休 transport、按原 provider session ID 自动恢复并续开新窗口，不再把一次 deadline 当作任务终态。仍需部署后采集真实租户 timeout → pause → retire → load_session → continue 的墙钟事件，校准 4 窗口默认值和 finalization reserve。 | Medium | 普通编程超时日志复盘 | Mitigated | — |
-| B064 | 2026-08-11 | Workflow 的 `ACPStreamBridge` 尚未注入 handler 图片 uploader；Agent 截图/图片只会生成 `IMAGE_FAILED` 占位。需用窄 callback 接通上传，CardState 只保存 `image_key`，并补真实图片事件回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
-| B065 | 2026-08-11 | ACP `ToolCallProgress.raw_output` 为快照语义，但 reducer 仍按 delta 拼接；连续 `A`/`AB` 会形成重复或无效内容并可能 O(n²) 膨胀。需为 full Workflow 投影使用 replace/去重语义并覆盖多 progress 回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
-| B066 | 2026-08-11 | 完整 tool input/progress/output 固定使用三反引号；载荷自带 fenced Markdown 时会提前闭合并被当作卡片 Markdown 解释。需使用动态 fence 长度并让分页保持原 fence，覆盖跨页 fenced payload。 | Medium | Workflow 完整执行卡审查 | Open | — |
-| B067 | 2026-08-11 | `agent-client-protocol==0.12.0` 仍在 Connection.close 时先停 dispatcher queue、后停 receive transport；2026-08-13 启动模型预热再次实证迟到帧会触发 `mssage queue already closed`。现由普通 session、通用/Coco 模型探测共享的 late-frame tolerant queue 兼容；关注上游修正后再移除适配。 | Low | ACP 关闭竞态 | Open | — |
-| B069 | 2026-08-12 | Employee `/status` 的 `scoped_attempt_status()` 会在 Journal 头变化时于同步锁内重放 Gateway 投影，再全扫 attempts；Actor 状态仍读取 `queue.Queue.qsize()` 的近似值。需维护按 tenant/agent/chat/thread 的活动计数投影与锁保护 mailbox counter，使状态查询成本不随全域历史增长。 | Medium | 前六命令性能/稳定性复审 | Open | — |
-| B070 | 2026-08-12 | `/stop`、`/history`、`/memory`、`/status` 及定向 `/task` 的确定性 Outbox 响应采用 `get_snapshot()` 后再 append；同一 acceptance 的并发首次调用可各自产生不同微秒 `created_at`，由第二个 writer 触发冲突而非稳定回读。需提供锁内 `get_or_create`/compare-and-return API，并覆盖每个 control 入口的多线程首次创建。 | Medium | 前六命令并发复审 | Open | — |
-| B071 | 2026-08-12 | Fire 仍以全局生命周期互斥覆盖部分远端 effect，Membership 的每 chat 锁也覆盖 SDK 成员查询/变更；Hire 已把准入域锁与 submit 分离，但工具选择仍可同步探测 provider，完整 provisioning intent 没有统一 monotonic 总 deadline。慢 SDK/provider 会串行阻塞同域操作，且超时的线程调用仍可能迟到完成。需把远端 I/O 移出域锁后用代际/CAS 复核，按指定工具缩小探测并为整个 intent 建立可恢复 deadline。 | Medium | 前六命令性能/稳定性复审 | Open | — |
-| B072 | 2026-08-12 | `test_ws_client_routing.py`（4,326 行/116 个测试函数）、`test_employee_team_gateway.py`（2,935/69）、`test_employee_router_queues.py`（2,488/44）、`test_employee_ingress_recovery.py`（1,696/36）与 `test_employee_membership_service.py`（1,023/34）已成为超大测试模块，增加定向运行、审查和冲突成本。需按 owner P2P、targeted group、handoff、terminal/reporting、membership recovery 拆分，同时保持共享 harness 单一来源。 | Low | 前六命令测试质量复审 | Open | — |
-| B073 | 2026-08-12 | Targeted `/task` 已区分确定拒绝与 `INDETERMINATE`，但 READY transport、union identity、TrustZone/ACL、membership 与投影读取等依赖失败仍缺少分阶段、脱敏的 reason telemetry；现场只能看到最终 deny/unknown/retry 行为。需记录 dependency、stage、稳定 reason code 与延迟，禁止包含正文、Open ID、union ID 或凭据。 | Medium | 前六命令可观测性复审 | Open | — |
-| B074 | 2026-08-12 | Dispatch reporting 的 `recovered_count=len(recovered)+reconciled` 可把同一 attempt 的“补终态”和“补快照”计为两次恢复；同时 missing/unreadable history 或 Outbox Blob 会保持周期 deferred，但缺少持久 ACTION_REQUIRED/运维修复入口。需拆分 attempt/snapshot 指标并为长期 poison record 建立可处置状态和告警。 | Medium | Employee reporting 恢复复审 | Open | — |
-| B076 | 2026-08-12 | Main-Bot warning Outbox 已耐久化 Employee handoff/pre-start 终态告警，但普通消息 backpressure 与主 Bot identity 不可用仍有同步直发分支；warning `ACTION_REQUIRED` 也没有查询、重试或处置入口。需统一需要响应所有权的告警策略，并提供受审计的运维视图和重试动作。 | Medium | Main-Bot warning 交付复审 | Open | — |
-| B077 | 2026-08-12 | Main-Bot warning 的公平轮转 cursor 与 delivery 锁只在单进程实例内；重启会从持久排序头重新开始，多副本也没有跨进程 delivery lease。其 origin digest 还以允许输入中出现的 NUL 作为字段分隔符。需持久化公平 cursor/claim lease，并改为长度前缀或 canonical JSON 编码坐标。 | Medium | Main-Bot warning 幂等/扩展性复审 | Open | — |
-| B078 | 2026-08-12 | 启动 membership audit 现已在 runtime ready 前执行并失败关闭；但若旧版本留下“员工已 ARCHIVED、历史 ADD 未有因果更晚 REMOVE”的异常账本，而凭据已销毁，线上无法自动调用远端 API 证明清理。需提供离线 repair saga、人工证据锚定与明确运维手册，不能伪造 REMOVE 成功。 | Medium | Employee retirement 恢复复审 | Open | — |
-| B079 | 2026-08-12 | `tests/conftest.py` 的 Node 泄漏诊断只在结束时枚举系统全部 Node 进程，没有记录测试启动基线，可能把用户或其他任务原有进程误报为本套件泄漏。需像线程诊断一样比较 PID/启动时间基线；当前没有证据表明本轮测试实际泄漏 Node。 | Low | 全量测试稳定性复审 | Open | — |
-| B080 | 2026-08-12 | `AsyncCallbackBridge` 已为外部 callback task 加稳定命名并让 `drain()` 等待全部 sibling 后聚合失败，但仓库缺少直接覆盖“一个 sibling 取消/失败，另一个外部 callback 仍完成后才返回”的桥接回归。需增加独立 async contract test，避免后续改回 fail-fast gather。 | Low | 外部 mutation gate 覆盖复审 | Open | — |
-| B082 | 2026-08-12 | `EmployeeOutboxDeliveryCoordinator` 的 delivery lock 只在单对象内生效；若同一 Outbox 被两个 coordinator 实例共享，两者可同时取得同一 EXECUTING effect 并双重外发。第二个 commit 直接回读已有 binding，不核对自己的 receipt，因此可静默丢失先返回的 receipt。当前生产组装仅创建一个 coordinator，需将此单例拓扑固化为合同，或增加耐久 claim/lease 及 receipt 坐标 CAS，覆盖嵌入式/未来多副本部署。 | Medium | Employee Outbox 并发投递复审 | Open | — |
-| B083 | 2026-08-12 | `FeishuWSClient.close()` 已在 SDK handler 创建前安装 binding barrier，但忽略 `WSHealthMonitor.disconnect()` 的 `False`；当 SDK disconnect 五秒超时或无可观测连接时，关闭仍可继续并返回成功。新 handler 会被 fence 拒绝，已调度 handler 也由 barrier 保护，因此未证明数据丢失；但底层 WS 资源仍可能滞留。需将 disconnect 结果纳入关闭结果/可重试资源所有权，并区分“本来无连接”与“断开超时”。 | Medium | WS 关闭 barrier 复审 | Open | — |
-| B084 | 2026-08-12 | Scheduler completion callback 内若重入调用 `FeishuWSClient.close()`，`wait_for_completion_callbacks()` 会检测自身并返回未空，关闭随后进入 best-effort `scheduler.stop(wait=True)`；虽不会销毁 callback 依赖，但会经历自等待超时并返回 `False`。需显式拒绝 callback 内关闭或将关闭转移给独立 owner 线程，避免无效延迟与含糊返回值。 | Low | Scheduler completion 关闭复审 | Open | — |
+| B067 | 2026-08-11 | `agent-client-protocol==0.12.0` 仍在 Connection.close 时先停 dispatcher queue、后停 receive transport；2026-11-19 实测 `agent-client-protocol==1.0.0` 已移除 `InMemoryMessageQueue` / `Connection(..., queue=...)` 而 `ToolCallStart` 仍要求 `title: str`，故当前需继续锁定 `0.12.0` 并保留 `LateFrameTolerantMessageQueue`，同时承载关闭迟到帧兼容与缺失 `title` 的部分 `tool_call` 帧改写。 | Low | ACP 关闭竞态 | Open | — |
 
-| B087 | 2026-08-13 | 完整工具载荷净化虽已有 64 层/10000 节点上限，但高基数 opaque ID × 文本叶仍可能形成二次复杂度，净化后 mapping key 碰撞也可能覆盖先前值；需增加总字节/opaque 基数预算、线性多模式替换及稳定碰撞后缀。非 full-content JSON 解析也应统一捕获深层递归失败。 | Medium | Workflow 结果账本可读化审计 | Open | — |
-| B088 | 2026-08-28 | `FeishuCOTStream.rollover()` 在旧 segment 已成功 seal、但新 segment 启动或 active-anchor 重放失败时仍返回 `sealed=False`。`ProgrammingCardSession` 因而会把包含已封存内容的完整 replay buffer 投影到主卡，造成过程重复展示。需区分 partial seal、只回放未封存尾部并补故障注入回归。 | Medium | COT 生命周期审计 | Open | — |
-| B089 | 2026-08-28 | 非 Codex final-phase 流中，handler 仍会在已有任意 streamed text 时忽略 `PromptResult.text`；而后者可能聚合多 source 和对账轮文本，二者都不能安全地单独作为结论。需在 ACP/会话层定义带 provenance 的公开 terminal-output 契约，再统一 fallback 优先级。 | Medium | COT 终答路由审计 | Open | — |
-
-> **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
-
-- 2026-08-10 [中/安全契约] `create_engine_session(require_tool_filter=True)` 当前只强制 ACP transport，不在工厂入口验证/安装具体 filter；现役 Workflow/Employee 调用方会随后安装 filter，但 API 容易被新调用方误用。后续应改为类型化 lane permission profile 或将 `tool_filter` 作为必填参数并在首个 prompt 前 fail-closed。
-- 2026-08-10 [中/可靠性] `SPEC_EXECUTION_TIMEOUT` 当前被复用为各阶段 prompt timeout 与卡片 TTL，不是真正的 Spec 总运行 deadline；应增加 monotonic 总 SLA，并从其推导 phase timeout，避免自动任务无限循环或名称误导。
-
-## 员工 ACTION_REQUIRED 恢复入口（2026-08-10）
-
-- 当前 `ACTION_REQUIRED` 员工的原因为 Slash Command reconciliation `recovery_exhausted`，现有控制面没有明确的重试/修复/重新授权转移路径。应补充可审计的恢复工作流，并恢复或替代当前孤立的 `/hire`、`/fire` 操作入口；职责标签更新不能替代生命周期恢复。
-
-## Codex 子代理对账扩展（2026-08-10）
-
-- 当前修复可从根父 rollout 补齐缺 path 的 direct child；若 ACP 同时缺失 nested child path，仍会安全地保持 incomplete。后续应使用已知 parent thread 的有界 rollout 闭包支持嵌套身份发现，并保持 parent/session/cwd/generation 一致性校验。
-- `_rollout_candidates()` 仍按精确 session ID 在 `CODEX_HOME/sessions` 下执行目录遍历；真实事故三次定位约 39 ms，但历史持续增长后可能成为同步延迟。应引入 UUIDv7 日期分区定位或可信 session 索引，禁止退化为读取全历史 rollout 内容。
-- 卡片 projector 与 ACP outcome 仍使用不同粒度的生命周期归并。后续应抽取共享、带 provenance/generation/malformed 语义的 reducer；在此之前不要让 outer `TOOL_CALL_DONE` 作为 child 权威终态进入最终 outcome。
-
-## ACP 分组能力兼容（2026-09-29，中）
-
-- SDK 0.12.0 的 select options 可分组；`_reasoning_effort_capability` 与 Codex 顶层模型解析未展开分组，可能丢能力。当前本机 codex-acp 1.2.0 使用平铺响应，非本次线上缺失根因。后续统一选项展开并以真实 SDK schema 补回归，不以静态 Effort 填充未知能力。
+> **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。
