@@ -1751,3 +1751,153 @@ def test_terminal_fence_drops_late_text_and_tool_events() -> None:
         )
     finally:
         programming.abort()
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["segment_start_fails", "anchor_replay_fails", "max_segments_reached"],
+)
+def test_end_to_end_cot_stream_partial_seal_never_replays_sealed_2048_events(
+    failure_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial seal on real FeishuCOTStream + ProgrammingCardSession replays only open anchors."""
+    from src.feishu.cot import FeishuCOTSession
+
+    class _FaultyCreateCOTClient(_COTRecordingClient):
+        def __init__(self, *, fail_create_on_call: int | None = None) -> None:
+            super().__init__()
+            self._fail_create_on_call = fail_create_on_call
+            self._create_calls = 0
+
+        def request(self, request: object) -> BaseResponse:
+            uri = getattr(request, "uri", "")
+            body = getattr(request, "body", None)
+            is_create = (
+                uri == "/open-apis/im/v1/message_cot"
+                and isinstance(body, dict)
+                and "receive_id" in body
+            )
+            if is_create:
+                with self._lock:
+                    self._create_calls += 1
+                    create_index = self._create_calls
+                if (
+                    self._fail_create_on_call is not None
+                    and create_index == self._fail_create_on_call
+                ):
+                    with self._lock:
+                        self.requests.append(request)
+                    response = BaseResponse()
+                    response.code = 500
+                    response.raw = RawResponse()
+                    response.raw.status_code = 500
+                    response.raw.content = json.dumps(
+                        {"code": 500, "msg": "create failed"}
+                    ).encode("utf-8")
+                    return response
+                with self._lock:
+                    self.requests.append(request)
+                response = BaseResponse()
+                response.code = 0
+                response.raw = RawResponse()
+                response.raw.status_code = 200
+                response.raw.content = json.dumps(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "cot_id": f"cot_seg_{create_index}",
+                            "message_id": f"om_seg_{create_index}",
+                        },
+                    }
+                ).encode("utf-8")
+                return response
+            return super().request(request)
+
+    cot_client = _FaultyCreateCOTClient(
+        fail_create_on_call=2 if failure_mode == "segment_start_fails" else None,
+    )
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.5),
+        chat_id="oc_partial_seal_e2e",
+        origin_message_id="om_partial_seal_origin",
+        input_text="长任务分段保护测试",
+        detail="detailed",
+        flush_interval=0.005,
+        queue_capacity=4096,
+        max_segments=1 if failure_mode == "max_segments_reached" else 32,
+    )
+    if failure_mode == "anchor_replay_fails":
+        original_emit = FeishuCOTSession.emit
+
+        def _reject_next_segment_anchor(self, event: CardEvent) -> bool:
+            if self is not sink._current:
+                return False
+            return original_emit(self, event)
+
+        monkeypatch.setattr(FeishuCOTSession, "emit", _reject_next_segment_anchor)
+
+    card_client, card_session, programming = _programming_session(process_sink=sink)
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+
+        # Fill the exact 2048-event replay safety budget in segment 1 while
+        # keeping one text block and one tool block open as continuation anchors.
+        programming.dispatch(CardEvent.text_started("seg-stream"))
+        programming.dispatch(CardEvent.tool_started("open-tool", "shell", "{}"))
+        for idx in range(2046):
+            programming.dispatch(CardEvent.text_delta("seg-stream", f"[seg1-{idx}]"))
+
+        assert len(programming._buffered_process_events) == 2048
+        assert programming._native_process_started is True
+
+        # Event #2049 triggers segment rollover, which seals segment 1 and hits
+        # the injected limitation/failure before segment 2 can accept work.
+        programming.dispatch(CardEvent.text_delta("seg-stream", "triggering-tail"))
+
+        assert programming._native_process_started is False
+        assert programming._sealed_process_segments == 1
+        assert sink.started is False
+        assert sink.healthy is False
+        assert card_session.state is not None
+        assert "已完成的过程分段仍保留" in str(card_session.state.footer.warning_banner)
+
+        text_blocks = [
+            block
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock) and block.block_id == "seg-stream"
+        ]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].content == "triggering-tail"
+        assert not any("[seg1-" in str(block) for block in card_session.state.blocks)
+        assert not any("[seg1-" in str(card) for card in card_client.updated_cards)
+
+        tool_blocks = [
+            block
+            for block in card_session.state.blocks
+            if isinstance(block, ToolBlock) and block.block_id == "open-tool"
+        ]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].status == "active"
+
+        # Segment 1 was durably sealed with status="done".
+        assert any(
+            event_type == "RUN_FINISHED" and content.get("status") == "done"
+            for event_type, content in _cot_wire_events(cot_client)
+        )
+
+        # Subsequent finish + abort must succeed cleanly without replaying segment 1.
+        programming.dispatch(
+            CardEvent(
+                type=CardEventType.TOOL_DONE,
+                payload={"block_id": "open-tool", "tool_output": "tool-finished"},
+            )
+        )
+        programming.finish()
+        assert card_session.state.terminal == "completed"
+        assert not any("[seg1-" in str(block) for block in card_session.state.blocks)
+        sink.abort()
+    finally:
+        programming.abort()

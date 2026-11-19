@@ -1945,3 +1945,269 @@ def test_worker_append_failure_exits_after_late_cleanup_without_caller_close() -
     assert terminal["event_type"] == "RUN_FINISHED"
     assert _event_content(terminal)["status"] == "paused"
     assert client.requests[4].queries[-1] == ("reason", "done")
+
+
+def test_rollover_returns_unsealed_when_closure_or_seal_fails() -> None:
+    closure_client = _RecordingClient(_create_response(), _empty_response(), _empty_response(), _empty_response())
+    stream = FeishuCOTStream(
+        _api(closure_client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+        queue_capacity=1,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("seg-1")) is True
+    # Fail the closure emit deterministically by making current segment reject emit.
+    stream._current.emit = lambda _event: False  # type: ignore[method-assign]
+    outcome = stream.rollover()
+    assert outcome.sealed is False
+    assert outcome.started is False
+    assert outcome.replay_events == ()
+    assert stream.started is False
+    assert stream.healthy is False
+    stream.abort()
+
+    seal_fail_client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),  # RUN_STARTED
+        _empty_response(),  # text start + closure
+        _response(code=500, msg="seal append rejected"),  # terminal RUN_FINISHED
+        _empty_response(),  # complete
+    )
+    seal_fail_stream = FeishuCOTStream(
+        _api(seal_fail_client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    seal_fail_stream.start()
+    assert seal_fail_stream.emit(CardEvent.text_started("seg-1")) is True
+    seal_outcome = seal_fail_stream.rollover()
+    assert seal_outcome.sealed is False
+    assert seal_outcome.started is False
+    assert seal_outcome.replay_events == ()
+    seal_fail_stream.abort()
+
+
+def test_rollover_preserves_partial_seal_when_next_segment_start_fails() -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),  # seg1 RUN_STARTED
+        _empty_response(),  # seg1 TEXT_MESSAGE_START + END
+        _empty_response(),  # seg1 RUN_FINISHED
+        _empty_response(),  # seg1 complete
+        _response(status_code=500, code=500, msg="create failed"),  # seg2 Create fails
+    )
+    started_ids: list[str] = []
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+        on_segment_started=started_ids.append,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("seg-1")) is True
+    assert stream.emit(CardEvent.text_delta("seg-1", "segment 1 content")) is True
+
+    outcome = stream.rollover()
+    assert outcome.sealed is True
+    assert outcome.started is False
+    assert [event.type for event in outcome.replay_events] == [CardEventType.TEXT_STARTED]
+    assert stream.started is False
+    assert stream.healthy is False
+    assert started_ids == ["om_cot_message_1"]
+    assert stream.message_ids == ("om_cot_message_1",)
+
+    # Segment 1 was durably sealed with status=done.
+    seg1_terminal = _event_content(_request_events(client.requests[3])[0])
+    assert seg1_terminal["status"] == "done"
+    assert client.requests[4].uri.endswith("/complete/:cot_id")
+    assert client.requests[4].queries[-1] == ("reason", "done")
+
+    request_count_before_abort = len(client.requests)
+    stream.abort()
+    stream.abort()
+    assert stream.complete(CardEvent.completed()) is False
+    assert len(client.requests) == request_count_before_abort
+
+
+def test_rollover_preserves_partial_seal_when_next_segment_build_or_unhealthy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),  # seg1 RUN_STARTED
+        _empty_response(),  # seg1 TEXT_MESSAGE_START + END
+        _empty_response(),  # seg1 RUN_FINISHED
+        _empty_response(),  # seg1 complete
+    )
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("seg-1")) is True
+
+    def _boom(_index: int) -> FeishuCOTSession:
+        raise RuntimeError("segment builder failure")
+
+    monkeypatch.setattr(stream, "_build_segment", _boom)
+    outcome = stream.rollover()
+    assert outcome.sealed is True
+    assert outcome.started is False
+    assert [event.type for event in outcome.replay_events] == [CardEventType.TEXT_STARTED]
+    assert stream.started is False
+    assert stream.healthy is False
+    stream.abort()
+
+    # Also verify non-raising start() that leaves segment unhealthy/unstarted.
+    client2 = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+    )
+    stream2 = FeishuCOTStream(
+        _api(client2, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    stream2.start()
+    assert stream2.emit(CardEvent.text_started("seg-1")) is True
+    fake_next = SimpleNamespace(
+        started=False,
+        healthy=False,
+        message_id=None,
+        abort_calls=0,
+    )
+
+    def _fake_start() -> None:
+        return None
+
+    def _fake_abort() -> None:
+        fake_next.abort_calls += 1
+
+    fake_next.start = _fake_start
+    fake_next.abort = _fake_abort
+    monkeypatch.setattr(stream2, "_build_segment", lambda _idx: fake_next)
+    outcome2 = stream2.rollover()
+    assert outcome2.sealed is True
+    assert outcome2.started is False
+    assert [event.type for event in outcome2.replay_events] == [CardEventType.TEXT_STARTED]
+    assert fake_next.abort_calls == 1
+    stream2.abort()
+    assert fake_next.abort_calls == 1
+
+
+def test_rollover_preserves_partial_seal_when_anchor_replay_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),  # seg1 RUN_STARTED
+        _empty_response(),  # seg1 events + closures
+        _empty_response(),  # seg1 RUN_FINISHED
+        _empty_response(),  # seg1 complete
+        _create_response_for(2),
+        _empty_response(),  # seg2 RUN_STARTED
+        _empty_response(),  # seg2 abort RUN_FINISHED (paused) or update
+        _empty_response(),  # seg2 abort complete
+        _empty_response(),
+    )
+    started_ids: list[str] = []
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+        queue_capacity=8,
+        on_segment_started=started_ids.append,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("seg-1")) is True
+    assert stream.emit(CardEvent.tool_started("tool-1", "shell", "{}")) is True
+
+    original_emit = FeishuCOTSession.emit
+    rejected: list[CardEventType] = []
+
+    def _reject_seg2_anchor(self: FeishuCOTSession, event: CardEvent) -> bool:
+        if self is not stream._current:
+            rejected.append(event.type)
+            return False
+        return original_emit(self, event)
+
+    monkeypatch.setattr(FeishuCOTSession, "emit", _reject_seg2_anchor)
+    outcome = stream.rollover()
+    assert outcome.sealed is True
+    assert outcome.started is False
+    assert rejected == [CardEventType.TEXT_STARTED]
+    assert [event.type for event in outcome.replay_events] == [
+        CardEventType.TEXT_STARTED,
+        CardEventType.TOOL_STARTED,
+    ]
+    assert stream.started is False
+    assert stream.healthy is False
+    assert started_ids == ["om_cot_message_1", "om_cot_message_2"]
+    assert stream.message_ids == ("om_cot_message_1", "om_cot_message_2")
+
+    # Abort after partial seal must not fail or double-close either segment.
+    stream.abort()
+    stream.abort()
+    _wait_until(
+        lambda: any(
+            getattr(req, "uri", "").endswith("/complete/:cot_id")
+            and getattr(req, "paths", {}).get("cot_id") == "cot_task_2"
+            for req in client.requests
+        )
+    )
+    seg1_completes = [
+        req
+        for req in client.requests
+        if getattr(req, "uri", "").endswith("/complete/:cot_id")
+        and getattr(req, "paths", {}).get("cot_id") == "cot_task_1"
+    ]
+    assert len(seg1_completes) == 1
+    assert seg1_completes[0].queries[-1] == ("reason", "done")
+
+
+def test_rollover_preserves_partial_seal_when_max_segments_reached() -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),  # seg1 RUN_STARTED
+        _empty_response(),  # seg1 events + closure
+        _empty_response(),  # seg1 RUN_FINISHED
+        _empty_response(),  # seg1 complete
+    )
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+        max_segments=1,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("seg-1")) is True
+    assert stream.emit(CardEvent.text_delta("seg-1", "segment 1 body")) is True
+
+    outcome = stream.rollover()
+    assert outcome.sealed is True
+    assert outcome.started is False
+    assert [event.type for event in outcome.replay_events] == [CardEventType.TEXT_STARTED]
+    assert stream.started is False
+    assert stream.healthy is False
+    assert stream.message_ids == ("om_cot_message_1",)
+
+    seg1_terminal = _event_content(_request_events(client.requests[3])[0])
+    assert seg1_terminal["status"] == "done"
+    assert client.requests[4].uri.endswith("/complete/:cot_id")
+
+    request_count = len(client.requests)
+    stream.abort()
+    stream.abort()
+    assert len(client.requests) == request_count

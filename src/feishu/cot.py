@@ -2208,6 +2208,7 @@ class FeishuCOTStream:
         self._started = False
         self._closed = False
         self._failed = False
+        self._current_sealed = False
         # Construct eagerly so invalid public arguments fail before the main
         # card begins delivery, matching the old single-session contract.
         self._current = self._build_segment(self._segment_index)
@@ -2259,7 +2260,7 @@ class FeishuCOTStream:
 
     def rollover(self) -> ProcessSegmentRollover:
         with self._lock:
-            if not self.healthy or self._segment_index >= self._max_segments:
+            if not self.healthy:
                 return ProcessSegmentRollover(sealed=False, started=False)
             current = self._current
             continuation_anchors = tuple(self._active_anchors.values())
@@ -2273,12 +2274,33 @@ class FeishuCOTStream:
                 self._started = False
                 return ProcessSegmentRollover(sealed=False, started=False)
 
+            # Segment N is now durably sealed on Feishu. Every subsequent
+            # segment limit or continuation failure must report sealed=True so
+            # the main card replays only open continuation anchors.
+            self._current_sealed = True
+
+            if self._segment_index >= self._max_segments:
+                self._failed = True
+                self._started = False
+                logger.warning(
+                    "Feishu COT segment limit reached after sealing segment=%d "
+                    "max_segments=%d",
+                    self._segment_index,
+                    self._max_segments,
+                )
+                return ProcessSegmentRollover(
+                    sealed=True,
+                    started=False,
+                    replay_events=continuation_anchors,
+                )
+
             next_index = self._segment_index + 1
-            next_segment = self._build_segment(next_index)
-            self._current = next_segment
+            next_segment: FeishuCOTSession | None = None
             try:
+                next_segment = self._build_segment(next_index)
                 next_segment.start()
             except Exception:
+                self._abort_segment_safely(next_segment)
                 self._failed = True
                 self._started = False
                 logger.warning(
@@ -2286,21 +2308,50 @@ class FeishuCOTStream:
                     next_index,
                     exc_info=True,
                 )
-                return ProcessSegmentRollover(sealed=False, started=False)
+                return ProcessSegmentRollover(
+                    sealed=True,
+                    started=False,
+                    replay_events=continuation_anchors,
+                )
+
+            if not next_segment.started or not next_segment.healthy:
+                self._abort_segment_safely(next_segment)
+                self._failed = True
+                self._started = False
+                logger.warning(
+                    "Feishu COT continuation segment unhealthy after start; segment=%d",
+                    next_index,
+                )
+                return ProcessSegmentRollover(
+                    sealed=True,
+                    started=False,
+                    replay_events=continuation_anchors,
+                )
+
+            if next_segment.message_id is not None:
+                self._remember_started_segment_locked(
+                    next_segment,
+                    segment_index=next_index,
+                )
 
             for anchor in continuation_anchors:
                 if not next_segment.emit(anchor) or not next_segment.healthy:
-                    next_segment.abort()
+                    self._abort_segment_safely(next_segment)
                     self._failed = True
                     self._started = False
                     logger.warning(
                         "Feishu COT continuation anchors were rejected; segment=%d",
                         next_index,
                     )
-                    return ProcessSegmentRollover(sealed=False, started=False)
+                    return ProcessSegmentRollover(
+                        sealed=True,
+                        started=False,
+                        replay_events=continuation_anchors,
+                    )
 
+            self._current = next_segment
+            self._current_sealed = False
             self._segment_index = next_index
-            self._remember_started_segment_locked(next_segment)
             return ProcessSegmentRollover(
                 sealed=True,
                 started=True,
@@ -2322,10 +2373,23 @@ class FeishuCOTStream:
         with self._lock:
             if self._closed:
                 return
-            self._current.abort()
+            if not self._current_sealed:
+                self._abort_segment_safely(self._current)
             self._closed = True
             self._started = False
             self._failed = True
+
+    @staticmethod
+    def _abort_segment_safely(segment: FeishuCOTSession | None) -> None:
+        if segment is None:
+            return
+        try:
+            segment.abort()
+        except Exception:
+            logger.warning(
+                "Failed to abort Feishu COT segment",
+                exc_info=True,
+            )
 
     def _build_segment(self, index: int) -> FeishuCOTSession:
         input_text = (
@@ -2349,6 +2413,8 @@ class FeishuCOTStream:
     def _remember_started_segment_locked(
         self,
         segment: FeishuCOTSession,
+        *,
+        segment_index: int | None = None,
     ) -> None:
         message_id = segment.message_id
         if message_id is None:
@@ -2362,7 +2428,7 @@ class FeishuCOTStream:
         except Exception:
             logger.warning(
                 "Feishu COT segment-link callback failed; segment=%d",
-                self._segment_index,
+                self._segment_index if segment_index is None else segment_index,
                 exc_info=True,
             )
 
