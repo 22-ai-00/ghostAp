@@ -1,8 +1,12 @@
 """Global test fixtures."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -563,25 +567,95 @@ def make_wf_coalescer():
             pass
 
 
+_NODE_PROCESS_NAMES = frozenset({"node", "nodejs"})
+
+
+def _snapshot_node_processes(*, _force_ps: bool = False) -> dict[tuple[int, object], str]:
+    """Snapshot running ``node``/``nodejs`` processes keyed by ``(pid, start_time)``."""
+    if not _force_ps:
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            pass
+        else:
+            procs: dict[tuple[int, object], str] = {}
+            try:
+                proc_iter = iter(psutil.process_iter(["pid", "name", "create_time"]))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return procs
+            while True:
+                try:
+                    proc = next(proc_iter)
+                except StopIteration:
+                    break
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                try:
+                    info = proc.info
+                    pid = info.get("pid")
+                    name = info.get("name")
+                    create_time = info.get("create_time")
+                    if pid is None or not name:
+                        continue
+                    if Path(str(name)).name.lower() not in _NODE_PROCESS_NAMES:
+                        continue
+                    started: object = (
+                        round(float(create_time), 3) if create_time is not None else None
+                    )
+                    procs[(int(pid), started)] = str(name)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            return procs
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "lstart=", "-o", "comm="],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if completed.returncode != 0 or not completed.stdout:
+        return {}
+
+    procs = {}
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        lstart = " ".join(parts[1:6])
+        comm = parts[6].strip()
+        if not comm or Path(comm).name.lower() not in _NODE_PROCESS_NAMES:
+            continue
+        procs[(pid, lstart)] = comm
+    return procs
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _detect_resource_leaks():
     """Session-scoped diagnostic fixture: detect thread/process leaks.
 
-    Records active threads at session start and warns at session end if
-    more than 5 extra threads remain. Also checks for leftover ``node``
-    subprocesses.
+    Records active threads and baseline ``node`` processes at session start,
+    and warns at session end if more than 5 extra threads remain or if any new
+    ``node`` subprocesses remain running.
 
     This is a diagnostic only — it never fails a test.
     """
-    import sys
-
     start_count = threading.active_count()
     start_threads = {t.name for t in threading.enumerate()}
+    baseline_nodes = _snapshot_node_processes()
 
     yield
 
     # Give daemon threads a moment to wind down
-    import time
     time.sleep(0.5)
 
     end_count = threading.active_count()
@@ -597,35 +671,17 @@ def _detect_resource_leaks():
         )
         print(f"[conftest] New thread names: {sorted(new_threads)}", file=sys.stderr)
 
-    # Check for leftover node subprocesses
-    try:
-        import psutil  # type: ignore
-
-        node_procs = [
-            p for p in psutil.process_iter(["name", "pid"])
-            if p.info["name"] and "node" in p.info["name"].lower()
-        ]
-        if node_procs:
-            print(
-                f"\n[conftest] WARNING: {len(node_procs)} node process(es) still running: "
-                + ", ".join(f"pid={p.info['pid']}" for p in node_procs),
-                file=sys.stderr,
-            )
-    except ImportError:
-        # Fallback: use ps aux
-        try:
-            import subprocess as _sp
-            output = _sp.check_output(["ps", "aux"], text=True)
-            node_lines = [
-                line for line in output.splitlines()
-                if "node" in line and "ps aux" not in line and "grep" not in line
-            ]
-            # Filter out entries that are clearly not node processes (e.g. "nodemon" etc is fine)
-            if node_lines:
-                # Only warn if there are more than a baseline — be conservative
-                print(
-                    f"\n[conftest] NOTE: {len(node_lines)} node-related process(es) found via ps.",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
+    end_nodes = _snapshot_node_processes()
+    leaked_keys = sorted(
+        end_nodes.keys() - baseline_nodes.keys(),
+        key=lambda key: (key[0], str(key[1])),
+    )
+    if leaked_keys:
+        print(
+            f"\n[conftest] WARNING: {len(leaked_keys)} leaked node process(es) still running: "
+            + ", ".join(
+                f"pid={pid} ({end_nodes[(pid, started)]})"
+                for pid, started in leaked_keys
+            ),
+            file=sys.stderr,
+        )
