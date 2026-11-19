@@ -79,7 +79,7 @@ def _decode_result_payload(result_text: str) -> Any:
             return parsed
         try:
             parsed = json.loads(text)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             return parsed
     return parsed
 

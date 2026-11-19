@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -98,6 +99,8 @@ _STRUCTURED_KEY_CAMEL_RE = re.compile(
 )
 _STRUCTURED_MAX_DEPTH = 64
 _STRUCTURED_MAX_NODES = 10_000
+_STRUCTURED_MAX_CHARS = 512_000
+_MAX_OPAQUE_IDS = 256
 _STRUCTURED_PAYLOAD_LIMIT_FALLBACK = "<redacted:structured_payload_limit>"
 _ALWAYS_SENSITIVE_KEY_WORDS = frozenset(
     {
@@ -345,7 +348,7 @@ def sanitize_full_tool_event_value(
             if parsed is None:
                 return _sanitize_full_payload_text(
                     text,
-                    opaque_values=_normalize_opaque_values(opaque_ids),
+                    opaque_regex=_compile_opaque_regex(opaque_ids),
                 )
         elif isinstance(content, Mapping) or (
             isinstance(content, Sequence)
@@ -359,7 +362,7 @@ def sanitize_full_tool_event_value(
         else:
             return _sanitize_full_payload_text(
                 _normalize_full_payload_text(str(content)),
-                opaque_values=_normalize_opaque_values(opaque_ids),
+                opaque_regex=_compile_opaque_regex(opaque_ids),
             )
 
         structured_opaque_values = _collect_structured_internal_values_bounded(
@@ -371,6 +374,7 @@ def sanitize_full_tool_event_value(
         return _redact_structured_secrets(
             parsed,
             opaque_values=normalized_opaque_values,
+            opaque_regex=_compile_opaque_regex(normalized_opaque_values),
             budget=_StructuredTraversalBudget(),
         )
     except (RecursionError, TypeError, ValueError, _StructuredPayloadLimit):
@@ -382,14 +386,26 @@ class _StructuredPayloadLimit(Exception):
 
 
 class _StructuredTraversalBudget:
-    __slots__ = ("nodes",)
+    __slots__ = ("nodes", "chars", "max_chars")
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_chars: int = _STRUCTURED_MAX_CHARS) -> None:
         self.nodes = 0
+        self.chars = 0
+        self.max_chars = max_chars
 
-    def visit(self, depth: int) -> None:
+    def visit(self, depth: int, chars: int = 0) -> None:
         self.nodes += 1
-        if depth > _STRUCTURED_MAX_DEPTH or self.nodes > _STRUCTURED_MAX_NODES:
+        self.chars += max(0, chars)
+        if (
+            depth > _STRUCTURED_MAX_DEPTH
+            or self.nodes > _STRUCTURED_MAX_NODES
+            or self.chars > self.max_chars
+        ):
+            raise _StructuredPayloadLimit
+
+    def charge_chars(self, chars: int) -> None:
+        self.chars += max(0, chars)
+        if self.chars > self.max_chars:
             raise _StructuredPayloadLimit
 
 
@@ -447,11 +463,15 @@ def _parse_full_payload_json(text: str) -> Any | None:
 def _sanitize_full_payload_text(
     value: str,
     *,
-    opaque_values: Iterable[str],
+    opaque_values: Iterable[str] = (),
+    opaque_regex: re.Pattern[str] | None = None,
 ) -> str:
     text = _normalize_full_payload_text(value)
     text = _sensitive_shadow_text(text)
-    text = _remove_opaque_values(text, opaque_values)
+    if opaque_regex is not None:
+        text = opaque_regex.sub("", text)
+    elif opaque_values:
+        text = _remove_opaque_values(text, opaque_values)
     text = _OPAQUE_CALL_ID_RE.sub("[redacted:call_id]", text)
     text = _QUOTED_SENSITIVE_VALUE_RE.sub(r'\1"<redacted>"', text)
     return redact_sensitive(text)
@@ -504,11 +524,13 @@ def _is_sensitive_structured_key(value: object) -> bool:
 def _sanitize_structured_key_text(
     value: object,
     *,
-    opaque_values: Iterable[str],
+    opaque_values: Iterable[str] = (),
+    opaque_regex: re.Pattern[str] | None = None,
 ) -> str:
     return _sanitize_full_payload_text(
         str(value),
         opaque_values=opaque_values,
+        opaque_regex=opaque_regex,
     )
 
 
@@ -517,24 +539,30 @@ def _redacted_agent_ids(
     *,
     depth: int,
     budget: _StructuredTraversalBudget,
-    opaque_values: Iterable[str],
+    opaque_values: Iterable[str] = (),
+    opaque_regex: re.Pattern[str] | None = None,
 ) -> Any:
     budget.visit(depth)
     if isinstance(value, Mapping):
-        return {
-            (
+        if len(value) > _STRUCTURED_MAX_NODES - budget.nodes:
+            raise _StructuredPayloadLimit
+        items: dict[str, Any] = {}
+        for index, (raw_key, item) in enumerate(value.items()):
+            budget.charge_chars(len(str(raw_key)))
+            redacted_key = (
                 "<redacted:agent_id>"
                 if index == 0
                 else f"<redacted:agent_id:{index + 1}>"
-            ): _redact_structured_secrets(
+            )
+            items[redacted_key] = _redact_structured_secrets(
                 item,
                 inside_agent_state=True,
                 depth=depth + 1,
                 budget=budget,
                 opaque_values=opaque_values,
+                opaque_regex=opaque_regex,
             )
-            for index, item in enumerate(value.values())
-        }
+        return items
     if isinstance(value, Sequence) and not isinstance(
         value,
         (str, bytes, bytearray),
@@ -554,7 +582,8 @@ def _redact_agent_state_map(
     *,
     depth: int,
     budget: _StructuredTraversalBudget,
-    opaque_values: Iterable[str],
+    opaque_values: Iterable[str] = (),
+    opaque_regex: re.Pattern[str] | None = None,
 ) -> Any:
     budget.visit(depth)
     if not isinstance(value, Mapping):
@@ -569,24 +598,30 @@ def _redact_agent_state_map(
                     depth=depth + 1,
                     budget=budget,
                     opaque_values=opaque_values,
+                    opaque_regex=opaque_regex,
                 )
                 for item in value
             ]
         return "<redacted:agent_state>" if value is not None else None
-    return {
-        (
+    if len(value) > _STRUCTURED_MAX_NODES - budget.nodes:
+        raise _StructuredPayloadLimit
+    items: dict[str, Any] = {}
+    for index, (raw_key, item) in enumerate(value.items()):
+        budget.charge_chars(len(str(raw_key)))
+        redacted_key = (
             "<redacted:agent_id>"
             if index == 0
             else f"<redacted:agent_id:{index + 1}>"
-        ): _redact_structured_secrets(
+        )
+        items[redacted_key] = _redact_structured_secrets(
             item,
             inside_agent_state=True,
             depth=depth + 1,
             budget=budget,
             opaque_values=opaque_values,
+            opaque_regex=opaque_regex,
         )
-        for index, item in enumerate(value.values())
-    }
+    return items
 
 
 def _redact_structured_secrets(
@@ -596,18 +631,31 @@ def _redact_structured_secrets(
     depth: int = 0,
     budget: _StructuredTraversalBudget | None = None,
     opaque_values: Iterable[str] = (),
+    opaque_regex: re.Pattern[str] | None = None,
 ) -> Any:
     if budget is None:
         budget = _StructuredTraversalBudget()
+    if opaque_regex is None and opaque_values:
+        opaque_regex = _compile_opaque_regex(opaque_values)
+        opaque_values = ()
     budget.visit(depth)
     if isinstance(value, Mapping):
-        redacted: dict[str, Any] = {}
+        if len(value) > _STRUCTURED_MAX_NODES - budget.nodes:
+            raise _StructuredPayloadLimit
+        raw_items: list[tuple[str, Any]] = []
+        raw_str_keys: set[str] = set()
         for key, item in value.items():
             text_key = str(key)
+            budget.charge_chars(len(text_key))
+            raw_items.append((text_key, item))
+            raw_str_keys.add(text_key)
+
+        redacted: dict[str, Any] = {}
+        for text_key, item in raw_items:
             normalized_key = _normalized_structured_key(text_key)
             safe_key = _sanitize_structured_key_text(
                 text_key,
-                opaque_values=opaque_values,
+                opaque_regex=opaque_regex,
             )
             display_key = _sensitive_shadow_text(
                 _normalize_full_payload_text(text_key)
@@ -623,7 +671,7 @@ def _redact_structured_secrets(
                     item,
                     depth=depth + 1,
                     budget=budget,
-                    opaque_values=opaque_values,
+                    opaque_regex=opaque_regex,
                 )
             elif normalized_key in _INTERNAL_AGENT_PATH_KEYS or (
                 inside_agent_state and normalized_key == "path"
@@ -636,7 +684,7 @@ def _redact_structured_secrets(
                     item,
                     depth=depth + 1,
                     budget=budget,
-                    opaque_values=opaque_values,
+                    opaque_regex=opaque_regex,
                 )
             else:
                 safe_item = _redact_structured_secrets(
@@ -647,25 +695,41 @@ def _redact_structured_secrets(
                     ),
                     depth=depth + 1,
                     budget=budget,
-                    opaque_values=opaque_values,
+                    opaque_regex=opaque_regex,
                 )
-            redacted[safe_key] = safe_item
+            target_key = safe_key
+            if target_key in redacted or (
+                target_key != text_key and target_key in raw_str_keys
+            ):
+                suffix = 2
+                while True:
+                    candidate = f"{safe_key}#{suffix}"
+                    if candidate not in redacted and (
+                        candidate == text_key or candidate not in raw_str_keys
+                    ):
+                        target_key = candidate
+                        break
+                    suffix += 1
+            redacted[target_key] = safe_item
         return redacted
     if isinstance(value, Sequence) and not isinstance(
         value,
         (str, bytes, bytearray),
     ):
+        if len(value) > _STRUCTURED_MAX_NODES - budget.nodes:
+            raise _StructuredPayloadLimit
         return [
             _redact_structured_secrets(
                 item,
                 inside_agent_state=inside_agent_state,
                 depth=depth + 1,
                 budget=budget,
-                opaque_values=opaque_values,
+                opaque_regex=opaque_regex,
             )
             for item in value
         ]
     if isinstance(value, str):
+        budget.charge_chars(len(value))
         text = _normalize_full_payload_text(value)
         nested = _parse_full_payload_json(text.strip())
         if nested is not None:
@@ -675,20 +739,22 @@ def _redact_structured_secrets(
                     inside_agent_state=inside_agent_state,
                     depth=depth + 1,
                     budget=budget,
-                    opaque_values=opaque_values,
+                    opaque_regex=opaque_regex,
                 ),
                 ensure_ascii=False,
                 default=str,
             )
         return _sanitize_full_payload_text(
             text,
-            opaque_values=opaque_values,
+            opaque_regex=opaque_regex,
         )
     if value is None or isinstance(value, (bool, int, float)):
         return value
+    raw_text = str(value)
+    budget.charge_chars(len(raw_text))
     return _sanitize_full_payload_text(
-        str(value),
-        opaque_values=opaque_values,
+        raw_text,
+        opaque_regex=opaque_regex,
     )
 
 
@@ -906,11 +972,13 @@ def _parse_json(text: str) -> Any | None:
         return None
     try:
         return json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return None
 
 
-def _find_failure_text(value: Any) -> str:
+def _find_failure_text(value: Any, *, depth: int = 0) -> str:
+    if depth > _STRUCTURED_MAX_DEPTH:
+        return ""
     if isinstance(value, Mapping):
         normalized = {
             str(key).strip().lower(): item
@@ -922,7 +990,7 @@ def _find_failure_text(value: Any) -> str:
             item = normalized[key]
             if isinstance(item, str) and item.strip():
                 return item.strip()
-            nested = _find_failure_text(item)
+            nested = _find_failure_text(item, depth=depth + 1)
             if nested:
                 return nested
         for key, item in normalized.items():
@@ -933,7 +1001,7 @@ def _find_failure_text(value: Any) -> str:
                 and not isinstance(item, (str, bytes, bytearray))
             ):
                 continue
-            nested = _find_failure_text(item)
+            nested = _find_failure_text(item, depth=depth + 1)
             if nested:
                 return nested
         return ""
@@ -942,23 +1010,29 @@ def _find_failure_text(value: Any) -> str:
         (str, bytes, bytearray),
     ):
         for item in value:
-            nested = _find_failure_text(item)
+            nested = _find_failure_text(item, depth=depth + 1)
             if nested:
                 return nested
     return ""
 
 
 def _collect_opaque_values(value: Any) -> tuple[str, ...]:
-    values: list[str] = []
+    values: dict[str, None] = {}
 
     def add(item: object) -> None:
+        if len(values) >= _MAX_OPAQUE_IDS:
+            return
         text = str(item if item is not None else "").strip()
-        if text and text not in values:
-            values.append(text)
+        if text:
+            values.setdefault(text, None)
 
-    def visit(item: Any) -> None:
+    def visit(item: Any, depth: int = 0) -> None:
+        if depth > _STRUCTURED_MAX_DEPTH or len(values) >= _MAX_OPAQUE_IDS:
+            return
         if isinstance(item, Mapping):
             for raw_key, nested in item.items():
+                if len(values) >= _MAX_OPAQUE_IDS:
+                    return
                 key = str(raw_key).strip().lower()
                 is_nested_collection = isinstance(nested, Mapping) or (
                     isinstance(nested, Sequence)
@@ -970,16 +1044,18 @@ def _collect_opaque_values(value: Any) -> tuple[str, ...]:
                     for command_value in _command_opaque_values(nested):
                         add(command_value)
                 if is_nested_collection:
-                    visit(nested)
+                    visit(nested, depth + 1)
         elif isinstance(item, Sequence) and not isinstance(
             item,
             (str, bytes, bytearray),
         ):
             for nested in item:
-                visit(nested)
+                if len(values) >= _MAX_OPAQUE_IDS:
+                    return
+                visit(nested, depth + 1)
 
     if value is not None:
-        visit(value)
+        visit(value, 0)
     return tuple(values)
 
 
@@ -995,33 +1071,28 @@ def _collect_structured_internal_values(value: Any) -> tuple[str, ...]:
 
 def _collect_structured_internal_values_bounded(value: Any) -> tuple[str, ...]:
     """Iteratively collect internal IDs/paths within display traversal limits."""
-    values: list[str] = []
-    seen_values: set[str] = set()
+    values: dict[str, None] = {}
     stack: list[tuple[Any, bool, int]] = [(value, False, 0)]
-    visited_nodes = 0
-
-    def visit_budget(depth: int) -> None:
-        nonlocal visited_nodes
-        visited_nodes += 1
-        if (
-            depth > _STRUCTURED_MAX_DEPTH
-            or visited_nodes > _STRUCTURED_MAX_NODES
-        ):
-            raise _StructuredPayloadLimit
+    budget = _StructuredTraversalBudget()
 
     def add(item: object) -> None:
+        if len(values) >= _MAX_OPAQUE_IDS:
+            return
         text = str(item if item is not None else "").strip()
-        if text and text not in seen_values:
-            seen_values.add(text)
-            values.append(text)
+        if text:
+            values.setdefault(text, None)
 
     def add_scalar_values(item: Any, depth: int) -> None:
         scalar_stack: list[tuple[Any, int]] = [(item, depth)]
         while scalar_stack:
             nested, nested_depth = scalar_stack.pop()
-            visit_budget(nested_depth)
+            budget.visit(
+                nested_depth,
+                len(nested) if isinstance(nested, str) else 0,
+            )
             if isinstance(nested, Mapping):
                 for nested_key, nested_value in nested.items():
+                    budget.charge_chars(len(str(nested_key)))
                     add(nested_key)
                     scalar_stack.append((nested_value, nested_depth + 1))
             elif isinstance(nested, Sequence) and not isinstance(
@@ -1037,10 +1108,12 @@ def _collect_structured_internal_values_bounded(value: Any) -> tuple[str, ...]:
 
     while stack:
         item, inside_agent_state, depth = stack.pop()
-        visit_budget(depth)
+        budget.visit(depth, len(item) if isinstance(item, str) else 0)
         if isinstance(item, Mapping):
             for raw_key, nested in item.items():
-                key = _normalized_structured_key(raw_key)
+                text_key = str(raw_key)
+                budget.charge_chars(len(text_key))
+                key = _normalized_structured_key(text_key)
                 if key in _INTERNAL_AGENT_ID_KEYS:
                     add_scalar_values(nested, depth + 1)
                     continue
@@ -1051,6 +1124,7 @@ def _collect_structured_internal_values_bounded(value: Any) -> tuple[str, ...]:
                     continue
                 if key == "agentsstates" and isinstance(nested, Mapping):
                     for source_id, state in nested.items():
+                        budget.charge_chars(len(str(source_id)))
                         add(source_id)
                         stack.append((state, True, depth + 1))
                     continue
@@ -1066,6 +1140,8 @@ def _collect_structured_internal_values_bounded(value: Any) -> tuple[str, ...]:
             item,
             (str, bytes, bytearray),
         ):
+            if len(item) > _STRUCTURED_MAX_NODES - budget.nodes:
+                raise _StructuredPayloadLimit
             stack.extend(
                 (nested, inside_agent_state, depth + 1)
                 for nested in item
@@ -1099,38 +1175,36 @@ def _command_opaque_values(value: Any) -> tuple[str, ...]:
 def _normalize_opaque_values(values: Iterable[object]) -> tuple[str, ...]:
     if isinstance(values, (str, bytes, bytearray)):
         values = (values,)
-    normalized: list[str] = []
-    for value in values:
-        text = str(value if value is not None else "").strip()
-        if text and text not in normalized:
-            normalized.append(text)
-    return tuple(normalized)
-
-
-def _remove_opaque_values(text: str, values: Iterable[str]) -> str:
-    cleaned = str(text or "")
-    unique = sorted(
-        {
-            str(value if value is not None else "").strip()
-            for value in values
-            if str(value if value is not None else "").strip()
-        },
-        key=len,
-        reverse=True,
+    deduped = dict.fromkeys(
+        text
+        for value in values
+        if (text := str(value if value is not None else "").strip())
     )
-    for value in unique:
-        cleaned = re.sub(
-            rf"(?<![\w]){re.escape(value)}(?![\w])",
-            "",
-            cleaned,
-        )
-    return cleaned
+    return tuple(itertools.islice(deduped, _MAX_OPAQUE_IDS))
 
 
-def _describe_json_payload(data: Any) -> str:
+def _compile_opaque_regex(opaque_values: Iterable[object]) -> re.Pattern[str] | None:
+    """Compile one bounded alternation regex for opaque identifier removal."""
+    normalized = _normalize_opaque_values(opaque_values)
+    if not normalized:
+        return None
+    ordered = sorted(normalized, key=len, reverse=True)
+    pattern = "|".join(re.escape(value) for value in ordered)
+    return re.compile(rf"(?<![\w])(?:{pattern})(?![\w])")
+
+
+def _remove_opaque_values(text: str, values: Iterable[object]) -> str:
+    cleaned = str(text or "")
+    pattern = _compile_opaque_regex(values)
+    return pattern.sub("", cleaned) if pattern is not None else cleaned
+
+
+def _describe_json_payload(data: Any, *, depth: int = 0) -> str:
+    if depth > _STRUCTURED_MAX_DEPTH:
+        return ""
     if isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
         for item in data:
-            desc = _describe_json_payload(item)
+            desc = _describe_json_payload(item, depth=depth + 1)
             if desc:
                 return desc
         return ""

@@ -458,7 +458,7 @@ def _extract_json_field(text: str, fields: tuple[str, ...]) -> str:
                     if len(val) > _MAX_SUMMARY_CHARS:
                         return val[:_MAX_SUMMARY_CHARS] + "…"
                     return val
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         pass
     return ""
 
