@@ -39,8 +39,8 @@ class EngineResourceGroup:
         timeout_s: float = 5.0,
         interval_s: float = 0.05,
     ) -> bool:
-        deadline = time.time() + max(0.1, timeout_s)
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
             any_running = False
             for engine in engines:
                 try:
@@ -51,7 +51,10 @@ class EngineResourceGroup:
                     continue
             if not any_running:
                 return True
-            time.sleep(interval_s)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval_s, remaining))
         for engine in engines:
             try:
                 if engine and getattr(engine, "is_running", False):

@@ -2233,6 +2233,39 @@ def test_observed_ws_tracks_scheduled_handler_before_business_entry(
     assert cleanup.call_count == len(mock_ws_client._handler_ctx.managers)
 
 
+def test_close_stops_engines_before_busy_scheduler_drain_and_skips_cleanup_on_timeout(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    events: list[str] = []
+    running_spec = MagicMock()
+    running_spec.is_running = True
+    running_spec.stop.side_effect = lambda: events.append("spec_stop")
+    mock_ws_client._spec_engine_manager.list_engines.return_value = [running_spec]
+    mock_ws_client._deep_engine_manager.list_engines.return_value = []
+    mock_ws_client._workflow_engine_manager.list_engines.return_value = []
+
+    scheduler = mock_ws_client._scheduler
+    scheduler.cancel_active.side_effect = lambda: events.append("cancel_active")
+    scheduler.wait_for_idle.side_effect = lambda _timeout: (
+        events.append("wait_for_idle"),
+        False,
+    )[1]
+    cleanup = mock_ws_client._handler_ctx.managers["coco"].cleanup_all
+    cleanup.reset_mock()
+
+    with patch(
+        "src.card.delivery.registry.delivery_registry.shutdown_all",
+        return_value=True,
+    ) as shutdown_all:
+        assert mock_ws_client.close() is False
+
+    assert events.index("spec_stop") < events.index("wait_for_idle")
+    assert events.index("cancel_active") < events.index("wait_for_idle")
+    cleanup.assert_not_called()
+    shutdown_all.assert_not_called()
+    scheduler.stop.assert_called_once_with(wait=True, shutdown_executor=False)
+
+
 def test_observed_ws_rejects_handler_scheduled_after_shutdown_fence(
     mock_ws_client: FeishuWSClient,
 ) -> None:

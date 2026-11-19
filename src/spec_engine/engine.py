@@ -705,7 +705,10 @@ class SpecEngine(BaseEngine):
                 self._run_task_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["task"])
                 self._run_build_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["build"])
                 if self._run_state != EngineRunState.RUNNING:
-                    raise RuntimeError("Spec execution stopped")
+                    cycle.fail()
+                    self._record_cycle(cycle, cycle_num, persist=True)
+                    termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                    break
 
                 # Pre-review objective verify (results fed to completion_control)
                 self._last_verify_passed = None
@@ -722,7 +725,18 @@ class SpecEngine(BaseEngine):
                         timeout=int(getattr(self.settings, "spec_objective_verify_timeout", 300)),
                     )
 
+                if self._run_state != EngineRunState.RUNNING:
+                    cycle.fail()
+                    self._record_cycle(cycle, cycle_num, persist=True)
+                    termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                    break
+
                 review_passed = self._run_review_phase(cycle_num, cycle, callbacks)
+                if self._run_state != EngineRunState.RUNNING:
+                    cycle.fail()
+                    self._record_cycle(cycle, cycle_num, persist=True)
+                    termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
+                    break
                 cycle.complete()
 
             except Exception as cycle_exc:
@@ -1064,10 +1078,14 @@ class SpecEngine(BaseEngine):
         )
 
         # --- CRITERIA EVALUATION ---
+        if self._run_state != EngineRunState.RUNNING:
+            return True, "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
         criteria_result = self._evaluate_criteria(self._project.acceptance_criteria, cycle_num)
         all_satisfied = criteria_result.get("all_satisfied", False)
 
         # --- POST-CYCLE PROBLEM DISCOVERY + SPEC GENERATION ---
+        if self._run_state != EngineRunState.RUNNING:
+            return True, "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
         _backlog_pending = sum(
             1 for w in self._project.work_items
             if w.status == SpecWorkItemStatus.PENDING
@@ -1082,10 +1100,16 @@ class SpecEngine(BaseEngine):
                 all_satisfied=all_satisfied,
                 backlog_pending=_backlog_pending,
             )
+            if self._run_state != EngineRunState.RUNNING:
+                return True, "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
             cycle.discovery_path = _persist_cycle_artifact(
                 self.root_path, self.settings, self._project, cycle_num, "discovery", json.dumps(discovery, ensure_ascii=False, indent=2), "json"
             )
+            if self._run_state != EngineRunState.RUNNING:
+                return True, "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
             new_items = self._generate_specs_from_discovery(cycle_num, discovery)
+            if self._run_state != EngineRunState.RUNNING:
+                return True, "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
             # 防止 backlog 无限制膨胀：只保留最近 N 条（长期任务可配合外部清理）
             if new_items:
                 self._project.work_items.extend(new_items)
@@ -1339,7 +1363,8 @@ class SpecEngine(BaseEngine):
                 ),
                 cancel_event=self._review_orchestrator.cancel_event,
                 review_agents=list(self._review_agent_pool),
-            )
+            ),
+            execution_context=self._review_orchestrator.execution_context,
         )
 
     def _consume_guidance(self) -> str:
@@ -1384,8 +1409,9 @@ class SpecEngine(BaseEngine):
         logger.info("[Spec] 用户引导已注入(队列=%d): %s...", len(self._user_guidance), message[:100])
 
     def _on_stop(self) -> None:
-        """Signal review cancel event when engine is stopped."""
+        """Signal review cancel event and cancel active review sessions immediately."""
         self._review_orchestrator.signal_stop()
+        self._review_orchestrator.cancel_active_sessions()
 
 
     def _handle_max_cycles_termination(self, max_cycles: int):

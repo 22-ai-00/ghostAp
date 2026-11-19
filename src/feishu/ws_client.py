@@ -891,6 +891,72 @@ class FeishuWSClient(WSManagedGroupsMixin):
             logger.debug("failed to disconnect primary WS intake", exc_info=True)
             return False, WSDisconnectOutcome.FAILED
 
+    def _stop_active_programming_runs(self) -> None:
+        """Request cooperative cancellation for any active programming runs."""
+        handlers = getattr(getattr(self, "_handler_ctx", None), "handlers", None)
+        if not isinstance(handlers, dict):
+            return
+        for handler in list(handlers.values()):
+            runs_map = getattr(handler, "_active_programming_runs", None)
+            if not isinstance(runs_map, dict) or not runs_map:
+                continue
+            runs_lock = getattr(handler, "_active_programming_runs_lock", None)
+            if runs_lock is not None:
+                with runs_lock:
+                    active_runs = list(runs_map.values())
+            else:
+                active_runs = list(runs_map.values())
+            for active_run in active_runs:
+                prog_session = getattr(active_run, "prog_session", None)
+                mark_stopping = getattr(prog_session, "mark_stopping", None)
+                if callable(mark_stopping):
+                    try:
+                        mark_stopping()
+                    except Exception:
+                        logger.debug(
+                            "Failed to mark active programming card stopping",
+                            exc_info=True,
+                        )
+                run_session = getattr(active_run, "session", None)
+                cancel_fn = getattr(run_session, "cancel", None)
+                if callable(cancel_fn):
+                    try:
+                        try:
+                            cancel_fn(wait=False)
+                        except TypeError:
+                            cancel_fn()
+                    except Exception:
+                        logger.debug(
+                            "Failed to cancel active programming run session",
+                            exc_info=True,
+                        )
+
+    @staticmethod
+    def _collect_new_stopped_engines(
+        group: EngineResourceGroup,
+        existing: list[Any],
+        seen_ids: set[int],
+    ) -> list[Any]:
+        """Stop any engines registered after the initial shutdown stop pass."""
+        try:
+            current = list(group.manager.list_engines())
+        except Exception:
+            logger.debug("failed to list %s engines", group.name, exc_info=True)
+            return existing
+        merged = list(existing)
+        for engine in current:
+            eid = id(engine)
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            merged.append(engine)
+            try:
+                if engine and getattr(engine, "is_running", False):
+                    engine.stop()
+            except Exception:
+                logger.debug("failed to stop %s engine instance", group.name, exc_info=True)
+        return merged
+
     def close(self) -> bool:
         """Fence intake, drain work, then clean up dependencies.
 
@@ -939,6 +1005,28 @@ class FeishuWSClient(WSManagedGroupsMixin):
         except Exception:
             logger.debug("failed to stop control_plane", exc_info=True)
 
+        # Immediately request cooperative cancellation for running engines,
+        # active programming runs, and scheduler workers BEFORE spending the
+        # bounded drain window waiting for them to go idle.
+        deep_resources = EngineResourceGroup("deep_engine", self._deep_engine_manager)
+        spec_resources = EngineResourceGroup("spec_engine", self._spec_engine_manager)
+        workflow_resources = EngineResourceGroup(
+            "workflow_engine",
+            self._workflow_engine_manager,
+        )
+        deep_engines = deep_resources.stop_running_engines()
+        spec_engines = spec_resources.stop_running_engines()
+        workflow_engines = workflow_resources.stop_running_engines()
+        self._stop_active_programming_runs()
+        seen_engine_ids = {
+            id(engine)
+            for engine in (*deep_engines, *spec_engines, *workflow_engines)
+        }
+        try:
+            self._scheduler.cancel_active()
+        except Exception:
+            logger.debug("failed to cancel active scheduler tasks", exc_info=True)
+
         scheduler_drain_deadline = (
             time.monotonic() + _SHUTDOWN_SCHEDULER_DRAIN_S
         )
@@ -947,11 +1035,6 @@ class FeishuWSClient(WSManagedGroupsMixin):
             scheduler_idle = self._scheduler.wait_for_idle(
                 max(0.0, scheduler_drain_deadline - time.monotonic())
             )
-            if not scheduler_idle:
-                self._scheduler.cancel_active()
-                scheduler_idle = self._scheduler.wait_for_idle(
-                    max(0.0, scheduler_drain_deadline - time.monotonic())
-                )
         except Exception:
             logger.debug("failed to drain scheduler before cleanup", exc_info=True)
             scheduler_idle = False
@@ -1012,29 +1095,38 @@ class FeishuWSClient(WSManagedGroupsMixin):
 
         self._detach_scheduler_listeners()
 
-        # Ask every delegated execution engine (Deep, Spec, Workflow) to stop
-        # before destroying ACP sessions.
-        deep_resources = EngineResourceGroup("deep_engine", self._deep_engine_manager)
-        spec_resources = EngineResourceGroup("spec_engine", self._spec_engine_manager)
-        workflow_resources = EngineResourceGroup(
-            "workflow_engine",
-            self._workflow_engine_manager,
+        # Sweep any delegated engine registered during drain and wait under one
+        # bounded deadline before destroying ACP sessions.
+        deep_engines = self._collect_new_stopped_engines(
+            deep_resources, deep_engines, seen_engine_ids
         )
-        deep_engines = deep_resources.stop_running_engines()
-        spec_engines = spec_resources.stop_running_engines()
-        workflow_engines = workflow_resources.stop_running_engines()
-
+        spec_engines = self._collect_new_stopped_engines(
+            spec_resources, spec_engines, seen_engine_ids
+        )
+        workflow_engines = self._collect_new_stopped_engines(
+            workflow_resources, workflow_engines, seen_engine_ids
+        )
+        delegated_deadline = time.monotonic() + _SHUTDOWN_DELEGATED_DRAIN_S
         delegated_idle = True
         delegated_idle = (
-            EngineResourceGroup.wait_stopped(deep_engines)
+            EngineResourceGroup.wait_stopped(
+                deep_engines,
+                timeout_s=max(0.0, delegated_deadline - time.monotonic()),
+            )
             and delegated_idle
         )
         delegated_idle = (
-            EngineResourceGroup.wait_stopped(spec_engines)
+            EngineResourceGroup.wait_stopped(
+                spec_engines,
+                timeout_s=max(0.0, delegated_deadline - time.monotonic()),
+            )
             and delegated_idle
         )
         delegated_idle = (
-            EngineResourceGroup.wait_stopped(workflow_engines)
+            EngineResourceGroup.wait_stopped(
+                workflow_engines,
+                timeout_s=max(0.0, delegated_deadline - time.monotonic()),
+            )
             and delegated_idle
         )
         if not delegated_idle:

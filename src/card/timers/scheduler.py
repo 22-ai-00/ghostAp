@@ -221,7 +221,12 @@ class TimerScheduler:
                     callback,
                     session_id,
                 )
-            except RuntimeError:
+            except RuntimeError as exc:
+                logger.debug(
+                    "TimerScheduler callback submit skipped during shutdown (session=%s): %s",
+                    session_id,
+                    exc,
+                )
                 self._callback_slots.release()
                 handle._cancelled = True
                 self._handles.discard(handle)

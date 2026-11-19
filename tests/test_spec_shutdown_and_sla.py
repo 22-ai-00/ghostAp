@@ -216,3 +216,315 @@ class TestWSCloseReentrantAndDisconnectOutcome:
         ):
             assert client.close() is True
         assert acp_cleanup.call_count == len(client._handler_ctx.managers)
+
+
+class TestSpecShutdownRaceAndGuards:
+    """B090: active Spec (in build and parallel review) exits cleanly on FeishuWSClient.close()."""
+
+    def test_active_spec_in_build_cancels_cleanly_on_ws_close(self, tmp_path, monkeypatch) -> None:
+        from src.acp.models import ACPEvent, ACPEventType
+        from src.spec_engine.engine import SpecEngine
+        from src.spec_engine.models import SpecProjectStatus
+
+        scheduler = TaskScheduler(max_concurrent=1, system_concurrency=1)
+        client = _build_minimal_ws_client(scheduler=scheduler)
+        build_entered = threading.Event()
+        prompt_cancelled = threading.Event()
+        criteria_called = threading.Event()
+        spec_json = (
+            '{"goals":["G"],"functional_spec":["F"],"acceptance_criteria":["C1"],'
+            '"required_experts":['
+            '{"role":"R1","purpose":"P1","focus":["F1"],"checks":["K1"]},'
+            '{"role":"R2","purpose":"P2","focus":["F2"],"checks":["K2"]},'
+            '{"role":"R3","purpose":"P3","focus":["F3"],"checks":["K3"]}]}'
+        )
+        plan_json = '{"architecture":"A","steps":["S"]}'
+
+        class _BuildSession:
+            def __init__(self) -> None:
+                self._call = 0
+
+            def send_prompt(self, _prompt, on_event=None, timeout=None):
+                self._call += 1
+                responses = [spec_json, plan_json, "1. T1 (依赖: 无)"]
+                if self._call <= len(responses):
+                    if on_event:
+                        on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=responses[self._call - 1]))
+                    return SimpleNamespace(stop_reason="end_turn")
+                build_entered.set()
+                assert prompt_cancelled.wait(timeout=3)
+                raise RuntimeError("cancelled during build")
+
+            def send_prompt_with_retry(self, prompt, on_event=None, timeout=None, **kw):
+                return self.send_prompt(prompt, on_event=on_event, timeout=timeout)
+
+            def cancel(self, wait=False, timeout=2.0):
+                prompt_cancelled.set()
+                return True
+
+            def close(self):
+                return None
+
+        settings = SimpleNamespace(
+            spec_max_cycles=2,
+            spec_max_cycles_limit=10,
+            spec_execution_timeout=120,
+            spec_convergence_window=2,
+            spec_min_cycles=1,
+            spec_review_enabled=False,
+            spec_discovery_enabled=False,
+            spec_persist_phase_artifacts=False,
+            spec_persist_every_phase=True,
+            spec_cycle_tasks_max=10,
+            spec_cycle_output_max_chars=4000,
+            spec_state_filename=".spec_engine_state.json",
+            spec_artifacts_dirname=".spec_engine",
+            spec_history_log_filename="history.jsonl",
+            spec_phase_output_persist_max_chars=4000,
+            spec_cycle_artifact_retention=10,
+            spec_generated_specs_retention=10,
+            spec_state_cycles_tail=10,
+            spec_state_work_items_tail=10,
+            spec_state_metrics_tail=10,
+            spec_max_retries=0,
+            spec_max_consecutive_failures=3,
+            spec_infinite_mode=False,
+            spec_disable_convergence=False,
+            spec_disable_early_stop=False,
+            spec_objective_verify_enabled=False,
+            spec_rebuild_session_between_cycles=False,
+            spec_cache_root=str(tmp_path / "cache"),
+        )
+        monkeypatch.setattr("src.engine_base.get_settings", lambda: settings)
+        engine = SpecEngine(
+            chat_id="oc_spec_build",
+            root_path=str(tmp_path),
+            create_session_fn=lambda **_kw: _BuildSession(),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_evaluate_criteria",
+            lambda *_a, **_kw: (criteria_called.set(), {"all_satisfied": False})[1],
+        )
+        client._spec_engine_manager.list_engines.return_value = [engine]
+        client._deep_engine_manager.list_engines.return_value = []
+        client._workflow_engine_manager.list_engines.return_value = []
+
+        result_holder: list[object] = []
+        handle = scheduler.submit(
+            TaskSpec(chat_id="oc_spec_build", name="spec-build"),
+            lambda _ctx: result_holder.append(engine.execute("build feature")),
+        )
+        assert handle is not None
+        assert build_entered.wait(timeout=3)
+
+        try:
+            with patch(
+                "src.card.delivery.registry.delivery_registry.shutdown_all",
+                return_value=True,
+            ):
+                assert client.close() is True
+            assert len(result_holder) == 1
+            assert engine.project.status == SpecProjectStatus.CANCELLED
+            assert criteria_called.is_set() is False
+        finally:
+            prompt_cancelled.set()
+            scheduler.stop(wait=True, shutdown_executor=True)
+
+    def test_active_spec_in_parallel_review_cancels_sessions_immediately(self, tmp_path, monkeypatch) -> None:
+        from src.acp.models import ACPEvent, ACPEventType
+        from src.spec_engine.engine import SpecEngine
+        from src.spec_engine.models import SpecProjectStatus
+
+        scheduler = TaskScheduler(max_concurrent=1, system_concurrency=1)
+        client = _build_minimal_ws_client(scheduler=scheduler)
+        review_entered = threading.Event()
+        review_cancelled = threading.Event()
+        eval_called = threading.Event()
+        spec_json = (
+            '{"goals":["G"],"functional_spec":["F"],"acceptance_criteria":["C1"],'
+            '"required_experts":['
+            '{"role":"R1","purpose":"P1","focus":["F1"],"checks":["K1"]},'
+            '{"role":"R2","purpose":"P2","focus":["F2"],"checks":["K2"]},'
+            '{"role":"R3","purpose":"P3","focus":["F3"],"checks":["K3"]}]}'
+        )
+        plan_json = '{"architecture":"A","steps":["S"]}'
+
+        class _MainSession:
+            def __init__(self) -> None:
+                self._call = 0
+
+            def send_prompt(self, _prompt, on_event=None, timeout=None):
+                self._call += 1
+                responses = [spec_json, plan_json, "1. T1 (依赖: 无)", "build ok"]
+                text = responses[self._call - 1] if self._call <= len(responses) else "ok"
+                if on_event:
+                    on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=text))
+                return SimpleNamespace(stop_reason="end_turn")
+
+            def send_prompt_with_retry(self, prompt, on_event=None, timeout=None, **kw):
+                return self.send_prompt(prompt, on_event=on_event, timeout=timeout)
+
+            def cancel(self, wait=False, timeout=2.0):
+                return True
+
+            def close(self):
+                return None
+
+        class _BlockingReviewActiveSession:
+            def __init__(self) -> None:
+                self.cancelled = threading.Event()
+
+            def send_prompt(self, _prompt, on_event=None, timeout=None):
+                review_entered.set()
+                assert self.cancelled.wait(timeout=3)
+                review_cancelled.set()
+                raise RuntimeError("review session cancelled")
+
+            def cancel(self, wait=False, timeout=2.0):
+                self.cancelled.set()
+                return True
+
+        class _FakeEphemeralReviewSession:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.session_started = True
+                self.startup_elapsed_s = 0.01
+                self._session = _BlockingReviewActiveSession()
+
+            def __enter__(self):
+                return self._session
+
+            def __exit__(self, *_exc):
+                return None
+
+        settings = SimpleNamespace(
+            spec_max_cycles=2,
+            spec_max_cycles_limit=10,
+            spec_execution_timeout=120,
+            spec_convergence_window=2,
+            spec_min_cycles=1,
+            spec_review_enabled=True,
+            spec_review_timeout=240,
+            spec_review_role_timeout_multipliers={},
+            spec_review_max_parallel=2,
+            spec_review_total_roles_max=4,
+            spec_review_retry_max_attempts=1,
+            spec_review_retry_base_delay=2.0,
+            spec_review_retry_max_delay=30,
+            spec_review_startup_timeout=30,
+            spec_review_failure_circuit_enabled=False,
+            spec_completion_gate_enabled=True,
+            spec_discovery_enabled=False,
+            spec_persist_phase_artifacts=False,
+            spec_persist_every_phase=True,
+            spec_cycle_tasks_max=10,
+            spec_cycle_output_max_chars=4000,
+            spec_state_filename=".spec_engine_state.json",
+            spec_artifacts_dirname=".spec_engine",
+            spec_history_log_filename="history.jsonl",
+            spec_phase_output_persist_max_chars=4000,
+            spec_cycle_artifact_retention=10,
+            spec_generated_specs_retention=10,
+            spec_state_cycles_tail=10,
+            spec_state_work_items_tail=10,
+            spec_state_metrics_tail=10,
+            spec_max_retries=0,
+            spec_max_consecutive_failures=3,
+            spec_infinite_mode=False,
+            spec_disable_convergence=False,
+            spec_disable_early_stop=False,
+            spec_objective_verify_enabled=False,
+            spec_rebuild_session_between_cycles=False,
+            spec_cache_root=str(tmp_path / "cache"),
+        )
+        monkeypatch.setattr("src.engine_base.get_settings", lambda: settings)
+        monkeypatch.setattr("src.spec_engine.review.EphemeralReviewSession", _FakeEphemeralReviewSession)
+        engine = SpecEngine(
+            chat_id="oc_spec_review",
+            root_path=str(tmp_path),
+            create_session_fn=lambda **_kw: _MainSession(),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_evaluate_criteria",
+            lambda *_a, **_kw: (eval_called.set(), {"all_satisfied": False})[1],
+        )
+        client._spec_engine_manager.list_engines.return_value = [engine]
+        client._deep_engine_manager.list_engines.return_value = []
+        client._workflow_engine_manager.list_engines.return_value = []
+
+        scheduler.submit(
+            TaskSpec(chat_id="oc_spec_review", name="spec-review"),
+            lambda _ctx: engine.execute("review feature"),
+        )
+        assert review_entered.wait(timeout=3)
+
+        try:
+            with patch(
+                "src.card.delivery.registry.delivery_registry.shutdown_all",
+                return_value=True,
+            ):
+                assert client.close() is True
+            assert review_cancelled.is_set()
+            assert engine.project.status == SpecProjectStatus.CANCELLED
+            assert eval_called.is_set() is False
+        finally:
+            scheduler.stop(wait=True, shutdown_executor=True)
+
+    def test_delivery_pool_and_timer_scheduler_guard_post_shutdown_submit(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from src.card.delivery.pool import _ShutdownSafePoolExecutor
+        from src.card.timers.scheduler import TimerScheduler
+
+        pool = _ShutdownSafePoolExecutor(max_workers=1, thread_name_prefix="test-pool")
+        pool.shutdown(wait=True)
+        ran: list[str] = []
+        with caplog.at_level(logging.DEBUG):
+            fut = pool.submit(lambda: ran.append("degraded") or "ok")
+        assert fut.result(timeout=1) == "ok"
+        assert ran == ["degraded"]
+        assert "delivery pool submit skipped after shutdown" in caplog.text
+
+        timer_sched = TimerScheduler(callback_workers=1, callback_queue_size=4)
+        try:
+            timer_sched._callback_executor.shutdown(wait=True)
+            handle = timer_sched.schedule(0.01, lambda: None, session_id="s-shutdown")
+            # Wait briefly for timer thread to attempt submit and hit RuntimeError
+            import time as _t
+
+            deadline = _t.monotonic() + 1.0
+            while not handle.cancelled and _t.monotonic() < deadline:
+                _t.sleep(0.01)
+            assert handle.cancelled is True
+        finally:
+            timer_sched.shutdown(timeout=1.0)
+
+    def test_close_cancels_active_programming_runs_before_scheduler_drain(self) -> None:
+        client = _build_minimal_ws_client()
+        events: list[str] = []
+        prog_session = SimpleNamespace(
+            mark_stopping=lambda: events.append("mark_stopping")
+        )
+        run_session = SimpleNamespace(
+            cancel=lambda wait=False: events.append(f"cancel:{wait}")
+        )
+        coco_handler = client._handler_ctx.handlers["coco"]
+        with coco_handler._active_programming_runs_lock:
+            coco_handler._active_programming_runs[("oc_1", "p_1", "")] = SimpleNamespace(
+                prog_session=prog_session,
+                session=run_session,
+            )
+        client._scheduler.wait_for_idle.side_effect = lambda _timeout: (
+            events.append("wait_for_idle"),
+            True,
+        )[1]
+        client._scheduler.wait_for_completion_callbacks.return_value = True
+
+        with patch(
+            "src.card.delivery.registry.delivery_registry.shutdown_all",
+            return_value=True,
+        ):
+            assert client.close() is True
+
+        assert events == ["mark_stopping", "cancel:False", "wait_for_idle"]

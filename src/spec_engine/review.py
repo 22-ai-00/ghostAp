@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable
+from typing import Any, Iterable
 
 from ..agent_session import EphemeralReviewSession
 from ..engine_base import PerspectiveReview, ReviewPerspective, ReviewResult
@@ -36,6 +36,58 @@ STARTUP_RETRIES = 2
 
 class _ReviewCancelled(RuntimeError):
     pass
+
+
+class ReviewExecutionContext:
+    """Track active review sessions so shutdown can cancel them immediately."""
+
+    def __init__(self, *, cancel_event: threading.Event | None = None) -> None:
+        self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._active_sessions: set[Any] = set()
+        self._cancelled = False
+        self._cancel_event = cancel_event
+
+    def reset(self, *, is_running: bool = True) -> None:
+        with self._lock:
+            self._cancelled = not is_running
+
+    def register_session(self, session: Any) -> bool:
+        """Register an active session; return False if stop was already signalled."""
+        with self._lock:
+            if self._cancelled or (
+                self._cancel_event is not None and self._cancel_event.is_set()
+            ):
+                return False
+            self._active_sessions.add(session)
+            return True
+
+    def unregister_session(self, session: Any) -> None:
+        with self._lock:
+            self._active_sessions.discard(session)
+
+    def cancel_active_sessions(self) -> int:
+        """Cancel all tracked active review sessions without holding the lock."""
+        with self._lock:
+            self._cancelled = True
+            sessions = list(self._active_sessions)
+        cancelled = 0
+        for session in sessions:
+            target = session
+            cancel_fn = getattr(target, "cancel", None)
+            if not callable(cancel_fn):
+                inner = getattr(target, "_session", None)
+                cancel_fn = getattr(inner, "cancel", None)
+            if not callable(cancel_fn):
+                continue
+            try:
+                try:
+                    cancel_fn(wait=False)
+                except TypeError:
+                    cancel_fn()
+                cancelled += 1
+            except Exception:
+                logger.debug("failed to cancel active review session", exc_info=True)
+        return cancelled
 
 
 def normalize_review_agents(items: Iterable[object] | None) -> list[ReviewAgentBinding]:
@@ -342,7 +394,16 @@ def _candidates(ctx: ReviewContext, primary: ReviewAgentBinding | None) -> list[
     return result
 
 
-def _run_prompt(ctx, role, binding, prompt, on_event, timeout) -> str:
+def _run_prompt(
+    ctx,
+    role,
+    binding,
+    prompt,
+    on_event,
+    timeout,
+    *,
+    execution_context: ReviewExecutionContext | None = None,
+) -> str:
     if callable(ctx.send_prompt_with_retry_fn) and ctx.session is None and not ctx.review_agents:
         response = ctx.send_prompt_with_retry_fn(prompt, on_event=on_event, timeout=timeout)
         return str(getattr(response, "text", response) or "")
@@ -355,9 +416,30 @@ def _run_prompt(ctx, role, binding, prompt, on_event, timeout) -> str:
             session = EphemeralReviewSession(agent, getattr(ctx.artifacts, "cwd", "") or ".", model, startup_timeout=startup_timeout)
             try:
                 with session as active:
-                    response = active.send_prompt(prompt, on_event=on_event, timeout=timeout)
-                    return str(getattr(response, "text", response) or "")
+                    tracked = (
+                        active
+                        if active is not None and callable(getattr(active, "cancel", None))
+                        else session
+                    )
+                    if execution_context is not None and not execution_context.register_session(tracked):
+                        cancel_fn = getattr(tracked, "cancel", None)
+                        if callable(cancel_fn):
+                            try:
+                                cancel_fn(wait=False)
+                            except TypeError:
+                                cancel_fn()
+                        raise _ReviewCancelled("cancelled")
+                    try:
+                        response = active.send_prompt(prompt, on_event=on_event, timeout=timeout)
+                        return str(getattr(response, "text", response) or "")
+                    finally:
+                        if execution_context is not None:
+                            execution_context.unregister_session(tracked)
+            except _ReviewCancelled:
+                raise
             except Exception as exc:
+                if ctx.cancel_event and ctx.cancel_event.is_set():
+                    raise _ReviewCancelled("cancelled") from exc
                 last_error = exc
                 try:
                     exc.startup_failed = not session.session_started  # type: ignore[attr-defined]
@@ -385,7 +467,13 @@ def _retry_event(ctx, status, attempt, maximum, delay=0):
             logger.debug("review retry callback failed", exc_info=True)
 
 
-def _run_role(ctx: ReviewContext, role: ReviewRoleSpec, binding: ReviewAgentBinding | None) -> RoleReviewOutcome:
+def _run_role(
+    ctx: ReviewContext,
+    role: ReviewRoleSpec,
+    binding: ReviewAgentBinding | None,
+    *,
+    execution_context: ReviewExecutionContext | None = None,
+) -> RoleReviewOutcome:
     timeout = float(getattr(ctx.settings, "spec_review_timeout", 240) or 240)
     timeout *= float((getattr(ctx.settings, "spec_review_role_timeout_multipliers", None) or {}).get(role.role_id, 1))
     retries = max(0, int(getattr(ctx.settings, "spec_review_retry_max_attempts", 2) or 0))
@@ -405,7 +493,21 @@ def _run_role(ctx: ReviewContext, role: ReviewRoleSpec, binding: ReviewAgentBind
 
         try:
             runner = ctx.prompt_runner_factory(role) if ctx.prompt_runner_factory else None
-            raw = runner(prompt, on_event, timeout) if runner else _run_prompt(ctx, role, binding, prompt, on_event, timeout)
+            raw = (
+                runner(prompt, on_event, timeout)
+                if runner
+                else _run_prompt(
+                    ctx,
+                    role,
+                    binding,
+                    prompt,
+                    on_event,
+                    timeout,
+                    execution_context=execution_context,
+                )
+            )
+            if ctx.cancel_event and ctx.cancel_event.is_set():
+                return _failure(role, "审查已取消", "cancelled")
             last_outcome = _parse(role, str(raw or "") or "".join(chunks), ctx.artifacts)
             if not last_outcome.error.startswith("format_failure:"):
                 if attempt:
@@ -416,6 +518,8 @@ def _run_role(ctx: ReviewContext, role: ReviewRoleSpec, binding: ReviewAgentBind
         except _ReviewCancelled:
             return _failure(role, "审查已取消", "cancelled")
         except Exception as exc:
+            if ctx.cancel_event and ctx.cancel_event.is_set():
+                return _failure(role, "审查已取消", "cancelled")
             last_error = exc
         if attempt < retries:
             delay = 0 if last_outcome else min(
@@ -457,11 +561,26 @@ def _run_role(ctx: ReviewContext, role: ReviewRoleSpec, binding: ReviewAgentBind
     return _failure(role, f"{role.display_name}{'超时' if timed_out else '失败'}，自动重试已耗尽", f"{'timeout' if timed_out else 'worker_error'}:{detail}")
 
 
-def _run_roles(ctx, roles, assignments):
+def _run_roles(
+    ctx,
+    roles,
+    assignments,
+    *,
+    execution_context: ReviewExecutionContext | None = None,
+):
     limit = min(len(roles), max(1, int(getattr(ctx.settings, "spec_review_max_parallel", 3) or 3)))
     outcomes = []
     with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="spec-review-") as pool:
-        futures = {pool.submit(_run_role, ctx, role, assignments.get(role.role_id)): role for role in roles}
+        futures = {
+            pool.submit(
+                _run_role,
+                ctx,
+                role,
+                assignments.get(role.role_id),
+                execution_context=execution_context,
+            ): role
+            for role in roles
+        }
         for future in as_completed(futures):
             role = futures[future]
             try:
@@ -590,8 +709,13 @@ def _record_failure(ctx, outcomes, elapsed):
     })
 
 
-def conduct_review(ctx: ReviewContext) -> AdaptiveReviewResult:
+def conduct_review(
+    ctx: ReviewContext,
+    *,
+    execution_context: ReviewExecutionContext | None = None,
+) -> AdaptiveReviewResult:
     """Run role planning, parallel review, parsing, aggregation and retry automatically."""
+    exec_ctx = execution_context or ReviewExecutionContext(cancel_event=ctx.cancel_event)
     started = time.monotonic()
     completion = bool(getattr(ctx.settings, "spec_completion_gate_enabled", True))
     if ctx.artifacts is None:
@@ -612,7 +736,7 @@ def conduct_review(ctx: ReviewContext) -> AdaptiveReviewResult:
             })
         else:
             assignments = _assign(ctx, roles)
-            outcomes = _run_roles(ctx, roles, assignments)
+            outcomes = _run_roles(ctx, roles, assignments, execution_context=exec_ctx)
             result = _build_result(outcomes, ctx.cycle, completion)
             result.role_plan_hash = role_hash
             result.blocking_review_passed = result.all_passed and not result.blocking_suggestion_hash
@@ -637,6 +761,7 @@ class ReviewOrchestrator:
     def __init__(self):
         self._circuit = ReviewCircuitState()
         self._cancel_event = threading.Event()
+        self._execution_context = ReviewExecutionContext(cancel_event=self._cancel_event)
 
     @property
     def circuit(self):
@@ -646,15 +771,25 @@ class ReviewOrchestrator:
     def cancel_event(self):
         return self._cancel_event
 
+    @property
+    def execution_context(self) -> ReviewExecutionContext:
+        return self._execution_context
+
     def reset_cancel_event(self, *, is_running: bool) -> bool:
         self._cancel_event.clear()
         if not is_running:
             self._cancel_event.set()
+            self._execution_context.reset(is_running=False)
             return False
+        self._execution_context.reset(is_running=True)
         return True
+
+    def cancel_active_sessions(self) -> int:
+        return self._execution_context.cancel_active_sessions()
 
     def signal_stop(self):
         self._cancel_event.set()
+        self._execution_context.cancel_active_sessions()
 
     def to_dict(self):
         return self._circuit.to_dict()

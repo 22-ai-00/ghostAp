@@ -10,13 +10,35 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 _pool: ThreadPoolExecutor | None = None
 _shutting_down = False
+
+
+class _ShutdownSafePoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that degrades gracefully if submitted during shutdown."""
+
+    def submit(self, fn, /, *args, **kwargs) -> Future[Any]:  # type: ignore[override]
+        try:
+            return super().submit(fn, *args, **kwargs)
+        except RuntimeError as exc:
+            logger.debug(
+                "delivery pool submit skipped after shutdown (%s); running inline",
+                exc,
+            )
+            future: Future[Any] = Future()
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as inner_exc:
+                future.set_exception(inner_exc)
+            else:
+                future.set_result(result)
+            return future
 
 
 def get_delivery_pool() -> ThreadPoolExecutor:
@@ -32,7 +54,7 @@ def get_delivery_pool() -> ThreadPoolExecutor:
         from src.config import get_settings
 
         max_workers = get_settings().card.delivery_pool_max_workers
-        _pool = ThreadPoolExecutor(
+        _pool = _ShutdownSafePoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="card-delivery",
         )
