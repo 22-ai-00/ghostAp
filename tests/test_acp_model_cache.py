@@ -8,6 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from acp.exceptions import RequestError
+from acp.schema import (
+    NewSessionResponse,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
+    SessionConfigSelectGroup,
+    SessionConfigSelectOption,
+    SetSessionConfigOptionResponse,
+)
 
 from src.acp import helper
 from src.acp.options import ACPModelOption
@@ -382,3 +390,132 @@ def test_cache_fill_between_miss_and_flight_registration_does_not_reprobe(
     assert leading_result[0].name == "model-a"
     assert delayed_result[0][0].name == "model-a"
     assert probe.call_count == 1
+
+
+def test_grouped_select_options_flatten_across_codex_and_config_models() -> None:
+    def make_options(*, include_efforts: bool, current_model: str) -> list:
+        options: list = [
+            SessionConfigOptionBoolean(
+                id="model",
+                name="Bool model flag",
+                type="boolean",
+                category="model",
+                current_value=True,
+            ),
+            SessionConfigOptionSelect(
+                id="ignored_dict_cat",
+                name="Ignored",
+                type="select",
+                category={"id": "model"},
+                current_value="should-not-match",
+                options=[SessionConfigSelectOption(value="should-not-match", name="Ignored")],
+            ),
+            SessionConfigOptionSelect(
+                id="model",
+                name="Model",
+                type="select",
+                category="model",
+                current_value=current_model,
+                options=[
+                    SessionConfigSelectGroup(
+                        group="empty",
+                        name="Empty Group",
+                        options=[],
+                    ),
+                    SessionConfigSelectGroup(
+                        group="flagship",
+                        name="Flagship",
+                        options=[
+                            SessionConfigSelectOption(value="gpt-5.4", name="GPT-5.4"),
+                            SessionConfigSelectOption(value="gpt-5.4-mini", name="GPT-5.4 Mini"),
+                        ],
+                    ),
+                ],
+            ),
+            SessionConfigOptionBoolean(
+                id="reasoning_effort",
+                name="Enable effort",
+                type="boolean",
+                category="thought_level",
+                current_value=False,
+            ),
+            SessionConfigOptionSelect(
+                id="other_dict_cat",
+                name="Dict category effort",
+                type="select",
+                category={"id": "thought_level"},
+                current_value="xhigh",
+                options=[SessionConfigSelectOption(value="xhigh", name="XHigh")],
+            ),
+        ]
+        if include_efforts:
+            options.append(
+                SessionConfigOptionSelect(
+                    id="reasoning_effort",
+                    name="Reasoning Effort",
+                    type="select",
+                    category="thought_level",
+                    current_value="high",
+                    options=[
+                        SessionConfigSelectGroup(group="empty_effort", name="Empty", options=[]),
+                        SessionConfigSelectGroup(
+                            group="tiers",
+                            name="Tiers",
+                            options=[
+                                SessionConfigSelectOption(value="medium", name="Medium"),
+                                SessionConfigSelectOption(value="high", name="High"),
+                            ],
+                        ),
+                    ],
+                )
+            )
+        return options
+
+    initial = NewSessionResponse(
+        session_id="sess-codex-grouped",
+        config_options=make_options(include_efforts=True, current_model="gpt-5.4"),
+    )
+
+    class Connection:
+        async def set_config_option(self, *, config_id: str, session_id: str, value: str):
+            assert config_id == "model"
+            assert session_id == "sess-codex-grouped"
+            return SetSessionConfigOptionResponse(
+                config_options=make_options(include_efforts=False, current_model=value),
+            )
+
+    # _config_models reuses _config_option + _flatten_config_options
+    flat_models = helper._config_models(initial, "")
+    assert [m.name for m in flat_models] == ["gpt-5.4", "gpt-5.4-mini"]
+    assert [m.is_default for m in flat_models] == [True, False]
+
+    # discover_codex_model_options flattens grouped models and grouped efforts,
+    # and NEVER backfills static efforts when a model reports no effort capability.
+    discovered = asyncio.run(helper.discover_codex_model_options(Connection(), initial))
+    assert [m.name for m in discovered] == ["gpt-5.4", "gpt-5.4-mini"]
+    assert discovered[0].reasoning_efforts == ("medium", "high")
+    assert discovered[0].default_reasoning_effort == "high"
+    assert [v.name for v in discovered[0].selection_variants] == [
+        "gpt-5.4/medium",
+        "gpt-5.4/high",
+    ]
+    assert discovered[1].reasoning_efforts == ()
+    assert discovered[1].default_reasoning_effort is None
+    assert [v.name for v in discovered[1].selection_variants] == ["gpt-5.4-mini"]
+
+
+@pytest.mark.parametrize(
+    "bad_options",
+    [
+        "not-a-list",
+        b"bytes-not-a-list",
+        {"value": "mapping"},
+        42,
+        [SimpleNamespace(group="bad-nested", options="bad-str")],
+        [SimpleNamespace(group="bad-nested-map", options={"k": "v"})],
+        [SimpleNamespace(group="bad-nested-int", options=99)],
+    ],
+)
+def test_flatten_config_options_ignores_malformed_non_iterable_options(bad_options) -> None:
+    root = SimpleNamespace(options=bad_options)
+    assert helper._flatten_config_options(root) == []

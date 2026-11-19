@@ -13,7 +13,13 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 from acp.schema import (
     AgentMessageChunk,
+    NewSessionResponse,
     PromptResponse,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
+    SessionConfigSelectGroup,
+    SessionConfigSelectOption,
+    SetSessionConfigOptionResponse,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -871,3 +877,109 @@ def test_agy_handler_swarm_adds_working_reaction_holds_until_done_and_notifies(t
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2.0)
         loop.close()
+
+
+def test_agy_grouped_select_options_flatten_and_never_backfill_unknown_efforts() -> None:
+    def make_options(*, include_efforts: bool, current_model: str) -> list:
+        options: list = [
+            SessionConfigOptionBoolean(
+                id="model",
+                name="Model bool",
+                type="boolean",
+                category="model",
+                current_value=True,
+            ),
+            SessionConfigOptionSelect(
+                id="model",
+                name="Model",
+                type="select",
+                category="model",
+                current_value=current_model,
+                options=[
+                    SessionConfigSelectGroup(group="empty", name="Empty", options=[]),
+                    SessionConfigSelectGroup(
+                        group="gemini",
+                        name="Gemini",
+                        options=[
+                            SessionConfigSelectOption(
+                                value="gemini-4-hydrogen",
+                                name="Gemini 4 Hydrogen",
+                            ),
+                            SessionConfigSelectOption(
+                                value="gemini-pro-orchestrator",
+                                name="Gemini Pro Orchestrator",
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            SessionConfigOptionBoolean(
+                id="thought_level",
+                name="Thought bool",
+                type="boolean",
+                category="reasoning_effort",
+                current_value=True,
+            ),
+            SessionConfigOptionSelect(
+                id="dict_cat",
+                name="Dict Cat",
+                type="select",
+                category={"id": "reasoning_effort"},
+                current_value="xhigh",
+                options=[SessionConfigSelectOption(value="xhigh", name="XHigh")],
+            ),
+        ]
+        if include_efforts:
+            options.append(
+                SessionConfigOptionSelect(
+                    id="thought_level",
+                    name="Thought Level",
+                    type="select",
+                    category="thought_level",
+                    current_value="medium",
+                    options=[
+                        SessionConfigSelectGroup(group="empty_thought", name="Empty", options=[]),
+                        SessionConfigSelectGroup(
+                            group="levels",
+                            name="Levels",
+                            options=[
+                                SessionConfigSelectOption(value="low", name="Low"),
+                                SessionConfigSelectOption(value="medium", name="Medium"),
+                                SessionConfigSelectOption(value="high", name="High"),
+                            ],
+                        ),
+                    ],
+                )
+            )
+        return options
+
+    initial = NewSessionResponse(
+        session_id="sess-agy-grouped",
+        config_options=make_options(include_efforts=True, current_model="gemini-4-hydrogen"),
+    )
+
+    class Connection:
+        async def set_config_option(self, *, config_id: str, session_id: str, value: str):
+            assert config_id == "model"
+            assert session_id == "sess-agy-grouped"
+            return SetSessionConfigOptionResponse(
+                config_options=make_options(include_efforts=False, current_model=value),
+            )
+
+    models = asyncio.run(helper_mod.discover_agy_model_options(Connection(), initial))
+    assert [m.name for m in models] == [
+        "gemini-4-hydrogen",
+        "gemini-pro-orchestrator",
+    ]
+    assert models[0].reasoning_efforts == ("low", "medium", "high")
+    assert models[0].default_reasoning_effort == "medium"
+    assert [v.name for v in models[0].selection_variants] == [
+        "gemini-4-hydrogen/low",
+        "gemini-4-hydrogen/medium",
+        "gemini-4-hydrogen/high",
+    ]
+
+    assert models[1].reasoning_efforts == ()
+    assert models[1].default_reasoning_effort is None
+    assert [v.name for v in models[1].selection_variants] == ["gemini-pro-orchestrator"]
+    assert models[1].selection_variants[0].effort is None

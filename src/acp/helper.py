@@ -8,7 +8,7 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from ..config import get_settings
@@ -389,20 +389,11 @@ def _codex_cli_fallback(current_model: str | None) -> list[ACPModelOption]:
 
 def _config_models(response: object, selected: str) -> list[ACPModelOption]:
     """Read the standard model select option from a new-session response."""
-    for wrapped in getattr(response, "config_options", None) or ():
-        root = getattr(wrapped, "root", wrapped)
-        if not (
-            str(getattr(root, "id", "") or "") == "model"
-            or str(getattr(root, "category", "") or "") == "model"
-        ):
-            continue
-        default = selected or str(getattr(root, "current_value", "") or "").strip()
-        options: list[object] = []
-        for option in getattr(root, "options", None) or ():
-            nested = getattr(option, "options", None)
-            options.extend(list(nested) if nested is not None else [option])
-        return _options(options, default, value_field="value")
-    return []
+    root = _config_option(response, "model")
+    if root is None:
+        return []
+    default = selected or str(getattr(root, "current_value", "") or "").strip()
+    return _options(_flatten_config_options(root), default, value_field="value")
 
 
 def _options(
@@ -429,14 +420,34 @@ def _options(
     return models
 
 
+def _iter_option_items(raw: object) -> Iterable[object]:
+    if (
+        raw is None
+        or isinstance(raw, (str, bytes, bytearray, Mapping))
+        or not isinstance(raw, Iterable)
+    ):
+        return ()
+    return raw
+
+
 def _config_option(response: object, *identifiers: str) -> object | None:
-    expected = {str(value or "").strip() for value in identifiers if value}
-    for wrapped in getattr(response, "config_options", None) or ():
+    expected = {
+        stripped
+        for value in identifiers
+        if value and (stripped := str(value).strip())
+    }
+    if not expected:
+        return None
+    for wrapped in _iter_option_items(getattr(response, "config_options", None)):
         root = getattr(wrapped, "root", wrapped)
-        if {
-            str(getattr(root, "id", "") or "").strip(),
-            str(getattr(root, "category", "") or "").strip(),
-        } & expected:
+        if getattr(root, "type", None) == "boolean":
+            continue
+        category = getattr(root, "category", None)
+        keys = {str(getattr(root, "id", "") or "").strip()}
+        if isinstance(category, str):
+            keys.add(category.strip())
+        keys.discard("")
+        if keys & expected:
             return root
     return None
 
@@ -446,7 +457,7 @@ def _reasoning_effort_capability(response: object) -> tuple[tuple[str, ...], str
     if root is None:
         return (), None
     values: list[str] = []
-    for option in getattr(root, "options", None) or ():
+    for option in _flatten_config_options(root):
         effort = str(getattr(option, "value", "") or "").strip().lower()
         if effort in CODEX_REASONING_EFFORTS and effort not in values:
             values.append(effort)
@@ -456,9 +467,16 @@ def _reasoning_effort_capability(response: object) -> tuple[tuple[str, ...], str
 
 def _flatten_config_options(root: object) -> list[object]:
     flattened: list[object] = []
-    for option in getattr(root, "options", None) or ():
+    for option in _iter_option_items(getattr(root, "options", None)):
+        if option is None:
+            continue
         nested = getattr(option, "options", None)
-        flattened.extend(list(nested) if nested is not None else [option])
+        if nested is not None:
+            flattened.extend(
+                item for item in _iter_option_items(nested) if item is not None
+            )
+        else:
+            flattened.append(option)
     return flattened
 
 
@@ -532,7 +550,7 @@ async def discover_codex_model_options(
         return []
     current_model = str(getattr(model_root, "current_value", "") or "").strip()
     live_models = _options(
-        list(getattr(model_root, "options", None) or ()),
+        _flatten_config_options(model_root),
         current_model,
         value_field="value",
     )
@@ -631,7 +649,7 @@ def _dsh_reasoning_capability(response: object) -> tuple[tuple[str, ...], str | 
     if root is None:
         return (), None
     efforts: list[str] = []
-    for option in getattr(root, "options", None) or ():
+    for option in _flatten_config_options(root):
         effort = decode_dsh_reasoning_value(
             str(getattr(option, "value", "") or "")
         )
@@ -689,7 +707,7 @@ def _agy_thought_level_capability(response: object) -> tuple[tuple[str, ...], st
     if root is None:
         return (), None
     values: list[str] = []
-    for option in getattr(root, "options", None) or ():
+    for option in _flatten_config_options(root):
         effort = str(getattr(option, "value", "") or "").strip().lower()
         if effort in AGY_REASONING_EFFORTS and effort not in values:
             values.append(effort)

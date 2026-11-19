@@ -9,6 +9,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from acp.schema import (
+    NewSessionResponse,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
+    SessionConfigSelectGroup,
+    SessionConfigSelectOption,
+    SetSessionConfigOptionResponse,
+)
 
 import src.acp.helper as helper_mod
 import src.acp.providers as providers_mod
@@ -272,3 +280,108 @@ def test_dsh_is_available_to_workflow_agent_pools() -> None:
     invalidate_cache()
     assert TOOL_DESCRIPTIONS["dsh"] == "DeepSeek Harness 原生 ACP 编程"
     assert get_available_tools()["dsh"] == "DeepSeek Harness 原生 ACP 编程"
+
+
+def test_dsh_grouped_select_options_flatten_and_never_backfill_unknown_efforts() -> None:
+    def make_options(*, include_efforts: bool, current_model: str) -> list:
+        options: list = [
+            SessionConfigOptionBoolean(
+                id="dsh.model",
+                name="Model toggle",
+                type="boolean",
+                category="model",
+                current_value=True,
+            ),
+            SessionConfigOptionSelect(
+                id="dsh.model",
+                name="Model",
+                type="select",
+                category="model",
+                current_value=current_model,
+                options=[
+                    SessionConfigSelectGroup(group="empty", name="Empty", options=[]),
+                    SessionConfigSelectGroup(
+                        group="deepseek-official",
+                        name="DeepSeek",
+                        options=[
+                            SessionConfigSelectOption(
+                                value='["deepseek-official","reasoner"]',
+                                name="Reasoner",
+                            ),
+                            SessionConfigSelectOption(
+                                value='["deepseek-official","chat"]',
+                                name="Chat",
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            SessionConfigOptionBoolean(
+                id="dsh.reasoning_effort",
+                name="Reasoning boolean",
+                type="boolean",
+                category="thought_level",
+                current_value=True,
+            ),
+            SessionConfigOptionSelect(
+                id="other_dict_cat",
+                name="Dict category",
+                type="select",
+                category={"id": "thought_level"},
+                current_value='["effort","max"]',
+                options=[SessionConfigSelectOption(value='["effort","max"]', name="Max")],
+            ),
+        ]
+        if include_efforts:
+            options.append(
+                SessionConfigOptionSelect(
+                    id="dsh.reasoning_effort",
+                    name="Reasoning Effort",
+                    type="select",
+                    category="thought_level",
+                    current_value='["effort","high"]',
+                    options=[
+                        SessionConfigSelectGroup(group="empty_eff", name="Empty", options=[]),
+                        SessionConfigSelectGroup(
+                            group="levels",
+                            name="Levels",
+                            options=[
+                                SessionConfigSelectOption(value='["default"]', name="Default"),
+                                SessionConfigSelectOption(value='["effort","low"]', name="Low"),
+                                SessionConfigSelectOption(value='["effort","high"]', name="High"),
+                            ],
+                        ),
+                    ],
+                )
+            )
+        return options
+
+    initial = NewSessionResponse(
+        session_id="sess-dsh-grouped",
+        config_options=make_options(
+            include_efforts=True,
+            current_model='["deepseek-official","reasoner"]',
+        ),
+    )
+
+    class Connection:
+        async def set_config_option(self, *, config_id: str, session_id: str, value: str):
+            assert config_id == "dsh.model"
+            assert session_id == "sess-dsh-grouped"
+            return SetSessionConfigOptionResponse(
+                config_options=make_options(include_efforts=False, current_model=value),
+            )
+
+    models = asyncio.run(helper_mod.discover_dsh_model_options(Connection(), initial))
+    assert [m.name for m in models] == [
+        "deepseek-official/reasoner",
+        "deepseek-official/chat",
+    ]
+    assert models[0].reasoning_efforts == ("default", "low", "high")
+    assert models[0].default_reasoning_effort == "high"
+    assert [v.effort for v in models[0].selection_variants] == ["default", "low", "high"]
+
+    assert models[1].reasoning_efforts == ()
+    assert models[1].default_reasoning_effort is None
+    assert [v.name for v in models[1].selection_variants] == ['["deepseek-official","chat"]']
+    assert models[1].selection_variants[0].effort is None
