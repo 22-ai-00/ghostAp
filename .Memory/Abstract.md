@@ -1,5 +1,8 @@
 # GhostAP 项目记忆索引
 
+## 2026-11-22
+- **AGY Effort与Orchestrator强化** - 补齐Planner/Executor Effort、`SyncAGYCLISession`混合传输与`/effort`命令 → [2026-11-22.md](2026-11-22.md)
+
 ## 2026-11-19
 - **架构SSOT与核心模块拆分** - 11后端单一来源及COT/WF/编程/WS大模块拆分 → [2026-11-19.md](2026-11-19.md)
 - **Card流式、COT与终答治理** - 快照进度、动态围栏、净化预算、部分封存与终答溯源 → [2026-11-19.md](2026-11-19.md)

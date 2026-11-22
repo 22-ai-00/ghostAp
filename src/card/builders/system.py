@@ -6,6 +6,7 @@ import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Sequence
 
+from src.acp.agy_selection import is_agy_orchestrator_model
 from src.acp.native_commands import (
     get_featured_native_commands,
     get_zero_arg_quick_commands,
@@ -824,16 +825,27 @@ class SystemBuilder:
                     ),
                 ]
             )
+            is_agy_orchestrator = tool == "agy" and is_agy_orchestrator_model(state.selected_model)
             if state.profiles:
+                profile_label = (
+                    UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"]
+                    if is_agy_orchestrator
+                    else UI_TEXT["system_acp_model_profile_label"]
+                )
+                profile_placeholder = (
+                    UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"]
+                    if is_agy_orchestrator
+                    else UI_TEXT["system_acp_model_profile_placeholder"]
+                )
                 elements.extend(
                     [
                         {
                             "tag": "markdown",
-                            "content": UI_TEXT["system_acp_model_profile_label"],
+                            "content": profile_label,
                         },
                         select_static(
                             name="model_profile",
-                            placeholder=UI_TEXT["system_acp_model_profile_placeholder"],
+                            placeholder=profile_placeholder,
                             values=state.profiles,
                             selected=state.selected_profile,
                             action=profile_action,
@@ -841,15 +853,25 @@ class SystemBuilder:
                     ]
                 )
             if state.efforts:
+                effort_label = (
+                    UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"]
+                    if is_agy_orchestrator
+                    else UI_TEXT["system_acp_model_effort_label"]
+                )
+                effort_placeholder = (
+                    UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"]
+                    if is_agy_orchestrator
+                    else UI_TEXT["system_acp_model_effort_placeholder"]
+                )
                 elements.extend(
                     [
                         {
                             "tag": "markdown",
-                            "content": UI_TEXT["system_acp_model_effort_label"],
+                            "content": effort_label,
                         },
                         select_static(
                             name="model_effort",
-                            placeholder=UI_TEXT["system_acp_model_effort_placeholder"],
+                            placeholder=effort_placeholder,
                             values=state.efforts,
                             selected=state.selected_effort,
                             action=effort_action,

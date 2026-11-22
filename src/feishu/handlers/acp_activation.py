@@ -379,10 +379,18 @@ class ACPActivationMixin:
                         session=live_session,
                         changed=False,
                     )
+            requires_transport_switch = False
+            if tool_name == "agy" and live_session is not None and model_name is not None:
+                from ...acp.agy_selection import requires_agy_cli_orchestrator_session
+
+                target_is_cli = requires_agy_cli_orchestrator_session(backend_model_name)
+                live_is_cli = bool(getattr(live_session, "_is_agy_cli_session", False))
+                requires_transport_switch = target_is_cli != live_is_cli
             if (
                 live_session is not None
                 and model_name is not None
                 and thread_id is None
+                and not requires_transport_switch
                 and callable(getattr(live_session, "set_model", None))
                 and callable(getattr(handler, "switch_model", None))
             ):
@@ -589,7 +597,14 @@ class ACPActivationMixin:
         live_session = manager.get_session(chat_id, project_id=pid)
         if live_session is None or not isinstance(getattr(live_session, "session_id", None), str):
             return ""
-        if model_name is not None:
+        transport_mismatch = False
+        if tool_name == "agy":
+            from ...acp.agy_selection import requires_agy_cli_orchestrator_session
+
+            transport_mismatch = requires_agy_cli_orchestrator_session(model_name) != bool(
+                getattr(live_session, "_is_agy_cli_session", False)
+            )
+        if model_name is not None and not transport_mismatch:
             set_model = getattr(live_session, "set_model", None)
             if callable(set_model):
                 try:
@@ -1538,6 +1553,10 @@ class ACPActivationMixin:
             )
             return
         model_name = None if requested.lower() == "default" else requested
+        if tool_name == "agy" and model_name:
+            from ...acp.agy_selection import normalize_agy_model_input
+
+            model_name = normalize_agy_model_input(model_name, model_names)
         if model_name and model_names and model_name not in model_names:
             self.reply_error(
                 message_id,
@@ -1579,6 +1598,262 @@ class ACPActivationMixin:
             _system_module().UI_TEXT["system_model_config_saved"].format(
                 tool=tool_name,
                 model=model_name or "default",
+            )
+            + sync_note,
+        )
+
+    def handle_effort_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Show or update the active model's thinking/reasoning effort."""
+        from ...acp.agy_selection import (
+            AGY_ORCHESTRATOR_DEFAULT_PROFILE,
+            is_agy_orchestrator_model,
+        )
+        from ...card.render.model_cascade import resolve_model_cascade
+
+        parts = (text or "").strip().split(maxsplit=1)
+        requested = parts[1].strip() if len(parts) > 1 else ""
+        project = self._configuration_project(chat_id, project)
+        tool_name = self._resolve_current_acp_tool(chat_id, project)
+        cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
+        current_model: Optional[str] = None
+        if project and getattr(project, "acp_tool_name", "") == tool_name:
+            current_model = getattr(project, "acp_model_name", None)
+
+        models = self._fetch_acp_models(
+            tool_name,
+            cwd=cwd,
+            current_model=current_model,
+        )
+        state = resolve_model_cascade(models, current_model=current_model)
+        if not state.selected_model:
+            self.reply_error(
+                message_id,
+                _system_module().UI_TEXT["system_effort_no_adjustable"].format(
+                    tool=tool_name,
+                    model=current_model or "default",
+                ),
+            )
+            return
+
+        active_model = state.selected_model
+        active_opt = next((opt for opt in (models or []) if opt.name == active_model), None)
+        model_variants = [v for v in state.selections if v.model == active_model]
+        is_agy_orch = (
+            tool_name == "agy"
+            and is_agy_orchestrator_model(active_model)
+            and any(
+                v.profile and v.profile != AGY_ORCHESTRATOR_DEFAULT_PROFILE and v.effort
+                for v in model_variants
+            )
+        )
+
+        if is_agy_orch:
+            planner_choices = tuple(
+                dict.fromkeys(
+                    v.profile
+                    for v in model_variants
+                    if v.profile and v.profile != AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                )
+            )
+            executor_choices = tuple(
+                dict.fromkeys(v.effort for v in model_variants if v.effort)
+            )
+            planner_disp = " · ".join(f"`{e}`" for e in (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices))
+            executor_disp = " · ".join(f"`{e}`" for e in executor_choices)
+            if not requested:
+                cur_planner = state.selected_profile or AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                cur_executor = (
+                    AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                    if cur_planner == AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                    else (state.selected_effort or AGY_ORCHESTRATOR_DEFAULT_PROFILE)
+                )
+                self.reply_text(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_orch_config_summary"].format(
+                        tool=tool_name,
+                        model=active_model,
+                        planner=cur_planner,
+                        executor=cur_executor,
+                        planner_available=planner_disp,
+                        executor_available=executor_disp,
+                    ),
+                )
+                return
+
+            raw_tokens = (
+                [tok.strip().lower() for tok in requested.split("/", 1)]
+                if "/" in requested and " " not in requested
+                else [tok.strip().lower() for tok in requested.split()]
+            )
+            target_variant = None
+            if len(raw_tokens) == 1 and raw_tokens[0] == "default":
+                target_variant = next(
+                    (
+                        v
+                        for v in model_variants
+                        if v.profile == AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                    ),
+                    None,
+                )
+            elif len(raw_tokens) == 1:
+                eff = raw_tokens[0]
+                target_variant = next(
+                    (v for v in model_variants if v.profile == eff and v.effort == eff),
+                    None,
+                )
+                if target_variant is None:
+                    default_exec = getattr(active_opt, "default_reasoning_effort", None)
+                    if default_exec:
+                        target_variant = next(
+                            (
+                                v
+                                for v in model_variants
+                                if v.profile == eff and v.effort == default_exec
+                            ),
+                            None,
+                        )
+                if target_variant is None:
+                    target_variant = next(
+                        (v for v in model_variants if v.profile == eff and v.effort),
+                        None,
+                    )
+            elif len(raw_tokens) == 2:
+                p_eff, e_eff = raw_tokens
+                target_variant = next(
+                    (
+                        v
+                        for v in model_variants
+                        if v.profile == p_eff and v.effort == e_eff
+                    ),
+                    None,
+                )
+
+            if target_variant is None:
+                self.reply_error(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_unsupported"].format(
+                        model=active_model,
+                        effort=requested,
+                        available=f"Planner: {planner_disp} / Executor: {executor_disp}",
+                    ),
+                )
+                return
+            next_model_name: Optional[str] = target_variant.value
+        else:
+            active_profile = state.selected_profile
+            efforts = tuple(
+                dict.fromkeys(
+                    v.effort
+                    for v in model_variants
+                    if v.profile == active_profile and v.effort
+                )
+            )
+            if not efforts:
+                self.reply_error(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_no_adjustable"].format(
+                        tool=tool_name,
+                        model=active_model,
+                    ),
+                )
+                return
+            available_disp = " · ".join(f"`{e}`" for e in efforts)
+            if not requested:
+                self.reply_text(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_config_summary"].format(
+                        tool=tool_name,
+                        model=active_model,
+                        current=state.selected_effort or "default",
+                        available=available_disp,
+                    ),
+                )
+                return
+
+            if "/" in requested or len(requested.split()) > 1:
+                self.reply_error(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_usage_pair_only_orch"].format(
+                        model=active_model,
+                    ),
+                )
+                return
+
+            token = requested.strip().lower()
+            target_variant = None
+            if token == "default":
+                default_effort = getattr(active_opt, "default_reasoning_effort", None)
+                target_variant = (
+                    next(
+                        (
+                            v
+                            for v in model_variants
+                            if v.profile == active_profile and v.effort == "default"
+                        ),
+                        None,
+                    )
+                    or next(
+                        (
+                            v
+                            for v in model_variants
+                            if v.profile == active_profile and v.effort is None
+                        ),
+                        None,
+                    )
+                    or (
+                        next(
+                            (
+                                v
+                                for v in model_variants
+                                if v.profile == active_profile and v.effort == default_effort
+                            ),
+                            None,
+                        )
+                        if default_effort
+                        else None
+                    )
+                )
+            else:
+                target_variant = next(
+                    (
+                        v
+                        for v in model_variants
+                        if v.profile == active_profile and v.effort == token
+                    ),
+                    None,
+                )
+
+            if target_variant is None:
+                self.reply_error(
+                    message_id,
+                    _system_module().UI_TEXT["system_effort_unsupported"].format(
+                        model=active_model,
+                        effort=requested,
+                        available=available_disp,
+                    ),
+                )
+                return
+            next_model_name = target_variant.value
+
+        if project is None or not self.project_manager.commit_acp_configuration(
+            project,
+            tool_name=tool_name,
+            model_name=next_model_name,
+        ):
+            self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
+            return
+        sync_note = self._sync_live_acp_model(chat_id, project, tool_name, next_model_name)
+        self.reply_text(
+            message_id,
+            _system_module().UI_TEXT["system_effort_config_saved"].format(
+                tool=tool_name,
+                model=next_model_name or "default",
             )
             + sync_note,
         )

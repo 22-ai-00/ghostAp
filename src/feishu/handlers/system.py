@@ -131,6 +131,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/cmds",
             "/info",
             "/model",
+            "/effort",
             "/btw",
             "/setadmin",
             "/access",
@@ -160,6 +161,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/cmds",
             "/acp",
             "/model",
+            "/effort",
             "/status",
             "/tasks",
             "/diff",
@@ -237,6 +239,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
             "/tools_status": lambda m, c, t, p: self.show_tools_status(m, c, p),
             "/model": lambda m, c, t, p: self.handle_model_command(m, c, t, p),
+            "/effort": lambda m, c, t, p: self.handle_effort_command(m, c, t, p),
             "/lock": lambda m, c, t, p: self._handle_lock_command(m, c, "lock"),
             "/unlock": lambda m, c, t, p: self._handle_lock_command(m, c, "unlock"),
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
@@ -253,6 +256,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             ("/acp", self.handle_acp_command),
             ("/cmds", lambda m, c, t, p: self.show_tool_commands(m, c, t, p)),
             ("/model", self.handle_model_command),
+            ("/effort", self.handle_effort_command),
         ]
 
     def _handle_direct_mode_enter(

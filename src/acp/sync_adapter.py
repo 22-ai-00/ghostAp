@@ -791,8 +791,19 @@ class SyncACPSession(PromptGenerationTracker):
     async def _apply_agy_selection(self, selection: str) -> bool:
         if not self._acp_session:
             return False
-        from .agy_selection import AGY_MODEL_CONFIG_ID, AGY_THOUGHT_LEVEL_CONFIG_ID, split_agy_model_selection
+        from .agy_selection import (
+            AGY_MODEL_CONFIG_ID,
+            AGY_THOUGHT_LEVEL_CONFIG_ID,
+            requires_agy_cli_orchestrator_session,
+            split_agy_model_selection,
+        )
 
+        if requires_agy_cli_orchestrator_session(selection):
+            logger.info(
+                "[ACP:AGY] orchestrator custom effort selection requires CLI transport: %s",
+                selection,
+            )
+            return False
         try:
             model_id, thought_level = split_agy_model_selection(selection)
         except ValueError as exc:

@@ -16,10 +16,14 @@ from ..mode.backends import ALL_BACKEND_METAS
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
 from .agy_selection import (
+    AGY_EFFORT_CONFIG_IDS,
     AGY_MODEL_CONFIG_ID,
+    AGY_ORCHESTRATOR_DEFAULT_PROFILE,
     AGY_REASONING_EFFORTS,
-    AGY_THOUGHT_LEVEL_CONFIG_ID,
     compose_agy_model_selection,
+    compose_agy_orchestrator_selection,
+    get_agy_orchestrator_spec,
+    register_agy_model_display_labels,
 )
 from .claude_selection import (
     CLAUDE_DEFAULT_EFFORT_TOKEN,
@@ -692,7 +696,7 @@ async def discover_dsh_model_options(
 
 
 def _agy_thought_level_capability(response: object) -> tuple[tuple[str, ...], str | None]:
-    root = _config_option(response, AGY_THOUGHT_LEVEL_CONFIG_ID, "reasoning_effort")
+    root = _config_option(response, *AGY_EFFORT_CONFIG_IDS)
     if root is None:
         return (), None
     values: list[str] = []
@@ -702,6 +706,116 @@ def _agy_thought_level_capability(response: object) -> tuple[tuple[str, ...], st
             values.append(effort)
     current = str(getattr(root, "current_value", "") or "").strip().lower()
     return tuple(values), current if current in values else None
+
+
+def _is_agy_enterprise_tier(response: object) -> bool:
+    for attr in ("field_meta", "_meta"):
+        meta = getattr(response, attr, None)
+        if not isinstance(meta, Mapping):
+            continue
+        agy_meta = meta.get("antigravity")
+        if not isinstance(agy_meta, Mapping):
+            continue
+        tier = agy_meta.get("tier")
+        if not isinstance(tier, Mapping):
+            continue
+        tier_id = str(tier.get("id") or "").strip().casefold()
+        tier_name = str(tier.get("name") or "").strip().casefold()
+        if "enterprise" in tier_id or "enterprise" in tier_name:
+            return True
+    return False
+
+
+def _register_agy_available_model_labels(
+    response: object,
+    discovered: Sequence[ACPModelOption],
+) -> None:
+    model_root = _config_option(response, AGY_MODEL_CONFIG_ID)
+    base_names: dict[str, str] = {}
+    if model_root is not None:
+        for opt in _flatten_config_options(model_root):
+            val = str(getattr(opt, "value", "") or "").strip()
+            name = str(getattr(opt, "name", "") or "").strip()
+            if val and name:
+                base_names[val] = name
+
+    base_ids = sorted({opt.name for opt in discovered if opt.name}, key=len, reverse=True)
+    state = getattr(response, "models", None)
+    available = getattr(state, "available_models", None) or ()
+    labels: dict[tuple[str, str], str] = {}
+    for item in available:
+        model_id = str(getattr(item, "model_id", "") or "").strip()
+        display_name = str(getattr(item, "name", "") or "").strip()
+        if not model_id or not display_name:
+            continue
+        for base_id in base_ids:
+            prefix = f"{base_id}-"
+            if model_id.startswith(prefix):
+                effort = model_id[len(prefix) :].strip().lower()
+                if effort in AGY_REASONING_EFFORTS:
+                    labels[(base_id, effort)] = display_name
+                break
+    register_agy_model_display_labels(labels, base_names=base_names)
+
+
+def _enrich_agy_orchestrator_options(
+    discovered: list[ACPModelOption],
+) -> list[ACPModelOption]:
+    by_name = {option.name: option for option in discovered}
+    enriched: list[ACPModelOption] = []
+    for option in discovered:
+        spec = get_agy_orchestrator_spec(option.name)
+        if spec is None or option.reasoning_efforts:
+            enriched.append(option)
+            continue
+        planner_opt = by_name.get(spec.planner_model_id)
+        executor_opt = by_name.get(spec.executor_model_id)
+        if (
+            planner_opt is None
+            or executor_opt is None
+            or not planner_opt.reasoning_efforts
+            or not executor_opt.reasoning_efforts
+        ):
+            enriched.append(option)
+            continue
+        default_executor = (
+            executor_opt.default_reasoning_effort
+            if executor_opt.default_reasoning_effort in executor_opt.reasoning_efforts
+            else executor_opt.reasoning_efforts[0]
+        )
+        variants: list[ACPModelSelectionVariant] = [
+            ACPModelSelectionVariant(
+                name=option.name,
+                model=option.name,
+                profile=AGY_ORCHESTRATOR_DEFAULT_PROFILE,
+                effort=None,
+                is_default=True,
+            )
+        ]
+        for planner_effort in planner_opt.reasoning_efforts:
+            for executor_effort in executor_opt.reasoning_efforts:
+                variants.append(
+                    ACPModelSelectionVariant(
+                        name=compose_agy_orchestrator_selection(
+                            option.name,
+                            planner_effort,
+                            executor_effort,
+                        ),
+                        model=option.name,
+                        profile=planner_effort,
+                        effort=executor_effort,
+                        is_default=(executor_effort == default_executor),
+                    )
+                )
+        enriched.append(
+            dataclasses.replace(
+                option,
+                selection_variants=tuple(variants),
+                reasoning_efforts=planner_opt.reasoning_efforts,
+                default_reasoning_effort=executor_opt.default_reasoning_effort,
+            )
+        )
+    return enriched
 
 
 async def discover_agy_model_options(
@@ -718,7 +832,7 @@ async def discover_agy_model_options(
         current_model,
         value_field="value",
     )
-    return await _discover_effort_matrix_options(
+    discovered = await _discover_effort_matrix_options(
         connection,
         response,
         config_id=AGY_MODEL_CONFIG_ID,
@@ -728,6 +842,10 @@ async def discover_agy_model_options(
         capability_fn=_agy_thought_level_capability,
         compose_fn=compose_agy_model_selection,
     )
+    _register_agy_available_model_labels(response, discovered)
+    if _is_agy_enterprise_tier(response):
+        return discovered
+    return _enrich_agy_orchestrator_options(discovered)
 
 
 async def _probe_acp_models(
