@@ -7,9 +7,11 @@ import threading
 import time
 from typing import Callable, Optional
 
+from ..acp.agy_selection import requires_agy_cli_orchestrator_session
 from ..acp.providers import normalize_acp_model_name
 from ..config import get_settings
 from ..utils.errors import get_error_detail
+from .agy_cli import SyncAGYCLISession
 from .backend_resolver import (
     cli_command_for_agent,
     is_cli_backend,
@@ -72,10 +74,18 @@ def _start_base_session(
     startup_log_failures: bool | None = None,
 ) -> SyncSession:
     """Start exactly one CLI or ACP transport with shared startup arguments."""
+    if agent_type == "agy" and requires_agy_cli_orchestrator_session(model_name):
+        session: SyncSession = SyncAGYCLISession(
+            cwd=cwd,
+            model_name=model_name,
+        )
+        session.start()
+        return session
+
     if is_cli_backend(agent_type):
         command = cli_command_for_agent(agent_type)
         if is_codex_cli_backend(agent_type):
-            session: SyncSession = SyncCodexCLISession(
+            session = SyncCodexCLISession(
                 cwd=cwd,
                 model_name=model_name,
                 config=CodexCLIConfig(command=command),

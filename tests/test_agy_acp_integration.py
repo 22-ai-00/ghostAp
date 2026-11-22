@@ -194,6 +194,7 @@ def test_agy_model_discovery_expands_per_model_thought_levels_and_omits_unsuppor
                     option("gemini-4-carbon", "Gemini 4 Carbon"),
                     option("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
                     option("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+                    option("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
                 ],
             )
         ]
@@ -209,6 +210,12 @@ def test_agy_model_discovery_expands_per_model_thought_levels_and_omits_unsuppor
         return SimpleNamespace(
             session_id="session-agy",
             config_options=config_options,
+            models=SimpleNamespace(
+                available_models=[
+                    SimpleNamespace(model_id="gemini-4-carbon-high", name="Gemini 4 Carbon (High)"),
+                    SimpleNamespace(model_id="gemini-4-hydrogen-xhigh", name="Gemini 4 Hydrogen (XHigh)"),
+                ]
+            ),
         )
 
     initial = response("gemini-4-carbon", "medium", ("low", "medium", "high"))
@@ -230,6 +237,7 @@ def test_agy_model_discovery_expands_per_model_thought_levels_and_omits_unsuppor
         "gemini-4-carbon",
         "gemini-4-hydrogen",
         "gemini-pro-orchestrator",
+        "gpt-oss-120b-medium",
     ]
     assert [variant.name for variant in models[0].selection_variants] == [
         "gemini-4-carbon/low",
@@ -242,23 +250,43 @@ def test_agy_model_discovery_expands_per_model_thought_levels_and_omits_unsuppor
         "gemini-4-hydrogen/high",
         "gemini-4-hydrogen/xhigh",
     ]
-    assert [variant.name for variant in models[2].selection_variants] == [
-        "gemini-pro-orchestrator",
-    ]
+    # Orchestrator exposes `default` (native ACP) plus Planner x Executor combinations
+    assert models[2].selection_variants[0].name == "gemini-pro-orchestrator"
+    assert models[2].selection_variants[0].profile == "default"
+    assert models[2].selection_variants[0].effort is None
+    assert len(models[2].selection_variants) == 1 + (3 * 4)
+    assert "gemini-pro-orchestrator/high/xhigh" in [v.name for v in models[2].selection_variants]
+    # Non-orchestrator fixed model continues to omit efforts.
+    assert [variant.name for variant in models[3].selection_variants] == ["gpt-oss-120b-medium"]
+    assert models[3].reasoning_efforts == ()
     assert models[0].is_default is True
     assert connection.calls == [
         ("model", "session-agy", "gemini-4-hydrogen"),
         ("model", "session-agy", "gemini-pro-orchestrator"),
+        ("model", "session-agy", "gpt-oss-120b-medium"),
     ]
 
     hydrogen_state = resolve_model_cascade(models, selected_model="gemini-4-hydrogen", selected_effort="xhigh")
     assert hydrogen_state.efforts == ("low", "medium", "high", "xhigh")
     assert hydrogen_state.selection == "gemini-4-hydrogen/xhigh"
 
-    orchestrator_state = resolve_model_cascade(models, selected_model="gemini-pro-orchestrator")
-    assert orchestrator_state.efforts == ()
-    assert orchestrator_state.selected_effort is None
-    assert orchestrator_state.selection == "gemini-pro-orchestrator"
+    orchestrator_default = resolve_model_cascade(models, selected_model="gemini-pro-orchestrator")
+    assert orchestrator_default.profiles == ("default", "low", "medium", "high")
+    assert orchestrator_default.selected_profile == "default"
+    assert orchestrator_default.efforts == ()
+    assert orchestrator_default.selected_effort is None
+    assert orchestrator_default.selection == "gemini-pro-orchestrator"
+
+    orchestrator_custom = resolve_model_cascade(
+        models,
+        selected_model="gemini-pro-orchestrator",
+        selected_profile="high",
+        selected_effort="xhigh",
+    )
+    assert orchestrator_custom.selected_profile == "high"
+    assert orchestrator_custom.efforts == ("low", "medium", "high", "xhigh")
+    assert orchestrator_custom.selected_effort == "xhigh"
+    assert orchestrator_custom.selection == "gemini-pro-orchestrator/high/xhigh"
 
 
 def test_agy_runtime_selection_applies_model_and_thought_level_and_fails_closed() -> None:
@@ -983,3 +1011,501 @@ def test_agy_grouped_select_options_flatten_and_never_backfill_unknown_efforts()
     assert models[1].default_reasoning_effort is None
     assert [v.name for v in models[1].selection_variants] == ["gemini-pro-orchestrator"]
     assert models[1].selection_variants[0].effort is None
+
+
+def test_agy_orchestrator_discovery_respects_enterprise_and_native_acp_precedence() -> None:
+    def option(value: str, name: str) -> SimpleNamespace:
+        return SimpleNamespace(value=value, name=name, description=None)
+
+    def make_response(
+        current_model: str,
+        efforts: tuple[str, ...],
+        *,
+        tier: dict | None = None,
+    ) -> SimpleNamespace:
+        config_options = [
+            SimpleNamespace(
+                id="model",
+                category="model",
+                current_value=current_model,
+                options=[
+                    option("gemini-4-neon", "Gemini 4 Neon"),
+                    option("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+                    option("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
+                ],
+            )
+        ]
+        if efforts:
+            config_options.append(
+                SimpleNamespace(
+                    id="thought_level",
+                    category="thought_level",
+                    current_value="medium",
+                    options=[option(effort, effort.title()) for effort in efforts],
+                )
+            )
+        return SimpleNamespace(
+            session_id="sess-agy-tier",
+            config_options=config_options,
+            field_meta={"antigravity": {"tier": tier}} if tier else None,
+        )
+
+    class Connection:
+        def __init__(self, *, orch_native_efforts: tuple[str, ...] = (), tier: dict | None = None) -> None:
+            self.orch_native_efforts = orch_native_efforts
+            self.tier = tier
+
+        async def set_config_option(self, *, config_id: str, session_id: str, value: str):
+            del config_id, session_id
+            if value in {"gemini-4-neon", "gemini-4-hydrogen"}:
+                return make_response(value, ("low", "medium", "high", "xhigh"), tier=self.tier)
+            return make_response(value, self.orch_native_efforts, tier=self.tier)
+
+    # Enterprise tier suppresses Orchestrator CLI custom-effort synthesis.
+    enterprise_initial = make_response(
+        "gemini-4-neon",
+        ("low", "medium", "high", "xhigh"),
+        tier={"id": "g1-enterprise-tier", "name": "Enterprise"},
+    )
+    enterprise_models = asyncio.run(
+        helper_mod.discover_agy_model_options(
+            Connection(tier={"id": "g1-enterprise-tier", "name": "Enterprise"}),
+            enterprise_initial,
+        )
+    )
+    assert [v.name for v in enterprise_models[2].selection_variants] == [
+        "gemini-pro-orchestrator-neon"
+    ]
+
+    # Native ACP thought_level on Orchestrator (if exposed by future agy acp) takes precedence.
+    native_initial = make_response("gemini-4-neon", ("low", "medium", "high", "xhigh"))
+    native_models = asyncio.run(
+        helper_mod.discover_agy_model_options(
+            Connection(orch_native_efforts=("low", "high")),
+            native_initial,
+        )
+    )
+    assert [v.name for v in native_models[2].selection_variants] == [
+        "gemini-pro-orchestrator-neon/low",
+        "gemini-pro-orchestrator-neon/high",
+    ]
+
+
+def test_agy_orchestrator_selection_settings_and_slug_normalization() -> None:
+    from src.acp.agy_selection import (
+        compose_agy_orchestrator_selection,
+        normalize_agy_model_input,
+        parse_agy_model_selection,
+        requires_agy_cli_orchestrator_session,
+        resolve_agy_orchestrator_settings,
+    )
+
+    assert compose_agy_orchestrator_selection("gemini-pro-orchestrator-neon", "default") == (
+        "gemini-pro-orchestrator-neon"
+    )
+    assert compose_agy_orchestrator_selection("gemini-pro-orchestrator-neon", "xhigh", "low") == (
+        "gemini-pro-orchestrator-neon/xhigh/low"
+    )
+    assert compose_agy_orchestrator_selection("gemini-pro-orchestrator-neon", "high") == (
+        "gemini-pro-orchestrator-neon/high/high"
+    )
+
+    parsed = parse_agy_model_selection("gemini-pro-orchestrator-neon/xhigh/low")
+    assert (parsed.model_id, parsed.planner_effort, parsed.executor_effort) == (
+        "gemini-pro-orchestrator-neon",
+        "xhigh",
+        "low",
+    )
+
+    assert requires_agy_cli_orchestrator_session("gemini-pro-orchestrator-neon/xhigh/low") is True
+    assert requires_agy_cli_orchestrator_session("gemini-pro-orchestrator-neon") is False
+    assert requires_agy_cli_orchestrator_session("gemini-4-neon/xhigh") is False
+    assert requires_agy_cli_orchestrator_session(None) is False
+
+    base_model, settings_payload = resolve_agy_orchestrator_settings(
+        "gemini-pro-orchestrator-neon/xhigh/low"
+    )
+    assert base_model == "gemini-pro-orchestrator-neon"
+    assert settings_payload == {
+        "orchestrator": {
+            "planner": "Gemini 4 Neon (XHigh)",
+            "executor": "Gemini 4 Hydrogen (Low)",
+        }
+    }
+
+    with pytest.raises(ValueError, match="invalid AGY model selection"):
+        split_agy_model_selection("gemini-pro-orchestrator/high/low")
+    with pytest.raises(ValueError, match="CLI settings"):
+        split_agy_model_selection("gemini-pro-orchestrator/high")
+
+    wrapper = SyncACPSession("agy", "/tmp", agent_cmd="agy", agent_args=["acp"])
+    wrapper._acp_session = SimpleNamespace(set_config_option=MagicMock())  # type: ignore[assignment]
+    assert asyncio.run(
+        wrapper._apply_agy_selection("gemini-pro-orchestrator/high/low")  # type: ignore[attr-defined]
+    ) is False
+
+    known = [
+        "gemini-4-neon/xhigh",
+        "claude-opus-5-5/high",
+        "gemini-pro-orchestrator-neon",
+        "gemini-pro-orchestrator-neon/xhigh/medium",
+        "gemini-pro-orchestrator-neon/xhigh/xhigh",
+    ]
+    assert normalize_agy_model_input("gemini-4-neon-xhigh", known) == "gemini-4-neon/xhigh"
+    assert normalize_agy_model_input("claude-opus-5-5-high", known) == "claude-opus-5-5/high"
+    assert (
+        normalize_agy_model_input("gemini-pro-orchestrator-neon/xhigh", known)
+        == "gemini-pro-orchestrator-neon/xhigh/xhigh"
+    )
+    assert (
+        normalize_agy_model_input("gemini-pro-orchestrator-neon-xhigh", known)
+        == "gemini-pro-orchestrator-neon/xhigh/xhigh"
+    )
+
+
+def test_sync_agy_cli_session_args_stream_json_and_set_model(tmp_path: Path) -> None:
+    from src.agent_session.agy_cli import SyncAGYCLISession
+
+    session = SyncAGYCLISession(
+        cwd=str(tmp_path),
+        model_name="gemini-pro-orchestrator-neon/xhigh/low",
+    )
+    turn1_args = session._build_args("- refactor this", resumed=False)
+    assert turn1_args[0] == "agy"
+    assert turn1_args[1].startswith("--prompt=- refactor this")
+    assert "--output-format" in turn1_args and "stream-json" in turn1_args
+    assert "--dangerously-skip-permissions" in turn1_args
+    assert turn1_args[turn1_args.index("--model") + 1] == "gemini-pro-orchestrator-neon"
+    settings_json = json.loads(turn1_args[turn1_args.index("--settings") + 1])
+    assert settings_json == {
+        "showThinking": True,
+        "orchestrator": {
+            "planner": "Gemini 4 Neon (XHigh)",
+            "executor": "Gemini 4 Hydrogen (Low)",
+        },
+    }
+    assert "--conversation" not in turn1_args
+
+    # Consume realistic agy 1.5.14 stream-json events
+    events: list[ACPEvent] = []
+    chunks: list[str] = []
+    lines = [
+        json.dumps({"event": "init", "conversation_id": "conv-agy-123", "init": {}}),
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-agy-123",
+                    "step_index": 1,
+                    "state": "ACTIVE",
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {"name": "run_command", "parameters": {"CommandLine": "ls"}},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-agy-123",
+                    "step_index": 1,
+                    "state": "DONE",
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {"name": "run_command", "output": "ok\n"},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-agy-123",
+                    "step_index": 2,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "Final ",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-agy-123",
+                    "step_index": 2,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "Answer",
+                    "usage": {"total_tokens": 321},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv-agy-123",
+                    "status": "SUCCESS",
+                    "response": "Final Answer",
+                    "usage": {"total_tokens": 321},
+                },
+            }
+        ),
+    ]
+    for line in lines:
+        assert session._consume_stdout_line(line, chunks, events.append) == ""
+
+    result = session._handle_process_exit(
+        rc=0,
+        out="".join(chunks),
+        err="",
+        state="ok",
+        backend_error="",
+        on_event=events.append,
+    )
+    assert session.session_id == "conv-agy-123"
+    assert result.stop_reason == "end_turn"
+    assert result.terminal_text == "Final Answer"
+    assert result.usage is not None and result.usage.used == 321
+    assert [ev.event_type for ev in events] == [
+        ACPEventType.TOOL_CALL_START,
+        ACPEventType.TOOL_CALL_DONE,
+        ACPEventType.TEXT_CHUNK,
+        ACPEventType.TEXT_CHUNK,
+    ]
+    assert session.supports_background_tool_continuation is False
+    assert session.to_snapshot()["agent_type"] == "agy"
+
+    # Switching between Orchestrator custom-effort presets updates in-place & resumes conversation.
+    assert session.set_model("gemini-pro-orchestrator-neon/low/xhigh") is True
+    turn2_args = session._build_args("next step", resumed=True)
+    assert turn2_args[turn2_args.index("--conversation") + 1] == "conv-agy-123"
+    turn2_settings = json.loads(turn2_args[turn2_args.index("--settings") + 1])
+    assert turn2_settings["orchestrator"] == {
+        "planner": "Gemini 4 Neon (Low)",
+        "executor": "Gemini 4 Hydrogen (XHigh)",
+    }
+
+    # Switching back to regular ACP or bare preset asks caller to replace transport.
+    assert session.set_model("gemini-4-neon/xhigh") is False
+    assert session.set_model("gemini-pro-orchestrator-neon") is False
+
+
+def test_agy_hybrid_transport_dispatch_card_labels_and_commands(tmp_path: Path) -> None:
+    from src.acp.manager import ACPSessionManager
+    from src.acp.options import ACPModelOption, ACPModelSelectionVariant
+    from src.acp.startup_utils import AcpRetryStarter, StartupBackend, select_startup_backend
+    from src.agent_session.agy_cli import SyncAGYCLISession
+    from src.agent_session.factory import create_engine_session
+    from src.card.builders.system import SystemBuilder
+    from src.feishu.handlers.system import SystemHandler
+    from src.feishu.product_catalog import resolve_command
+
+    assert select_startup_backend("agy") == StartupBackend.ACP
+    assert select_startup_backend("agy", model_name="gemini-4-neon/xhigh") == StartupBackend.ACP
+    assert select_startup_backend("agy", model_name="gemini-pro-orchestrator-neon") == StartupBackend.ACP
+    assert (
+        select_startup_backend("agy", model_name="gemini-pro-orchestrator-neon/xhigh/low")
+        == StartupBackend.CLI
+    )
+
+    with patch("src.agent_session.agy_cli.SyncAGYCLISession") as cli_cls:
+        AcpRetryStarter._build_session(
+            backend=StartupBackend.CLI,
+            agent_type="agy",
+            cwd=str(tmp_path),
+            model_name="gemini-pro-orchestrator-neon/xhigh/low",
+            acp_session_cls=MagicMock(),
+            cli_session_cls=MagicMock(),
+        )
+    cli_cls.assert_called_once_with(
+        cwd=str(tmp_path),
+        model_name="gemini-pro-orchestrator-neon/xhigh/low",
+    )
+
+    settings = MagicMock(rate_limit_retry_enabled=False, acp_startup_timeout=20)
+    with (
+        patch("src.agent_session.factory.get_settings", return_value=settings),
+        patch("src.agent_session.factory.SyncAGYCLISession") as factory_cli_cls,
+    ):
+        create_engine_session(
+            "agy",
+            str(tmp_path),
+            model_name="gemini-pro-orchestrator-neon/xhigh/low",
+        )
+    factory_cli_cls.assert_called_once_with(
+        cwd=str(tmp_path),
+        model_name="gemini-pro-orchestrator-neon/xhigh/low",
+    )
+
+    # Manager ensure_session replaces existing session across ACP <-> AGY CLI transport boundary.
+    mgr = ACPSessionManager("agy")
+    cli_live = SyncAGYCLISession(
+        cwd=str(tmp_path),
+        model_name="gemini-pro-orchestrator-neon/xhigh/low",
+    )
+    cli_live.session_id = "conv-old"
+    acp_new = MagicMock(session_id="acp-new", _model_name="gemini-4-neon/xhigh")
+    mgr._sessions[mgr._session_key("chat-1", "proj-1")] = cli_live  # type: ignore[assignment]
+    with patch.object(mgr, "_create_session", return_value=acp_new) as create_mock:
+        returned = mgr.ensure_session(
+            "chat-1",
+            cwd=str(tmp_path),
+            project_id="proj-1",
+            model_name="gemini-4-neon/xhigh",
+        )
+    assert returned is acp_new
+    create_mock.assert_called_once()
+
+    # Model card labels show Planner Effort / Executor Effort only for AGY Orchestrator.
+    orch_option = ACPModelOption(
+        name="gemini-pro-orchestrator-neon",
+        description="Orchestrator (Neon)",
+        selection_variants=(
+            ACPModelSelectionVariant(
+                name="gemini-pro-orchestrator-neon",
+                model="gemini-pro-orchestrator-neon",
+                profile="default",
+                is_default=True,
+            ),
+            ACPModelSelectionVariant(
+                name="gemini-pro-orchestrator-neon/xhigh/low",
+                model="gemini-pro-orchestrator-neon",
+                profile="xhigh",
+                effort="low",
+            ),
+        ),
+        reasoning_efforts=("low", "medium", "high", "xhigh"),
+        default_reasoning_effort="high",
+    )
+    reg_option = ACPModelOption(
+        name="gemini-4-neon",
+        description="Gemini 4 Neon",
+        selection_variants=(
+            ACPModelSelectionVariant(
+                name="gemini-4-neon/xhigh",
+                model="gemini-4-neon",
+                effort="xhigh",
+                is_default=True,
+            ),
+        ),
+        reasoning_efforts=("xhigh",),
+        default_reasoning_effort="xhigh",
+    )
+    _t, orch_card_json = SystemBuilder.build_acp_model_cascade_card(
+        [orch_option, reg_option],
+        "agy",
+        project_id="proj-1",
+        pending_group="gemini-pro-orchestrator-neon",
+        pending_profile="xhigh",
+        pending_effort="low",
+    )
+    assert "**Planner Effort**" in orch_card_json
+    assert "**Executor Effort**" in orch_card_json
+
+    _t, reg_card_json = SystemBuilder.build_acp_model_cascade_card(
+        [orch_option, reg_option],
+        "agy",
+        project_id="proj-1",
+        pending_group="gemini-4-neon",
+        pending_effort="xhigh",
+    )
+    assert "**Planner Effort**" not in reg_card_json
+    assert "**Effort**" in reg_card_json
+
+    # /effort catalog registration + /effort and /model command handling + cross-transport activation.
+    assert resolve_command("/effort") is not None
+
+    project = ProjectContext("proj-1", "Project 1", str(tmp_path))
+    project.acp_tool_name = "agy"
+    project.acp_model_name = "gemini-pro-orchestrator-neon"
+
+    committed: list[tuple[str, str | None]] = []
+    project_mgr = MagicMock()
+    project_mgr.get_active_project.return_value = project
+    def _commit(proj, *, tool_name: str, model_name: str | None) -> bool:
+        proj.acp_tool_name = tool_name
+        proj.acp_model_name = model_name
+        committed.append((tool_name, model_name))
+        return True
+    project_mgr.commit_acp_configuration.side_effect = _commit
+
+    agy_handler = MagicMock()
+    agy_handler.current_model = project.acp_model_name
+    agy_session_mgr = MagicMock()
+    live_acp = SimpleNamespace(session_id="acp-1", _model_name="gemini-pro-orchestrator-neon", set_model=MagicMock(return_value=False))
+    replaced_cli = SimpleNamespace(session_id="cli-1", _model_name="gemini-pro-orchestrator-neon/xhigh/low")
+    agy_session_mgr.get_session.return_value = live_acp
+    agy_session_mgr.replace_session.return_value = SimpleNamespace(session=replaced_cli, created=True)
+    agy_handler._get_session_manager.return_value = agy_session_mgr
+    agy_handler._get_agent_type_override.return_value = None
+
+    ctx = MagicMock(
+        settings=SimpleNamespace(acp_startup_timeout=20),
+        mode_manager=ModeManager(),
+        project_manager=project_mgr,
+        working_dir=str(tmp_path),
+        handlers={"agy": agy_handler},
+        scheduler=MagicMock(),
+    )
+    ctx.get_handler.side_effect = lambda name: ctx.handlers.get(name)
+    system = SystemHandler(ctx)
+    replies: list[tuple[str, str]] = []
+    errors: list[tuple[str, str]] = []
+    system.reply_text = lambda mid, body, **_kw: replies.append((mid, body))  # type: ignore[method-assign]
+    system.reply_error = lambda mid, body, **_kw: errors.append((mid, body))  # type: ignore[method-assign]
+    system._fetch_acp_models = lambda tool, **_kw: [orch_option, reg_option]  # type: ignore[method-assign]
+
+    from src.feishu.slash_command_parser import SlashCommandParser
+
+    effort_match = SlashCommandParser.parse("/effort xhigh low")
+    assert SystemHandler.is_ghostap_control_command(effort_match, in_programming_mode=True) is True
+    assert SystemHandler.is_fast_lane_system_command("/effort xhigh low", in_programming_mode=True) is True
+
+    # Query current /effort on Orchestrator
+    system.handle_effort_command("m1", "chat-1", "/effort", project=project)
+    assert "Orchestrator Effort" in replies[-1][1]
+
+    # Set dual Planner + Executor effort
+    system.handle_effort_command("m2", "chat-1", "/effort xhigh low", project=project)
+    assert committed[-1] == ("agy", "gemini-pro-orchestrator-neon/xhigh/low")
+    agy_session_mgr.retire_session.assert_called_once_with("chat-1", project_id="proj-1")
+
+    # Reset back to Orchestrator default
+    system.handle_effort_command("m3", "chat-1", "/effort default", project=project)
+    assert committed[-1] == ("agy", "gemini-pro-orchestrator-neon")
+
+    # Reject bogus effort
+    system.handle_effort_command("m4", "chat-1", "/effort bogus", project=project)
+    assert "bogus" in errors[-1][1]
+
+    # /model accepts hyphenated slug and normalizes
+    system.handle_model_command("m5", "chat-1", "/model gemini-4-neon-xhigh", project=project)
+    assert committed[-1] == ("agy", "gemini-4-neon/xhigh")
+
+    # _enter_mode_with_acp_model replaces live ACP session when targeting CLI Orchestrator
+    effect = system._enter_mode_with_acp_model(
+        "m6",
+        "chat-1",
+        "agy",
+        "gemini-pro-orchestrator-neon/xhigh/low",
+        project,
+    )
+    assert effect is not None
+    assert effect.session is replaced_cli  # type: ignore[union-attr]
+    agy_handler.switch_model.assert_not_called()
+    agy_session_mgr.replace_session.assert_called_once()
+
+    # Same-transport switch remains fail-closed when switch_model returns False.
+    agy_handler.switch_model.return_value = False
+    same_transport_effect = system._enter_mode_with_acp_model(
+        "m7",
+        "chat-1",
+        "agy",
+        "gemini-4-neon/xhigh",
+        project,
+    )
+    assert same_transport_effect is None
+    agy_handler.switch_model.assert_called_once()

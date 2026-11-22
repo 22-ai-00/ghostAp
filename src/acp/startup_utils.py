@@ -69,10 +69,20 @@ class SessionStartupResult:
     model_name: Optional[str] = None
 
 
-def select_startup_backend(agent_type: str) -> StartupBackend:
+def select_startup_backend(
+    agent_type: str,
+    *,
+    model_name: Optional[str] = None,
+) -> StartupBackend:
+    from ..acp.agy_selection import requires_agy_cli_orchestrator_session
     from ..agent_session.backend_resolver import is_cli_backend
 
-    return StartupBackend.CLI if is_cli_backend(agent_type) else StartupBackend.ACP
+    normalized = (agent_type or "").lower().strip()
+    if is_cli_backend(normalized):
+        return StartupBackend.CLI
+    if normalized == "agy" and requires_agy_cli_orchestrator_session(model_name):
+        return StartupBackend.CLI
+    return StartupBackend.ACP
 
 
 def normalize_startup_cwd(cwd: str, *, normalize_fn: Callable[[str], str | None]) -> str:
@@ -84,8 +94,18 @@ def normalize_startup_cwd(cwd: str, *, normalize_fn: Callable[[str], str | None]
         return raw_cwd
 
 
-def build_retry_plan(agent_type: str, *, retries: int, startup_timeout: float) -> RetryPlan:
-    attempts = 1 if select_startup_backend(agent_type) == StartupBackend.CLI else max(1, int(retries or 1))
+def build_retry_plan(
+    agent_type: str,
+    *,
+    retries: int,
+    startup_timeout: float,
+    model_name: Optional[str] = None,
+) -> RetryPlan:
+    attempts = (
+        1
+        if select_startup_backend(agent_type, model_name=model_name) == StartupBackend.CLI
+        else max(1, int(retries or 1))
+    )
     return RetryPlan(attempts=attempts, startup_timeout=float(startup_timeout or 60))
 
 
@@ -113,6 +133,13 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
+            if (agent_type or "").lower().strip() == "agy":
+                from ..agent_session.agy_cli import SyncAGYCLISession
+
+                return SyncAGYCLISession(
+                    cwd=cwd or ".",
+                    model_name=model_name,
+                )
             from ..agent_session.backend_resolver import cli_command_for_agent, is_codex_cli_backend
 
             command = cli_command_for_agent(agent_type)
@@ -205,7 +232,10 @@ class SessionStartupCoordinator:
         remaining: float,
     ) -> tuple[Any, str, dict[str, Any] | None] | None:
         agent_type = request.effective_agent_type
-        if not callable(self._session_starter) or select_startup_backend(agent_type) != StartupBackend.ACP:
+        if (
+            not callable(self._session_starter)
+            or select_startup_backend(agent_type, model_name=request.model_name) != StartupBackend.ACP
+        ):
             return None
         try:
             return self._session_starter(
@@ -363,11 +393,12 @@ class SessionStartupCoordinator:
             raise TimeoutError("ACP startup deadline exhausted")
 
         agent_type = request.effective_agent_type
-        backend = select_startup_backend(agent_type)
+        backend = select_startup_backend(agent_type, model_name=request.model_name)
         retry_plan = build_retry_plan(
             agent_type,
             retries=int(request.retries or 1),
             startup_timeout=float(request.startup_timeout or 60),
+            model_name=request.model_name,
         )
 
         injected = self._try_injected_starter(request=request, retries=retry_plan.attempts, remaining=remaining)

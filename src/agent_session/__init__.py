@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .agy_cli import SyncAGYCLISession
     from .backend_resolver import (
         agent_type_for_cli_command,
         cli_command_for_agent,
@@ -50,6 +51,11 @@ def __getattr__(name: str):
 
         globals()["SyncClaudeCLISession"] = SyncClaudeCLISession
         return SyncClaudeCLISession
+    if name == "SyncAGYCLISession":
+        from .agy_cli import SyncAGYCLISession
+
+        globals()["SyncAGYCLISession"] = SyncAGYCLISession
+        return SyncAGYCLISession
     if name in _FACTORY_EXPORTS:
         from . import factory as _factory
 
@@ -65,7 +71,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "SyncSession", "SyncClaudeCLISession", "EphemeralReviewSession",
+    "SyncSession", "SyncClaudeCLISession", "SyncAGYCLISession", "EphemeralReviewSession",
     "create_engine_session", "create_auxiliary_session", "close_session_safely",
     "is_cli_backend", "resolve_cwd", "cli_command_for_agent",
     "agent_type_for_cli_command",

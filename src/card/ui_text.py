@@ -137,6 +137,10 @@ UI_TEXT = {
     "system_acp_model_group_placeholder": "选择模型",
     "system_acp_model_profile_placeholder": "选择 Profile",
     "system_acp_model_effort_placeholder": "选择 Effort",
+    "system_acp_agy_orchestrator_planner_effort_label": "**Planner Effort**",
+    "system_acp_agy_orchestrator_planner_effort_placeholder": "选择 Planner Effort",
+    "system_acp_agy_orchestrator_executor_effort_label": "**Executor Effort**",
+    "system_acp_agy_orchestrator_executor_effort_placeholder": "选择 Executor Effort",
     "system_acp_default_model_option": "默认模型（推荐）",
     "system_acp_confirm_model": "确认此模型：{model}",
     "system_acp_refresh_models": "刷新模型",
@@ -163,6 +167,12 @@ UI_TEXT = {
     "system_acp_config_saved": "ACP 配置已保存：`{tool}` / `{model}`。后续任务将自动采用。",
     "system_model_config_summary": "**模型配置** · `{tool}`\n当前模型：`{current}`\n可用模型：{available}\n用法：`/model <model>` 或 `/model default`",
     "system_model_config_saved": "模型配置已保存：`{tool}` / `{model}`。后续任务将自动采用。",
+    "system_effort_config_summary": "**Effort 配置** · `{tool}` / `{model}`\n当前档位：`{current}`\n可用档位：{available}\n用法：`/effort <level>` 或 `/effort default`",
+    "system_effort_orch_config_summary": "**Orchestrator Effort 配置** · `{tool}` / `{model}`\n当前 Planner Effort：`{planner}`\n当前 Executor Effort：`{executor}`\n可用 Planner 档位：{planner_available}\n可用 Executor 档位：{executor_available}\n用法：`/effort <level>`（同时设置）、`/effort <planner> <executor>` 或 `/effort default`",
+    "system_effort_config_saved": "Effort 配置已保存：`{tool}` / `{model}`。后续任务将自动采用。",
+    "system_effort_unsupported": "当前模型 `{model}` 未提供可调整的 Effort `{effort}`。可用选项：{available}",
+    "system_effort_no_adjustable": "当前工具 `{tool}` 的模型 `{model}` 不支持 Effort 调节。",
+    "system_effort_usage_pair_only_orch": "当前模型 `{model}` 不支持双档位格式，请使用 `/effort <level>` 或 `/effort default`。",
     "system_acp_config_save_failed": "ACP 配置保存失败，原配置保持不变。",
     "system_acp_unknown_model": "当前工具未报告模型 `{model}`。请发送 `/model` 查看可用值。",
     "system_acp_native_cmds_btn": "原生命令 /cmds",
@@ -212,7 +222,7 @@ UI_TEXT = {
         "`/coco` · `/claude` · `/aiden` · `/codex` · `/gemini` · `/traex` · `/grok` · `/dsh` · `/agy` · 进入对应编程模式\n"
         "`/<工具> <需求>` · 单句直达对应工具执行任务（如 `/agy /swarm 修复测试`）\n"
         "`/cmds [工具]` · 查看工具原生 `/` 命令与 Skills（如 `/swarm`、`/review`、`/compact`）\n"
-        "`/model [模型|list|default]` · `/acp [工具]` · 查看或热切换工具与模型\n"
+        "`/model [模型|list|default]` · `/effort [档位]` · `/acp [工具]` · 查看或热切换工具与模型/Effort\n"
         "`/stop` · 立即停止当前任务（保持模式）  ·  `/clear` · 清空上下文（保留工具与模型）\n"
         "`/sh <命令>` · 直接执行 Shell  ·  `/ask <工具> <问题>` · 零副作用旁路咨询\n"
         "`/info` · `/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/gemini_info` · `/traex_info` · `/grok_info` · `/dsh_info` · `/agy_info` · 会话详情\n"
