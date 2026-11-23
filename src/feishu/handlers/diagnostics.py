@@ -268,7 +268,11 @@ class DiagnosticsHandler(BaseHandler):
             mode_key = ""
 
         tool_name = mode_key or (getattr(project, "acp_tool_name", None) if project else "") or ""
-        model_name = (getattr(project, "acp_model_name", None) if project else None) or ""
+        model_name = (
+            (getattr(project, "acp_model_name", None) or "")
+            if project and tool_name and getattr(project, "acp_tool_name", None) == tool_name
+            else ""
+        )
         session_id = ""
         message_count = None
         usage_text = ""

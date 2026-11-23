@@ -665,6 +665,7 @@ class ProgrammingExecutionMixin:
                 return
             renderer.process_event(event)
 
+        result = None
         final_response = ""
         prompt_outcome = PromptOutcome.INCOMPLETE
         prompt_stop_reason = "exception"
@@ -772,7 +773,10 @@ class ProgrammingExecutionMixin:
                 startup_timeout=resume_timeout,
                 project_id=project_id,
                 agent_type_override=self._get_agent_type_override(project),
-                model_name=self._get_model_name_override(project),
+                model_name=self._session_bound_model_name(
+                    _retired_session,
+                    self._get_model_name_override(project),
+                ),
                 thread_id=thread_id,
             )
             active_session[0] = resumed
