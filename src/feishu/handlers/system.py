@@ -1099,7 +1099,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
                 self.project_manager.persist_project_context(target_project)
             elif callable(getattr(self.project_manager, "save_projects", None)):
                 self.project_manager.save_projects()
-        saved_model = getattr(target_project, "acp_model_name", None) if target_project else None
+        saved_model = (
+            getattr(target_project, "acp_model_name", None)
+            if target_project and getattr(target_project, "acp_tool_name", None) == target_tool
+            else None
+        )
         self.reply_text(
             message_id,
             UI_TEXT["system_clear_done"].format(tool=target_tool, model=saved_model or "default"),

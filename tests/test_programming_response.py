@@ -2304,3 +2304,185 @@ def test_execute_programming_response_tier1_locked_conclusion_outranks_prompt_re
         assert final_block2 == "已捕获终答"
     finally:
         prog_session2.abort()
+
+
+def test_cross_tool_enter_mode_clears_stale_model_and_preserves_same_tool(tmp_path) -> None:
+    from src.feishu.handlers.programming import TraexModeHandler
+    from src.mode import ModeManager
+    from src.project.context import ProjectContext
+
+    project = ProjectContext("proj-cross", "Cross", str(tmp_path))
+    project.set_programming_mode("agy", True, session_id="agy-s1", query_count=1)
+    project.acp_tool_name = "agy"
+    project.acp_model_name = "gemini-pro-orchestrator"
+
+    traex_session = MagicMock()
+    traex_session.session_id = "traex-s1"
+    traex_mgr = MagicMock()
+    traex_mgr.get_session.return_value = None
+    traex_mgr.ensure_session.return_value = traex_session
+
+    ctx = MagicMock()
+    ctx.settings = MagicMock(acp_startup_timeout=20)
+    ctx.mode_manager = ModeManager()
+    ctx.project_manager = MagicMock()
+    ctx.project_manager.validate_project_path.return_value = (True, "")
+    ctx.traex_manager = traex_mgr
+
+    traex_handler = TraexModeHandler(ctx)
+    traex_handler.reply_text = MagicMock()
+    traex_handler.reply_card = MagicMock(return_value="card-msg-1")
+    traex_handler.add_reaction = MagicMock()
+    traex_handler.register_message_project = MagicMock()
+    traex_handler.record_mode_transition = MagicMock()
+    traex_handler._exit_other_programming_modes = MagicMock()
+
+    assert traex_handler.enter_mode("m1", "chat-cross", project=project, silent=True) is True
+    assert project.acp_tool_name == "traex"
+    assert project.acp_model_name is None
+    assert traex_mgr.ensure_session.call_args.kwargs["model_name"] is None
+
+    # Re-entering the same tool without model_override keeps its own saved model.
+    project.acp_model_name = "c_o_new/standard/high"
+    assert traex_handler.enter_mode("m2", "chat-cross", project=project, silent=True) is True
+    assert project.acp_tool_name == "traex"
+    assert project.acp_model_name == "c_o_new/standard/high"
+    assert traex_mgr.ensure_session.call_args.kwargs["model_name"] == "c_o_new/standard/high"
+
+
+def test_window_rollover_and_timeout_replacement_use_session_bound_model(tmp_path) -> None:
+    from src.project.context import ProjectContext
+
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler.settings.programming_max_execution_windows = 3
+    manager = MagicMock()
+    handler.ctx.claude_manager = manager
+
+    project = ProjectContext("proj-rollover", "Rollover", str(tmp_path))
+    project.acp_tool_name = "claude"
+    # Even if project metadata somehow held another model, rollover must honor
+    # the running session's actual bound model (`_model_name`).
+    project.acp_model_name = "gemini-pro-orchestrator"
+
+    class _Session:
+        def __init__(self, sid: str, model_name):
+            self.session_id = sid
+            self.message_count = 1
+            self._force_dead = False
+            self._model_name = model_name
+
+    first_session = _Session("provider-session-rollover", None)
+    resumed_session = _Session("provider-session-rollover", None)
+    manager.resume_retired_session.return_value = resumed_session
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            side_effect=[
+                _incomplete_execution(entered_finalization=True),
+                _completed_execution("finished window 2"),
+            ],
+        ),
+    ):
+        handler.handle_response(
+            "msg-rollover-bound",
+            "chat-1",
+            "finish the task",
+            first_session,
+            project,
+            str(tmp_path),
+            str(tmp_path),
+        )
+
+    assert manager.resume_retired_session.call_args.kwargs["model_name"] is None
+
+    # Timeout dead-session replacement also honors timed-out session's bound model.
+    manager.replace_session.return_value = MagicMock(created=True, session=resumed_session)
+    timed_out = _Session("provider-session-timeout", "claude-sonnet-4-5")
+    handler._replace_timed_out_session(
+        chat_id="chat-1",
+        project=project,
+        cwd=str(tmp_path),
+        thread_id=None,
+        timed_out_session=timed_out,
+        startup_budget_s=15.0,
+    )
+    assert manager.replace_session.call_args.kwargs["model_name"] == "claude-sonnet-4-5"
+
+
+def test_execution_exception_before_result_skips_unbound_local_error(tmp_path) -> None:
+    from src.project.context import ProjectContext
+
+    handler = _make_handler()
+    card_session, prog_session = _real_prog_session()
+    del card_session
+    prog_session.start()
+
+    project = ProjectContext("proj-err", "Err", str(tmp_path))
+    project.acp_tool_name = "claude"
+    session = MagicMock()
+    session.session_id = "sess-err"
+    session.message_count = 1
+    session._force_dead = False
+
+    try:
+        with patch(
+            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
+            side_effect=RuntimeError("Traex ACP rejected selected model: bogus"),
+        ):
+            handler._execute_programming_response(
+                "msg-err-post",
+                "chat-1",
+                "do work",
+                session,
+                project,
+                str(tmp_path),
+                str(tmp_path),
+                prog_session=prog_session,
+            )
+    finally:
+        prog_session.abort()
+
+    assert handler.context_manager.update_context.call_count == 2
+    user_call, assistant_call = handler.context_manager.update_context.call_args_list
+    assert user_call.kwargs["file_changes"] is None
+    assert "Traex ACP rejected selected model: bogus" in assistant_call.kwargs["conversation"]["content"]
+
+
+def test_diagnostics_and_clear_do_not_leak_other_tools_model(tmp_path) -> None:
+    from src.feishu.handlers.diagnostics import DiagnosticsHandler
+    from src.feishu.handlers.system import SystemHandler
+    from src.mode import InteractionMode, ModeManager
+    from src.project.context import ProjectContext
+
+    project = ProjectContext("proj-leak", "LeakCheck", str(tmp_path))
+    project.acp_tool_name = "agy"
+    project.acp_model_name = "gemini-pro-orchestrator"
+
+    mode_mgr = ModeManager()
+    mode_mgr.enter_programming_mode("chat-leak", InteractionMode.TRAEX, project_id=project.project_id)
+
+    ctx = MagicMock()
+    ctx.settings = MagicMock(acp_startup_timeout=20)
+    ctx.mode_manager = mode_mgr
+    ctx.project_manager = MagicMock()
+    ctx.project_manager.get_active_project.return_value = project
+    ctx.working_dir = str(tmp_path)
+    traex_handler = MagicMock()
+    traex_handler._get_session_manager.return_value = None
+    ctx.get_handler.side_effect = lambda name: traex_handler if name == "traex" else None
+
+    diag = DiagnosticsHandler(ctx)
+    summary = diag._collect_direct_cockpit_info("chat-leak", project)
+    assert summary["tool_name"] == "traex"
+    assert summary["model_name"] == ""
+
+    system = SystemHandler(ctx)
+    replies: list[str] = []
+    system.reply_text = lambda _mid, body, **_kw: replies.append(body)  # type: ignore[method-assign]
+    system.handle_clear_command("m-clear", "chat-leak", project=project)
+    assert replies
+    assert "`traex` / 模型 `default`" in replies[-1]
+    assert "gemini-pro-orchestrator" not in replies[-1]

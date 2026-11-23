@@ -292,6 +292,22 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 return mgr
         return getattr(ctx, f"{self.mode_key}_manager")
 
+    @staticmethod
+    def _session_bound_model_name(
+        session: object,
+        fallback: Optional[str],
+    ) -> Optional[str]:
+        """Return the model actually bound to *session* when explicitly known, else *fallback*."""
+        if session is not None:
+            session_dict = getattr(session, "__dict__", None)
+            if isinstance(session_dict, dict) and "_model_name" in session_dict:
+                raw = session_dict.get("_model_name")
+                if raw is None:
+                    return None
+                if isinstance(raw, str):
+                    return raw.strip() or None
+        return fallback
+
     def _replace_timed_out_session(
         self,
         *,
@@ -321,7 +337,10 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             startup_timeout=remaining_budget,
             project_id=project_id,
             agent_type_override=self._get_agent_type_override(project),
-            model_name=self._get_model_name_override(project),
+            model_name=self._session_bound_model_name(
+                timed_out_session,
+                self._get_model_name_override(project),
+            ),
             thread_id=thread_id,
         )
         if not outcome.created:
@@ -457,11 +476,28 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
     def _get_interaction_mode(self):
         return self.interaction_mode
 
-    def _set_mode_on_project(self, project: "ProjectContext", active: bool, session_id: str = "", count: int = 0):
+    def _set_mode_on_project(
+        self,
+        project: "ProjectContext",
+        active: bool,
+        session_id: str = "",
+        count: int = 0,
+        *,
+        model_name: object = _MODEL_OVERRIDE_UNSET,
+    ):
         if active:
+            previous_tool = str(getattr(project, "acp_tool_name", "") or "").strip().lower()
             project.set_programming_mode(self.mode_key, True, session_id, count)
             if self.mode_key in PROGRAMMING_MODE_VALUES:
                 project.acp_tool_name = self.mode_key
+                if model_name is not _MODEL_OVERRIDE_UNSET:
+                    project.acp_model_name = (
+                        model_name.strip() or None
+                        if isinstance(model_name, str)
+                        else None
+                    )
+                elif previous_tool != self.mode_key:
+                    project.acp_model_name = None
         else:
             project.set_programming_mode(self.mode_key, False)
 
@@ -656,7 +692,12 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
         if project:
             if not thread_id and commit_project_state:
                 self._deactivate_other_project_modes(project)
-                self._set_mode_on_project(project, True, session.session_id)
+                self._set_mode_on_project(
+                    project,
+                    True,
+                    session.session_id,
+                    model_name=model_override,
+                )
             if not silent:
                 from ...card.builders.core import CoreBuilder
                 from ...card.builders.project import ProjectBuilder
@@ -774,10 +815,14 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 project_id = active.project_id if active else (session.session_id or "unknown")
                 if active:
                     project = active
-            if project and not tool_name and getattr(project, "acp_tool_name", None):
-                tool_name = project.acp_tool_name
-            if project and not model_name and getattr(project, "acp_model_name", None):
-                model_name = project.acp_model_name
+            tool_name = mode_name
+            if (
+                project
+                and str(getattr(project, "acp_tool_name", "") or "").strip().lower() == mode_name
+            ):
+                model_name = getattr(project, "acp_model_name", None)
+            else:
+                model_name = self._session_bound_model_name(session, None)
 
             get_thread_manager().register(
                 thread_root_id=thread_root_id,

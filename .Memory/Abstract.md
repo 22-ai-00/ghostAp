@@ -1,5 +1,8 @@
 # GhostAP 项目记忆索引
 
+## 2026-11-23
+- **Traex跨工具模型残留与异常修复** - 切换工具清旧模型、续窗沿用会话模型并消除UnboundLocalError → [2026-11-23.md](2026-11-23.md)
+
 ## 2026-11-22
 - **AGY Effort与Orchestrator强化** - 补齐Planner/Executor Effort、`SyncAGYCLISession`混合传输与`/effort`命令 → [2026-11-22.md](2026-11-22.md)
 
