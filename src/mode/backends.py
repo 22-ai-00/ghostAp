@@ -330,9 +330,18 @@ def get_backend_spec(key_or_name: object) -> Optional[BackendSpec]:
 get_backend_meta = get_backend_spec
 
 
-def resolve_project_programming_mode(project: object) -> Optional[InteractionMode]:
+def resolve_project_programming_mode(
+    project: object,
+    chat_id: Optional[str] = None,
+) -> Optional[InteractionMode]:
     """Resolve the active ``InteractionMode`` from any of the project mode flags."""
     if project is None:
+        return None
+    normalized_chat = str(chat_id or "").strip()
+    if normalized_chat and callable(getattr(type(project), "get_programming_mode", None)):
+        for spec in _SCAN_ORDER:
+            if project.get_programming_mode(spec.mode_key, normalized_chat) is True:  # type: ignore[attr-defined]
+                return spec.interaction_mode
         return None
     for spec in _SCAN_ORDER:
         flag = getattr(project, spec.project_mode_attr, False)

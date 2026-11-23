@@ -131,7 +131,15 @@ class ProgrammingExecutionMixin:
                 return
 
         raw_task_text = text
-        text = self.inject_bridge_context(text, project, chat_id=chat_id)
+        try:
+            text = self.inject_bridge_context(
+                text,
+                project,
+                chat_id=chat_id,
+                thread_id=thread_id or "",
+            )
+        except TypeError:
+            text = self.inject_bridge_context(text, project, chat_id=chat_id)
         global_working_dir = self.get_working_dir(chat_id)
         cwd = project.root_path if project else global_working_dir
 
@@ -298,7 +306,10 @@ class ProgrammingExecutionMixin:
         project_id = project.project_id if project else None
 
         logger.info("开始 %s 输出: project=%s, path=%s", self.mode_name, project_name, project_path)
-        model_name = self._get_model_name_override(project)
+        try:
+            model_name = self._get_model_name_override(project, chat_id=chat_id)
+        except TypeError:
+            model_name = self._get_model_name_override(project)
 
         metadata = build_programming_metadata(
             self.mode_name,
@@ -775,7 +786,7 @@ class ProgrammingExecutionMixin:
                 agent_type_override=self._get_agent_type_override(project),
                 model_name=self._session_bound_model_name(
                     _retired_session,
-                    self._get_model_name_override(project),
+                    self._get_model_name_override(project, chat_id=chat_id),
                 ),
                 thread_id=thread_id,
             )
@@ -1143,14 +1154,15 @@ class ProgrammingExecutionMixin:
                     id(final_session) in retired_session_objects
                     or getattr(final_session, "_force_dead", False) is True
                 ):
-                    self._clear_snapshot_for_session(project, session)
-                    self._clear_snapshot_for_session(project, final_session)
+                    self._clear_snapshot_for_session(project, session, chat_id=chat_id)
+                    self._clear_snapshot_for_session(project, final_session, chat_id=chat_id)
                 else:
                     self._update_snapshot_on_project(
                         project,
                         raw_user_text,
                         final_session.message_count,
                         final_session.session_id,
+                        chat_id=chat_id,
                     )
                 source = (
                     self.context_source.value
@@ -1158,17 +1170,33 @@ class ProgrammingExecutionMixin:
                     else self.mode_key
                 )
                 modified_files = sorted(getattr(result, "modified_files", None) or ())
-                self.context_manager.update_context(
-                    project.project_id,
-                    conversation={"role": "user", "content": raw_user_text, "source_mode": source, "message_id": message_id},
-                    file_changes=modified_files or None,
-                    chat_id=chat_id,
-                )
-                self.context_manager.update_context(
-                    project.project_id,
-                    conversation={"role": "assistant", "content": final_response, "source_mode": source},
-                    chat_id=chat_id,
-                )
+                thread_scope = thread_id or ""
+                try:
+                    self.context_manager.update_context(
+                        project.project_id,
+                        conversation={"role": "user", "content": raw_user_text, "source_mode": source, "message_id": message_id},
+                        file_changes=modified_files or None,
+                        chat_id=chat_id,
+                        thread_id=thread_scope,
+                    )
+                    self.context_manager.update_context(
+                        project.project_id,
+                        conversation={"role": "assistant", "content": final_response, "source_mode": source},
+                        chat_id=chat_id,
+                        thread_id=thread_scope,
+                    )
+                except TypeError:
+                    self.context_manager.update_context(
+                        project.project_id,
+                        conversation={"role": "user", "content": raw_user_text, "source_mode": source, "message_id": message_id},
+                        file_changes=modified_files or None,
+                        chat_id=chat_id,
+                    )
+                    self.context_manager.update_context(
+                        project.project_id,
+                        conversation={"role": "assistant", "content": final_response, "source_mode": source},
+                        chat_id=chat_id,
+                    )
         except Exception as e:
             logger.warning("编程后处理异常(不影响表情回复): %s", e, exc_info=True)
 

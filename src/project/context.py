@@ -31,6 +31,38 @@ class SessionSnapshot:
     is_resumable: bool = True
 
 
+@dataclass
+class ChatProjectState:
+    """Per-chat isolated ACP tool/model configuration, mode flags, and snapshots."""
+
+    acp_tool_name: Optional[str] = None
+    acp_model_name: Optional[str] = None
+    has_acp_config: bool = False
+    active_modes: set[str] = field(default_factory=set)
+    session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict)
+
+    def clone(self) -> "ChatProjectState":
+        return ChatProjectState(
+            acp_tool_name=self.acp_tool_name,
+            acp_model_name=self.acp_model_name,
+            has_acp_config=self.has_acp_config,
+            active_modes=set(self.active_modes),
+            session_snapshots={
+                mode: (
+                    SessionSnapshot(
+                        session_id=snap.session_id,
+                        query_count=snap.query_count,
+                        last_query=snap.last_query,
+                        is_resumable=snap.is_resumable,
+                    )
+                    if snap is not None
+                    else None
+                )
+                for mode, snap in self.session_snapshots.items()
+            },
+        )
+
+
 
 
 @dataclass
@@ -45,6 +77,7 @@ class ProjectContext:
 
     _active_modes: set[str] = field(default_factory=set, repr=False)
     session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict, repr=False)
+    chat_states: dict[str, ChatProjectState] = field(default_factory=dict, repr=False)
 
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
@@ -84,6 +117,172 @@ class ProjectContext:
             self.working_dir = self.root_path
         self.root_path = os.path.expanduser(self.root_path)
         self.working_dir = os.path.expanduser(self.working_dir)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        object.__setattr__(self, name, value)
+        if name not in {"acp_tool_name", "acp_model_name"}:
+            return
+        chat_states = self.__dict__.get("chat_states")
+        if not isinstance(chat_states, dict) or len(chat_states) != 1:
+            return
+        sole_cid = next(iter(chat_states))
+        if not sole_cid or self._known_other_chats_unlocked(sole_cid):
+            return
+        state = chat_states[sole_cid]
+        if name == "acp_tool_name":
+            state.acp_tool_name = value  # type: ignore[assignment]
+            if value is not None:
+                state.has_acp_config = True
+        else:
+            state.acp_model_name = value  # type: ignore[assignment]
+            if self.__dict__.get("acp_tool_name") is not None or value is not None:
+                state.has_acp_config = True
+
+    @staticmethod
+    def _normalized_chat_id(chat_id: Optional[str]) -> str:
+        return str(chat_id or "").strip()
+
+    def _known_other_chats_unlocked(self, chat_id: str) -> bool:
+        chat_states = self.__dict__.get("chat_states")
+        if isinstance(chat_states, dict) and any(
+            cid and cid != chat_id for cid in chat_states
+        ):
+            return True
+        allowed = self.__dict__.get("allowed_chat_ids")
+        if allowed and any(cid and cid != chat_id for cid in allowed):
+            return True
+        for field_name in ("owner_chat_id", "bound_chat_id"):
+            cid = str(self.__dict__.get(field_name) or "").strip()
+            if cid and cid != chat_id:
+                return True
+        return False
+
+    def _should_sync_legacy_unlocked(self, chat_id: str) -> bool:
+        return (not chat_id) or (not self._known_other_chats_unlocked(chat_id))
+
+    def _ensure_chat_state_unlocked(self, chat_id: str) -> ChatProjectState:
+        state = self.chat_states.get(chat_id)
+        if state is None:
+            state = ChatProjectState()
+            self.chat_states[chat_id] = state
+        return state
+
+    def _sync_sole_legacy_mode_attr(self, mode_name: str, enabled: bool) -> None:
+        chat_states = self.__dict__.get("chat_states")
+        if not isinstance(chat_states, dict) or len(chat_states) != 1:
+            return
+        sole_cid = next(iter(chat_states))
+        if not sole_cid or self._known_other_chats_unlocked(sole_cid):
+            return
+        state = chat_states[sole_cid]
+        if enabled:
+            state.active_modes.add(mode_name)
+        else:
+            state.active_modes.discard(mode_name)
+
+    def _sync_sole_legacy_snapshot_attr(
+        self,
+        mode_name: str,
+        snap: Optional[SessionSnapshot],
+    ) -> None:
+        chat_states = self.__dict__.get("chat_states")
+        if not isinstance(chat_states, dict) or len(chat_states) != 1:
+            return
+        sole_cid = next(iter(chat_states))
+        if not sole_cid or self._known_other_chats_unlocked(sole_cid):
+            return
+        state = chat_states[sole_cid]
+        if snap is not None:
+            state.session_snapshots[mode_name] = snap
+        else:
+            state.session_snapshots.pop(mode_name, None)
+
+    def get_acp_tool_name(self, chat_id: Optional[str] = None) -> Optional[str]:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            if cid:
+                state = self.chat_states.get(cid)
+                if state is not None and state.has_acp_config:
+                    return state.acp_tool_name
+            return self.acp_tool_name
+
+    def get_acp_model_name(
+        self,
+        chat_id: Optional[str] = None,
+        *,
+        tool_name: Optional[str] = None,
+    ) -> Optional[str]:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            state = self.chat_states.get(cid) if cid else None
+            if state is not None and state.has_acp_config:
+                resolved_tool = state.acp_tool_name
+                resolved_model = state.acp_model_name
+            else:
+                resolved_tool = self.acp_tool_name
+                resolved_model = self.acp_model_name
+            if tool_name is not None and resolved_tool != tool_name:
+                return None
+            return resolved_model
+
+    def get_acp_config(
+        self,
+        chat_id: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            state = self.chat_states.get(cid) if cid else None
+            if state is not None and state.has_acp_config:
+                return state.acp_tool_name, state.acp_model_name
+            return self.acp_tool_name, self.acp_model_name
+
+    def get_programming_mode(
+        self,
+        mode_type: str,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            if cid:
+                state = self.chat_states.get(cid)
+                if state is not None:
+                    return mode_type in state.active_modes
+                if self.chat_states:
+                    return False
+            return mode_type in self._active_modes
+
+    def get_programming_snapshot(
+        self,
+        mode_type: str,
+        chat_id: Optional[str] = None,
+    ) -> Optional[SessionSnapshot]:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            if cid:
+                state = self.chat_states.get(cid)
+                if state is not None:
+                    return state.session_snapshots.get(mode_type)
+                if self.chat_states:
+                    return None
+            return self.session_snapshots.get(mode_type)
+
+    def set_acp_configuration(
+        self,
+        tool_name: Optional[str],
+        model_name: Optional[str],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> None:
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                state.acp_tool_name = tool_name
+                state.acp_model_name = model_name
+                state.has_acp_config = True
+            if self._should_sync_legacy_unlocked(cid):
+                object.__setattr__(self, "acp_tool_name", tool_name)
+                object.__setattr__(self, "acp_model_name", model_name)
 
     def touch(self):
         self.last_active = time.time()
@@ -166,6 +365,7 @@ class ProjectContext:
                     break
                 evicted_chat_id = victim_cid
                 del self.allowed_chat_ids[victim_cid]
+                self.chat_states.pop(victim_cid, None)
                 # Record eviction in bounded OrderedDict (LRU pruning)
                 self.evicted_chat_ids[victim_cid] = now
                 self.evicted_chat_ids.move_to_end(victim_cid)
@@ -190,12 +390,21 @@ class ProjectContext:
             self.allowed_chat_ids[chat_id] = now
             return evicted_chat_id
 
-    def clear_session_state(self, mode_type: Optional[str] = None) -> None:
+    def clear_session_state(
+        self,
+        mode_type: Optional[str] = None,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> None:
         """Clear active snapshot while keeping mode/tool/model config."""
+        cid = self._normalized_chat_id(chat_id)
         with self._chat_lock:
             if mode_type and mode_type in self._MODE_ATTRS:
-                _, snap_attr = self._MODE_ATTRS[mode_type]
-                setattr(self, snap_attr, None)
+                if cid:
+                    state = self._ensure_chat_state_unlocked(cid)
+                    state.session_snapshots.pop(mode_type, None)
+                if self._should_sync_legacy_unlocked(cid):
+                    self.session_snapshots.pop(mode_type, None)
             self.touch()
 
     # ── Mode name → (mode_flag_attr, snapshot_attr) mapping ──
@@ -204,47 +413,115 @@ class ProjectContext:
         for spec in ALL_BACKEND_METAS
     }
 
-    def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
+    def set_programming_mode(
+        self,
+        mode_type: str,
+        enabled: bool,
+        session_id: Optional[str] = None,
+        query_count: int = 0,
+        *,
+        chat_id: Optional[str] = None,
+    ):
         """Generic mode setter — replaces per-mode set_*_mode methods."""
-        mode_flag, snap_attr = self._MODE_ATTRS[mode_type]
+        if mode_type not in self._MODE_ATTRS:
+            raise KeyError(mode_type)
+        cid = self._normalized_chat_id(chat_id)
         with self._chat_lock:
-            setattr(self, mode_flag, enabled)
-            if enabled and session_id:
-                setattr(self, snap_attr, SessionSnapshot(
-                    session_id=session_id, query_count=query_count, last_query="", is_resumable=True
-                ))
-            elif not enabled:
-                snap = getattr(self, snap_attr)
-                if snap:
-                    snap.is_resumable = True
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                if enabled:
+                    state.active_modes.add(mode_type)
+                    if session_id:
+                        state.session_snapshots[mode_type] = SessionSnapshot(
+                            session_id=session_id,
+                            query_count=query_count,
+                            last_query="",
+                            is_resumable=True,
+                        )
+                else:
+                    state.active_modes.discard(mode_type)
+                    snap = state.session_snapshots.get(mode_type)
+                    if snap:
+                        snap.is_resumable = True
+            if self._should_sync_legacy_unlocked(cid):
+                if enabled:
+                    self._active_modes.add(mode_type)
+                    if session_id:
+                        self.session_snapshots[mode_type] = SessionSnapshot(
+                            session_id=session_id,
+                            query_count=query_count,
+                            last_query="",
+                            is_resumable=True,
+                        )
+                else:
+                    self._active_modes.discard(mode_type)
+                    snap = self.session_snapshots.get(mode_type)
+                    if snap:
+                        snap.is_resumable = True
 
-    def update_programming_snapshot(self, mode_type: str, query: str, query_count: int, session_id: Optional[str] = None):
+    def update_programming_snapshot(
+        self,
+        mode_type: str,
+        query: str,
+        query_count: int,
+        session_id: Optional[str] = None,
+        *,
+        chat_id: Optional[str] = None,
+    ):
         """Generic snapshot updater — replaces per-mode update_*_snapshot methods."""
-        _, snap_attr = self._MODE_ATTRS[mode_type]
+        if mode_type not in self._MODE_ATTRS:
+            raise KeyError(mode_type)
+        cid = self._normalized_chat_id(chat_id)
         with self._chat_lock:
-            snap = getattr(self, snap_attr)
-            if snap:
-                snap.last_query = query
-                snap.query_count = query_count
-                if session_id:
-                    snap.session_id = session_id
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                snap = state.session_snapshots.get(mode_type)
+                if snap is not None:
+                    snap.last_query = query
+                    snap.query_count = query_count
+                    if session_id:
+                        snap.session_id = session_id
+                elif session_id:
+                    state.session_snapshots[mode_type] = SessionSnapshot(
+                        session_id=session_id,
+                        query_count=query_count,
+                        last_query=query,
+                        is_resumable=True,
+                    )
+            if self._should_sync_legacy_unlocked(cid):
+                snap = self.session_snapshots.get(mode_type)
+                if snap is not None:
+                    snap.last_query = query
+                    snap.query_count = query_count
+                    if session_id:
+                        snap.session_id = session_id
 
     def clear_programming_snapshot_if_matches(
         self,
         mode_type: str,
         session_id: str,
+        *,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Compare-and-clear a snapshot without erasing a newer replacement."""
         expected = str(session_id or "")
-        if not expected:
+        if not expected or mode_type not in self._MODE_ATTRS:
             return False
-        _, snap_attr = self._MODE_ATTRS[mode_type]
+        cid = self._normalized_chat_id(chat_id)
         with self._chat_lock:
-            snapshot = getattr(self, snap_attr)
-            if str(getattr(snapshot, "session_id", "") or "") != expected:
-                return False
-            setattr(self, snap_attr, None)
-            return True
+            cleared = False
+            if cid:
+                state = self.chat_states.get(cid)
+                snapshot = state.session_snapshots.get(mode_type) if state else None
+                if str(getattr(snapshot, "session_id", "") or "") == expected:
+                    state.session_snapshots.pop(mode_type, None)  # type: ignore[union-attr]
+                    cleared = True
+            if self._should_sync_legacy_unlocked(cid):
+                snapshot = self.session_snapshots.get(mode_type)
+                if str(getattr(snapshot, "session_id", "") or "") == expected:
+                    self.session_snapshots.pop(mode_type, None)
+                    cleared = True
+            return cleared
 
     def commit_acp_programming_activation(
         self,
@@ -254,6 +531,8 @@ class ProjectContext:
         session_id: str,
         query_count: int = 0,
         activate_mode: bool = True,
+        *,
+        chat_id: Optional[str] = None,
     ) -> dict[str, object]:
         """Atomically select an ACP backend and activate its project mode.
 
@@ -264,33 +543,51 @@ class ProjectContext:
         """
         if mode_type not in self._MODE_ATTRS:
             raise ValueError(f"unsupported programming mode: {mode_type}")
+        cid = self._normalized_chat_id(chat_id)
         with self._chat_lock:
-            previous = {
+            existing_state = self.chat_states.get(cid) if cid else None
+            previous: dict[str, object] = {
+                "chat_id": cid,
+                "had_chat_state": existing_state is not None,
+                "chat_state": existing_state.clone() if existing_state is not None else None,
                 "acp_tool_name": self.acp_tool_name,
                 "acp_model_name": self.acp_model_name,
                 "last_active": self.last_active,
                 "modes": {
-                    name: (getattr(self, flag), getattr(self, snapshot))
-                    for name, (flag, snapshot) in self._MODE_ATTRS.items()
+                    name: (
+                        name in self._active_modes,
+                        self.session_snapshots.get(name),
+                    )
+                    for name in self._MODE_ATTRS
                 },
             }
-            if activate_mode:
-                for flag, _snapshot in self._MODE_ATTRS.values():
-                    setattr(self, flag, False)
-                mode_flag, snapshot_attr = self._MODE_ATTRS[mode_type]
-                setattr(self, mode_flag, True)
-                setattr(
-                    self,
-                    snapshot_attr,
-                    SessionSnapshot(
-                        session_id=session_id,
-                        query_count=query_count,
-                        last_query="",
-                        is_resumable=True,
-                    ),
-                )
-            self.acp_tool_name = tool_name
-            self.acp_model_name = model_name
+            new_snap = SessionSnapshot(
+                session_id=session_id,
+                query_count=query_count,
+                last_query="",
+                is_resumable=True,
+            )
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                if activate_mode:
+                    state.active_modes.clear()
+                    state.active_modes.add(mode_type)
+                    state.session_snapshots[mode_type] = SessionSnapshot(
+                        session_id=new_snap.session_id,
+                        query_count=new_snap.query_count,
+                        last_query=new_snap.last_query,
+                        is_resumable=new_snap.is_resumable,
+                    )
+                state.acp_tool_name = tool_name
+                state.acp_model_name = model_name
+                state.has_acp_config = True
+            if self._should_sync_legacy_unlocked(cid):
+                if activate_mode:
+                    self._active_modes.clear()
+                    self._active_modes.add(mode_type)
+                    self.session_snapshots[mode_type] = new_snap
+                object.__setattr__(self, "acp_tool_name", tool_name)
+                object.__setattr__(self, "acp_model_name", model_name)
             self.touch()
             return previous
 
@@ -299,23 +596,80 @@ class ProjectContext:
         tool_name: str,
         model_name: Optional[str],
     ) -> tuple[Optional[str], Optional[str]]:
-        """Replace the saved tool/model pair and return rollback state."""
+        """Replace the saved tool/model pair and return legacy 2-tuple rollback state."""
         with self._chat_lock:
             previous = (self.acp_tool_name, self.acp_model_name)
             self.acp_tool_name = tool_name
             self.acp_model_name = model_name
             return previous
 
+    def replace_acp_configuration_for_chat(
+        self,
+        tool_name: str,
+        model_name: Optional[str],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        """Replace saved tool/model configuration scoped to *chat_id* with full rollback."""
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            existing_state = self.chat_states.get(cid) if cid else None
+            previous: dict[str, object] = {
+                "chat_id": cid,
+                "had_chat_state": existing_state is not None,
+                "chat_state": existing_state.clone() if existing_state is not None else None,
+                "acp_tool_name": self.acp_tool_name,
+                "acp_model_name": self.acp_model_name,
+            }
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                state.acp_tool_name = tool_name
+                state.acp_model_name = model_name
+                state.has_acp_config = True
+            if self._should_sync_legacy_unlocked(cid):
+                object.__setattr__(self, "acp_tool_name", tool_name)
+                object.__setattr__(self, "acp_model_name", model_name)
+            return previous
+
+    def restore_acp_configuration(self, previous: dict[str, object]) -> None:
+        """Restore rollback data from a failed persisted ACP configuration change."""
+        with self._chat_lock:
+            cid = self._normalized_chat_id(previous.get("chat_id"))  # type: ignore[arg-type]
+            if cid:
+                if previous.get("had_chat_state"):
+                    prev_state = previous.get("chat_state")
+                    if isinstance(prev_state, ChatProjectState):
+                        self.chat_states[cid] = prev_state.clone()
+                else:
+                    self.chat_states.pop(cid, None)
+            object.__setattr__(self, "acp_tool_name", previous["acp_tool_name"])
+            object.__setattr__(self, "acp_model_name", previous["acp_model_name"])
+
     def restore_acp_programming_activation(self, previous: dict[str, object]) -> None:
         """Restore rollback data from a failed persisted ACP activation."""
         with self._chat_lock:
-            self.acp_tool_name = previous["acp_tool_name"]  # type: ignore[assignment]
-            self.acp_model_name = previous["acp_model_name"]  # type: ignore[assignment]
-            self.last_active = float(previous["last_active"])
-            for name, (mode_flag, snapshot_attr) in self._MODE_ATTRS.items():
-                enabled, snapshot = previous["modes"][name]  # type: ignore[index]
-                setattr(self, mode_flag, enabled)
-                setattr(self, snapshot_attr, snapshot)
+            cid = self._normalized_chat_id(previous.get("chat_id"))  # type: ignore[arg-type]
+            if cid:
+                if previous.get("had_chat_state"):
+                    prev_state = previous.get("chat_state")
+                    if isinstance(prev_state, ChatProjectState):
+                        self.chat_states[cid] = prev_state.clone()
+                else:
+                    self.chat_states.pop(cid, None)
+            object.__setattr__(self, "acp_tool_name", previous["acp_tool_name"])
+            object.__setattr__(self, "acp_model_name", previous["acp_model_name"])
+            self.last_active = float(previous["last_active"])  # type: ignore[arg-type]
+            modes = previous["modes"]
+            for name in self._MODE_ATTRS:
+                enabled, snapshot = modes[name]  # type: ignore[index]
+                if enabled:
+                    self._active_modes.add(name)
+                else:
+                    self._active_modes.discard(name)
+                if snapshot is not None:
+                    self.session_snapshots[name] = snapshot
+                else:
+                    self.session_snapshots.pop(name, None)
 
     def get_status_emoji(self) -> str:
         status_map = {
@@ -363,6 +717,21 @@ class ProjectContext:
             for mode_type, (mode_flag, snap_attr) in self._MODE_ATTRS.items():
                 d[mode_flag] = getattr(self, mode_flag)
                 d[snap_attr] = self._snap_to_dict(getattr(self, snap_attr))
+            if self.chat_states:
+                d["chat_states"] = {
+                    cid: {
+                        "acp_tool_name": st.acp_tool_name,
+                        "acp_model_name": st.acp_model_name,
+                        "has_acp_config": st.has_acp_config,
+                        "active_modes": sorted(st.active_modes),
+                        "session_snapshots": {
+                            mode_key: self._snap_to_dict(snap)
+                            for mode_key, snap in st.session_snapshots.items()
+                            if snap is not None
+                        },
+                    }
+                    for cid, st in self.chat_states.items()
+                }
         return d
 
     @staticmethod
@@ -428,7 +797,67 @@ class ProjectContext:
                     last_query=snap_data["last_query"],
                     is_resumable=snap_data.get("is_resumable", True),
                 ))
+        raw_chat_states = data.get("chat_states")
+        if isinstance(raw_chat_states, dict):
+            for raw_cid, raw_state in raw_chat_states.items():
+                cid = cls._normalized_chat_id(raw_cid)
+                if not cid or not isinstance(raw_state, dict):
+                    continue
+                chat_tool = cls.normalize_acp_tool_name(raw_state.get("acp_tool_name"))
+                raw_has_cfg = bool(raw_state.get("has_acp_config", chat_tool is not None))
+                chat_model = (
+                    raw_state.get("acp_model_name")
+                    if chat_tool
+                    else None
+                )
+                active_modes = {
+                    str(m)
+                    for m in (raw_state.get("active_modes") or ())
+                    if str(m) in cls._MODE_ATTRS
+                }
+                snapshots: dict[str, Optional[SessionSnapshot]] = {}
+                raw_snaps = raw_state.get("session_snapshots")
+                if isinstance(raw_snaps, dict):
+                    for mode_key, sdata in raw_snaps.items():
+                        if mode_key in cls._MODE_ATTRS and isinstance(sdata, dict):
+                            snapshots[mode_key] = SessionSnapshot(
+                                session_id=sdata["session_id"],
+                                query_count=sdata["query_count"],
+                                last_query=sdata["last_query"],
+                                is_resumable=sdata.get("is_resumable", True),
+                            )
+                ctx.chat_states[cid] = ChatProjectState(
+                    acp_tool_name=chat_tool,
+                    acp_model_name=chat_model,
+                    has_acp_config=raw_has_cfg,
+                    active_modes=active_modes,
+                    session_snapshots=snapshots,
+                )
         return ctx
+
+
+def _set_legacy_mode_descriptor(
+    project: ProjectContext,
+    mode_name: str,
+    enabled: bool,
+) -> None:
+    if enabled:
+        project._active_modes.add(mode_name)
+    else:
+        project._active_modes.discard(mode_name)
+    project._sync_sole_legacy_mode_attr(mode_name, enabled)
+
+
+def _set_legacy_snapshot_descriptor(
+    project: ProjectContext,
+    mode_name: str,
+    snap: Optional[SessionSnapshot],
+) -> None:
+    if snap is not None:
+        project.session_snapshots[mode_name] = snap
+    else:
+        project.session_snapshots.pop(mode_name, None)
+    project._sync_sole_legacy_snapshot_attr(mode_name, snap)
 
 
 def _attach_mode_descriptors() -> None:
@@ -439,8 +868,8 @@ def _attach_mode_descriptors() -> None:
             mode_flag,
             property(
                 lambda self, m=mode_name: m in self._active_modes,
-                lambda self, enabled, m=mode_name: (
-                    self._active_modes.add(m) if enabled else self._active_modes.discard(m)
+                lambda self, enabled, m=mode_name: _set_legacy_mode_descriptor(
+                    self, m, bool(enabled)
                 ),
             ),
         )
@@ -449,13 +878,71 @@ def _attach_mode_descriptors() -> None:
             snap_attr,
             property(
                 lambda self, m=mode_name: self.session_snapshots.get(m),
-                lambda self, snap, m=mode_name: (
-                    self.session_snapshots.__setitem__(m, snap)
-                    if snap is not None
-                    else self.session_snapshots.pop(m, None)
+                lambda self, snap, m=mode_name: _set_legacy_snapshot_descriptor(
+                    self, m, snap
                 ),
             ),
         )
 
 
 _attach_mode_descriptors()
+
+
+def get_project_acp_tool_name(
+    project: object,
+    chat_id: Optional[str] = None,
+) -> Optional[str]:
+    """Read *project*'s ACP tool name scoped to *chat_id* when supported."""
+    if project is None:
+        return None
+    if chat_id and callable(getattr(type(project), "get_acp_tool_name", None)):
+        return project.get_acp_tool_name(chat_id)  # type: ignore[attr-defined]
+    return getattr(project, "acp_tool_name", None)
+
+
+def get_project_acp_model_name(
+    project: object,
+    chat_id: Optional[str] = None,
+    *,
+    tool_name: Optional[str] = None,
+) -> Optional[str]:
+    """Read *project*'s ACP model name scoped to *chat_id* and optional *tool_name*."""
+    if project is None:
+        return None
+    if chat_id and callable(getattr(type(project), "get_acp_model_name", None)):
+        return project.get_acp_model_name(chat_id, tool_name=tool_name)  # type: ignore[attr-defined]
+    if tool_name is not None and getattr(project, "acp_tool_name", None) != tool_name:
+        return None
+    return getattr(project, "acp_model_name", None)
+
+
+def get_project_programming_snapshot(
+    project: object,
+    mode_type: str,
+    chat_id: Optional[str] = None,
+) -> Optional[SessionSnapshot]:
+    """Read *project*'s session snapshot for *mode_type* scoped to *chat_id*."""
+    if project is None:
+        return None
+    if chat_id and callable(getattr(type(project), "get_programming_snapshot", None)):
+        return project.get_programming_snapshot(mode_type, chat_id)  # type: ignore[attr-defined]
+    pair = ProjectContext._MODE_ATTRS.get(mode_type)
+    if pair is None:
+        return None
+    return getattr(project, pair[1], None)
+
+
+def get_project_programming_mode(
+    project: object,
+    mode_type: str,
+    chat_id: Optional[str] = None,
+) -> bool:
+    """Read whether *mode_type* is active on *project* for *chat_id*."""
+    if project is None:
+        return False
+    if chat_id and callable(getattr(type(project), "get_programming_mode", None)):
+        return bool(project.get_programming_mode(mode_type, chat_id))  # type: ignore[attr-defined]
+    pair = ProjectContext._MODE_ATTRS.get(mode_type)
+    if pair is None:
+        return False
+    return getattr(project, pair[0], False) is True

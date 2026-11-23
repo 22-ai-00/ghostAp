@@ -17,7 +17,11 @@ from ...acp.manager import ACPSessionManager
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, InteractionMode
 from ...mode.backends import ALL_BACKEND_METAS, BACKEND_SPEC_BY_MODE
-from ...project import ContextSourceMode
+from ...project import (
+    ContextSourceMode,
+    get_project_acp_model_name,
+    get_project_acp_tool_name,
+)
 from ...utils.errors import get_error_detail, log_exception
 from ..emoji import EmojiReaction
 from ..message_formatter import FeishuMessageFormatter as fmt
@@ -143,10 +147,85 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
     def __init__(self, ctx):
         super().__init__(ctx)
         self._current_model: Optional[str] = None
+        self._scoped_models: dict[tuple[str, str], Optional[str]] = {}
+        self._scoped_models_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._active_programming_runs: dict[
             tuple[str, str, str], _ActiveProgrammingRun
         ] = {}
         self._active_programming_runs_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+
+    def _scoped_models_state(
+        self,
+    ) -> tuple[dict[tuple[str, str], Optional[str]], threading.Lock]:
+        state = self.__dict__.get("_scoped_models")
+        lock = self.__dict__.get("_scoped_models_lock")
+        if state is None:
+            state = {}
+            self._scoped_models = state
+        if lock is None:
+            lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            self._scoped_models_lock = lock
+        return state, lock
+
+    @staticmethod
+    def _model_scope_key(
+        chat_id: Optional[str],
+        project: Optional["ProjectContext"] = None,
+    ) -> tuple[str, str]:
+        return (
+            str(chat_id or "").strip(),
+            str(getattr(project, "project_id", "") or "").strip(),
+        )
+
+    def get_scoped_model(
+        self,
+        chat_id: Optional[str],
+        project: Optional["ProjectContext"] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Return ``(present, model_name)`` for the given chat/project scope."""
+        key = self._model_scope_key(chat_id, project)
+        if not key[0]:
+            return False, None
+        state, lock = self._scoped_models_state()
+        with lock:
+            if key in state:
+                return True, state[key]
+            return False, None
+
+    def set_scoped_model(
+        self,
+        chat_id: Optional[str],
+        model_name: Optional[str],
+        project: Optional["ProjectContext"] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Set model override for ``(chat_id, project_id)``; returns previous state."""
+        key = self._model_scope_key(chat_id, project)
+        if not key[0]:
+            return False, None
+        state, lock = self._scoped_models_state()
+        with lock:
+            had_previous = key in state
+            previous_value = state.get(key)
+            state[key] = model_name
+            return had_previous, previous_value
+
+    def restore_scoped_model(
+        self,
+        chat_id: Optional[str],
+        had_previous: bool,
+        previous_value: Optional[str],
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Restore a previous scoped model state (used on failed activation rollback)."""
+        key = self._model_scope_key(chat_id, project)
+        if not key[0]:
+            return
+        state, lock = self._scoped_models_state()
+        with lock:
+            if had_previous:
+                state[key] = previous_value
+            else:
+                state.pop(key, None)
 
     @staticmethod
     def _active_run_key(
@@ -172,7 +251,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             task_text=task_text,
             cwd=cwd,
             agent_type=agent_type,
-            model_name=self._get_model_name_override(project),
+            model_name=self._get_model_name_override(project, chat_id=chat_id),
         )
         key = self._active_run_key(chat_id, project)
         with self._active_programming_runs_lock:
@@ -326,6 +405,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             project,
             timed_out_session,
             persistence_timeout_s=min(1.0, max(0.0, startup_budget_s / 4)),
+            chat_id=chat_id,
         )
         remaining_budget = replacement_deadline - time.monotonic()
         if remaining_budget <= 0:
@@ -339,7 +419,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             agent_type_override=self._get_agent_type_override(project),
             model_name=self._session_bound_model_name(
                 timed_out_session,
-                self._get_model_name_override(project),
+                self._get_model_name_override(project, chat_id=chat_id),
             ),
             thread_id=thread_id,
         )
@@ -377,6 +457,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 1.0,
                 max(0.0, retirement_budget_s / 4),
             ),
+            chat_id=chat_id,
         )
         remaining_budget = retirement_deadline - time.monotonic()
         if remaining_budget <= 0:
@@ -394,18 +475,30 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
         project,
         session: SyncSession,
         persistence_timeout_s: float | None = None,
+        *,
+        chat_id: Optional[str] = None,
     ) -> None:
         """Clear only a snapshot that still points at the retiring session."""
         if project is None:
             return
         session_id = str(getattr(session, "session_id", "") or "")
-        cleared = bool(
-            session_id
-            and project.clear_programming_snapshot_if_matches(
-                self.mode_key,
-                session_id,
-            )
-        )
+        cleared = False
+        if session_id:
+            try:
+                cleared = bool(
+                    project.clear_programming_snapshot_if_matches(
+                        self.mode_key,
+                        session_id,
+                        chat_id=chat_id,
+                    )
+                )
+            except TypeError:
+                cleared = bool(
+                    project.clear_programming_snapshot_if_matches(
+                        self.mode_key,
+                        session_id,
+                    )
+                )
         if cleared:
             self._persist_project_context(
                 project,
@@ -484,29 +577,85 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
         count: int = 0,
         *,
         model_name: object = _MODEL_OVERRIDE_UNSET,
+        chat_id: Optional[str] = None,
     ):
         if active:
-            previous_tool = str(getattr(project, "acp_tool_name", "") or "").strip().lower()
-            project.set_programming_mode(self.mode_key, True, session_id, count)
+            previous_tool = str(get_project_acp_tool_name(project, chat_id) or "").strip().lower()
+            try:
+                project.set_programming_mode(
+                    self.mode_key,
+                    True,
+                    session_id,
+                    count,
+                    chat_id=chat_id,
+                )
+            except TypeError:
+                project.set_programming_mode(self.mode_key, True, session_id, count)
             if self.mode_key in PROGRAMMING_MODE_VALUES:
-                project.acp_tool_name = self.mode_key
                 if model_name is not _MODEL_OVERRIDE_UNSET:
-                    project.acp_model_name = (
+                    resolved_model: Optional[str] = (
                         model_name.strip() or None
                         if isinstance(model_name, str)
                         else None
                     )
-                elif previous_tool != self.mode_key:
-                    project.acp_model_name = None
+                elif previous_tool == self.mode_key:
+                    resolved_model = get_project_acp_model_name(
+                        project,
+                        chat_id,
+                        tool_name=self.mode_key,
+                    )
+                else:
+                    resolved_model = None
+                if callable(getattr(type(project), "set_acp_configuration", None)):
+                    project.set_acp_configuration(
+                        self.mode_key,
+                        resolved_model,
+                        chat_id=chat_id,
+                    )
+                else:
+                    project.acp_tool_name = self.mode_key
+                    project.acp_model_name = resolved_model
         else:
-            project.set_programming_mode(self.mode_key, False)
+            try:
+                project.set_programming_mode(self.mode_key, False, chat_id=chat_id)
+            except TypeError:
+                project.set_programming_mode(self.mode_key, False)
 
-    def _update_snapshot_on_project(self, project: "ProjectContext", query: str, count: int, session_id: str = ""):
-        project.update_programming_snapshot(self.mode_key, query, count, session_id)
+    def _update_snapshot_on_project(
+        self,
+        project: "ProjectContext",
+        query: str,
+        count: int,
+        session_id: str = "",
+        *,
+        chat_id: Optional[str] = None,
+    ):
+        try:
+            project.update_programming_snapshot(
+                self.mode_key,
+                query,
+                count,
+                session_id,
+                chat_id=chat_id,
+            )
+        except TypeError:
+            project.update_programming_snapshot(self.mode_key, query, count, session_id)
 
-    def _get_model_name_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        if project and getattr(project, "acp_tool_name", "") == self.mode_key:
-            return getattr(project, "acp_model_name", None)
+    def _get_model_name_override(
+        self,
+        project: Optional["ProjectContext"] = None,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if project is not None and get_project_acp_tool_name(project, chat_id) == self.mode_key:
+            return get_project_acp_model_name(project, chat_id, tool_name=self.mode_key)
+        if chat_id:
+            scoped_models, scoped_lock = self._scoped_models_state()
+            scope_key = self._model_scope_key(chat_id, project)
+            with scoped_lock:
+                if scope_key in scoped_models:
+                    return scoped_models[scope_key]
+            return None
         return getattr(self, "_current_model", None)
 
     @property
@@ -526,13 +675,21 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
     def _uses_claude_cli(self) -> bool:
         return False
 
-    def _deactivate_other_project_modes(self, project: Optional["ProjectContext"]) -> None:
+    def _deactivate_other_project_modes(
+        self,
+        project: Optional["ProjectContext"],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> None:
         if not project:
             return
         current = self._get_interaction_mode()
         for mode, _predicate, key in self._PROGRAMMING_MODE_KEYS:
             if mode != current:
-                project.set_programming_mode(key, False)
+                try:
+                    project.set_programming_mode(key, False, chat_id=chat_id)
+                except TypeError:
+                    project.set_programming_mode(key, False)
 
     def _iter_other_programming_mode_entries(self):
         current = self._get_interaction_mode()
@@ -641,11 +798,13 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
 
         try:
             agent_type_override = self._get_agent_type_override(project)
-            model_name = (
-                self._get_model_name_override(project)
-                if model_override is _MODEL_OVERRIDE_UNSET
-                else model_override
-            )
+            if model_override is _MODEL_OVERRIDE_UNSET:
+                try:
+                    model_name = self._get_model_name_override(project, chat_id=chat_id)
+                except TypeError:
+                    model_name = self._get_model_name_override(project)
+            else:
+                model_name = model_override
             session = self._get_session_manager().ensure_session(
                 chat_id,
                 cwd=cwd,
@@ -691,12 +850,13 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
 
         if project:
             if not thread_id and commit_project_state:
-                self._deactivate_other_project_modes(project)
+                self._deactivate_other_project_modes(project, chat_id=chat_id)
                 self._set_mode_on_project(
                     project,
                     True,
                     session.session_id,
                     model_name=model_override,
+                    chat_id=chat_id,
                 )
             if not silent:
                 from ...card.builders.core import CoreBuilder
@@ -727,13 +887,27 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                     )
 
         if project and commit_project_state:
-            self.record_mode_transition(
-                project.project_id,
-                previous_mode,
-                self._get_interaction_mode(),
-                reason=f"enter_{self.mode_name.lower()}_mode",
-                chat_id=chat_id,
-            )
+            transition_kwargs: dict[str, Any] = {
+                "reason": f"enter_{self.mode_name.lower()}_mode",
+                "chat_id": chat_id,
+            }
+            if thread_id:
+                transition_kwargs["thread_id"] = thread_id
+            try:
+                self.record_mode_transition(
+                    project.project_id,
+                    previous_mode,
+                    self._get_interaction_mode(),
+                    **transition_kwargs,
+                )
+            except TypeError:
+                self.record_mode_transition(
+                    project.project_id,
+                    previous_mode,
+                    self._get_interaction_mode(),
+                    reason=f"enter_{self.mode_name.lower()}_mode",
+                    chat_id=chat_id,
+                )
         return True
 
     # ------------------------------------------------------------------
@@ -818,9 +992,9 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             tool_name = mode_name
             if (
                 project
-                and str(getattr(project, "acp_tool_name", "") or "").strip().lower() == mode_name
+                and str(get_project_acp_tool_name(project, chat_id) or "").strip().lower() == mode_name
             ):
-                model_name = getattr(project, "acp_model_name", None)
+                model_name = get_project_acp_model_name(project, chat_id, tool_name=mode_name)
             else:
                 model_name = self._session_bound_model_name(session, None)
 
@@ -866,22 +1040,45 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
         project_state_persisted = True
         if project:
             if session:
-                self._update_snapshot_on_project(
-                    project,
-                    query=session.last_query,
-                    count=session.message_count,
-                    session_id=session.session_id,
-                )
-                self.context_manager.update_context(
-                    project.project_id,
-                    session_snapshot={
-                        "data": session.to_snapshot(),
-                        "source_mode": self.context_source.value,
-                    },
-                    chat_id=chat_id,
-                )
+                try:
+                    self._update_snapshot_on_project(
+                        project,
+                        query=session.last_query,
+                        count=session.message_count,
+                        session_id=session.session_id,
+                        chat_id=chat_id,
+                    )
+                except TypeError:
+                    self._update_snapshot_on_project(
+                        project,
+                        query=session.last_query,
+                        count=session.message_count,
+                        session_id=session.session_id,
+                    )
+                try:
+                    self.context_manager.update_context(
+                        project.project_id,
+                        session_snapshot={
+                            "data": session.to_snapshot(),
+                            "source_mode": self.context_source.value,
+                        },
+                        chat_id=chat_id,
+                        thread_id=thread_id or "",
+                    )
+                except TypeError:
+                    self.context_manager.update_context(
+                        project.project_id,
+                        session_snapshot={
+                            "data": session.to_snapshot(),
+                            "source_mode": self.context_source.value,
+                        },
+                        chat_id=chat_id,
+                    )
             if not thread_id:
-                self._set_mode_on_project(project, False)
+                try:
+                    self._set_mode_on_project(project, False, chat_id=chat_id)
+                except TypeError:
+                    self._set_mode_on_project(project, False)
                 persist = getattr(
                     self.project_manager,
                     "persist_project_context",
@@ -1078,14 +1275,21 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
             except Exception:
                 logger.debug("Failed to end session during clear_session_context", exc_info=True)
         if project is not None:
-            if hasattr(project, "clear_session_state"):
-                project.clear_session_state(self.mode_key)
+            clear_state = getattr(project, "clear_session_state", None)
+            if callable(clear_state):
+                try:
+                    clear_state(self.mode_key, chat_id=chat_id)
+                except TypeError:
+                    clear_state(self.mode_key)
             store = getattr(self.context_manager, "store", None)
             if store is not None and callable(getattr(store, "clear", None)):
                 try:
-                    store.clear(pid, chat_id=chat_id)
+                    store.clear(pid, chat_id=chat_id, thread_id=thread_id or "")
                 except TypeError:
-                    pass
+                    try:
+                        store.clear(pid, chat_id=chat_id)
+                    except TypeError:
+                        pass
 
     # ------------------------------------------------------------------
     # show_info

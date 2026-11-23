@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
 from ...card.ui_text import UI_TEXT
-from ...project import ContextEntryType, ContextSourceMode
+from ...project import (
+    ContextEntryType,
+    ContextSourceMode,
+    get_project_acp_model_name,
+    get_project_acp_tool_name,
+    get_project_programming_mode,
+)
 from .base import BaseHandler
 
 if TYPE_CHECKING:
@@ -45,7 +51,12 @@ class ProjectHandler(BaseHandler):
         active_project = self.project_manager.get_active_project(chat_id)
         current_id = active_project.project_id if active_project else None
 
-        msg_type, content = ProjectBuilder.build_status_board_card(projects, current_id, page=page)
+        msg_type, content = ProjectBuilder.build_status_board_card(
+            projects,
+            current_id,
+            page=page,
+            chat_id=chat_id,
+        )
 
         if origin_message_id:
             if self.update_card(origin_message_id, content):
@@ -72,7 +83,11 @@ class ProjectHandler(BaseHandler):
         from ...card.builders.project import ProjectBuilder
 
         global_working_dir = self.get_working_dir(chat_id)
-        msg_type, card_content = ProjectBuilder.build_project_status_report_card(project, global_working_dir)
+        msg_type, card_content = ProjectBuilder.build_project_status_report_card(
+            project,
+            global_working_dir,
+            chat_id=chat_id,
+        )
 
         if origin_message_id:
             if self.update_card(origin_message_id, card_content):
@@ -116,12 +131,21 @@ class ProjectHandler(BaseHandler):
         session = manager.get_session(chat_id, project_id=pid)
         if not session:
             return
-        project.update_programming_snapshot(
-            mode_key,
-            query=session.last_query,
-            query_count=session.message_count,
-            session_id=session.session_id,
-        )
+        try:
+            project.update_programming_snapshot(
+                mode_key,
+                query=session.last_query,
+                query_count=session.message_count,
+                session_id=session.session_id,
+                chat_id=chat_id,
+            )
+        except TypeError:
+            project.update_programming_snapshot(
+                mode_key,
+                query=session.last_query,
+                query_count=session.message_count,
+                session_id=session.session_id,
+            )
         source_value = (
             ContextSourceMode(mode_key).value
             if mode_key in ContextSourceMode._value2member_map_
@@ -265,17 +289,23 @@ class ProjectHandler(BaseHandler):
 
         from ...project.context import ProjectContext as _ProjectContext
 
-        saved_tool = _ProjectContext.normalize_acp_tool_name(getattr(project, "acp_tool_name", None))
+        saved_tool = _ProjectContext.normalize_acp_tool_name(
+            get_project_acp_tool_name(project, chat_id)
+        )
         if auto_enter_coco:
             if saved_tool:
                 target_handler = coco_handler if (saved_tool == "coco" and coco_handler) else self.get_handler(saved_tool)
                 if target_handler and hasattr(target_handler, "enter_mode"):
                     enter_kwargs: dict = {"project": project}
                     if saved_tool != "coco":
-                        enter_kwargs["model_override"] = getattr(project, "acp_model_name", None)
+                        enter_kwargs["model_override"] = get_project_acp_model_name(
+                            project,
+                            chat_id,
+                            tool_name=saved_tool,
+                        )
                     target_handler.enter_mode(message_id, chat_id, **enter_kwargs)
                     return
-            elif getattr(project, "coco_mode", False) is True and coco_handler:
+            elif get_project_programming_mode(project, "coco", chat_id) and coco_handler:
                 coco_handler.enter_mode(message_id, chat_id, project=project)
                 return
 

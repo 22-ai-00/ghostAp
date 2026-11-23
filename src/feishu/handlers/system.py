@@ -13,6 +13,7 @@ from ...card.backend_meta import VISIBLE_BACKEND_METAS, get_backend_meta
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
 from ...mode.backends import ALL_BACKEND_METAS
+from ...project import get_project_acp_model_name, get_project_acp_tool_name
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.lock_order import LockLevel, ordered_rlock
 from ..emoji import EmojiReaction
@@ -487,7 +488,11 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
 
         is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
         cfg_project = self._configuration_project(chat_id, project)
-        preferred_tool = getattr(cfg_project, "acp_tool_name", None) if cfg_project else None
+        preferred_tool = (
+            get_project_acp_tool_name(cfg_project, chat_id)
+            if cfg_project
+            else None
+        )
 
         available_tools = [
             tool
@@ -1059,7 +1064,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             candidates.append(active_key)
         for fallback in (
             str((value or {}).get("tool_name") or "").strip().lower(),
-            getattr(project, "acp_tool_name", None) if project else None,
+            get_project_acp_tool_name(project, chat_id) if project else None,
         ):
             if fallback and fallback in PROGRAMMING_MODE_VALUES and fallback not in candidates:
                 candidates.append(fallback)
@@ -1100,8 +1105,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             elif callable(getattr(self.project_manager, "save_projects", None)):
                 self.project_manager.save_projects()
         saved_model = (
-            getattr(target_project, "acp_model_name", None)
-            if target_project and getattr(target_project, "acp_tool_name", None) == target_tool
+            get_project_acp_model_name(
+                target_project,
+                chat_id,
+                tool_name=target_tool,
+            )
+            if target_project
             else None
         )
         self.reply_text(
@@ -1210,8 +1219,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             else None
         ) or self.get_working_dir(chat_id)
         model_name = (
-            getattr(target_project, "acp_model_name", None)
-            if target_project is not None and getattr(target_project, "acp_tool_name", None) == tool_name
+            get_project_acp_model_name(
+                target_project,
+                chat_id,
+                tool_name=tool_name,
+            )
+            if target_project is not None
             else None
         )
         self.add_reaction(message_id, EmojiReaction.on_processing())

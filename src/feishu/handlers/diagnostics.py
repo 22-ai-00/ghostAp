@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, Optional
 
 from ...card.ui_text import UI_TEXT
 from ...mode import PROGRAMMING_MODES
-from ...project import context_helper
+from ...project import (
+    context_helper,
+    get_project_acp_model_name,
+    get_project_acp_tool_name,
+)
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.errors import get_error_detail
 from .base import BaseHandler
@@ -267,10 +271,10 @@ class DiagnosticsHandler(BaseHandler):
         except Exception:
             mode_key = ""
 
-        tool_name = mode_key or (getattr(project, "acp_tool_name", None) if project else "") or ""
+        tool_name = mode_key or (get_project_acp_tool_name(project, chat_id) if project else "") or ""
         model_name = (
-            (getattr(project, "acp_model_name", None) or "")
-            if project and tool_name and getattr(project, "acp_tool_name", None) == tool_name
+            (get_project_acp_model_name(project, chat_id, tool_name=tool_name) or "")
+            if project and tool_name
             else ""
         )
         session_id = ""

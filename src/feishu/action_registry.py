@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 from ..card.actions import dispatch as action_ids
 from ..card.ui_text import UI_TEXT
 from ..mode import PROGRAMMING_MODES, InteractionMode
+from ..project import get_project_acp_tool_name
 from ..utils.signing import VerifyResult, verify_command_sig
 from .slash_command_parser import SlashCommandParser
 
@@ -187,7 +188,7 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         if project is None:
             base.reply_text(mid, UI_TEXT["lock_project_not_found_hint"])
             return
-        saved_tool = getattr(project, "acp_tool_name", None)
+        saved_tool = get_project_acp_tool_name(project, cid)
         if saved_tool:
             system.handle_enter_acp_saved_selection(mid, cid, saved_tool, project)
         else:

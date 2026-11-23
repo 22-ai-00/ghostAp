@@ -315,6 +315,7 @@ class ProjectManager:
         session_id: str,
         query_count: int = 0,
         activate_mode: bool = True,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Persist one successful ACP selection and its project-mode snapshot.
 
@@ -332,6 +333,7 @@ class ProjectManager:
                 session_id,
                 query_count,
                 activate_mode,
+                chat_id=chat_id,
             )
             if self._save_projects():
                 return True
@@ -344,15 +346,20 @@ class ProjectManager:
         *,
         tool_name: str,
         model_name: Optional[str],
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Persist one explicit tool/model setting with rollback on failure."""
         with self._lock:
             if self._projects.get(project.project_id) is not project:
                 return False
-            previous = project.replace_acp_configuration(tool_name, model_name)
+            previous = project.replace_acp_configuration_for_chat(
+                tool_name,
+                model_name,
+                chat_id=chat_id,
+            )
             if self._save_projects():
                 return True
-            project.replace_acp_configuration(*previous)
+            project.restore_acp_configuration(previous)
             return False
 
     @staticmethod

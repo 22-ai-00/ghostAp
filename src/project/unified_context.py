@@ -309,7 +309,7 @@ class ProjectContextManager:
     """The sole in-memory owner of chat-scoped project context."""
 
     def __init__(self, max_entries: int = 200, max_versions: int = 50) -> None:
-        self._contexts: dict[tuple[str, str], UnifiedContext] = {}
+        self._contexts: dict[tuple[str, ...], UnifiedContext] = {}
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._max_entries = max_entries
         self._max_versions = max_versions
@@ -320,11 +320,20 @@ class ProjectContextManager:
         return self
 
     @staticmethod
-    def _key(project_id: str, chat_id: str) -> tuple[str, str]:
+    def _key(project_id: str, chat_id: str, thread_id: str = "") -> tuple[str, ...]:
+        normalized_thread = str(thread_id or "").strip()
+        if normalized_thread:
+            return chat_id, project_id, normalized_thread
         return chat_id, project_id
 
-    def get_or_create(self, project_id: str, *, chat_id: str = "") -> UnifiedContext:
-        key = self._key(project_id, chat_id)
+    def get_or_create(
+        self,
+        project_id: str,
+        *,
+        chat_id: str = "",
+        thread_id: str = "",
+    ) -> UnifiedContext:
+        key = self._key(project_id, chat_id, thread_id=thread_id)
         with self._lock:
             context = self._contexts.get(key)
             if context is None:
@@ -337,9 +346,32 @@ class ProjectContextManager:
                 logger.info("[ContextStore] created context for chat/project %r", key)
             return context
 
-    def get(self, project_id: str, *, chat_id: str = "") -> Optional[UnifiedContext]:
+    def get(
+        self,
+        project_id: str,
+        *,
+        chat_id: str = "",
+        thread_id: str = "",
+    ) -> Optional[UnifiedContext]:
         with self._lock:
-            return self._contexts.get(self._key(project_id, chat_id))
+            return self._contexts.get(self._key(project_id, chat_id, thread_id=thread_id))
+
+    def clear(
+        self,
+        project_id: str,
+        *,
+        chat_id: str = "",
+        thread_id: str = "",
+    ) -> bool:
+        """Remove one chat/project(/thread) context stream cleanly."""
+        if not project_id or not project_id.strip():
+            return False
+        key = self._key(project_id, chat_id, thread_id=thread_id)
+        with self._lock:
+            removed = self._contexts.pop(key, None) is not None
+        if removed:
+            logger.info("[ContextStore] cleared context for chat/project %r", key)
+        return removed
 
     @staticmethod
     def _source(value: object, default: ContextSourceMode) -> ContextSourceMode:
@@ -356,11 +388,12 @@ class ProjectContextManager:
         file_changes: Optional[Iterable[str]] = None,
         source_mode: Optional[str] = None,
         chat_id: str = "",
+        thread_id: str = "",
     ) -> int:
         """Append the production context payloads and return the added count."""
         if not project_id or not project_id.strip():
             return 0
-        context = self.get_or_create(project_id, chat_id=chat_id)
+        context = self.get_or_create(project_id, chat_id=chat_id, thread_id=thread_id)
         added = 0
         if conversation:
             context.add_conversation(

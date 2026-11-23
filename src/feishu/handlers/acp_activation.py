@@ -7,6 +7,7 @@ import sys
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...mode.backends import BACKEND_META_BY_KEY
+from ...project import get_project_acp_model_name, get_project_acp_tool_name
 from ...tasking import TaskStatus
 from ...utils.errors import safe_error_message
 
@@ -488,6 +489,71 @@ class ACPActivationMixin:
                     names.append(name)
         return names
 
+    def _commit_acp_configuration_for_chat(
+        self,
+        project: Optional["ProjectContext"],
+        *,
+        tool_name: str,
+        model_name: Optional[str],
+        chat_id: str,
+    ) -> bool:
+        if project is None:
+            return False
+        commit_fn = self.project_manager.commit_acp_configuration
+        try:
+            return bool(
+                commit_fn(
+                    project,
+                    tool_name=tool_name,
+                    model_name=model_name,
+                    chat_id=chat_id,
+                )
+            )
+        except TypeError:
+            return bool(
+                commit_fn(
+                    project,
+                    tool_name=tool_name,
+                    model_name=model_name,
+                )
+            )
+
+    def _commit_acp_programming_activation_for_chat(
+        self,
+        project: "ProjectContext",
+        *,
+        tool_name: str,
+        model_name: Optional[str],
+        session_id: str,
+        query_count: int = 0,
+        activate_mode: bool = True,
+        chat_id: str,
+    ) -> bool:
+        commit_fn = self.project_manager.commit_acp_programming_activation
+        try:
+            return bool(
+                commit_fn(
+                    project,
+                    tool_name=tool_name,
+                    model_name=model_name,
+                    session_id=session_id,
+                    query_count=query_count,
+                    activate_mode=activate_mode,
+                    chat_id=chat_id,
+                )
+            )
+        except TypeError:
+            return bool(
+                commit_fn(
+                    project,
+                    tool_name=tool_name,
+                    model_name=model_name,
+                    session_id=session_id,
+                    query_count=query_count,
+                    activate_mode=activate_mode,
+                )
+            )
+
     def handle_acp_command(
         self,
         message_id: str,
@@ -502,7 +568,7 @@ class ACPActivationMixin:
             for item in _system_module().list_acp_tools()
         ]
         names = [name for name in names if name]
-        current = str(getattr(project, "acp_tool_name", "") or "").strip() or "未设置"
+        current = str(get_project_acp_tool_name(project, chat_id) or "").strip() or "未设置"
         parts = (text or "").strip().split(maxsplit=1)
         requested = parts[1].strip().lower() if len(parts) > 1 else ""
         if not requested:
@@ -520,11 +586,15 @@ class ACPActivationMixin:
         if project is None:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
-        previous_tool = str(getattr(project, "acp_tool_name", "") or "").strip()
-        model_name = getattr(project, "acp_model_name", None) if previous_tool == requested else None
+        previous_tool = str(get_project_acp_tool_name(project, chat_id) or "").strip()
+        model_name = (
+            get_project_acp_model_name(project, chat_id, tool_name=requested)
+            if previous_tool == requested
+            else None
+        )
         active_key = self._resolve_active_programming_mode_key(chat_id, project)
-        if not self.project_manager.commit_acp_configuration(
-            project, tool_name=requested, model_name=model_name
+        if not self._commit_acp_configuration_for_chat(
+            project, tool_name=requested, model_name=model_name, chat_id=chat_id
         ):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
@@ -567,7 +637,10 @@ class ACPActivationMixin:
             new_mode = _system_module().InteractionMode(new_tool)
         except ValueError:
             return False
-        project.set_programming_mode(new_tool, True)
+        try:
+            project.set_programming_mode(new_tool, True, chat_id=chat_id)
+        except TypeError:
+            project.set_programming_mode(new_tool, True)
         enter_fn = getattr(self.mode_manager, "enter_programming_mode", None)
         if callable(enter_fn):
             enter_fn(chat_id, new_mode, project_id=pid)
@@ -588,6 +661,8 @@ class ACPActivationMixin:
             handler = None
         if handler is None:
             return ""
+        if callable(getattr(type(handler), "set_scoped_model", None)):
+            handler.set_scoped_model(chat_id, model_name, project=project)
         if callable(getattr(handler, "_enter_mode_on_manager", None)) and hasattr(handler, "current_model"):
             handler.current_model = model_name
         mgr_getter = getattr(handler, "_get_session_manager", None)
@@ -688,10 +763,10 @@ class ACPActivationMixin:
         if target_project is None:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
-        current_model = (
-            getattr(target_project, "acp_model_name", None)
-            if getattr(target_project, "acp_tool_name", None) == tool
-            else None
+        current_model = get_project_acp_model_name(
+            target_project,
+            chat_id,
+            tool_name=tool,
         )
         card_message_id = origin_message_id
         if show_loading:
@@ -866,11 +941,7 @@ class ACPActivationMixin:
         models = self._fetch_acp_models(
             tool,
             cwd=project.root_path,
-            current_model=(
-                getattr(project, "acp_model_name", None)
-                if getattr(project, "acp_tool_name", None) == tool
-                else None
-            ),
+            current_model=get_project_acp_model_name(project, chat_id, tool_name=tool),
         )
         if value.get("use_default_model") is True:
             model_name = None
@@ -936,9 +1007,11 @@ class ACPActivationMixin:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_tool_prompt"])
             return
 
-        stored_model = None
-        if project and getattr(project, "acp_tool_name", "") == tool:
-            stored_model = getattr(project, "acp_model_name", None)
+        stored_model = (
+            get_project_acp_model_name(project, chat_id, tool_name=tool)
+            if project
+            else None
+        )
         model_name = str(stored_model).strip() if stored_model else None
         self._activate_acp_selection(
             message_id,
@@ -1161,17 +1234,31 @@ class ACPActivationMixin:
                 if (
                     not explicit_card
                     and target_project is not None
-                    and getattr(target_project, "acp_tool_name", None) == tool
+                    and get_project_acp_tool_name(target_project, chat_id) == tool
                 ):
                     # A selector queued just before this user task may have
                     # committed a newer model while the task was waiting.  A
                     # saved-selection task consumes that committed value; it
                     # must not switch the session or project back to the stale
                     # value captured at ingress.
-                    activation_model = getattr(
+                    activation_model = get_project_acp_model_name(
                         target_project,
-                        "acp_model_name",
-                        None,
+                        chat_id,
+                        tool_name=tool,
+                    )
+                had_previous_scoped_model = False
+                previous_scoped_model: Optional[str] = None
+                if (
+                    thread_root_id is None
+                    and handler
+                    and callable(getattr(type(handler), "set_scoped_model", None))
+                ):
+                    had_previous_scoped_model, previous_scoped_model = (
+                        handler.set_scoped_model(
+                            chat_id,
+                            activation_model,
+                            project=target_project,
+                        )
                     )
                 previous_handler_model = (
                     handler.current_model
@@ -1192,6 +1279,20 @@ class ACPActivationMixin:
                     # while the explicit input prevents a later selection from
                     # changing an already-running callback's startup model.
                     handler.current_model = activation_model
+
+            def _rollback_handler_model() -> None:
+                if not (thread_root_id is None and handler):
+                    return
+                if callable(getattr(type(handler), "restore_scoped_model", None)):
+                    handler.restore_scoped_model(
+                        chat_id,
+                        had_previous_scoped_model,
+                        previous_scoped_model,
+                        project=target_project,
+                    )
+                if hasattr(handler, "current_model"):
+                    handler.current_model = previous_handler_model
+
             try:
                 activation_effect = self._enter_mode_with_acp_model(
                     message_id,
@@ -1209,24 +1310,14 @@ class ACPActivationMixin:
                     tool,
                     activation_model or "<default>",
                 )
-                if (
-                    _owns_activation()
-                    and thread_root_id is None
-                    and handler
-                    and hasattr(handler, "current_model")
-                ):
-                    handler.current_model = previous_handler_model
+                if _owns_activation():
+                    _rollback_handler_model()
                 _publish_failure(safe_error_message(exc))
                 return False
 
             if not activation_effect:
-                if (
-                    _owns_activation()
-                    and thread_root_id is None
-                    and handler
-                    and hasattr(handler, "current_model")
-                ):
-                    handler.current_model = previous_handler_model
+                if _owns_activation():
+                    _rollback_handler_model()
                 _publish_failure(_system_module().UI_TEXT["system_acp_activation_failed_safe"])
                 return False
 
@@ -1303,6 +1394,7 @@ class ACPActivationMixin:
                             is not target_project
                         ):
                             _retire_changed_effect()
+                            _rollback_handler_model()
                             _publish_failure(
                                 _system_module().UI_TEXT["system_acp_activation_failed_safe"]
                             )
@@ -1326,25 +1418,21 @@ class ACPActivationMixin:
                             and session is not effect_session
                         ):
                             _retire_changed_effect()
-                            if (
-                                thread_root_id is None
-                                and handler
-                                and hasattr(handler, "current_model")
-                            ):
-                                handler.current_model = previous_handler_model
+                            _rollback_handler_model()
                             _publish_failure(
                                 _system_module().UI_TEXT["system_acp_activation_failed_safe"]
                             )
                             return False
                         committed = True
                         if thread_root_id is None:
-                            committed = self.project_manager.commit_acp_programming_activation(
+                            committed = self._commit_acp_programming_activation_for_chat(
                                 target_project,
                                 tool_name=tool,
                                 model_name=activation_model,
                                 session_id=session.session_id,
                                 query_count=session.message_count,
                                 activate_mode=True,
+                                chat_id=chat_id,
                             )
                         if not committed:
                             # Startup/replacement and live setModel have already
@@ -1353,12 +1441,7 @@ class ACPActivationMixin:
                             # runtime state cannot silently diverge from the
                             # saved tool/model selection.
                             _retire_changed_effect()
-                            if (
-                                thread_root_id is None
-                                and handler
-                                and hasattr(handler, "current_model")
-                            ):
-                                handler.current_model = previous_handler_model
+                            _rollback_handler_model()
                             _publish_failure(
                                 _system_module().UI_TEXT["system_acp_config_save_failed"]
                             )
@@ -1410,13 +1493,8 @@ class ACPActivationMixin:
                     tool,
                     activation_model or "<default>",
                 )
-                if (
-                    _owns_activation()
-                    and thread_root_id is None
-                    and handler
-                    and hasattr(handler, "current_model")
-                ):
-                    handler.current_model = previous_handler_model
+                if _owns_activation():
+                    _rollback_handler_model()
                 _publish_failure(safe_error_message(exc))
                 return False
 
@@ -1488,21 +1566,32 @@ class ACPActivationMixin:
         """Resolve the ACP tool name relevant to the current context.
 
         Priority:
-        1. project.acp_tool_name (explicit tool set on active project)
+        1. project.get_acp_tool_name(chat_id) (explicit tool set on active project)
         2. Current programming interaction mode
         3. Default: "coco"
         """
-        if project and getattr(project, "acp_tool_name", ""):
+        raw_tool = get_project_acp_tool_name(project, chat_id) if project else None
+        if raw_tool:
             from ...project.context import ProjectContext
 
-            tool_name = ProjectContext.normalize_acp_tool_name(
-                project.acp_tool_name
-            )
+            tool_name = ProjectContext.normalize_acp_tool_name(raw_tool)
             if tool_name:
-                project.acp_tool_name = tool_name
+                if tool_name != raw_tool:
+                    if callable(getattr(type(project), "set_acp_configuration", None)):
+                        existing_model = get_project_acp_model_name(project, chat_id)
+                        project.set_acp_configuration(  # type: ignore[union-attr]
+                            tool_name,
+                            existing_model,
+                            chat_id=chat_id,
+                        )
+                    else:
+                        project.acp_tool_name = tool_name  # type: ignore[union-attr]
                 return tool_name
-            project.acp_tool_name = None
-            project.acp_model_name = None
+            if callable(getattr(type(project), "set_acp_configuration", None)):
+                project.set_acp_configuration(None, None, chat_id=chat_id)  # type: ignore[union-attr]
+            else:
+                project.acp_tool_name = None  # type: ignore[union-attr]
+                project.acp_model_name = None  # type: ignore[union-attr]
 
         project_id = project.project_id if project else None
         mode = self.mode_manager.get_mode(chat_id, project_id=project_id)
@@ -1532,9 +1621,11 @@ class ACPActivationMixin:
             )
             return
         cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-        current_model: Optional[str] = None
-        if project and getattr(project, "acp_tool_name", "") == tool_name:
-            current_model = getattr(project, "acp_model_name", None)
+        current_model: Optional[str] = (
+            get_project_acp_model_name(project, chat_id, tool_name=tool_name)
+            if project
+            else None
+        )
         model_names = self._model_names(
             self._fetch_acp_models(
                 tool_name,
@@ -1585,10 +1676,11 @@ class ACPActivationMixin:
                     ),
                 )
                 return
-        if project is None or not self.project_manager.commit_acp_configuration(
+        if not self._commit_acp_configuration_for_chat(
             project,
             tool_name=tool_name,
             model_name=model_name,
+            chat_id=chat_id,
         ):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
@@ -1621,9 +1713,11 @@ class ACPActivationMixin:
         project = self._configuration_project(chat_id, project)
         tool_name = self._resolve_current_acp_tool(chat_id, project)
         cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-        current_model: Optional[str] = None
-        if project and getattr(project, "acp_tool_name", "") == tool_name:
-            current_model = getattr(project, "acp_model_name", None)
+        current_model: Optional[str] = (
+            get_project_acp_model_name(project, chat_id, tool_name=tool_name)
+            if project
+            else None
+        )
 
         models = self._fetch_acp_models(
             tool_name,
@@ -1841,10 +1935,11 @@ class ACPActivationMixin:
                 return
             next_model_name = target_variant.value
 
-        if project is None or not self.project_manager.commit_acp_configuration(
+        if not self._commit_acp_configuration_for_chat(
             project,
             tool_name=tool_name,
             model_name=next_model_name,
+            chat_id=chat_id,
         ):
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return

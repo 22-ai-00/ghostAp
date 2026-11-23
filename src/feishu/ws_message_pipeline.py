@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 from ..access_control import AccessOperation
 from ..card.ui_text import UI_TEXT
 from ..mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES
+from ..project import get_project_acp_tool_name
 from ..thread import get_current_thread_id
 from ..trust.models import TrustZone
 from ..utils.errors import get_error_detail
@@ -745,7 +746,7 @@ class WSMessagePipelineMixin:
                     dispatch(bound_project)
                     return
                 tool = str(
-                    getattr(bound_project, "acp_tool_name", None)
+                    get_project_acp_tool_name(bound_project, chat_id)
                     or getattr(self.settings, "default_acp_tool", None)
                     or "coco"
                 ).strip().lower()

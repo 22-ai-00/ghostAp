@@ -9,6 +9,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from ...card.ui_text import UI_TEXT
+from ...project import get_project_acp_model_name, get_project_acp_tool_name
 from ...utils.errors import fmt_error, get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
@@ -78,8 +79,8 @@ class SpecHandler(BaseEngineHandler):
         directly from the project's ACP config so that ``/model`` in SMART
         mode is respected.
         """
-        if project and project.acp_tool_name and project.acp_model_name:
-            return project.acp_model_name
+        if project and get_project_acp_tool_name(project, chat_id):
+            return get_project_acp_model_name(project, chat_id) or ""
         return ""
 
     def _get_spec_reporter(self):

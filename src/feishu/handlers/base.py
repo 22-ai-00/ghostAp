@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...card.ui_text import UI_TEXT
+from ...project import get_project_acp_model_name, get_project_acp_tool_name
 from ...utils.engine_identity import resolve_engine_identity
 from ...utils.errors import (
     LARK_CODE_MESSAGE_NOT_FOUND,
@@ -842,7 +843,16 @@ class BaseHandler:
         }
         return mapping.get(mode, ContextSourceMode.SMART)
 
-    def record_mode_transition(self, project_id: str, from_mode, to_mode, reason: str = "", *, chat_id: str = ""):
+    def record_mode_transition(
+        self,
+        project_id: str,
+        from_mode,
+        to_mode,
+        reason: str = "",
+        *,
+        chat_id: str = "",
+        thread_id: str = "",
+    ):
         """Record a mode switch into the unified context and build a bridge summary."""
         from_source = self.mode_to_context_source(from_mode)
         to_source = self.mode_to_context_source(to_mode)
@@ -857,16 +867,33 @@ class BaseHandler:
         logger.info(
             "[模式切换] project=%s: %s -> %s, reason=%s", project_id, from_source.value, to_source.value, reason
         )
-        self.ctx.context_manager.update_context(
-            project_id,
-            mode_transition={
-                "from_mode": from_source.value,
-                "to_mode": to_source.value,
-                "reason": reason,
-            },
-            chat_id=chat_id,
-        )
-        ctx = self.ctx.context_manager.store.get(project_id, chat_id=chat_id)
+        try:
+            self.ctx.context_manager.update_context(
+                project_id,
+                mode_transition={
+                    "from_mode": from_source.value,
+                    "to_mode": to_source.value,
+                    "reason": reason,
+                },
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+            ctx = self.ctx.context_manager.store.get(
+                project_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        except TypeError:
+            self.ctx.context_manager.update_context(
+                project_id,
+                mode_transition={
+                    "from_mode": from_source.value,
+                    "to_mode": to_source.value,
+                    "reason": reason,
+                },
+                chat_id=chat_id,
+            )
+            ctx = self.ctx.context_manager.store.get(project_id, chat_id=chat_id)
         if ctx:
             ctx.build_bridge_summary(from_source, to_source)
             ctx.create_version(
@@ -874,7 +901,14 @@ class BaseHandler:
                 source_mode=from_source,
             )
 
-    def inject_bridge_context(self, text: str, project: Optional["ProjectContext"], *, chat_id: str = "") -> str:
+    def inject_bridge_context(
+        self,
+        text: str,
+        project: Optional["ProjectContext"],
+        *,
+        chat_id: str = "",
+        thread_id: str = "",
+    ) -> str:
         """Consume and prepend bridge summary to the user prompt (one-shot)."""
         if not project:
             return text
@@ -883,7 +917,14 @@ class BaseHandler:
 
         if is_pure_zero_arg_native_slash(stripped):
             return text
-        ctx = self.ctx.context_manager.store.get(project.project_id, chat_id=chat_id)
+        try:
+            ctx = self.ctx.context_manager.store.get(
+                project.project_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        except TypeError:
+            ctx = self.ctx.context_manager.store.get(project.project_id, chat_id=chat_id)
         if not ctx:
             return text
         bridge = ctx.consume_bridge_summary()
@@ -949,8 +990,8 @@ class BaseHandler:
                 project = None
         identity = resolve_engine_identity(
             mode=current_mode,
-            acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
-            acp_model_name=getattr(project, "acp_model_name", None) if project else None,
+            acp_tool_name=get_project_acp_tool_name(project, chat_id) if project else None,
+            acp_model_name=get_project_acp_model_name(project, chat_id) if project else None,
         )
         return identity.engine_name
 

@@ -5,6 +5,12 @@ from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote
 
 from src.mode.manager import InteractionMode
+from src.project.context import (
+    get_project_acp_model_name,
+    get_project_acp_tool_name,
+    get_project_programming_mode,
+    get_project_programming_snapshot,
+)
 
 from ..backend_meta import ALL_BACKEND_METAS, get_backend_meta, resolve_project_programming_mode
 from ..shared import (
@@ -85,7 +91,12 @@ class ProjectBuilder:
         )
 
     @staticmethod
-    def build_project_status_report_card(project: ProjectContext, global_working_dir: str) -> tuple[str, str]:
+    def build_project_status_report_card(
+        project: ProjectContext,
+        global_working_dir: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> tuple[str, str]:
         """Build the full card for project status report."""
         del global_working_dir  # status card keeps one directory row for compactness
 
@@ -112,8 +123,8 @@ class ProjectBuilder:
         ]
 
         for meta in ALL_BACKEND_METAS:
-            if getattr(project, meta.project_mode_attr, False):
-                snap = getattr(project, meta.project_snapshot_attr, None)
+            if get_project_programming_mode(project, meta.mode_key, chat_id):
+                snap = get_project_programming_snapshot(project, meta.mode_key, chat_id)
                 if snap:
                     lines.append(
                         f"• {meta.display_name}: `{snap.session_id}` · {UI_TEXT['project_session_count_label'].format(count=snap.query_count).lstrip('• ')}"
@@ -280,6 +291,8 @@ class ProjectBuilder:
         current_project_id: Optional[str] = None,
         page: int = 1,
         page_size: int = 5,
+        *,
+        chat_id: Optional[str] = None,
     ) -> tuple[str, str]:
         board_title = UI_TEXT["project_board_title"]
         if not projects:
@@ -323,12 +336,12 @@ class ProjectBuilder:
             current_marker = UI_TEXT["project_board_current_marker"] if is_current else ""
 
             mode_info = ""
-            active_mode = resolve_project_programming_mode(project)
+            active_mode = resolve_project_programming_mode(project, chat_id=chat_id)
             if active_mode is not None:
                 meta = get_backend_meta(active_mode)
                 query_count = 0
                 if meta is not None:
-                    snap = getattr(project, meta.project_snapshot_attr, None)
+                    snap = get_project_programming_snapshot(project, meta.mode_key, chat_id)
                     if snap:
                         query_count = getattr(snap, "query_count", 0) or 0
                 if active_mode == InteractionMode.CLAUDE:
@@ -338,10 +351,14 @@ class ProjectBuilder:
                 elif meta is not None:
                     mode_info = f" · {meta.emoji} {meta.display_name}({query_count})"
             else:
-                saved_tool = getattr(project, "acp_tool_name", None)
+                saved_tool = get_project_acp_tool_name(project, chat_id)
                 meta = get_backend_meta(saved_tool) if saved_tool else None
                 if meta is not None:
-                    saved_model = getattr(project, "acp_model_name", None)
+                    saved_model = get_project_acp_model_name(
+                        project,
+                        chat_id,
+                        tool_name=saved_tool,
+                    )
                     model_suffix = f"/{saved_model}" if saved_model else ""
                     mode_info = f" · {meta.emoji} {meta.display_name}{model_suffix}"
 

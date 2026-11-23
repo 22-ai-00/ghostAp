@@ -8,6 +8,7 @@ import os
 import threading
 from typing import TYPE_CHECKING, Optional
 
+from ...project import get_project_acp_model_name, get_project_acp_tool_name
 from ...utils.errors import get_error_detail
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
@@ -75,8 +76,8 @@ class DeepHandler(BaseEngineHandler):
         mode by default.  Read the model directly from the project's ACP config
         so that a model selected via ``/model`` in SMART mode is picked up.
         """
-        if project and project.acp_tool_name and project.acp_model_name:
-            return project.acp_model_name
+        if project and get_project_acp_tool_name(project, chat_id):
+            return get_project_acp_model_name(project, chat_id) or ""
         return ""
 
     # Command router
