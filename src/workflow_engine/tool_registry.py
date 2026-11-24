@@ -32,7 +32,7 @@ _cached_tools: dict[str, str] | None = None
 _cached_at: float = 0.0
 _cached_selectable_tools: dict[str, str] | None = None
 _cached_selectable_at: float = 0.0
-_cached_capabilities: dict[str, tuple[float, dict[str, "ToolCapability"]]] = {}
+_cached_capabilities: dict[str, tuple[float, int, dict[str, "ToolCapability"]]] = {}
 
 EFFORT_CAPABLE_TOOLS: frozenset[str] = frozenset(
     {"codex", "codex_w", "claude", "claude_w", "agy", "traex", "dsh"}
@@ -59,6 +59,7 @@ class ToolCapability:
         default_factory=lambda: MappingProxyType({})
     )
     description: str = ""
+    authoritative_models: bool = False
 
     def __post_init__(self) -> None:
         tool_name = str(self.tool_name or "").strip().lower()
@@ -107,6 +108,7 @@ class ToolCapability:
         object.__setattr__(self, "default_effort", default_effort)
         object.__setattr__(self, "profiles_by_model", frozen_profiles)
         object.__setattr__(self, "description", str(self.description or ""))
+        object.__setattr__(self, "authoritative_models", bool(self.authoritative_models))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +122,7 @@ class ToolCapability:
             "default_effort": self.default_effort,
             "profiles_by_model": {k: list(v) for k, v in self.profiles_by_model.items()},
             "description": self.description,
+            "authoritative_models": self.authoritative_models,
         }
 
 # ---------------------------------------------------------------------------
@@ -204,6 +207,15 @@ def invalidate_cache() -> None:
         _cached_capabilities.clear()
 
 
+def _acp_cache_version() -> int:
+    try:
+        from ..acp.helper import get_acp_model_cache_version
+
+        return int(get_acp_model_cache_version())
+    except Exception:
+        return 0
+
+
 def get_tool_capabilities(
     force_refresh: bool = False,
     *,
@@ -212,24 +224,37 @@ def get_tool_capabilities(
     """Return cached non-blocking capabilities for all Workflow backends.
 
     Returns a fresh dict mapping ``tool_name -> ToolCapability``. Never runs a
-    synchronous ACP probe on cache miss.
+    synchronous ACP probe on cache miss. Invalidates immediately when the
+    underlying ACP model probe cache version advances.
     """
     cache_key = str(cwd or "")
+    acp_version = _acp_cache_version()
     now = time.monotonic()
     if not force_refresh:
         with _cache_lock:
             entry = _cached_capabilities.get(cache_key)
-            if entry is not None and (now - entry[0]) < _CACHE_TTL_S:
-                return dict(entry[1])
+            if entry is not None and (now - entry[0]) < _CACHE_TTL_S and entry[1] == acp_version:
+                return dict(entry[2])
 
     with _cache_lock:
+        acp_version = _acp_cache_version()
         if not force_refresh:
             entry = _cached_capabilities.get(cache_key)
-            if entry is not None and (time.monotonic() - entry[0]) < _CACHE_TTL_S:
-                return dict(entry[1])
+            if (
+                entry is not None
+                and (time.monotonic() - entry[0]) < _CACHE_TTL_S
+                and entry[1] == acp_version
+            ):
+                return dict(entry[2])
 
         capabilities = _discover_tool_capabilities(cwd=cwd)
-        _cached_capabilities[cache_key] = (time.monotonic(), capabilities)
+        # Stamp with pre-discovery acp_version so concurrent _store() updates
+        # during _discover_tool_capabilities() invalidate on the next read.
+        _cached_capabilities[cache_key] = (
+            time.monotonic(),
+            acp_version,
+            capabilities,
+        )
         return dict(capabilities)
 
 
@@ -369,10 +394,12 @@ def _discover_tool_capabilities(*, cwd: str | None = None) -> dict[str, ToolCapa
         except Exception:
             cached_options = []
 
+        authoritative_models = False
         if cached_options:
             models, efforts_by_model, profiles_by_model, default_effort = (
                 _extract_option_capabilities(tool_name, cached_options)
             )
+            authoritative_models = bool(models)
         elif tool_name == "traex":
             try:
                 traex_meta = load_traex_model_metadata()
@@ -399,6 +426,7 @@ def _discover_tool_capabilities(*, cwd: str | None = None) -> dict[str, ToolCapa
                     if eff_list:
                         efforts_by_model[item.config_name] = tuple(eff_list)
                 models = tuple(dict.fromkeys(meta_models))
+                authoritative_models = bool(models)
 
         if not supports_effort:
             efforts_by_model = {}
@@ -420,6 +448,7 @@ def _discover_tool_capabilities(*, cwd: str | None = None) -> dict[str, ToolCapa
             default_effort=default_effort,
             profiles_by_model=profiles_by_model,
             description=description,
+            authoritative_models=authoritative_models,
         )
 
     return capabilities
@@ -469,13 +498,20 @@ def validate_agent_binding_spec(
     raw_model = str(model_name or "").strip() or None
     raw_profile = str(profile or "").strip().lower() or None
     raw_effort = str(effort or "").strip().lower() or None
+    if raw_effort == "default":
+        raw_effort = None
 
     if not cap.supports_effort:
         if raw_effort is not None:
             return False, f"工具 {tool} 不支持设置 effort（收到 effort={raw_effort}）"
         if raw_profile is not None:
             return False, f"工具 {tool} 不支持设置 profile（收到 profile={raw_profile}）"
-        if raw_model is not None and cap.models and raw_model not in cap.models:
+        if (
+            raw_model is not None
+            and raw_model.lower() != "default"
+            and cap.models
+            and raw_model not in cap.models
+        ):
             return (
                 False,
                 f"工具 {tool} 不支持模型: {raw_model}（可用: {', '.join(cap.models[:8])}）",
@@ -636,6 +672,8 @@ def validate_agent_binding_spec(
             )
 
     effective_effort = raw_effort or emb_effort
+    if effective_effort == "default" and tool != "dsh":
+        effective_effort = None
     if effective_effort is not None:
         if tool in {"claude", "claude_w"}:
             allowed = set(CLAUDE_REASONING_EFFORTS) | {CLAUDE_DEFAULT_EFFORT_TOKEN}
@@ -647,6 +685,18 @@ def validate_agent_binding_spec(
                 )
         elif tool in {"codex", "codex_w"}:
             model_efforts = cap.efforts_by_model.get(base_model or "") if base_model else None
+            if (
+                tool == "codex"
+                and cap.authoritative_models
+                and base_model
+                and not is_default_base
+                and base_model in cap.models
+                and not model_efforts
+            ):
+                return (
+                    False,
+                    f"Codex 模型 {base_model} 不支持设置 effort（收到 effort={effective_effort}）",
+                )
             if model_efforts:
                 allowed = set(model_efforts)
                 if tool == "codex_w":
@@ -672,6 +722,17 @@ def validate_agent_binding_spec(
                 )
             else:
                 model_efforts = cap.efforts_by_model.get(base_model or "") if base_model else None
+                if (
+                    cap.authoritative_models
+                    and base_model
+                    and not is_default_base
+                    and base_model in cap.models
+                    and not model_efforts
+                ):
+                    return (
+                        False,
+                        f"AGY 模型 {base_model} 不支持设置 effort（收到 effort={effective_effort}）",
+                    )
                 allowed = set(model_efforts) if model_efforts else set(AGY_REASONING_EFFORTS)
             if effective_effort not in allowed:
                 return (
@@ -694,8 +755,21 @@ def validate_agent_binding_spec(
                             False,
                             f"Traex 模型 {base_model} 不支持 profile={target_profile}",
                         )
-                    if prof_obj.reasoning_efforts:
-                        traex_efforts = prof_obj.reasoning_efforts
+                    if not prof_obj.reasoning_efforts:
+                        return (
+                            False,
+                            f"Traex 模型 {base_model}（profile={target_profile}）不支持设置 effort（收到 effort={effective_effort}）",
+                        )
+                    traex_efforts = prof_obj.reasoning_efforts
+                elif (
+                    cap.authoritative_models
+                    and base_model in cap.models
+                    and not cap.efforts_by_model.get(base_model)
+                ):
+                    return (
+                        False,
+                        f"Traex 模型 {base_model} 不支持设置 effort（收到 effort={effective_effort}）",
+                    )
                 if traex_efforts is None:
                     traex_efforts = cap.efforts_by_model.get(base_model)
             allowed = set(traex_efforts) if traex_efforts else set(CODEX_REASONING_EFFORTS)
@@ -707,11 +781,17 @@ def validate_agent_binding_spec(
                 )
         elif tool == "dsh":
             model_efforts = cap.efforts_by_model.get(base_model or "") if base_model else None
-            allowed = (
-                set(model_efforts)
-                if model_efforts
-                else set(CODEX_REASONING_EFFORTS) | {"off", DSH_DEFAULT_REASONING}
-            )
+            if model_efforts:
+                allowed = set(model_efforts) | {DSH_DEFAULT_REASONING}
+            elif (
+                cap.authoritative_models
+                and base_model
+                and not is_default_base
+                and base_model in cap.models
+            ):
+                allowed = {DSH_DEFAULT_REASONING}
+            else:
+                allowed = set(CODEX_REASONING_EFFORTS) | {"off", DSH_DEFAULT_REASONING}
             if effective_effort not in allowed:
                 return (
                     False,

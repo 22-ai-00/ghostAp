@@ -1663,3 +1663,366 @@ def test_stop_during_generation_transitions_clicked_card_inplace(tmp_path: Path)
     assert "Workflow · 已取消" in json.dumps(handler.update_card.call_args.args[1], ensure_ascii=False)
     handler.send_card_to_chat.assert_not_called()
 
+
+def test_acp_cache_version_invalidates_stale_tool_capabilities_immediately(tmp_path: Path) -> None:
+    from src.acp import helper as acp_helper
+    from src.acp.options import ACPModelOption, ACPModelSelectionVariant
+    from src.workflow_engine.tool_registry import get_tool_capabilities, invalidate_cache
+
+    cwd = str(tmp_path / "repo")
+    Path(cwd).mkdir(parents=True, exist_ok=True)
+    invalidate_cache()
+    acp_helper.invalidate_acp_model_cache("agy", cwd)
+
+    with (
+        patch("src.acp.helper.is_programming_tool_available", return_value=True),
+        patch("src.acp.providers.get_providers", return_value={"agy": object()}),
+        patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "agy" else None),
+    ):
+        cold_caps = get_tool_capabilities(cwd=cwd)
+        assert cold_caps["agy"].models == ()
+
+        key = acp_helper._key("agy", cwd)
+        with acp_helper._cache_lock:
+            gen = acp_helper._cache_generation.get(key, 0)
+        assert acp_helper._store(
+            key,
+            [
+                ACPModelOption(
+                    name="gemini-4-neon",
+                    is_default=True,
+                    reasoning_efforts=("low", "medium", "high", "xhigh"),
+                    default_reasoning_effort="high",
+                    selection_variants=(
+                        ACPModelSelectionVariant(name="gemini-4-neon/high", model="gemini-4-neon", effort="high", is_default=True),
+                    ),
+                )
+            ],
+            generation=gen,
+        )
+
+        # Without force_refresh=True, version bump invalidates stale empty snapshot
+        warm_caps = get_tool_capabilities(cwd=cwd)
+        assert warm_caps["agy"].models == ("gemini-4-neon",)
+        assert warm_caps["agy"].authoritative_models is True
+
+    # Pre-discovery version stamp check: concurrent _store() during _discover_tool_capabilities()
+    # must invalidate the pre-stamped snapshot on the very next read.
+    invalidate_cache()
+    acp_helper.invalidate_acp_model_cache("agy", cwd)
+    from src.workflow_engine import tool_registry as tr_mod
+
+    orig_discover = tr_mod._discover_tool_capabilities
+
+    def _racy_discover(*, cwd: str | None = None):
+        caps = orig_discover(cwd=cwd)
+        r_key = acp_helper._key("agy", cwd)
+        with acp_helper._cache_lock:
+            r_gen = acp_helper._cache_generation.get(r_key, 0)
+        acp_helper._store(
+            r_key,
+            [ACPModelOption(name="gemini-4-carbon", is_default=True)],
+            generation=r_gen,
+        )
+        return caps
+
+    with (
+        patch("src.acp.helper.is_programming_tool_available", return_value=True),
+        patch("src.acp.providers.get_providers", return_value={"agy": object()}),
+        patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "agy" else None),
+    ):
+        with patch.object(tr_mod, "_discover_tool_capabilities", side_effect=_racy_discover):
+            first_caps = get_tool_capabilities(cwd=cwd)
+            assert first_caps["agy"].models == ()
+        second_caps = get_tool_capabilities(cwd=cwd)
+        assert second_caps["agy"].models == ("gemini-4-carbon",)
+
+    acp_helper.invalidate_acp_model_cache("agy", cwd)
+    invalidate_cache()
+
+
+def test_show_workflow_config_preheats_agy_and_refreshes_late_tools_inplace(tmp_path: Path) -> None:
+    from src.acp import helper as acp_helper
+    from src.acp.options import ACPModelOption, ACPModelSelectionVariant
+    from src.workflow_engine.tool_registry import invalidate_cache
+
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    cwd = str(repo)
+
+    mgr = ProjectManager(str(tmp_path / "projects.json"))
+    ok, _, proj = mgr.create_project("p1", "Proj1", cwd, chat_id="oc_warm")
+    assert ok and proj is not None
+
+    handler = _make_workflow_handler()
+    handler.ctx.project_manager = mgr
+    handler.get_working_dir = MagicMock(return_value=cwd)
+    handler._allow_wf_model_preheat_in_test = True
+
+    codex_release = threading.Event()
+    update_done = threading.Event()
+    updated_cards: list[tuple[str, dict]] = []
+
+    def _capture_update(mid: str, card: dict) -> bool:
+        updated_cards.append((mid, card))
+        update_done.set()
+        return True
+
+    handler.update_card = MagicMock(side_effect=_capture_update)
+
+    def _fake_probe(tool_name: str, probe_cwd: str | None) -> list[ACPModelOption]:
+        key = acp_helper._key(tool_name, probe_cwd)
+        with acp_helper._cache_lock:
+            gen = acp_helper._cache_generation.get(key, 0)
+        if tool_name == "agy":
+            opts = [
+                ACPModelOption(
+                    name="gemini-4-neon",
+                    is_default=True,
+                    reasoning_efforts=("low", "medium", "high", "xhigh"),
+                    default_reasoning_effort="high",
+                    selection_variants=(
+                        ACPModelSelectionVariant(name="gemini-4-neon/high", model="gemini-4-neon", effort="high", is_default=True),
+                    ),
+                ),
+                ACPModelOption(
+                    name="gpt-oss-120b-medium",
+                    selection_variants=(ACPModelSelectionVariant(name="gpt-oss-120b-medium", model="gpt-oss-120b-medium", is_default=True),),
+                ),
+            ]
+        elif tool_name == "codex":
+            codex_release.wait(timeout=2.0)
+            opts = [
+                ACPModelOption(
+                    name="gpt-6-astra",
+                    is_default=True,
+                    selection_variants=(ACPModelSelectionVariant(name="gpt-6-astra", model="gpt-6-astra", is_default=True),),
+                ),
+                ACPModelOption(
+                    name="gpt-6-luna",
+                    reasoning_efforts=("low", "high", "xhigh"),
+                    default_reasoning_effort="xhigh",
+                    selection_variants=(
+                        ACPModelSelectionVariant(name="gpt-6-luna/xhigh", model="gpt-6-luna", effort="xhigh", is_default=True),
+                    ),
+                ),
+            ]
+        else:
+            opts = []
+        acp_helper._store(key, opts, generation=gen)
+        return opts
+
+    invalidate_cache()
+    acp_helper.invalidate_acp_model_cache("agy", cwd)
+    acp_helper.invalidate_acp_model_cache("codex", cwd)
+
+    try:
+        with (
+            patch("src.acp.providers.get_providers", return_value={"agy": object(), "codex": object()}),
+            patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name in {"agy", "codex"} else None),
+            patch("src.acp.helper.is_programming_tool_available", return_value=True),
+            patch("src.feishu.handlers.workflow_config._WF_CONFIG_INITIAL_WARMUP_BUDGET_S", 0.5),
+            patch("src.feishu.handlers.workflow_config._WF_CONFIG_PROBE_TIMEOUT_S", 2.0),
+            patch.object(handler, "_probe_single_workflow_tool_models", side_effect=_fake_probe),
+        ):
+            handler.show_workflow_config("om_init", "oc_warm", proj, requirement="Inspect models")
+
+            # Initial card already has AGY models after switching editor tool to agy!
+            assert handler.reply_card.call_count == 1
+            select_agy_card, toast_t, _ = handler.handle_workflow_config_callback_sync(
+                "om_reply_card",
+                "oc_warm",
+                "p1",
+                {"action": action_ids.WF_SELECT_TOOL, "_option": "agy"},
+            )
+            assert toast_t != "error"
+            raw_agy = json.dumps(select_agy_card, ensure_ascii=False)
+            assert "gemini-4-neon" in raw_agy
+            assert "gpt-oss-120b-medium" in raw_agy
+
+            # Switch editor tool to codex while codex probe is still blocked, then release codex
+            handler.handle_workflow_config_callback_sync(
+                "om_reply_card",
+                "oc_warm",
+                "p1",
+                {"action": action_ids.WF_SELECT_TOOL, "_option": "codex"},
+            )
+            codex_release.set()
+            assert update_done.wait(timeout=2.0), "late codex preheat did not refresh config card"
+            for wt in list(getattr(handler, "_wf_config_refresh_threads", ())):
+                wt.join(timeout=2.0)
+            refreshed_mid, refreshed_card = updated_cards[-1]
+            assert refreshed_mid == "om_reply_card"
+            raw_codex = json.dumps(refreshed_card, ensure_ascii=False)
+            assert "gpt-6-astra" in raw_codex
+            assert "gpt-6-luna" in raw_codex
+
+            # Launched session blocks subsequent background refresh overwrites
+            handler.handle_workflow_config_callback_sync(
+                "om_reply_card",
+                "oc_warm",
+                "p1",
+                {"action": action_ids.WF_START_WORKFLOW},
+            )
+            assert handler._is_wf_config_launched(
+                config_session_id="",
+                message_id="om_reply_card",
+            )
+    finally:
+        codex_release.set()
+        for wt in list(getattr(handler, "_wf_config_refresh_threads", ())):
+            wt.join(timeout=2.0)
+        acp_helper.invalidate_acp_model_cache("agy", cwd)
+        acp_helper.invalidate_acp_model_cache("codex", cwd)
+        invalidate_cache()
+
+
+def test_default_selection_roundtrip_and_effortless_authoritative_validation(tmp_path: Path) -> None:
+    from src.acp import helper as acp_helper
+    from src.acp.options import ACPModelOption, ACPModelSelectionVariant
+    from src.workflow_engine.agent_pool import resolve_effective_model_name
+    from src.workflow_engine.tool_registry import ToolCapability, validate_agent_binding_spec
+
+    caps = {
+        "agy": ToolCapability(
+            tool_name="agy",
+            display_name="AGY",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("gemini-4-neon", "gpt-oss-120b-medium"),
+            efforts_by_model={"gemini-4-neon": ("low", "medium", "high")},
+            default_effort="high",
+            authoritative_models=True,
+        ),
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("gpt-6-astra", "gpt-6-luna"),
+            efforts_by_model={"gpt-6-luna": ("low", "high", "xhigh")},
+            authoritative_models=True,
+        ),
+        "traex": ToolCapability(
+            tool_name="traex",
+            display_name="Traex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("Doubao-Seed-Evolving",),
+            authoritative_models=True,
+        ),
+        "coco": ToolCapability(
+            tool_name="coco",
+            display_name="Coco",
+            available=True,
+            supports_model=True,
+            supports_effort=False,
+            models=("Doubao-Seed-Evolving",),
+            authoritative_models=True,
+        ),
+    }
+
+    with patch("src.acp.traex_selection.load_traex_model_metadata", return_value=()):
+        assert validate_agent_binding_spec("coco", model_name="default", capabilities=caps) == (True, None)
+        assert validate_agent_binding_spec("coco", model_name="default", effort="default", capabilities=caps) == (True, None)
+        assert validate_agent_binding_spec("agy", model_name="gpt-oss-120b-medium", effort=None, capabilities=caps) == (True, None)
+        assert validate_agent_binding_spec("agy", model_name="gpt-oss-120b-medium", effort="high", capabilities=caps)[0] is False
+        assert validate_agent_binding_spec("codex", model_name="gpt-6-astra", effort=None, capabilities=caps) == (True, None)
+        assert validate_agent_binding_spec("codex", model_name="gpt-6-astra", effort="xhigh", capabilities=caps)[0] is False
+        assert validate_agent_binding_spec("traex", model_name="Doubao-Seed-Evolving", effort="high", capabilities=caps)[0] is False
+
+    assert resolve_effective_model_name("coco", "default") is None
+    assert resolve_effective_model_name("agy", "default", effort="default") is None
+    assert resolve_effective_model_name("traex", "default", effort="default") is None
+
+    # Effortless default model in cache must not get paired with explicit effort
+    effortless_codex = [
+        ACPModelOption(
+            name="gpt-6-astra",
+            is_default=True,
+            selection_variants=(ACPModelSelectionVariant(name="gpt-6-astra", model="gpt-6-astra", is_default=True),),
+        ),
+        ACPModelOption(
+            name="gpt-6-luna",
+            reasoning_efforts=("low", "high", "xhigh"),
+            selection_variants=(ACPModelSelectionVariant(name="gpt-6-luna/high", model="gpt-6-luna", effort="high", is_default=True),),
+        ),
+    ]
+    with patch.object(acp_helper, "get_cached_acp_models", return_value=effortless_codex):
+        assert resolve_effective_model_name("codex", None, effort="high") == "gpt-6-luna/high"
+    with patch.object(acp_helper, "get_cached_acp_models", return_value=effortless_codex[:1]):
+        assert resolve_effective_model_name("codex", None, effort="high") == "default/high"
+
+    mgr = ProjectManager(str(tmp_path / "projects.json"))
+    ok, _, proj = mgr.create_project("p1", "Proj1", str(tmp_path / "repo"), chat_id="oc_def")
+    assert ok and proj is not None
+
+    handler = _make_workflow_handler()
+    handler.ctx.project_manager = mgr
+
+    with (
+        patch("src.workflow_engine.tool_registry.get_tool_capabilities", return_value=caps),
+        patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"agy": "AGY", "codex": "Codex", "traex": "Traex", "coco": "Coco"},
+        ),
+    ):
+        handler.show_workflow_config("om_init", "oc_def", proj, requirement="Check default")
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_AGENT, "_option": "__new__"})
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_TOOL, "_option": "agy"})
+        # Select specific model with default_reasoning_effort="high", then pick explicit "default" effort -> must NOT snap back to "high"
+        _card_model, _, _ = handler.handle_workflow_config_callback_sync(
+            "om_reply_card",
+            "oc_def",
+            "p1",
+            {"action": action_ids.WF_SELECT_MODEL, "_option": "gemini-4-neon"},
+        )
+        assert _card_model is not None
+        card_eff, _, _ = handler.handle_workflow_config_callback_sync(
+            "om_reply_card",
+            "oc_def",
+            "p1",
+            {"action": action_ids.WF_SELECT_EFFORT, "_option": "default"},
+        )
+        eff_sels = [
+            s
+            for s in (card_eff or {}).get("body", {}).get("elements", [])
+            if isinstance(s, dict) and s.get("tag") == "select_static" and s.get("name") == "effort"
+        ]
+        assert eff_sels and eff_sels[0].get("initial_option") == "default"
+        _c, toast_add, msg_add = handler.handle_workflow_config_callback_sync(
+            "om_reply_card",
+            "oc_def",
+            "p1",
+            {"action": action_ids.WF_ADD_OR_UPDATE_AGENT},
+        )
+        assert toast_add == "success", msg_add
+        st = handler._get_wf_config_state(config_session_id="", chat_id="oc_def", project_id="p1", message_id="om_reply_card")
+        assert st is not None
+        added_agy = st.members[-1]
+        assert added_agy.tool_name == "agy"
+        assert added_agy.model_name == "gemini-4-neon"
+        assert added_agy.effort is None
+        assert added_agy.effective_model_name() == "gemini-4-neon"
+
+        # Switching to model="default" + effort="default" also roundtrips to None/None
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_AGENT, "_option": "__new__"})
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_TOOL, "_option": "agy"})
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_MODEL, "_option": "default"})
+        handler.handle_workflow_config_callback_sync("om_reply_card", "oc_def", "p1", {"action": action_ids.WF_SELECT_EFFORT, "_option": "default"})
+        _c2, toast_add2, msg_add2 = handler.handle_workflow_config_callback_sync(
+            "om_reply_card",
+            "oc_def",
+            "p1",
+            {"action": action_ids.WF_ADD_OR_UPDATE_AGENT},
+        )
+        assert toast_add2 == "success", msg_add2
+        st2 = handler._get_wf_config_state(config_session_id="", chat_id="oc_def", project_id="p1", message_id="om_reply_card")
+        assert st2 is not None
+        assert st2.members[-1].model_name is None
+        assert st2.members[-1].effort is None
+        assert st2.members[-1].effective_model_name() is None
+

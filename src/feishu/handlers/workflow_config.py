@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -16,6 +17,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _WF_CONFIG_MAX_SESSIONS = 256
+_WF_CONFIG_MAX_LAUNCHED = 512
+_WF_CONFIG_INITIAL_WARMUP_BUDGET_S = 2.5
+_WF_CONFIG_PROBE_TIMEOUT_S = 6.0
 _WF_CONFIG_SESSIONS_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
 _PREFERRED_TOOL_ORDER: tuple[str, ...] = (
@@ -52,6 +56,15 @@ def _next_agent_id(members: tuple[Any, ...]) -> str:
     while f"A{idx}" in used:
         idx += 1
     return f"A{idx}"
+
+
+def _norm_default_opt(value: Any, *, lowercase: bool = False) -> str | None:
+    text = str(value or "").strip()
+    if lowercase:
+        text = text.lower()
+    if not text or text.lower() == "default":
+        return None
+    return text
 
 
 class WorkflowConfigMixin:
@@ -164,6 +177,14 @@ class WorkflowConfigMixin:
             sessions, msg_index = self._ensure_wf_config_store()
             sessions[state.config_session_id] = state
             sessions.move_to_end(state.config_session_id)
+            seq_map = getattr(self, "_wf_config_state_seq", None)
+            if not isinstance(seq_map, OrderedDict):
+                seq_map = OrderedDict()
+                self._wf_config_state_seq = seq_map
+            seq_map[state.config_session_id] = seq_map.get(state.config_session_id, 0) + 1
+            seq_map.move_to_end(state.config_session_id)
+            while len(seq_map) > _WF_CONFIG_MAX_SESSIONS:
+                seq_map.popitem(last=False)
             while len(sessions) > _WF_CONFIG_MAX_SESSIONS:
                 sessions.popitem(last=False)
             if message_id:
@@ -172,6 +193,74 @@ class WorkflowConfigMixin:
                 msg_index.move_to_end(key)
                 while len(msg_index) > _WF_CONFIG_MAX_SESSIONS:
                     msg_index.popitem(last=False)
+
+    def _get_wf_config_state_seq(self, config_session_id: str) -> int:
+        with _WF_CONFIG_SESSIONS_LOCK:
+            seq_map = getattr(self, "_wf_config_state_seq", None)
+            if not isinstance(seq_map, OrderedDict):
+                return 0
+            return int(seq_map.get(config_session_id, 0))
+
+    def _get_wf_config_delivery_lock(self, message_id: str) -> threading.Lock | None:
+        clean_id = str(message_id or "").strip()
+        if not clean_id:
+            return None
+        with _WF_CONFIG_SESSIONS_LOCK:
+            dlocks = getattr(self, "_wf_config_delivery_locks", None)
+            if not isinstance(dlocks, OrderedDict):
+                dlocks = OrderedDict()
+                self._wf_config_delivery_locks = dlocks
+            lock = dlocks.get(clean_id)
+            if lock is None:
+                lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+                dlocks[clean_id] = lock
+            dlocks.move_to_end(clean_id)
+            while len(dlocks) > _WF_CONFIG_MAX_SESSIONS:
+                oldest_key, oldest_lock = next(iter(dlocks.items()))
+                if oldest_key == clean_id or oldest_lock.locked():
+                    break
+                dlocks.popitem(last=False)
+            return lock
+
+    def _ensure_wf_launched_store(self) -> OrderedDict[str, float]:
+        launched = getattr(self, "_wf_config_launched_keys", None)
+        if not isinstance(launched, OrderedDict):
+            launched = OrderedDict()
+            self._wf_config_launched_keys = launched
+        return launched
+
+    def _mark_wf_config_launched(
+        self,
+        *,
+        config_session_id: str,
+        message_id: str,
+    ) -> None:
+        with _WF_CONFIG_SESSIONS_LOCK:
+            launched = self._ensure_wf_launched_store()
+            now = time.monotonic()
+            for key in (
+                f"sid:{config_session_id}" if config_session_id else "",
+                f"msg:{message_id}" if message_id else "",
+            ):
+                if not key:
+                    continue
+                launched[key] = now
+                launched.move_to_end(key)
+            while len(launched) > _WF_CONFIG_MAX_LAUNCHED:
+                launched.popitem(last=False)
+
+    def _is_wf_config_launched(
+        self,
+        *,
+        config_session_id: str,
+        message_id: str,
+    ) -> bool:
+        with _WF_CONFIG_SESSIONS_LOCK:
+            launched = self._ensure_wf_launched_store()
+            return bool(
+                (config_session_id and f"sid:{config_session_id}" in launched)
+                or (message_id and f"msg:{message_id}" in launched)
+            )
 
     @staticmethod
     def _load_workflow_capabilities(
@@ -215,6 +304,7 @@ class WorkflowConfigMixin:
                         default_effort=cap.default_effort,
                         profiles_by_model=cap.profiles_by_model,
                         description=desc,
+                        authoritative_models=cap.authoritative_models,
                     )
                 else:
                     merged[name] = ToolCapability(
@@ -229,6 +319,329 @@ class WorkflowConfigMixin:
                 merged[name] = cap
 
         return merged, dict(avail_tools)
+
+    @staticmethod
+    def _load_workflow_model_options(
+        capabilities: dict[str, Any],
+        root_path: str | None = None,
+        *,
+        editor_tool: str | None = None,
+        editor_model: str | None = None,
+    ) -> dict[str, list[Any]]:
+        """Load UI-normalized ACPModelOption lists from non-blocking caches/metadata."""
+        from ...acp.helper import build_traex_model_options, get_cached_acp_models
+        from ...acp.options import ACPModelOption
+        from ...acp.traex_selection import load_traex_model_metadata
+        from ...card.builders.workflow import normalize_workflow_acp_options
+
+        result: dict[str, list[ACPModelOption]] = {}
+        active_tool = str(editor_tool or "").strip().lower()
+        for name, cap in capabilities.items():
+            if not getattr(cap, "available", True):
+                continue
+            cur_model = editor_model if name == active_tool else None
+            try:
+                raw_opts = get_cached_acp_models(name, root_path, current_model=cur_model)
+            except Exception:
+                raw_opts = []
+            if raw_opts and cap.models:
+                raw_names = {getattr(opt, "name", "") for opt in raw_opts}
+                if not any(model_id in raw_names for model_id in cap.models):
+                    raw_opts = []
+            if not raw_opts and name == "traex":
+                try:
+                    traex_meta = load_traex_model_metadata()
+                except Exception:
+                    traex_meta = ()
+                if traex_meta and (
+                    not cap.models
+                    or any(item.config_name in cap.models for item in traex_meta)
+                ):
+                    raw_opts = build_traex_model_options(
+                        [
+                            ACPModelOption(
+                                name=item.config_name,
+                                is_default=(idx == 0),
+                            )
+                            for idx, item in enumerate(traex_meta)
+                        ],
+                        traex_meta,
+                    )
+            result[name] = normalize_workflow_acp_options(
+                cap,
+                raw_opts or None,
+                current_model=cur_model,
+            )
+        return result
+
+    @staticmethod
+    def _probe_single_workflow_tool_models(
+        tool_name: str,
+        root_path: str | None,
+    ) -> list[Any]:
+        """Probe live ACP models for one tool using a bounded timeout."""
+        from ...acp.helper import fetch_acp_models
+
+        return fetch_acp_models(
+            tool_name,
+            root_path,
+            probe_timeout=_WF_CONFIG_PROBE_TIMEOUT_S,
+        )
+
+    def _can_preheat_workflow_models(self, root_path: str | None) -> bool:
+        """Skip live subprocess probes under unit tests unless explicitly enabled or mocked."""
+        if getattr(self, "_disable_wf_model_preheat", False):
+            return False
+        probe_fn = getattr(self, "_probe_single_workflow_tool_models", None)
+        if probe_fn is not None and (
+            "unittest.mock" in type(probe_fn).__module__
+            or "_probe_single_workflow_tool_models" in getattr(self, "__dict__", {})
+        ):
+            return True
+        if getattr(self, "_allow_wf_model_preheat_in_test", False):
+            return True
+        if os.getenv("PYTEST_CURRENT_TEST") is not None:
+            return False
+        if type(getattr(self, "ctx", None)).__module__.startswith("unittest.mock"):
+            return False
+        return bool(not root_path or os.path.isdir(root_path))
+
+    def _warm_workflow_models_for_config(
+        self,
+        capabilities: dict[str, Any],
+        root_path: str | None,
+        *,
+        priority_tools: tuple[str, ...] = (),
+        wait_budget_s: float = 0.0,
+    ) -> tuple[list[threading.Thread], int]:
+        """Launch single-flight ACP model warmup threads and optionally wait up to budget."""
+        from ...acp.helper import (
+            get_acp_model_cache_version,
+            is_acp_model_cache_settled,
+        )
+        from ...agent_session.backend_resolver import is_cli_backend
+
+        initial_version = get_acp_model_cache_version()
+        if not self._can_preheat_workflow_models(root_path):
+            return [], initial_version
+
+        ordered_candidates = list(
+            dict.fromkeys(
+                [
+                    *(str(t or "").strip().lower() for t in priority_tools if t),
+                    "agy",
+                    "traex",
+                    "codex",
+                    "coco",
+                    "dsh",
+                    "grok",
+                    "aiden",
+                    "gemini",
+                    *capabilities.keys(),
+                ]
+            )
+        )
+        priority_set = {str(t or "").strip().lower() for t in priority_tools if t} | {
+            "agy",
+            "traex",
+        }
+        unsettled: list[str] = []
+        for tool in ordered_candidates:
+            cap = capabilities.get(tool)
+            if cap is None or not cap.available or is_cli_backend(tool):
+                continue
+            try:
+                if not is_acp_model_cache_settled(tool, root_path):
+                    unsettled.append(tool)
+            except Exception:
+                continue
+
+        if not unsettled:
+            return [], initial_version
+
+        started_threads: list[tuple[str, threading.Thread]] = []
+        for tool in unsettled:
+            def _probe_worker(t_name: str = tool) -> None:
+                try:
+                    self._probe_single_workflow_tool_models(t_name, root_path)
+                except Exception:
+                    logger.debug(
+                        "[WF] model preheat failed for tool=%s",
+                        t_name,
+                        exc_info=True,
+                    )
+
+            thread = threading.Thread(
+                target=_probe_worker,
+                name=f"wf-cfg-preheat-{tool}",
+                daemon=True,
+            )
+            thread.start()
+            started_threads.append((tool, thread))
+
+        if wait_budget_s > 0.0:
+            deadline = time.monotonic() + wait_budget_s
+            wait_targets = [
+                thread
+                for tool, thread in started_threads
+                if tool in priority_set
+            ] or [thread for _, thread in started_threads]
+            for thread in wait_targets:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                thread.join(timeout=remaining)
+
+        return [thread for _, thread in started_threads], initial_version
+
+    def _schedule_wf_config_preheat_refresh(
+        self,
+        *,
+        threads: list[threading.Thread],
+        baseline_version: int,
+        message_id: str,
+        chat_id: str,
+        project_id: str,
+        config_session_id: str,
+        root_path: str | None,
+        delay_before_patch_s: float = 0.0,
+    ) -> None:
+        """Refresh the open config card in-place if late ACP probes finish."""
+        from ...acp.helper import get_acp_model_cache_version
+
+        pending = [thread for thread in threads if thread.is_alive()]
+        already_advanced = get_acp_model_cache_version() != baseline_version
+        if (not pending and not already_advanced) or not message_id or not config_session_id:
+            return
+        started_at = time.monotonic()
+
+        def _watch_and_refresh() -> None:
+            from contextlib import nullcontext
+
+            from ...card.builders.workflow import build_workflow_config_card
+
+            deadline = time.monotonic() + max(_WF_CONFIG_PROBE_TIMEOUT_S, 15.0) + 1.0
+            for thread in pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                thread.join(timeout=remaining)
+
+            if delay_before_patch_s > 0.0:
+                rem_delay = delay_before_patch_s - (time.monotonic() - started_at)
+                if rem_delay > 0.0:
+                    time.sleep(rem_delay)
+
+            if get_acp_model_cache_version() == baseline_version:
+                return
+            if self._is_wf_config_launched(
+                config_session_id=config_session_id,
+                message_id=message_id,
+            ):
+                return
+
+            session_lock = self._acquire_wf_config_session_lock(
+                config_session_id=config_session_id,
+                chat_id=chat_id,
+                project_id=project_id,
+                message_id=message_id,
+            )
+            delivery_lock = self._get_wf_config_delivery_lock(message_id)
+            for _attempt in range(2):
+                fresh_card: dict[str, Any] | None = None
+                captured_seq = 0
+                captured_version = baseline_version
+                with session_lock:
+                    if self._is_wf_config_launched(
+                        config_session_id=config_session_id,
+                        message_id=message_id,
+                    ):
+                        return
+                    captured_version = get_acp_model_cache_version()
+                    with _WF_CONFIG_SESSIONS_LOCK:
+                        refreshed = getattr(self, "_wf_config_refreshed_versions", None)
+                        already_refreshed = (
+                            refreshed.get(message_id, -1)
+                            if isinstance(refreshed, OrderedDict)
+                            else -1
+                        )
+                    if (
+                        captured_version == baseline_version
+                        or already_refreshed >= captured_version
+                    ):
+                        return
+
+                    cur_state = self._get_wf_config_state(
+                        config_session_id=config_session_id,
+                        chat_id=chat_id,
+                        project_id=project_id,
+                        message_id=message_id,
+                    )
+                    if cur_state is None or cur_state.config_session_id != config_session_id:
+                        return
+                    captured_seq = self._get_wf_config_state_seq(config_session_id)
+                    fresh_caps, _ = self._load_workflow_capabilities(root_path)
+                    fresh_opts = self._load_workflow_model_options(
+                        fresh_caps,
+                        root_path,
+                        editor_tool=cur_state.editor_tool,
+                        editor_model=cur_state.editor_model,
+                    )
+                    fresh_card = build_workflow_config_card(
+                        cur_state,
+                        fresh_caps,
+                        model_options_by_tool=fresh_opts,
+                    )
+
+                if fresh_card is None:
+                    return
+
+                need_retry = False
+                with (delivery_lock if delivery_lock is not None else nullcontext()):
+                    if self._is_wf_config_launched(
+                        config_session_id=config_session_id,
+                        message_id=message_id,
+                    ):
+                        return
+                    if self._get_wf_config_state_seq(config_session_id) != captured_seq:
+                        need_retry = True
+                    else:
+                        with _WF_CONFIG_SESSIONS_LOCK:
+                            refreshed = getattr(self, "_wf_config_refreshed_versions", None)
+                            if not isinstance(refreshed, OrderedDict):
+                                refreshed = OrderedDict()
+                                self._wf_config_refreshed_versions = refreshed
+                            if refreshed.get(message_id, -1) >= captured_version:
+                                return
+                            refreshed[message_id] = captured_version
+                            refreshed.move_to_end(message_id)
+                            while len(refreshed) > _WF_CONFIG_MAX_SESSIONS:
+                                refreshed.popitem(last=False)
+                        try:
+                            self.update_card(message_id, fresh_card)
+                        except Exception:
+                            logger.debug(
+                                "[WF] async config card refresh failed mid=%s",
+                                message_id,
+                                exc_info=True,
+                            )
+                        return
+                if not need_retry:
+                    return
+
+        thread = threading.Thread(
+            target=_watch_and_refresh,
+            name=f"wf-cfg-refresh-{config_session_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        with _WF_CONFIG_SESSIONS_LOCK:
+            watchers = getattr(self, "_wf_config_refresh_threads", None)
+            if not isinstance(watchers, list):
+                watchers = []
+                self._wf_config_refresh_threads = watchers
+            watchers[:] = [w for w in watchers if w.is_alive()]
+            watchers.append(thread)
 
     @staticmethod
     def _default_members_for_preset(
@@ -266,7 +679,31 @@ class WorkflowConfigMixin:
             cap = capabilities[tool_name]
             role = roles[min(idx, len(roles) - 1)]
             model_name = cap.models[0] if getattr(cap, "models", ()) else None
-            effort = cap.default_effort if getattr(cap, "supports_effort", False) else None
+            if model_name == "default":
+                model_name = None
+            effs_for_model = (
+                cap.efforts_by_model.get(model_name, ())
+                if (model_name and getattr(cap, "efforts_by_model", None))
+                else ()
+            )
+            if not getattr(cap, "supports_effort", False):
+                effort = None
+            elif (
+                model_name
+                and getattr(cap, "authoritative_models", False)
+                and not effs_for_model
+            ):
+                effort = None
+            elif effs_for_model:
+                effort = (
+                    cap.default_effort
+                    if cap.default_effort in effs_for_model
+                    else effs_for_model[0]
+                )
+            else:
+                effort = cap.default_effort
+            if effort == "default":
+                effort = None
             bindings.append(
                 WorkflowAgentBinding(
                     agent_id=f"A{idx + 1}",
@@ -446,12 +883,41 @@ class WorkflowConfigMixin:
         if not project:
             return
 
+        root_path = self._get_root_path(chat_id, project)
         state, capabilities = self._build_initial_config_state(
             chat_id=chat_id,
             project=project,
             preset_override=preset_id,
             requirement=requirement,
         )
+        priority_tools = tuple(
+            dict.fromkeys(
+                [
+                    state.editor_tool,
+                    *(m.tool_name for m in state.members),
+                ]
+            )
+        )
+        warm_threads, baseline_version = self._warm_workflow_models_for_config(
+            capabilities,
+            root_path,
+            priority_tools=priority_tools,
+            wait_budget_s=_WF_CONFIG_INITIAL_WARMUP_BUDGET_S,
+        )
+        rendered_version = baseline_version
+        if warm_threads:
+            from ...acp.helper import get_acp_model_cache_version
+
+            rendered_version = get_acp_model_cache_version()
+            if rendered_version != baseline_version:
+                state, capabilities = self._build_initial_config_state(
+                    chat_id=chat_id,
+                    project=project,
+                    preset_override=preset_id,
+                    requirement=requirement,
+                    config_session_id=state.config_session_id,
+                )
+
         if state.requirement:
             self._persist_pending_workflow_requirement(
                 project,
@@ -459,20 +925,43 @@ class WorkflowConfigMixin:
                 state.config_session_id,
                 state.requirement,
             )
-        card = build_workflow_config_card(state, capabilities)
+        model_options = self._load_workflow_model_options(
+            capabilities,
+            root_path,
+            editor_tool=state.editor_tool,
+            editor_model=state.editor_model,
+        )
+        card = build_workflow_config_card(
+            state,
+            capabilities,
+            model_options_by_tool=model_options,
+        )
         sent_id = self.reply_card(message_id, card)
-        self._put_wf_config_state(state, message_id=str(sent_id or message_id))
+        target_message_id = str(sent_id or message_id)
+        self._put_wf_config_state(state, message_id=target_message_id)
+        if warm_threads and sent_id:
+            self._schedule_wf_config_preheat_refresh(
+                threads=warm_threads,
+                baseline_version=rendered_version,
+                message_id=target_message_id,
+                chat_id=chat_id,
+                project_id=(project.project_id if project else ""),
+                config_session_id=state.config_session_id,
+                root_path=root_path,
+            )
 
     @staticmethod
     def _resolve_editor_cascade(
         state: Any,
         capabilities: dict[str, Any],
-    ) -> tuple[Any, str | None, str | None, str | None, str]:
+        *,
+        model_options_by_tool: dict[str, list[Any]] | None = None,
+    ) -> tuple[Any, str | None, str | None, str | None, str, bool]:
         from ...card.builders.workflow import (
             WORKFLOW_ROLE_CATALOG,
-            capability_to_acp_options,
+            normalize_workflow_acp_options,
+            resolve_workflow_cascade_state,
         )
-        from ...card.render.model_cascade import resolve_model_cascade
         from ...workflow_engine.tool_registry import ToolCapability
 
         tool = str(state.editor_tool or "").strip().lower()
@@ -483,24 +972,41 @@ class WorkflowConfigMixin:
             supports_model=True,
             supports_effort=True,
         )
-        opts = capability_to_acp_options(cap, current_model=state.editor_model)
-        cascade = resolve_model_cascade(
-            opts,
-            current_model=state.editor_model,
-            selected_model=state.editor_model,
-            selected_profile=state.editor_profile,
-            selected_effort=state.editor_effort,
-        )
-        resolved_model = cascade.selected_model or state.editor_model
-        resolved_profile = cascade.selected_profile if cascade.profiles else None
-        resolved_effort = (
-            (cascade.selected_effort if cascade.efforts else None)
-            if cap.supports_effort
+        raw_opts = (
+            model_options_by_tool[tool]
+            if model_options_by_tool and tool in model_options_by_tool
             else None
+        )
+        opts = normalize_workflow_acp_options(
+            cap,
+            raw_opts,
+            current_model=state.editor_model,
+        )
+        (
+            _cascade,
+            _raw_resolved_model,
+            resolved_model,
+            _raw_resolved_profile,
+            resolved_profile,
+            resolved_effort,
+            has_adjustable_effort,
+        ) = resolve_workflow_cascade_state(
+            cap,
+            opts,
+            editor_model=state.editor_model,
+            editor_profile=state.editor_profile,
+            editor_effort=state.editor_effort,
         )
         valid_roles = {role_id for role_id, _ in WORKFLOW_ROLE_CATALOG}
         resolved_role = state.editor_role if state.editor_role in valid_roles else "worker"
-        return cap, resolved_model, resolved_profile, resolved_effort, resolved_role
+        return (
+            cap,
+            resolved_model,
+            resolved_profile,
+            resolved_effort,
+            resolved_role,
+            has_adjustable_effort,
+        )
 
     def _build_validated_editor_binding(
         self,
@@ -508,26 +1014,39 @@ class WorkflowConfigMixin:
         capabilities: dict[str, Any],
         *,
         agent_id: str,
+        model_options_by_tool: dict[str, list[Any]] | None = None,
     ) -> tuple[Any | None, str | None]:
         from ...acp.agy_selection import is_agy_orchestrator_model
         from ...workflow_engine.agent_pool import WorkflowAgentBinding
         from ...workflow_engine.tool_registry import validate_agent_binding_spec
 
-        cap, resolved_model, resolved_profile, resolved_effort, resolved_role = (
-            self._resolve_editor_cascade(state, capabilities)
+        (
+            cap,
+            resolved_model,
+            resolved_profile,
+            resolved_effort,
+            resolved_role,
+            has_adjustable_effort,
+        ) = self._resolve_editor_cascade(
+            state,
+            capabilities,
+            model_options_by_tool=model_options_by_tool,
         )
-        raw_effort = str(state.editor_effort or "").strip().lower() or None
-        raw_profile = str(state.editor_profile or "").strip().lower() or None
+        raw_effort = _norm_default_opt(state.editor_effort, lowercase=True)
+        raw_profile = _norm_default_opt(state.editor_profile, lowercase=True)
         effort_to_validate = (
             (raw_effort or resolved_effort)
-            if cap.supports_effort
+            if (cap.supports_effort and (has_adjustable_effort or raw_effort is not None))
             else None
         )
         supports_profile = bool(
             cap.supports_effort
             and (
                 resolved_profile is not None
-                or cap.tool_name == "traex"
+                or (
+                    cap.tool_name == "traex"
+                    and resolved_model is not None
+                )
                 or (
                     cap.tool_name == "agy"
                     and resolved_model is not None
@@ -583,7 +1102,10 @@ class WorkflowConfigMixin:
             except Exception:
                 project = None
 
+        from ...acp.helper import get_acp_model_cache_version
+
         root_path = self._get_root_path(chat_id, project)
+        acp_ver_before_caps = get_acp_model_cache_version()
         capabilities, _ = self._load_workflow_capabilities(root_path)
 
         cfg_sid = str(value.get("config_session_id") or "").strip()
@@ -600,10 +1122,12 @@ class WorkflowConfigMixin:
                 chat_id=chat_id,
                 effective_pid=effective_pid,
                 project=project,
+                root_path=root_path,
                 value=value,
                 action=action,
                 cfg_sid=cfg_sid,
                 capabilities=capabilities,
+                capabilities_version=acp_ver_before_caps,
             )
 
     def _apply_config_transition_locked(
@@ -613,10 +1137,12 @@ class WorkflowConfigMixin:
         chat_id: str,
         effective_pid: str,
         project: Optional["ProjectContext"],
+        root_path: str | None = None,
         value: dict[str, Any],
         action: str,
         cfg_sid: str,
         capabilities: dict[str, Any],
+        capabilities_version: int = 0,
     ) -> tuple[dict[str, Any] | None, str, str, dict[str, Any] | None]:
         from ...card.actions import dispatch as action_ids
         from ...card.builders.workflow import (
@@ -760,6 +1286,26 @@ class WorkflowConfigMixin:
                 config_session_id=state.config_session_id,
             )
             toast_content = "已打开 Workflow 团队配置"
+            warm_threads, _baseline_ver = self._warm_workflow_models_for_config(
+                capabilities,
+                root_path,
+                priority_tools=(
+                    state.editor_tool,
+                    *(m.tool_name for m in state.members),
+                ),
+                wait_budget_s=0.0,
+            )
+            if message_id:
+                self._schedule_wf_config_preheat_refresh(
+                    threads=warm_threads,
+                    baseline_version=capabilities_version,
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    project_id=effective_pid,
+                    config_session_id=state.config_session_id,
+                    root_path=root_path,
+                    delay_before_patch_s=0.35,
+                )
 
         elif action == action_ids.WF_SELECT_PRESET:
             chosen_preset = str(
@@ -860,9 +1406,28 @@ class WorkflowConfigMixin:
                     saved_as_default=False,
                 )
                 toast_content = f"已切换工具：{chosen_tool}"
+                warm_threads, _baseline_ver = self._warm_workflow_models_for_config(
+                    capabilities,
+                    root_path,
+                    priority_tools=(chosen_tool,),
+                    wait_budget_s=0.0,
+                )
+                if message_id:
+                    self._schedule_wf_config_preheat_refresh(
+                        threads=warm_threads,
+                        baseline_version=capabilities_version,
+                        message_id=message_id,
+                        chat_id=chat_id,
+                        project_id=effective_pid,
+                        config_session_id=state.config_session_id,
+                        root_path=root_path,
+                        delay_before_patch_s=0.35,
+                    )
 
         elif action == action_ids.WF_SELECT_MODEL:
-            chosen_model = str(value.get("_option") or value.get("model_name") or "").strip() or None
+            chosen_model = _norm_default_opt(
+                value.get("_option") or value.get("model_name")
+            )
             state = replace(
                 state,
                 editor_model=chosen_model,
@@ -873,7 +1438,10 @@ class WorkflowConfigMixin:
             toast_content = f"已选择模型：{chosen_model or 'default'}"
 
         elif action == action_ids.WF_SELECT_PROFILE:
-            chosen_profile = str(value.get("_option") or value.get("profile") or "").strip().lower() or None
+            chosen_profile = _norm_default_opt(
+                value.get("_option") or value.get("profile"),
+                lowercase=True,
+            )
             state = replace(
                 state,
                 editor_profile=chosen_profile,
@@ -883,7 +1451,10 @@ class WorkflowConfigMixin:
             toast_content = f"已选择 Profile：{chosen_profile or 'default'}"
 
         elif action == action_ids.WF_SELECT_EFFORT:
-            chosen_effort = str(value.get("_option") or value.get("effort") or "").strip().lower() or None
+            chosen_effort = _norm_default_opt(
+                value.get("_option") or value.get("effort"),
+                lowercase=True,
+            )
             state = replace(
                 state,
                 editor_effort=chosen_effort,
@@ -899,10 +1470,17 @@ class WorkflowConfigMixin:
                 if is_updating
                 else _next_agent_id(state.members)
             )
+            model_options = self._load_workflow_model_options(
+                capabilities,
+                root_path,
+                editor_tool=state.editor_tool,
+                editor_model=state.editor_model,
+            )
             new_binding, err = self._build_validated_editor_binding(
                 state,
                 capabilities,
                 agent_id=target_id,
+                model_options_by_tool=model_options,
             )
             if new_binding is None:
                 toast_type = "error"
@@ -1015,16 +1593,23 @@ class WorkflowConfigMixin:
             if current_member is not None:
                 has_pending_edit = (
                     str(state.editor_tool or "").strip().lower() != current_member.tool_name
-                    or (str(state.editor_model or "").strip() or None) != (current_member.model_name or None)
-                    or (str(state.editor_profile or "").strip().lower() or None) != (current_member.profile or None)
-                    or (str(state.editor_effort or "").strip().lower() or None) != (current_member.effort or None)
+                    or _norm_default_opt(state.editor_model) != _norm_default_opt(current_member.model_name)
+                    or _norm_default_opt(state.editor_profile, lowercase=True) != _norm_default_opt(current_member.profile, lowercase=True)
+                    or _norm_default_opt(state.editor_effort, lowercase=True) != _norm_default_opt(current_member.effort, lowercase=True)
                     or _ui_role(state.editor_role) != _ui_role(current_member.role)
                 )
                 if has_pending_edit:
+                    model_options = self._load_workflow_model_options(
+                        capabilities,
+                        root_path,
+                        editor_tool=state.editor_tool,
+                        editor_model=state.editor_model,
+                    )
                     updated_binding, err_edit = self._build_validated_editor_binding(
                         state,
                         capabilities,
                         agent_id=current_member.agent_id,
+                        model_options_by_tool=model_options,
                     )
                     if updated_binding is None:
                         validation_err = f"{current_member.agent_id}: {err_edit}"
@@ -1169,6 +1754,10 @@ class WorkflowConfigMixin:
                         state.config_session_id,
                         None,
                     )
+                    self._mark_wf_config_launched(
+                        config_session_id=state.config_session_id,
+                        message_id=message_id,
+                    )
                     launch_spec = {
                         "requirement": state.requirement,
                         "preset_id": state.preset_id,
@@ -1185,7 +1774,17 @@ class WorkflowConfigMixin:
             else state
         )
         self._put_wf_config_state(cached_state, message_id=message_id)
-        card = build_workflow_config_card(state, capabilities)
+        model_options = self._load_workflow_model_options(
+            capabilities,
+            root_path,
+            editor_tool=state.editor_tool,
+            editor_model=state.editor_model,
+        )
+        card = build_workflow_config_card(
+            state,
+            capabilities,
+            model_options_by_tool=model_options,
+        )
         return card, toast_type, toast_content, launch_spec
 
     def handle_workflow_config_callback_sync(
@@ -1212,6 +1811,8 @@ class WorkflowConfigMixin:
         value: dict[str, Any],
     ) -> None:
         """Async/direct action_registry handler for ``WF_CONFIG_ACTIONS``."""
+        from contextlib import nullcontext
+
         from ...card.actions import dispatch as action_ids
 
         card, toast_type, _toast_content, launch_spec = self._apply_config_transition(
@@ -1220,7 +1821,13 @@ class WorkflowConfigMixin:
             project_id,
             value,
         )
+        delivery_lock = self._get_wf_config_delivery_lock(message_id)
         if launch_spec is not None:
+            if delivery_lock is not None:
+                # Drain any in-flight background card refresh before start_workflow reuses message_id;
+                # subsequent watchers observe _is_wf_config_launched() == True inside delivery_lock.
+                with delivery_lock:
+                    pass
             self.start_workflow(
                 message_id,
                 chat_id,
@@ -1236,5 +1843,6 @@ class WorkflowConfigMixin:
         if action == action_ids.WF_START_WORKFLOW and toast_type == "warning":
             return
         if card is not None:
-            if not (message_id and self.update_card(message_id, card)):
-                self.reply_card(message_id, card)
+            with (delivery_lock if delivery_lock is not None else nullcontext()):
+                if not (message_id and self.update_card(message_id, card)):
+                    self.reply_card(message_id, card)

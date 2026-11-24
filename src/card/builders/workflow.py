@@ -6,6 +6,7 @@ Strict import boundary: this module MUST NEVER import ``src.card.delivery``,
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -144,7 +145,18 @@ def _extract_current_base_model(
     tool: str,
     raw_current: str | None,
 ) -> str | None:
-    if not raw_current or raw_current.startswith("["):
+    if not raw_current:
+        return None
+    if raw_current.startswith("["):
+        if tool == "dsh":
+            from src.acp.dsh_selection import decode_dsh_model_value, split_dsh_model_selection
+
+            try:
+                model_json, _reasoning = split_dsh_model_selection(raw_current)
+                provider, model_id = decode_dsh_model_value(model_json)
+                return f"{provider}/{model_id}"
+            except ValueError:
+                return None
         return None
     if not (
         cap.supports_effort
@@ -299,10 +311,10 @@ def capability_to_acp_options(
         profiles = tuple(cap.profiles_by_model.get(model_name, ()))
         if cap.supports_effort:
             efforts = tuple(cap.efforts_by_model.get(model_name, ()))
-            if not efforts:
+            if not efforts and not cap.authoritative_models:
                 efforts = _default_efforts_for_tool(tool)
             default_effort = (
-                cap.default_effort if cap.default_effort in efforts else efforts[0]
+                cap.default_effort if cap.default_effort in efforts else (efforts[0] if efforts else None)
             )
         else:
             efforts = ()
@@ -364,6 +376,360 @@ def capability_to_acp_options(
             )
         )
     return options
+
+
+def _collect_tool_efforts(
+    cap: ToolCapability,
+    options: Sequence[ACPModelOption],
+) -> tuple[str, ...]:
+    if not cap.supports_effort:
+        return ()
+    efforts: list[str] = []
+    for opt in options:
+        for eff in getattr(opt, "reasoning_efforts", ()) or ():
+            clean = str(eff or "").strip().lower()
+            if clean and clean != "default" and clean not in efforts:
+                efforts.append(clean)
+        for var in getattr(opt, "selection_variants", ()) or ():
+            clean = str(getattr(var, "effort", "") or "").strip().lower()
+            if clean and clean != "default" and clean not in efforts:
+                efforts.append(clean)
+    for model_efforts in cap.efforts_by_model.values():
+        for eff in model_efforts:
+            clean = str(eff or "").strip().lower()
+            if clean and clean != "default" and clean not in efforts:
+                efforts.append(clean)
+    return tuple(efforts) or _default_efforts_for_tool(cap.tool_name)
+
+
+def _normalize_single_option_variants(
+    option: ACPModelOption,
+    *,
+    supports_effort: bool,
+) -> ACPModelOption:
+    model_name = option.name
+    raw_variants = list(option.selection_variants or ())
+    if not raw_variants:
+        efforts = (
+            tuple(
+                dict.fromkeys(
+                    str(item).strip().lower()
+                    for item in (option.reasoning_efforts or ())
+                    if str(item or "").strip()
+                )
+            )
+            if supports_effort
+            else ()
+        )
+        if efforts:
+            if "default" not in efforts:
+                efforts = ("default", *efforts)
+            has_explicit_default = (
+                option.default_reasoning_effort in efforts
+                and option.default_reasoning_effort != "default"
+            )
+            synth = tuple(
+                ACPModelSelectionVariant(
+                    name=f"{model_name}/{eff}" if eff != "default" else f"{model_name}/default",
+                    model=model_name,
+                    effort=eff,
+                    is_default=(
+                        eff == option.default_reasoning_effort
+                        if has_explicit_default
+                        else eff == "default"
+                    ),
+                )
+                for eff in efforts
+            )
+            return dataclasses.replace(
+                option,
+                selection_variants=synth,
+                reasoning_efforts=efforts,
+                default_reasoning_effort=(
+                    option.default_reasoning_effort if has_explicit_default else "default"
+                ),
+            )
+        return dataclasses.replace(
+            option,
+            selection_variants=(
+                ACPModelSelectionVariant(
+                    name=model_name,
+                    model=model_name,
+                    is_default=True,
+                ),
+            ),
+            reasoning_efforts=(),
+            default_reasoning_effort=None,
+        )
+
+    if not supports_effort:
+        cleaned_variants: list[ACPModelSelectionVariant] = []
+        seen_profiles: set[str | None] = set()
+        for variant in raw_variants:
+            prof = variant.profile
+            if prof in seen_profiles:
+                continue
+            seen_profiles.add(prof)
+            cleaned_variants.append(
+                ACPModelSelectionVariant(
+                    name=f"{model_name}/{prof}" if prof else model_name,
+                    model=model_name,
+                    profile=prof,
+                    effort=None,
+                    is_default=(len(cleaned_variants) == 0),
+                )
+            )
+        return dataclasses.replace(
+            option,
+            selection_variants=tuple(cleaned_variants),
+            reasoning_efforts=(),
+            default_reasoning_effort=None,
+        )
+
+    by_profile: dict[str | None, list[ACPModelSelectionVariant]] = {}
+    for variant in raw_variants:
+        by_profile.setdefault(variant.profile, []).append(variant)
+
+    normalized_variants: list[ACPModelSelectionVariant] = []
+    seen_names: set[str] = set()
+    all_efforts: list[str] = []
+    for prof, group in by_profile.items():
+        group_efforts = [v.effort for v in group if v.effort]
+        if group_efforts and "default" not in group_efforts:
+            group_has_default = any(v.is_default and v.effort for v in group) or (
+                option.default_reasoning_effort in group_efforts
+            )
+            default_var_name = (
+                f"{model_name}/{prof}/default" if prof else f"{model_name}/default"
+            )
+            if default_var_name not in seen_names:
+                seen_names.add(default_var_name)
+                normalized_variants.append(
+                    ACPModelSelectionVariant(
+                        name=default_var_name,
+                        model=model_name,
+                        profile=prof,
+                        effort="default",
+                        is_default=not group_has_default,
+                    )
+                )
+            if "default" not in all_efforts:
+                all_efforts.append("default")
+        for variant in group:
+            if variant.effort and variant.effort not in all_efforts:
+                all_efforts.append(variant.effort)
+            if variant.name in seen_names:
+                continue
+            seen_names.add(variant.name)
+            normalized_variants.append(variant)
+
+    return dataclasses.replace(
+        option,
+        selection_variants=tuple(normalized_variants),
+        reasoning_efforts=tuple(all_efforts),
+    )
+
+
+def _build_default_workflow_option(
+    *,
+    existing: ACPModelOption | None,
+    tool_efforts: tuple[str, ...],
+    supports_effort: bool,
+    select_default_model: bool,
+) -> ACPModelOption:
+    if not supports_effort:
+        return ACPModelOption(
+            name="default",
+            description="default（默认模型）",
+            is_default=select_default_model,
+            selection_variants=(
+                ACPModelSelectionVariant(
+                    name="default",
+                    model="default",
+                    is_default=select_default_model,
+                ),
+            ),
+        )
+
+    efforts_list: list[str] = ["default"]
+    if existing is not None:
+        for eff in getattr(existing, "reasoning_efforts", ()) or ():
+            clean = str(eff or "").strip().lower()
+            if clean and clean not in efforts_list:
+                efforts_list.append(clean)
+        for var in getattr(existing, "selection_variants", ()) or ():
+            clean = str(getattr(var, "effort", "") or "").strip().lower()
+            if clean and clean not in efforts_list:
+                efforts_list.append(clean)
+    for eff in tool_efforts:
+        if eff and eff not in efforts_list:
+            efforts_list.append(eff)
+    efforts = tuple(efforts_list)
+    variants = tuple(
+        ACPModelSelectionVariant(
+            name="default" if eff == "default" else f"default/{eff}",
+            model="default",
+            effort=eff,
+            is_default=(eff == "default"),
+        )
+        for eff in efforts
+    )
+    return ACPModelOption(
+        name="default",
+        description="default（默认模型）",
+        is_default=select_default_model,
+        selection_variants=variants,
+        reasoning_efforts=efforts,
+        default_reasoning_effort="default",
+    )
+
+
+def normalize_workflow_acp_options(
+    cap: ToolCapability,
+    raw_options: Sequence[ACPModelOption] | None = None,
+    *,
+    current_model: str | None = None,
+) -> list[ACPModelOption]:
+    """Return UI-normalized ACPModelOptions starting with ``default`` for any backend."""
+    tool = str(cap.tool_name or "").strip().lower()
+    raw_current = str(current_model or "").strip() or None
+    current_base = _extract_current_base_model(cap, tool, raw_current)
+
+    source_options = (
+        [dataclasses.replace(opt) for opt in raw_options if getattr(opt, "name", None)]
+        if raw_options is not None
+        else capability_to_acp_options(cap, current_model=current_model)
+    )
+    by_name: dict[str, ACPModelOption] = {}
+    for opt in source_options:
+        if opt.name not in by_name:
+            by_name[opt.name] = opt
+
+    if (
+        current_base
+        and current_base != "default"
+        and current_base not in by_name
+        and not current_base.startswith("[")
+    ):
+        extra_cap = dataclasses.replace(cap, models=(*cap.models, current_base))
+        for synth in capability_to_acp_options(extra_cap, current_model=raw_current):
+            if synth.name == current_base:
+                by_name[current_base] = synth
+                break
+
+    existing_default = by_name.get("default")
+    non_default_names = [name for name in by_name if name != "default"]
+    capped_non_default = _cap_options_preserving(
+        non_default_names,
+        keep=(current_base, raw_current),
+        limit=max(0, _MAX_SELECT_OPTIONS - 1),
+    )
+
+    tool_efforts = _collect_tool_efforts(cap, list(by_name.values()))
+    select_default_model = not current_base or current_base == "default"
+    normalized: list[ACPModelOption] = [
+        _build_default_workflow_option(
+            existing=existing_default,
+            tool_efforts=tool_efforts,
+            supports_effort=cap.supports_effort,
+            select_default_model=select_default_model,
+        )
+    ]
+    for name in capped_non_default:
+        normalized.append(
+            _normalize_single_option_variants(
+                by_name[name],
+                supports_effort=cap.supports_effort,
+            )
+        )
+    return normalized
+
+
+def resolve_workflow_cascade_state(
+    cap: ToolCapability,
+    tool_options: Sequence[ACPModelOption],
+    *,
+    editor_model: str | None = None,
+    editor_profile: str | None = None,
+    editor_effort: str | None = None,
+) -> tuple[Any, str, str | None, str | None, str | None, str | None, bool]:
+    """Resolve cascade state & normalized defaults shared by config card and handler."""
+    tool = str(cap.tool_name or "").strip().lower()
+    raw_model = str(editor_model or "").strip() or None
+    extracted_base = _extract_current_base_model(cap, tool, raw_model)
+
+    selected_model_input = raw_model or "default"
+    if (
+        raw_model
+        and raw_model.startswith("[")
+        and tool == "dsh"
+        and extracted_base
+    ):
+        selected_model_input = extracted_base
+
+    embedded_effort: str | None = None
+    if editor_effort is None and raw_model:
+        for opt in tool_options:
+            for var in getattr(opt, "selection_variants", ()) or ():
+                if var.name == raw_model and var.effort and var.effort != "default":
+                    embedded_effort = var.effort
+                    break
+            if embedded_effort:
+                break
+        if not embedded_effort and tool == "dsh" and raw_model.startswith("["):
+            from src.acp.dsh_selection import (
+                decode_dsh_reasoning_value,
+                split_dsh_model_selection,
+            )
+
+            try:
+                _mj, r_json = split_dsh_model_selection(raw_model)
+                decoded = decode_dsh_reasoning_value(r_json) if r_json else None
+                if decoded and decoded != "default":
+                    embedded_effort = decoded
+            except ValueError:
+                pass
+
+    selected_effort_input = (
+        editor_effort
+        if editor_effort is not None
+        else (embedded_effort if embedded_effort else "default")
+    )
+    cascade = resolve_model_cascade(
+        tool_options,
+        current_model=raw_model,
+        selected_model=selected_model_input,
+        selected_profile=editor_profile,
+        selected_effort=selected_effort_input,
+    )
+    raw_resolved_model = cascade.selected_model or raw_model or "default"
+    resolved_model = None if raw_resolved_model == "default" else raw_resolved_model
+    raw_resolved_profile = cascade.selected_profile if cascade.profiles else None
+    resolved_profile = (
+        None if raw_resolved_profile in (None, "default") else raw_resolved_profile
+    )
+    raw_resolved_effort = (
+        (cascade.selected_effort if cascade.efforts else None)
+        if cap.supports_effort
+        else None
+    )
+    has_adjustable_effort = bool(
+        cap.supports_effort and any(eff != "default" for eff in cascade.efforts)
+    )
+    resolved_effort = (
+        None
+        if (not has_adjustable_effort or raw_resolved_effort in (None, "default"))
+        else raw_resolved_effort
+    )
+    return (
+        cascade,
+        raw_resolved_model,
+        resolved_model,
+        raw_resolved_profile,
+        resolved_profile,
+        resolved_effort,
+        has_adjustable_effort,
+    )
 
 
 def _coerce_member(raw: WorkflowAgentBinding | Mapping[str, Any]) -> WorkflowAgentBinding | None:
@@ -546,27 +912,35 @@ def build_workflow_config_card(
         supports_effort=True,
     )
 
-    if model_options_by_tool and editor_tool in model_options_by_tool:
-        tool_options = list(model_options_by_tool[editor_tool])
-    else:
-        tool_options = capability_to_acp_options(
-            cap,
-            current_model=cfg.editor_model,
-        )
-
-    cascade = resolve_model_cascade(
-        tool_options,
+    raw_tool_options = (
+        model_options_by_tool[editor_tool]
+        if model_options_by_tool and editor_tool in model_options_by_tool
+        else None
+    )
+    tool_options = normalize_workflow_acp_options(
+        cap,
+        raw_tool_options,
         current_model=cfg.editor_model,
-        selected_model=cfg.editor_model,
-        selected_profile=cfg.editor_profile,
-        selected_effort=cfg.editor_effort,
     )
 
-    resolved_model = cascade.selected_model or cfg.editor_model
-    resolved_profile = cascade.selected_profile if cascade.profiles else None
-    resolved_effort = (
+    (
+        cascade,
+        raw_resolved_model,
+        resolved_model,
+        raw_resolved_profile,
+        resolved_profile,
+        resolved_effort,
+        has_adjustable_effort,
+    ) = resolve_workflow_cascade_state(
+        cap,
+        tool_options,
+        editor_model=cfg.editor_model,
+        editor_profile=cfg.editor_profile,
+        editor_effort=cfg.editor_effort,
+    )
+    raw_resolved_effort = (
         (cascade.selected_effort if cascade.efforts else None)
-        if cap.supports_effort
+        if has_adjustable_effort
         else None
     )
     resolved_role = cfg.editor_role or "worker"
@@ -751,31 +1125,26 @@ def build_workflow_config_card(
 
     capped_models = _cap_options_preserving(
         cascade.model_names,
-        keep=(resolved_model,),
+        keep=("default", raw_resolved_model),
         limit=_MAX_SELECT_OPTIONS,
+    ) or ("default",)
+    model_ui_options = [
+        ("default", "default（默认模型）") if m == "default" else (m, m)
+        for m in capped_models
+    ]
+    elements.append(
+        _select_static(
+            name="model_name",
+            placeholder="选择模型",
+            options=model_ui_options,
+            selected=raw_resolved_model,
+            callback_value=cb_for(action_ids.WF_SELECT_MODEL),
+        )
     )
-    if capped_models:
-        elements.append(
-            _select_static(
-                name="model_name",
-                placeholder="选择模型",
-                options=[(m, m) for m in capped_models],
-                selected=resolved_model,
-                callback_value=cb_for(action_ids.WF_SELECT_MODEL),
-            )
-        )
-    else:
-        elements.append(
-            {
-                "tag": "markdown",
-                "text_size": "notation",
-                "content": f"模型：`{_escape_md(resolved_model or '默认（自动）', limit=48)}`",
-            }
-        )
 
     capped_profiles = _cap_options_preserving(
         cascade.profiles,
-        keep=(resolved_profile,),
+        keep=(raw_resolved_profile,),
         limit=_MAX_SELECT_OPTIONS,
     )
     if capped_profiles:
@@ -783,35 +1152,38 @@ def build_workflow_config_card(
             _select_static(
                 name="profile",
                 placeholder="选择 Profile",
-                options=[(p, p) for p in capped_profiles],
-                selected=resolved_profile,
+                options=[
+                    ("default", "default（默认 Profile）") if p == "default" else (p, p)
+                    for p in capped_profiles
+                ],
+                selected=raw_resolved_profile,
                 callback_value=cb_for(action_ids.WF_SELECT_PROFILE),
             )
         )
 
     capped_efforts = _cap_options_preserving(
         cascade.efforts,
-        keep=(resolved_effort,),
+        keep=("default", raw_resolved_effort),
         limit=_MAX_SELECT_OPTIONS,
     )
-    if cap.supports_effort and capped_efforts:
-        elements.append(
-            _select_static(
-                name="effort",
-                placeholder="选择 Effort",
-                options=[(e, e) for e in capped_efforts],
-                selected=resolved_effort,
-                callback_value=cb_for(action_ids.WF_SELECT_EFFORT),
-            )
-        )
+    if has_adjustable_effort and capped_efforts:
+        effort_ui_options = [
+            ("default", "default（默认 Effort）") if e == "default" else (e, e)
+            for e in capped_efforts
+        ]
+        effort_selected = raw_resolved_effort or "default"
     else:
-        elements.append(
-            {
-                "tag": "markdown",
-                "text_size": "notation",
-                "content": f"Effort：`{_escape_md(editor_tool or '当前工具', limit=24)}` 仅支持模型选择，不支持 Effort",
-            }
+        effort_ui_options = [("default", "default（默认 Effort · 无需切换）")]
+        effort_selected = "default"
+    elements.append(
+        _select_static(
+            name="effort",
+            placeholder="选择 Effort",
+            options=effort_ui_options,
+            selected=effort_selected,
+            callback_value=cb_for(action_ids.WF_SELECT_EFFORT),
         )
+    )
 
     editor_buttons = [
         build_callback_button(
@@ -1027,4 +1399,6 @@ __all__ = [
     "build_workflow_help_card",
     "build_workflow_preset_launch_card",
     "capability_to_acp_options",
+    "normalize_workflow_acp_options",
+    "resolve_workflow_cascade_state",
 ]

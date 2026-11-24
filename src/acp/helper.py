@@ -95,6 +95,7 @@ _NEGATIVE_TTL = 300.0
 _probe_cache: dict[tuple[str, str], tuple[float, list[ACPModelOption]]] = {}
 _negative_cache: dict[tuple[str, str], float] = {}
 _cache_generation: dict[tuple[str, str], int] = {}
+_cache_version: int = 0
 _inflight: dict[tuple[tuple[str, str], int], threading.Event] = {}
 _cache_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
@@ -164,6 +165,7 @@ def _store(
     *,
     generation: int,
 ) -> bool:
+    global _cache_version
     with _cache_lock:
         if _cache_generation.get(key, 0) != generation:
             return False
@@ -172,17 +174,50 @@ def _store(
             _negative_cache.pop(key, None)
         else:
             _negative_cache[key] = time.time()
+        _cache_version += 1
         return True
+
+
+def get_acp_model_cache_version() -> int:
+    """Return a monotonic counter bumped whenever ACP model caches change."""
+    with _cache_lock:
+        return _cache_version
+
+
+def is_acp_model_cache_settled(tool_name: str, cwd: str | None = None) -> bool:
+    """Return True if ``(tool_name, cwd)`` has a warm positive or negative cache entry.
+
+    CLI backends use static option matrices and are always settled immediately.
+    """
+    tool = str(tool_name or "").strip().lower()
+    if not tool:
+        return True
+
+    from ..agent_session.backend_resolver import is_cli_backend
+
+    if is_cli_backend(tool):
+        return True
+
+    models, failed = _cached(_key(tool, cwd), tool)
+    if models is not None or failed:
+        return True
+    if cwd:
+        global_models, global_failed = _cached(_key(tool, None), tool)
+        if global_models is not None or global_failed:
+            return True
+    return False
 
 
 def invalidate_acp_model_cache(
     tool_name: str, cwd: str | None = None
 ) -> None:
+    global _cache_version
     key = _key(tool_name, cwd)
     with _cache_lock:
         _probe_cache.pop(key, None)
         _negative_cache.pop(key, None)
         _cache_generation[key] = _cache_generation.get(key, 0) + 1
+        _cache_version += 1
 
 
 def is_programming_tool_available(

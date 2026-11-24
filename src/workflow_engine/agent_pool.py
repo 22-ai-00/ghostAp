@@ -30,7 +30,12 @@ def _normalize_roles(raw_roles: object) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _cached_default_model(tool_name: str, *, skip_orchestrator: bool = False) -> str | None:
+def _cached_default_model(
+    tool_name: str,
+    *,
+    skip_orchestrator: bool = False,
+    require_effort: bool = False,
+) -> str | None:
     try:
         from src.acp.helper import get_cached_acp_models
 
@@ -43,6 +48,18 @@ def _cached_default_model(tool_name: str, *, skip_orchestrator: bool = False) ->
         from src.acp.agy_selection import is_agy_orchestrator_model
 
         options = [opt for opt in options if not is_agy_orchestrator_model(opt.name)]
+        if not options:
+            return None
+    if require_effort:
+        options = [
+            opt
+            for opt in options
+            if getattr(opt, "reasoning_efforts", ())
+            or any(
+                getattr(var, "effort", None) and var.effort != "default"
+                for var in (getattr(opt, "selection_variants", ()) or ())
+            )
+        ]
         if not options:
             return None
     default_opt = next((opt for opt in options if opt.is_default), None) or options[0]
@@ -68,8 +85,12 @@ def resolve_effective_model_name(
     raw_model = str(model_name or "").strip() or None
     prof = str(profile or "").strip().lower() or None
     eff = str(effort or "").strip().lower() or None
+    if eff == "default" and tool != "dsh":
+        eff = None
 
     if tool not in _EFFORT_CAPABLE_TOOLS:
+        if raw_model and raw_model.lower() == "default":
+            return None
         return raw_model
 
     if tool in {"claude", "claude_w"}:
@@ -104,7 +125,10 @@ def resolve_effective_model_name(
         base = emb_base
         if base is None and resolved_effort:
             if tool == "codex":
-                base = _cached_default_model("codex") or CODEX_DEFAULT_MODEL_TOKEN
+                base = (
+                    _cached_default_model("codex", require_effort=True)
+                    or CODEX_DEFAULT_MODEL_TOKEN
+                )
             else:
                 base = CODEX_DEFAULT_MODEL_TOKEN
         if base is None:
@@ -118,16 +142,37 @@ def resolve_effective_model_name(
             split_traex_model_selection,
         )
 
-        emb_base, emb_profile, emb_effort = split_traex_model_selection(raw_model)
+        traex_raw_model = (
+            None if raw_model and raw_model.lower() == "default" else raw_model
+        )
+        emb_base, emb_profile, emb_effort = split_traex_model_selection(traex_raw_model)
         resolved_profile = prof or emb_profile or "standard"
         resolved_effort = eff or emb_effort
-        base = emb_base or None
+        base = None if (not emb_base or emb_base.lower() == "default") else emb_base
         if base is None and (resolved_effort or resolved_profile != "standard"):
             meta = load_traex_model_metadata()
-            if meta:
-                base = meta[0].config_name
+            matched_item = next(
+                (
+                    item
+                    for item in meta
+                    if any(
+                        p.profile == resolved_profile
+                        and (not resolved_effort or p.reasoning_efforts)
+                        for p in item.profiles
+                    )
+                ),
+                None,
+            )
+            if matched_item is not None:
+                base = matched_item.config_name
             else:
-                base = _cached_default_model("traex") or "default"
+                base = (
+                    _cached_default_model(
+                        "traex",
+                        require_effort=bool(resolved_effort),
+                    )
+                    or "default"
+                )
         if base is None:
             return None
         return compose_traex_model_selection(base, resolved_profile, resolved_effort)
@@ -162,9 +207,12 @@ def resolve_effective_model_name(
                 executor,
             )
 
-        if raw_model:
+        agy_raw_model = (
+            None if raw_model and raw_model.lower() == "default" else raw_model
+        )
+        if agy_raw_model:
             model_id, thought_level = split_slash_model_effort(
-                raw_model,
+                agy_raw_model,
                 allowed_efforts=AGY_REASONING_EFFORTS,
             )
         else:
@@ -172,9 +220,16 @@ def resolve_effective_model_name(
         resolved_effort = eff or thought_level
         if resolved_effort == AGY_ORCHESTRATOR_DEFAULT_PROFILE:
             resolved_effort = None
-        base = model_id
+        base = None if (not model_id or model_id.lower() == "default") else model_id
         if base is None and resolved_effort:
-            base = _cached_default_model("agy", skip_orchestrator=True) or "default"
+            base = (
+                _cached_default_model(
+                    "agy",
+                    skip_orchestrator=True,
+                    require_effort=True,
+                )
+                or "default"
+            )
         if base is None:
             return None
         if resolved_effort and resolved_effort in AGY_REASONING_EFFORTS:
@@ -217,7 +272,7 @@ def resolve_effective_model_name(
                     return compose_dsh_model_selection(model_json, eff)
             return raw_model
         if eff:
-            cached = _cached_default_model("dsh")
+            cached = _cached_default_model("dsh", require_effort=True)
             if cached and "/" in cached:
                 provider, _, model_id = cached.partition("/")
                 if provider.strip() and model_id.strip():

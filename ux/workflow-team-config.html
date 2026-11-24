@@ -258,15 +258,17 @@
             <div>
               <label for="tool-select">工具 (Tool · <code>wf_select_tool</code>)</label>
               <select id="tool-select">
-                <option value="codex">codex (OpenAI Codex)</option>
-                <option value="claude">claude (Claude CLI)</option>
                 <option value="traex">traex (TRAE CLI)</option>
+                <option value="claude">claude (Claude CLI)</option>
+                <option value="codex">codex (OpenAI Codex)</option>
                 <option value="agy">agy (Google Antigravity)</option>
                 <option value="dsh">dsh (DeepSeek Harness)</option>
-                <option value="coco">coco (ByteDance AI · 无 Effort)</option>
-                <option value="gemini">gemini (Gemini CLI · 无 Effort)</option>
-                <option value="grok">grok (xAI Grok · 无 Effort)</option>
-                <option value="aiden">aiden (Aiden CLI · 无 Effort)</option>
+                <option value="grok">grok (xAI Grok · 仅模型)</option>
+                <option value="aiden">aiden (Aiden CLI · 仅模型)</option>
+                <option value="gemini">gemini (Gemini CLI · 仅模型)</option>
+                <option value="coco">coco (ByteDance AI · 仅模型)</option>
+                <option value="claude_w">claude_w (Claude Gateway CLI)</option>
+                <option value="codex_w">codex_w (Codex Gateway CLI)</option>
               </select>
             </div>
             <div>
@@ -306,41 +308,73 @@
 
   <script>
     const TOOL_CAPS = {
-      codex: { supportsEffort: true, models: ["gpt-5.4", "gpt-5.3-codex", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh"] },
-      claude: { supportsEffort: true, models: ["sonnet", "opus", "haiku", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh", "max"] },
-      traex: { supportsEffort: true, models: ["c_o_new_thinking", "kimi-k2", "doubao-seed-2.1-pro"], profiles: ["standard", "max"], efforts: ["low", "medium", "high", "xhigh", "max"] },
-      agy: { supportsEffort: true, models: ["gemini-2.5-pro", "agy-orchestrator", "default"], profiles: ["low", "medium", "high"], efforts: ["low", "medium", "high", "xhigh"] },
-      dsh: { supportsEffort: true, models: ["deepseek/deepseek-reasoner", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh"] },
-      coco: { supportsEffort: false, models: ["default", "openai/gpt-4o"], profiles: [], efforts: [] },
-      gemini: { supportsEffort: false, models: ["gemini-2.5-pro", "default"], profiles: [], efforts: [] },
-      grok: { supportsEffort: false, models: ["grok-3", "default"], profiles: [], efforts: [] },
+      traex: {
+        supportsEffort: true,
+        models: ["default", "Doubao-Seed-Evolving", "deepseek-v4.1-flash", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "DeepSeek-V4-Pro"],
+        modelSpecs: {
+          "Doubao-Seed-Evolving": { profiles: ["standard"], efforts: [] },
+          "deepseek-v4.1-flash": { profiles: ["standard", "max"], efforts: ["default", "low", "medium", "high", "max"] }
+        },
+        profiles: ["standard", "max"],
+        efforts: ["default", "low", "medium", "high", "xhigh", "max"]
+      },
+      claude: { supportsEffort: true, models: ["default"], profiles: [], efforts: ["default", "low", "medium", "high", "xhigh", "max"] },
+      claude_w: { supportsEffort: true, models: ["default"], profiles: [], efforts: ["default", "low", "medium", "high", "xhigh", "max"] },
+      codex: {
+        supportsEffort: true,
+        models: ["default", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"],
+        modelSpecs: {
+          "gpt-6-astra": { profiles: [], efforts: [] },
+          "gpt-5.6-terra": { profiles: [], efforts: ["default", "low", "medium", "high", "xhigh", "max", "ultra"] }
+        },
+        profiles: [],
+        efforts: ["default", "low", "medium", "high", "xhigh", "max"]
+      },
+      codex_w: { supportsEffort: true, models: ["default"], profiles: [], efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+      agy: {
+        supportsEffort: true,
+        models: ["default", "gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-pro-orchestrator-neon", "gemini-3.8-flash", "claude-opus-5-5", "gpt-oss-120b-medium"],
+        modelSpecs: {
+          "gemini-pro-orchestrator-neon": {
+            profiles: ["default", "low", "medium", "high"],
+            effortsByProfile: { default: [], low: ["default", "low", "medium", "high", "xhigh"], medium: ["default", "low", "medium", "high", "xhigh"], high: ["default", "low", "medium", "high", "xhigh"] }
+          },
+          "gpt-oss-120b-medium": { profiles: [], efforts: [] }
+        },
+        profiles: [],
+        efforts: ["default", "low", "medium", "high", "xhigh"]
+      },
+      dsh: { supportsEffort: true, models: ["default", "deepseek/deepseek-reasoner"], profiles: [], efforts: ["default", "low", "medium", "high", "xhigh", "off"] },
+      coco: { supportsEffort: false, models: ["default", "Doubao-Seed-Evolving", "gpt-6.1-sol", "DeepSeek-V4-Pro"], profiles: [], efforts: [] },
+      gemini: { supportsEffort: false, models: ["default"], profiles: [], efforts: [] },
+      grok: { supportsEffort: false, models: ["default"], profiles: [], efforts: [] },
       aiden: { supportsEffort: false, models: ["default"], profiles: [], efforts: [] }
     };
 
     const PRESETS = {
       collaborative: [
-        { agent_id: "A1", role: "scout", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "low" },
-        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
-        { agent_id: "A3", role: "verifier", tool_name: "claude", model_name: "sonnet", profile: null, effort: "high" }
+        { agent_id: "A1", role: "scout", tool_name: "traex", model_name: "gpt-6.1-sol", profile: "standard", effort: "low" },
+        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-6-luna", profile: null, effort: "xhigh" },
+        { agent_id: "A3", role: "verifier", tool_name: "agy", model_name: "gemini-4-neon", profile: null, effort: "high" }
       ],
       quick: [
-        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "high" },
-        { agent_id: "A2", role: "verifier", tool_name: "claude", model_name: "sonnet", profile: null, effort: "medium" }
+        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "gpt-6-luna", profile: null, effort: "high" },
+        { agent_id: "A2", role: "verifier", tool_name: "claude", model_name: "default", profile: null, effort: "medium" }
       ],
       review_team: [
-        { agent_id: "A1", role: "planner", tool_name: "traex", model_name: "c_o_new_thinking", profile: "max", effort: "high" },
-        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
-        { agent_id: "A3", role: "verifier", tool_name: "claude", model_name: "opus", profile: null, effort: "high" },
-        { agent_id: "A4", role: "synthesizer", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "medium" }
+        { agent_id: "A1", role: "planner", tool_name: "traex", model_name: "gpt-6.2-sol", profile: "max", effort: "high" },
+        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-6-luna", profile: null, effort: "xhigh" },
+        { agent_id: "A3", role: "verifier", tool_name: "agy", model_name: "gemini-4-neon", profile: null, effort: "high" },
+        { agent_id: "A4", role: "synthesizer", tool_name: "claude", model_name: "default", profile: null, effort: "medium" }
       ],
       deep_collab: [
-        { agent_id: "A1", role: "scout", tool_name: "traex", model_name: "c_o_new_thinking", profile: "standard", effort: "medium" },
-        { agent_id: "A2", role: "planner", tool_name: "claude", model_name: "opus", profile: null, effort: "high" },
-        { agent_id: "A3", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
-        { agent_id: "A4", role: "verifier", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "low" }
+        { agent_id: "A1", role: "scout", tool_name: "traex", model_name: "gpt-6.1-sol", profile: "standard", effort: "medium" },
+        { agent_id: "A2", role: "planner", tool_name: "agy", model_name: "gemini-pro-orchestrator-neon", profile: "high", effort: "high" },
+        { agent_id: "A3", role: "worker", tool_name: "codex", model_name: "gpt-6-luna", profile: null, effort: "xhigh" },
+        { agent_id: "A4", role: "verifier", tool_name: "claude", model_name: "default", profile: null, effort: "high" }
       ],
       auto: [
-        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "high" }
+        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "default", profile: null, effort: "high" }
       ]
     };
 
@@ -363,15 +397,34 @@
     const effortHint = document.getElementById("effort-hint");
     const warnEl = document.getElementById("validation-warn");
 
-    function fillSelect(sel, values, selected) {
+    function fillSelect(sel, values, selected, labels = {}) {
       sel.innerHTML = "";
       values.forEach(v => {
         const opt = document.createElement("option");
         opt.value = v;
-        opt.textContent = v;
+        opt.textContent = labels[v] || v;
         if (v === selected) opt.selected = true;
         sel.appendChild(opt);
       });
+    }
+
+    function activeSpecs() {
+      const cap = TOOL_CAPS[toolSelect.value];
+      const model = modelSelect.value || "default";
+      const spec = (cap.modelSpecs && cap.modelSpecs[model]) || {};
+      const profiles = spec.profiles !== undefined ? spec.profiles : (model === "default" ? [] : cap.profiles);
+      const selectedProfile = profiles.length ? (profileSelect.value && profiles.includes(profileSelect.value) ? profileSelect.value : profiles[0]) : null;
+      let efforts = [];
+      if (cap.supportsEffort) {
+        if (spec.effortsByProfile && selectedProfile !== null) {
+          efforts = spec.effortsByProfile[selectedProfile] || [];
+        } else if (spec.efforts !== undefined) {
+          efforts = spec.efforts;
+        } else {
+          efforts = cap.efforts;
+        }
+      }
+      return { cap, model, profiles, selectedProfile, efforts };
     }
 
     function syncEditorFromSelected() {
@@ -379,7 +432,7 @@
       if (m) {
         roleSelect.value = m.role;
         toolSelect.value = m.tool_name;
-        syncToolDependencies(m.model_name, m.profile, m.effort);
+        syncToolDependencies(m.model_name || "default", m.profile, m.effort || "default");
       } else {
         roleSelect.value = "worker";
         syncToolDependencies();
@@ -388,23 +441,40 @@
 
     function syncToolDependencies(preferredModel, preferredProfile, preferredEffort) {
       const cap = TOOL_CAPS[toolSelect.value];
-      fillSelect(modelSelect, cap.models, preferredModel && cap.models.includes(preferredModel) ? preferredModel : cap.models[0]);
-      if (cap.profiles.length) {
+      const models = cap.models.length ? cap.models : ["default"];
+      const chosenModel = preferredModel && models.includes(preferredModel) ? preferredModel : models[0];
+      fillSelect(modelSelect, models, chosenModel, { default: "default（默认模型）" });
+
+      const spec = (cap.modelSpecs && cap.modelSpecs[chosenModel]) || {};
+      const profiles = spec.profiles !== undefined ? spec.profiles : (chosenModel === "default" ? [] : cap.profiles);
+      if (profiles.length) {
         profileWrap.style.display = "block";
-        fillSelect(profileSelect, cap.profiles, preferredProfile && cap.profiles.includes(preferredProfile) ? preferredProfile : cap.profiles[0]);
+        const chosenProf = preferredProfile && profiles.includes(preferredProfile) ? preferredProfile : profiles[0];
+        fillSelect(profileSelect, profiles, chosenProf, { default: "default（默认 Profile）" });
       } else {
         profileWrap.style.display = "none";
         profileSelect.innerHTML = "";
       }
+
+      const activeProf = profiles.length ? profileSelect.value : null;
+      let efforts = [];
       if (cap.supportsEffort) {
-        effortWrap.style.display = "block";
+        if (spec.effortsByProfile && activeProf !== null) {
+          efforts = spec.effortsByProfile[activeProf] || [];
+        } else if (spec.efforts !== undefined) {
+          efforts = spec.efforts;
+        } else {
+          efforts = cap.efforts;
+        }
+      }
+      effortWrap.style.display = "block";
+      if (efforts.some(e => e !== "default")) {
         effortHint.style.display = "none";
-        fillSelect(effortSelect, cap.efforts, preferredEffort && cap.efforts.includes(preferredEffort) ? preferredEffort : cap.efforts[0]);
+        const chosenEff = preferredEffort && efforts.includes(preferredEffort) ? preferredEffort : "default";
+        fillSelect(effortSelect, efforts, chosenEff, { default: "default（默认 Effort）" });
       } else {
-        effortWrap.style.display = "none";
-        effortHint.style.display = "block";
-        effortHint.textContent = `工具 ${toolSelect.value} 仅支持模型选择，不支持 Effort。`;
-        effortSelect.innerHTML = "";
+        effortHint.style.display = "none";
+        fillSelect(effortSelect, ["default"], "default", { default: "default（默认 Effort · 无需切换）" });
       }
       renderPayload("wf_select_tool");
     }
@@ -419,7 +489,7 @@
         left.className = "roster-meta";
         left.innerHTML = `<strong>${m.agent_id}</strong>`
           + `<span class="badge role">${m.role}</span>`
-          + `<span><code>${m.tool_name}</code> / <code>${m.model_name}</code></span>`
+          + `<span><code>${m.tool_name}</code> / <code>${m.model_name || "default"}</code></span>`
           + (m.profile ? `<span class="badge">profile: ${m.profile}</span>` : "")
           + (m.effort ? `<span class="badge effort">effort: ${m.effort}</span>` : "")
           + (m.agent_id === state.orchestrator_agent_id ? `<span class="badge orch">★ 主编排</span>` : "");
@@ -456,7 +526,10 @@
     }
 
     function renderPayload(action) {
-      const cap = TOOL_CAPS[toolSelect.value];
+      const { profiles, efforts } = activeSpecs();
+      const rawModel = modelSelect.value;
+      const rawProfile = profiles.length ? profileSelect.value : null;
+      const rawEffort = efforts.some(e => e !== "default") ? effortSelect.value : "default";
       const payload = {
         action,
         chat_id: "oc_preview",
@@ -467,9 +540,9 @@
         orchestrator_agent_id: state.orchestrator_agent_id,
         role: roleSelect.value,
         tool_name: toolSelect.value,
-        model_name: modelSelect.value,
-        ...(cap.profiles.length && profileSelect.value ? { profile: profileSelect.value } : {}),
-        ...(cap.supportsEffort && effortSelect.value ? { effort: effortSelect.value } : {})
+        ...(rawModel && rawModel !== "default" ? { model_name: rawModel } : {}),
+        ...(rawProfile && rawProfile !== "default" ? { profile: rawProfile } : {}),
+        ...(rawEffort && rawEffort !== "default" ? { effort: rawEffort } : {})
       };
       document.getElementById("payload-preview").textContent = JSON.stringify(payload, null, 2);
     }
@@ -516,20 +589,22 @@
 
     toolSelect.addEventListener("change", () => syncToolDependencies());
     roleSelect.addEventListener("change", () => renderPayload("wf_select_role"));
-    modelSelect.addEventListener("change", () => renderPayload("wf_select_model"));
-    profileSelect.addEventListener("change", () => renderPayload("wf_select_profile"));
+    modelSelect.addEventListener("change", () => syncToolDependencies(modelSelect.value, profileSelect.value, effortSelect.value));
+    profileSelect.addEventListener("change", () => syncToolDependencies(modelSelect.value, profileSelect.value, effortSelect.value));
     effortSelect.addEventListener("change", () => renderPayload("wf_select_effort"));
 
     document.getElementById("btn-upsert").addEventListener("click", () => {
       warnEl.style.display = "none";
-      const cap = TOOL_CAPS[toolSelect.value];
+      const { profiles, efforts } = activeSpecs();
+      const chosenProf = profiles.length ? profileSelect.value : null;
+      const chosenEff = efforts.some(e => e !== "default") ? effortSelect.value : "default";
       const next = {
         agent_id: state.selected_agent_id === "__new__" ? `A${state.members.length + 1}` : state.selected_agent_id,
         role: roleSelect.value,
         tool_name: toolSelect.value,
-        model_name: modelSelect.value,
-        profile: cap.profiles.length ? profileSelect.value : null,
-        effort: cap.supportsEffort ? effortSelect.value : null
+        model_name: modelSelect.value === "default" ? null : modelSelect.value,
+        profile: chosenProf === "default" ? null : chosenProf,
+        effort: chosenEff === "default" ? null : chosenEff
       };
       const dup = state.members.find(m =>
         m.agent_id !== next.agent_id &&

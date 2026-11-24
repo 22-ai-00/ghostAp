@@ -182,18 +182,20 @@ def test_config_card_cold_cache_effort_tool_and_model_only_tool() -> None:
         ),
     }
 
-    # Cold-cache effort-capable tool still gets Effort select_static
+    # Cold-cache effort-capable tool gets unified Model + Effort select_static
     codex_card = build_workflow_config_card(
         WorkflowConfigEditorState(editor_tool="codex", editor_effort="xhigh"),
         caps,
     )
     _assert_card_2_valid(codex_card)
     codex_selects = [d for d in _walk_dicts(codex_card) if d.get("tag") == "select_static"]
+    assert any(s.get("name") == "model_name" for s in codex_selects)
     assert any(s.get("name") == "effort" for s in codex_selects)
     effort_sel = next(s for s in codex_selects if s.get("name") == "effort")
     assert effort_sel.get("initial_option") == "xhigh"
 
-    # Model-only tool omits Effort select_static and preserves OpenRouter slash model name
+    # Model-only tool renders unified single-option default Effort select_static
+    # (no invalid effort value in callbacks) and preserves OpenRouter slash model name.
     opts = capability_to_acp_options(caps["coco"], current_model="openai/gpt-4o")
     assert [o.name for o in opts] == ["openai/gpt-4o"]
     coco_card = build_workflow_config_card(
@@ -201,9 +203,19 @@ def test_config_card_cold_cache_effort_tool_and_model_only_tool() -> None:
         caps,
     )
     _assert_card_2_valid(coco_card)
-    coco_selects = [d for d in _walk_dicts(coco_card) if d.get("tag") == "select_static"]
-    assert not any(s.get("name") == "effort" for s in coco_selects)
-    assert "不支持 Effort" in json.dumps(coco_card, ensure_ascii=False)
+    coco_selects = {s["name"]: s for s in _walk_dicts(coco_card) if s.get("tag") == "select_static"}
+    assert "model_name" in coco_selects
+    assert [opt["value"] for opt in coco_selects["model_name"]["options"]] == [
+        "default",
+        "openai/gpt-4o",
+    ]
+    assert coco_selects["model_name"].get("initial_option") == "openai/gpt-4o"
+    assert "effort" in coco_selects
+    assert [opt["value"] for opt in coco_selects["effort"]["options"]] == ["default"]
+    assert coco_selects["effort"].get("initial_option") == "default"
+    for d in _walk_dicts(coco_card):
+        if "value" in d and isinstance(d["value"], dict) and "action" in d["value"]:
+            assert "effort" not in d["value"]
     assert action_ids.WF_START_WORKFLOW not in json.dumps(coco_card, ensure_ascii=False)
 
 
@@ -427,8 +439,10 @@ def test_config_card_clears_stale_effort_when_custom_options_have_no_efforts() -
         model_options_by_tool=custom_options,
     )
     _assert_card_2_valid(card)
-    selects = [d for d in _walk_dicts(card) if d.get("tag") == "select_static"]
-    assert not any(s.get("name") == "effort" for s in selects)
+    selects = {s["name"]: s for s in _walk_dicts(card) if s.get("tag") == "select_static"}
+    assert "effort" in selects
+    assert [opt["value"] for opt in selects["effort"]["options"]] == ["default"]
+    assert selects["effort"].get("initial_option") == "default"
     for d in _walk_dicts(card):
         if "value" in d and isinstance(d["value"], dict) and "action" in d["value"]:
             assert "effort" not in d["value"]
@@ -628,4 +642,172 @@ def test_launch_config_card_places_header_and_quick_launch_cta_before_selectors(
     assert first_btn["value"]["action"] == action_ids.WF_START_WORKFLOW
     assert second_btn["type"] == "default"
     assert second_btn["value"]["action"] == action_ids.WF_SAVE_TEAM
+
+
+def test_unified_11_tool_model_and_effort_config_card_matrix() -> None:
+    caps = {
+        "traex": ToolCapability(
+            tool_name="traex",
+            display_name="Traex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("Doubao-Seed-Evolving", "gpt-6.2-sol"),
+            profiles_by_model={
+                "Doubao-Seed-Evolving": ("standard",),
+                "gpt-6.2-sol": ("standard", "max"),
+            },
+            efforts_by_model={"gpt-6.2-sol": ("low", "medium", "high", "xhigh")},
+            authoritative_models=True,
+        ),
+        "claude": ToolCapability(tool_name="claude", display_name="Claude", available=True, supports_model=True, supports_effort=True, models=("default",)),
+        "claude_w": ToolCapability(tool_name="claude_w", display_name="Claude-W", available=True, supports_model=True, supports_effort=True, models=("default",)),
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("gpt-6-astra", "gpt-6-luna"),
+            efforts_by_model={"gpt-6-luna": ("low", "medium", "high", "xhigh", "max")},
+            default_effort="xhigh",
+            authoritative_models=True,
+        ),
+        "codex_w": ToolCapability(tool_name="codex_w", display_name="Codex-W", available=True, supports_model=True, supports_effort=True, models=("default",)),
+        "agy": ToolCapability(
+            tool_name="agy",
+            display_name="AGY",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("gemini-4-neon", "gemini-pro-orchestrator-neon", "gpt-oss-120b-medium"),
+            efforts_by_model={
+                "gemini-4-neon": ("low", "medium", "high", "xhigh"),
+                "gemini-pro-orchestrator-neon": ("low", "medium", "high", "xhigh"),
+            },
+            profiles_by_model={"gemini-pro-orchestrator-neon": ("low", "medium", "high")},
+            default_effort="high",
+            authoritative_models=True,
+        ),
+        "dsh": ToolCapability(tool_name="dsh", display_name="DSH", available=True, supports_model=True, supports_effort=True, models=("deepseek/deepseek-reasoner",), efforts_by_model={"deepseek/deepseek-reasoner": ("low", "medium", "high")}),
+        "grok": ToolCapability(tool_name="grok", display_name="Grok", available=True, supports_model=True, supports_effort=False, models=()),
+        "aiden": ToolCapability(tool_name="aiden", display_name="Aiden", available=True, supports_model=True, supports_effort=False, models=()),
+        "gemini": ToolCapability(tool_name="gemini", display_name="Gemini", available=True, supports_model=True, supports_effort=False, models=()),
+        "coco": ToolCapability(tool_name="coco", display_name="Coco", available=True, supports_model=True, supports_effort=False, models=("Doubao-Seed-Evolving", "gpt-6.1-sol"), authoritative_models=True),
+    }
+    model_options = {
+        "agy": [
+            ACPModelOption(
+                name="gemini-4-neon",
+                is_default=True,
+                reasoning_efforts=("low", "medium", "high", "xhigh"),
+                default_reasoning_effort="high",
+                selection_variants=(
+                    ACPModelSelectionVariant(name="gemini-4-neon/low", model="gemini-4-neon", effort="low"),
+                    ACPModelSelectionVariant(name="gemini-4-neon/high", model="gemini-4-neon", effort="high", is_default=True),
+                ),
+            ),
+            ACPModelOption(
+                name="gemini-pro-orchestrator-neon",
+                selection_variants=(
+                    ACPModelSelectionVariant(name="gemini-pro-orchestrator-neon", model="gemini-pro-orchestrator-neon", profile="default", effort=None, is_default=True),
+                    ACPModelSelectionVariant(name="gemini-pro-orchestrator-neon/high/high", model="gemini-pro-orchestrator-neon", profile="high", effort="high"),
+                ),
+            ),
+            ACPModelOption(
+                name="gpt-oss-120b-medium",
+                selection_variants=(ACPModelSelectionVariant(name="gpt-oss-120b-medium", model="gpt-oss-120b-medium", is_default=True),),
+            ),
+        ],
+    }
+
+    for tool_name in caps:
+        card = build_workflow_config_card(
+            WorkflowConfigEditorState(editor_tool=tool_name),
+            caps,
+            model_options_by_tool=model_options,
+        )
+        _assert_card_2_valid(card)
+        selects = {s["name"]: s for s in _walk_dicts(card) if s.get("tag") == "select_static"}
+        assert "model_name" in selects and "effort" in selects
+        assert selects["model_name"]["options"][0]["value"] == "default"
+        assert selects["model_name"].get("initial_option") == "default"
+        assert selects["effort"]["options"][0]["value"] == "default"
+
+    # AGY standard model shows real catalog + default & effort ladder
+    agy_std_card = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="agy", editor_model="gemini-4-neon"),
+        caps,
+        model_options_by_tool=model_options,
+    )
+    _assert_card_2_valid(agy_std_card)
+    agy_std_sels = {s["name"]: s for s in _walk_dicts(agy_std_card) if s.get("tag") == "select_static"}
+    assert [o["value"] for o in agy_std_sels["model_name"]["options"]] == [
+        "default",
+        "gemini-4-neon",
+        "gemini-pro-orchestrator-neon",
+        "gpt-oss-120b-medium",
+    ]
+    assert [o["value"] for o in agy_std_sels["effort"]["options"]] == ["default", "low", "high"]
+    assert agy_std_sels["effort"].get("initial_option") == "default"
+    assert "effort" not in agy_std_sels["effort"]["value"]
+
+    # Explicit Effort choice selects "high" cleanly
+    agy_hi_card = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="agy", editor_model="gemini-4-neon", editor_effort="high"),
+        caps,
+        model_options_by_tool=model_options,
+    )
+    _assert_card_2_valid(agy_hi_card)
+    agy_hi_sels = {s["name"]: s for s in _walk_dicts(agy_hi_card) if s.get("tag") == "select_static"}
+    assert agy_hi_sels["effort"].get("initial_option") == "high"
+    assert agy_hi_sels["effort"]["value"].get("effort") == "high"
+
+    # DSH JSON wire selection on cold/warm model decodes cleanly to provider/model + effort
+    dsh_wire_card = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="dsh", editor_model='["deepseek","deepseek-reasoner","high"]'),
+        caps,
+    )
+    _assert_card_2_valid(dsh_wire_card)
+    dsh_sels = {s["name"]: s for s in _walk_dicts(dsh_wire_card) if s.get("tag") == "select_static"}
+    assert dsh_sels["model_name"].get("initial_option") == "deepseek/deepseek-reasoner"
+    assert dsh_sels["effort"].get("initial_option") == "high"
+
+    # AGY Orchestrator with profile=default keeps single default Effort; profile=high exposes Effort
+    agy_orch_default = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="agy", editor_model="gemini-pro-orchestrator-neon", editor_profile="default"),
+        caps,
+        model_options_by_tool=model_options,
+    )
+    _assert_card_2_valid(agy_orch_default)
+    orch_def_sels = {s["name"]: s for s in _walk_dicts(agy_orch_default) if s.get("tag") == "select_static"}
+    assert orch_def_sels["profile"].get("initial_option") == "default"
+    assert [o["value"] for o in orch_def_sels["effort"]["options"]] == ["default"]
+
+    agy_orch_high = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="agy", editor_model="gemini-pro-orchestrator-neon", editor_profile="high"),
+        caps,
+        model_options_by_tool=model_options,
+    )
+    _assert_card_2_valid(agy_orch_high)
+    orch_hi_sels = {s["name"]: s for s in _walk_dicts(agy_orch_high) if s.get("tag") == "select_static"}
+    assert [o["value"] for o in orch_hi_sels["effort"]["options"]] == ["default", "high"]
+    assert orch_hi_sels["effort"].get("initial_option") == "default"
+
+    # Effortless authoritative models on effort-capable backends (codex gpt-6-astra, traex Doubao, agy gpt-oss)
+    for t_name, m_name in (
+        ("codex", "gpt-6-astra"),
+        ("traex", "Doubao-Seed-Evolving"),
+        ("agy", "gpt-oss-120b-medium"),
+    ):
+        card = build_workflow_config_card(
+            WorkflowConfigEditorState(editor_tool=t_name, editor_model=m_name),
+            caps,
+            model_options_by_tool=model_options,
+        )
+        _assert_card_2_valid(card)
+        sels = {s["name"]: s for s in _walk_dicts(card) if s.get("tag") == "select_static"}
+        assert [o["value"] for o in sels["effort"]["options"]] == ["default"]
+        assert sels["effort"].get("initial_option") == "default"
+        assert "effort" not in sels["effort"]["value"]
 
