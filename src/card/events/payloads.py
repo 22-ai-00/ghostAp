@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, NotRequired, TypedDict
+
+from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
 
 # Private transport metadata carried with logicalized tool events.  It is not
 # rendered by CardState; process transports use it only to redact a provider's
@@ -183,22 +186,130 @@ class TaskSnapshotPayload(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Allowed fields for the remaining Workflow stop callback.
-_WORKFLOW_BUTTON_FIELDS: set[str] = {
-    "action",
-    "chat_id",
-    "project_id",
-}
+# Allowed fields for Workflow card callbacks.
+_WORKFLOW_BUTTON_FIELDS: frozenset[str] = frozenset(
+    {
+        "action",
+        "chat_id",
+        "project_id",
+    }
+)
+
+_WORKFLOW_CONFIG_ID_FIELDS: frozenset[str] = frozenset(
+    {
+        "action",
+        "chat_id",
+        "project_id",
+        "thread_root_id",
+        "config_id",
+        "config_session_id",
+        "preset_id",
+        "agent_id",
+        "orchestrator_agent_id",
+        "role",
+        "tool_name",
+        "profile",
+        "effort",
+        "model_profile",
+        "model_effort",
+    }
+)
+
+_WORKFLOW_CONFIG_TEXT_FIELDS: frozenset[str] = frozenset(
+    {
+        "model_name",
+        "model_group",
+        "display_name",
+        "_option",
+    }
+)
+
+_WORKFLOW_ACTION_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_WORKFLOW_STOP_STR_MAX = 128
+_WORKFLOW_TEXT_STR_MAX = 256
+_WORKFLOW_OPTIONS_MAX = 16
+
+
+def _has_control_chars(text: str) -> bool:
+    return any(
+        ord(ch) < 32 or ord(ch) == 127 or 0xD800 <= ord(ch) <= 0xDFFF
+        for ch in text
+    )
+
+
+def _sanitize_workflow_text(value: Any, *, max_len: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > max_len or _has_control_chars(value):
+        return None
+    return value
+
+
+def _sanitize_workflow_id(value: Any) -> str | None:
+    text = _sanitize_workflow_text(value, max_len=128)
+    if text is None:
+        return None
+    if not _WORKFLOW_ID_RE.fullmatch(text):
+        return None
+    return text
 
 
 def filter_workflow_button_value(value: dict[str, Any]) -> dict[str, Any]:
     """Return a button-value dict stripped of any field not in the schema.
 
     Safety: a Feishu callback can carry arbitrary keys injected into the
-    button payload by a compromised client. We strip unknown fields at the
-    handler boundary so downstream code cannot read forged fields such as
-    ``"confirmed"``, ``"admin"``, or ``"override_budget"``.
+    button payload by a compromised client. We strip unknown fields,
+    non-strings, control characters, and oversized strings at the handler
+    boundary so downstream code cannot read forged fields such as
+    ``"confirmed"``, ``"admin"``, ``"override_budget"``, or ``"shell_cmd"``.
+
+    When ``action == WORKFLOW_STOP_RUNNING``, only ``action``, ``chat_id``,
+    and ``project_id`` are permitted.
     """
     if not isinstance(value, dict):
         return {}
-    return {k: v for k, v in value.items() if k in _WORKFLOW_BUTTON_FIELDS}
+
+    raw_action = value.get("action")
+    if raw_action is not None:
+        if not isinstance(raw_action, str) or not _WORKFLOW_ACTION_RE.fullmatch(raw_action):
+            return {}
+
+    if raw_action == WORKFLOW_STOP_RUNNING:
+        cleaned_stop: dict[str, Any] = {}
+        for key in _WORKFLOW_BUTTON_FIELDS:
+            if key not in value:
+                continue
+            item = value[key]
+            if key == "action":
+                cleaned_stop[key] = raw_action
+            elif isinstance(item, str) and len(item) <= _WORKFLOW_STOP_STR_MAX and not _has_control_chars(item):
+                cleaned_stop[key] = item
+        return cleaned_stop
+
+    cleaned: dict[str, Any] = {}
+    for key, raw in value.items():
+        if raw is None:
+            continue
+        if key in _WORKFLOW_CONFIG_ID_FIELDS:
+            if key in {"chat_id", "project_id", "thread_root_id"}:
+                safe_val = _sanitize_workflow_text(raw, max_len=_WORKFLOW_STOP_STR_MAX)
+                if safe_val is not None and _WORKFLOW_ID_RE.fullmatch(safe_val):
+                    cleaned[key] = safe_val
+            else:
+                safe_id = _sanitize_workflow_id(raw)
+                if safe_id is not None:
+                    cleaned[key] = safe_id
+        elif key in _WORKFLOW_CONFIG_TEXT_FIELDS:
+            safe_text = _sanitize_workflow_text(raw, max_len=_WORKFLOW_TEXT_STR_MAX)
+            if safe_text is not None:
+                cleaned[key] = safe_text
+        elif key == "_options" and isinstance(raw, list):
+            safe_opts: list[str] = []
+            for item in raw[:_WORKFLOW_OPTIONS_MAX]:
+                safe_item = _sanitize_workflow_text(item, max_len=_WORKFLOW_TEXT_STR_MAX)
+                if safe_item is not None:
+                    safe_opts.append(safe_item)
+            if safe_opts:
+                cleaned[key] = safe_opts
+    return cleaned

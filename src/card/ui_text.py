@@ -253,11 +253,12 @@ UI_TEXT = {
     ),
     "system_help_section_workflow": "⚡ Workflow · 多 Agent 编排执行",
     "system_help_section_workflow_body": (
-        "`/wf <需求>` · 自动绑定推荐 Agent Pool（1–8 个 Agent）并开始编排\n"
+        "`/wf <需求>` · 自动绑定推荐或已保存的 Agent Pool（1–8 个 Agent）并开始编排\n"
+        "`/wf` / `/wf_config` · 打开 Teamwork 团队与 `tool + model + effort` 配置卡\n"
         "`/wf_status` · 查看当前 Workflow 进度\n"
         "`/wf_help`（`/workflow_help`） · Workflow 命令帮助\n"
         "`/stop_wf` · 停止正在运行的 Workflow\n"
-        "别名：`/workflow` · `/workflow_status` · `/stop_workflow`\n"
+        "别名：`/workflow` · `/workflow_config` · `/workflow_status` · `/stop_workflow`\n"
         "流程：自动绑定可用推荐 Agent Pool 与主编排器 → "
         "全自动生成、验证并执行脚本 → 汇总结果"
     ),

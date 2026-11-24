@@ -7,7 +7,10 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
+from src.card.render.buttons import build_responsive_button_row
 from src.card.render.renderer import render_card as render_card
+from src.card.ui_text import UI_TEXT
 from src.utils.text import format_duration, format_elapsed_clock
 
 from .models import (
@@ -126,6 +129,12 @@ from .renderer_elements import (
     _binding_model_parts as _binding_model_parts,
 )
 from .renderer_elements import (
+    _binding_role_markdown as _binding_role_markdown,
+)
+from .renderer_elements import (
+    _binding_roles as _binding_roles,
+)
+from .renderer_elements import (
     _binding_value as _binding_value,
 )
 from .renderer_elements import (
@@ -238,11 +247,15 @@ class WorkflowGenerationRenderer:
         agent_pool: Any,
         orchestrator_agent_id: str,
         orchestrator_was_auto: bool = False,
+        chat_id: str = "",
+        project_id: str = "",
     ) -> None:
         self.requirement = str(requirement or "")
         self.agent_pool = tuple(agent_pool or ())
         self.orchestrator_agent_id = str(orchestrator_agent_id or "")
         self.orchestrator_was_auto = bool(orchestrator_was_auto)
+        self.chat_id = str(chat_id or "")
+        self.project_id = str(project_id or "")
 
     @staticmethod
     def _one_line(value: Any, *, limit: int) -> str:
@@ -258,7 +271,7 @@ class WorkflowGenerationRenderer:
         elapsed_seconds: int = 0,
         terminal_status: str | None = None,
     ) -> dict[str, Any]:
-        """Render the current generation or cancelled card payload."""
+        """Render the current generation or terminal Card JSON 2.0 payload."""
         orchestrator = next(
             (
                 binding
@@ -287,15 +300,22 @@ class WorkflowGenerationRenderer:
             or "",
             one_line=True,
         )
-        is_cancelled = str(terminal_status or "").lower() == "cancelled"
-        default_activity = (
-            "Workflow 任务已由用户停止"
-            if is_cancelled
-            else
-            f"{self.orchestrator_agent_id} 正在生成并验证 Workflow 编排脚本"
-            if self.orchestrator_agent_id
-            else "正在生成并验证 Workflow 编排脚本"
-        )
+        normalized_terminal = str(terminal_status or "").strip().lower()
+        is_cancelled = normalized_terminal == "cancelled"
+        is_failed = normalized_terminal == "failed"
+        is_completed = normalized_terminal == "completed"
+        is_terminal = normalized_terminal in {"cancelled", "failed", "completed"}
+
+        if is_cancelled:
+            default_activity = "Workflow 任务已由用户停止"
+        elif is_failed:
+            default_activity = "Workflow 编排生成失败"
+        elif is_completed:
+            default_activity = "Workflow 编排脚本已生成"
+        elif self.orchestrator_agent_id:
+            default_activity = f"{self.orchestrator_agent_id} 正在生成并验证 Workflow 编排脚本"
+        else:
+            default_activity = "正在生成并验证 Workflow 编排脚本"
         activity = self._one_line(current_activity or default_activity, limit=240)
         requirement = self._one_line(self.requirement, limit=600)
         elapsed = max(0, int(elapsed_seconds or 0))
@@ -316,22 +336,45 @@ class WorkflowGenerationRenderer:
                 ),
                 one_line=True,
             )
-            role = " · 主编排" if raw_agent_id == self.orchestrator_agent_id else ""
+            orch_badge = " · 主编排" if raw_agent_id == self.orchestrator_agent_id else ""
             pool_lines.append(
-                f"- **{agent_id}** · {display_name}{role}\n  {_binding_config_markdown(binding)}"
+                f"- **{agent_id}** · {display_name}{orch_badge}\n  {_binding_config_markdown(binding)}"
             )
 
-        status_content = (
-            "**CANCELLED** · Workflow 已取消\n"
-            f"**最终状态** · {activity}\n"
-            f"⏱ 结束于启动后 {elapsed_text}"
-            if is_cancelled
-            else
-            "**当前阶段** · 生成并验证编排脚本\n"
-            f"**当前操作** · {activity}\n"
-            f"⏱ 已等待 {elapsed_text}\n\n"
-            "① 生成脚本（进行中） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果"
+        if is_cancelled:
+            status_content = (
+                "**CANCELLED** · Workflow 已取消\n"
+                f"**最终状态** · {activity}\n"
+                f"⏱ 结束于启动后 {elapsed_text}"
+            )
+        elif is_failed:
+            status_content = (
+                "**FAILED** · Workflow 生成失败\n"
+                f"**最终状态** · {activity}\n"
+                f"⏱ 结束于启动后 {elapsed_text}"
+            )
+        elif is_completed:
+            status_content = (
+                "**COMPLETED** · 编排脚本已生成\n"
+                f"**最终状态** · {activity}\n"
+                f"⏱ 生成耗时 {elapsed_text}\n\n"
+                "① 生成脚本（已完成） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果"
+            )
+        else:
+            status_content = (
+                "**当前阶段** · 生成并验证编排脚本\n"
+                f"**当前操作** · {activity}\n"
+                f"⏱ 已等待 {elapsed_text}\n\n"
+                "① 生成脚本（进行中） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果"
+            )
+
+        orchestrator_line = (
+            f"**主编排 Agent** · {orchestrator_label}"
+            f"{f' · {orchestrator_name}' if orchestrator_name else ''}"
         )
+        if orchestrator is not None:
+            orchestrator_line += f"\n{_binding_config_markdown(orchestrator)}"
+
         elements: list[dict[str, Any]] = [
             {
                 "tag": "markdown",
@@ -345,10 +388,7 @@ class WorkflowGenerationRenderer:
             {"tag": "hr"},
             {
                 "tag": "markdown",
-                "content": (
-                    f"**主编排 Agent** · {orchestrator_label}"
-                    f"{f' · {orchestrator_name}' if orchestrator_name else ''}"
-                ),
+                "content": orchestrator_line,
             },
             {
                 "tag": "markdown",
@@ -359,19 +399,75 @@ class WorkflowGenerationRenderer:
                 ),
             },
         ]
+
+        if not is_terminal:
+            stop_value = {
+                "action": WORKFLOW_STOP_RUNNING,
+                "chat_id": self.chat_id,
+                "project_id": self.project_id,
+            }
+            stop_button = {
+                "tag": "button",
+                "text": {
+                    "tag": "plain_text",
+                    "content": UI_TEXT.get("workflow_btn_stop_generation", "⏹️ 停止生成"),
+                },
+                "type": "danger",
+                "value": stop_value,
+                "behaviors": [{"type": "callback", "value": dict(stop_value)}],
+                "confirm": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": UI_TEXT.get("workflow_btn_confirm_stop_title", "确认停止 Workflow？"),
+                    },
+                    "text": {
+                        "tag": "plain_text",
+                        "content": UI_TEXT.get(
+                            "workflow_btn_confirm_stop_body",
+                            "正在执行的步骤将中断，已完成的部分不受影响。",
+                        ),
+                    },
+                },
+            }
+            elements.append({"tag": "hr"})
+            elements.extend(build_responsive_button_row([stop_button]))
+
+        if is_cancelled:
+            title_content = "Workflow · 已取消"
+            subtitle_content = "执行已停止"
+            template = "grey"
+        elif is_failed:
+            title_content = "Workflow · 生成失败"
+            subtitle_content = "编排已终止"
+            template = "red"
+        elif is_completed:
+            title_content = "Workflow · 编排已生成"
+            subtitle_content = "编排脚本已就绪"
+            template = "green"
+        else:
+            title_content = "Workflow · 生成编排中"
+            subtitle_content = "Agent Pool 已锁定"
+            template = "blue"
+
+        summary_content = " ".join(title_content.split()) or "Workflow 生成状态"
+        if len(summary_content) < 8:
+            summary_content = f"Workflow · {summary_content}"
+        if len(summary_content) > 60:
+            summary_content = summary_content[:59].rstrip() + "…"
+
         return {
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": "Workflow · 已取消" if is_cancelled else "Workflow · 生成编排中",
-                },
-                "subtitle": {
-                    "tag": "plain_text",
-                    "content": "执行已停止" if is_cancelled else "Agent Pool 已锁定",
-                },
-                "template": "grey" if is_cancelled else "blue",
+            "schema": "2.0",
+            "config": {
+                "compact_width": False,
+                "wide_screen_mode": True,
+                "summary": {"content": summary_content},
             },
-            "elements": elements,
+            "header": {
+                "title": {"tag": "plain_text", "content": title_content},
+                "subtitle": {"tag": "plain_text", "content": subtitle_content},
+                "template": template,
+            },
+            "body": {"elements": elements},
         }
 
 
@@ -696,18 +792,39 @@ class WorkflowProgressRenderer:
                 limit=_LABEL_TRUNCATION_LIMIT,
                 one_line=True,
             )
+            raw_aid = str(getattr(active_agent, "agent_id", "") or "").strip()
+            aid_prefix = (
+                f"`{_safe_dynamic_markdown(raw_aid, one_line=True)}` · "
+                if raw_aid and raw_aid not in str(active_agent.label or "")
+                else ""
+            )
+            role_md = _binding_role_markdown(active_agent)
+            role_suffix = f" · {role_md}" if role_md else ""
             agent_status_icon = STATUS_ICONS.get(active_agent.status, "⏳")
-            lines.append(f"🤖 **{agent_label_key}:** {agent_status_icon} {agent_label}")
+            lines.append(
+                f"🤖 **{agent_label_key}:** {agent_status_icon} {aid_prefix}{agent_label}{role_suffix}"
+            )
             if active_agent.tool:
-                tool = _safe_dynamic_markdown(active_agent.tool, one_line=True)
-                model = _safe_dynamic_markdown(
-                    active_agent.model or "默认模型",
-                    one_line=True,
+                binding = _binding_config_markdown(
+                    active_agent,
+                    include_role=False,
+                    default_tool="未指定工具",
+                    default_model="默认模型",
                 )
-                binding = f"`{tool}` / `{model}`"
                 lines.append(f"🛠 **{tool_label_key}:** {binding}")
             else:
-                lines.append(f"🛠 **{tool_label_key}:** (未指定工具)")
+                _, _, prof, eff = _binding_model_parts(
+                    active_agent,
+                    default_tool="",
+                    default_model="",
+                )
+                extras = []
+                if prof:
+                    extras.append(f"Profile `{_safe_dynamic_markdown(prof, one_line=True)}`")
+                if eff:
+                    extras.append(f"Effort `{_safe_dynamic_markdown(eff, one_line=True)}`")
+                extra_text = (" · " + " · ".join(extras)) if extras else ""
+                lines.append(f"🛠 **{tool_label_key}:** (未指定工具){extra_text}")
             if active_agent.task_summary:
                 task = _safe_dynamic_markdown(
                     active_agent.task_summary,
@@ -918,20 +1035,37 @@ class WorkflowProgressRenderer:
             label, color = status_meta[key]
             lines: list[str] = []
             for agent in group:
-                safe_tool = _safe_dynamic_markdown(
-                    agent.tool or "未指定工具",
-                    one_line=True,
-                )
-                safe_model = _safe_dynamic_markdown(
-                    agent.model or "默认模型",
-                    one_line=True,
-                )
-                tool_badge = f"`{safe_tool}` / `{safe_model}`"
+                if agent.tool:
+                    tool_badge = _binding_config_markdown(
+                        agent,
+                        include_role=False,
+                        default_tool="未指定工具",
+                        default_model="默认模型",
+                    )
+                else:
+                    _, _, prof, eff = _binding_model_parts(
+                        agent,
+                        default_tool="未指定工具",
+                        default_model="默认模型",
+                    )
+                    badge_parts = ["`未指定工具`"]
+                    if prof:
+                        badge_parts.append(f"Profile `{_safe_dynamic_markdown(prof, one_line=True)}`")
+                    if eff:
+                        badge_parts.append(f"Effort `{_safe_dynamic_markdown(eff, one_line=True)}`")
+                    tool_badge = " · ".join(badge_parts)
                 display_label = _safe_dynamic_markdown(
                     agent.label or "agent",
                     limit=_LABEL_TRUNCATION_LIMIT,
                     one_line=True,
                 )
+                raw_aid = str(getattr(agent, "agent_id", "") or "").strip()
+                if raw_aid and raw_aid not in str(agent.label or ""):
+                    id_and_label = f"`{_safe_dynamic_markdown(raw_aid, one_line=True)}` · {display_label}"
+                else:
+                    id_and_label = display_label
+                role_md = _binding_role_markdown(agent)
+                role_suffix = f" · {role_md}" if role_md else ""
                 display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
                 attempt = max(1, int(getattr(agent, "attempt", 1) or 1))
                 status_text = status_meta[key][0]
@@ -953,7 +1087,7 @@ class WorkflowProgressRenderer:
                         else ""
                     )
                 row = (
-                    f"{STATUS_ICONS.get(agent.status, '·')} #{display_index} {display_label} · "
+                    f"{STATUS_ICONS.get(agent.status, '·')} #{display_index} {id_and_label}{role_suffix} · "
                     f"{status_text} · Attempt {attempt} · {tool_badge}{elapsed_suffix}\n"
                     "任务："
                     f"{_safe_dynamic_markdown(task, limit=100, one_line=True)}\n"

@@ -934,6 +934,176 @@ class TestRunningAgentElapsed(unittest.TestCase):
         self.assertNotIn("已运行", content)
 
 
+class TestWorkflowEffortAndRoleVisibility(unittest.TestCase):
+    """F8 coverage: generation card, progress card, execution pages, and completion card."""
+
+    def test_generation_renderer_shows_role_effort_and_stop_control(self) -> None:
+        from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
+        from src.card.schema import require_card_json_2
+        from src.workflow_engine.agent_pool import WorkflowAgentBinding
+        from src.workflow_engine.renderer import WorkflowGenerationRenderer
+
+        pool = (
+            WorkflowAgentBinding(
+                agent_id="A1",
+                tool_name="codex",
+                model_name="gpt-5.4",
+                display_name="Scout",
+                effort="low",
+                role="scout",
+            ),
+            WorkflowAgentBinding(
+                agent_id="A2",
+                tool_name="codex",
+                model_name="gpt-5.4",
+                display_name="Worker",
+                effort="xhigh",
+                role="worker",
+            ),
+        )
+        renderer = WorkflowGenerationRenderer(
+            requirement="Audit security",
+            agent_pool=pool,
+            orchestrator_agent_id="A2",
+            orchestrator_was_auto=True,
+            chat_id="oc_1",
+            project_id="p_1",
+        )
+        active = renderer.render(current_activity="规划节点中", elapsed_seconds=4)
+        require_card_json_2(active)
+        raw = json.dumps(active, ensure_ascii=False)
+        self.assertIn("low", raw)
+        self.assertIn("xhigh", raw)
+        self.assertIn("scout", raw)
+        self.assertIn("worker", raw)
+        self.assertIn(WORKFLOW_STOP_RUNNING, raw)
+
+        failed = renderer.render(terminal_status="failed", elapsed_seconds=9)
+        require_card_json_2(failed)
+        self.assertNotIn(WORKFLOW_STOP_RUNNING, json.dumps(failed, ensure_ascii=False))
+        self.assertIn("生成失败", json.dumps(failed, ensure_ascii=False))
+
+        completed = renderer.render(terminal_status="completed", elapsed_seconds=12)
+        require_card_json_2(completed)
+        completed_raw = json.dumps(completed, ensure_ascii=False)
+        self.assertNotIn(WORKFLOW_STOP_RUNNING, completed_raw)
+        self.assertNotIn("生成编排中", completed_raw)
+        self.assertNotIn("进行中", completed_raw)
+        self.assertIn("Workflow · 编排已生成", completed_raw)
+        self.assertIn("编排脚本已就绪", completed_raw)
+        self.assertIn("① 生成脚本（已完成）", completed_raw)
+        self.assertEqual(completed["header"]["template"], "green")
+        summary_content = completed["config"]["summary"]["content"]
+        self.assertTrue(8 <= len(summary_content) <= 60)
+
+    def test_progress_and_execution_cards_surface_effort_profile_and_role(self) -> None:
+        from src.card.state.models import ContentBlock
+        from src.workflow_engine.renderer_execution_pages import clear_agent_execution_card_cache
+
+        clear_agent_execution_card_cache()
+        agents = [
+            AgentProgress(
+                agent_id="A1",
+                label="scan",
+                tool="codex",
+                model="gpt-5.4/low",
+                effort="low",
+                role="scout",
+                status=AgentStatus.DONE,
+                duration_s=3.0,
+            ),
+            AgentProgress(
+                agent_id="A2",
+                label="implement",
+                tool="traex",
+                model="kimi-k2/max/xhigh",
+                profile="max",
+                effort="xhigh",
+                role="worker",
+                status=AgentStatus.RUNNING,
+                started_at=time.time() - 5,
+                execution_blocks=[
+                    ContentBlock(kind="text", block_id="t1", content="working", status="active")
+                ],
+            ),
+            AgentProgress(
+                agent_id="A3",
+                label="review",
+                tool="claude",
+                model="sonnet",
+                effort="high",
+                role="verifier",
+                status=AgentStatus.PENDING,
+            ),
+        ]
+        project = WorkflowProject(
+            name="wf-effort",
+            status=WorkflowStatus.RUNNING,
+            phases=[PhaseProgress(title="Execution", agents=agents, started_at=time.time() - 10)],
+        )
+        cards = WorkflowProgressRenderer(project).render_progress_cards(project)
+        progress_text = TestWorkflowProgressRenderer._extract_all_text(cards[0]["elements"])
+        self.assertIn("执行中 · Attempt 1", progress_text)
+        self.assertIn("xhigh", progress_text)
+        self.assertIn("max", progress_text)
+        self.assertIn("worker", progress_text)
+        self.assertIn("low", progress_text)
+        self.assertIn("high", progress_text)
+
+        exec_raw = json.dumps(cards[1], ensure_ascii=False)
+        self.assertIn("xhigh", exec_raw)
+        self.assertIn("max", exec_raw)
+        self.assertIn("worker", exec_raw)
+
+        # Changing effort must invalidate execution card cache cleanly
+        agents[1].effort = "medium"
+        cards_updated = WorkflowProgressRenderer(project).render_progress_cards(project)
+        exec_updated_raw = json.dumps(cards_updated[1], ensure_ascii=False)
+        self.assertIn("medium", exec_updated_raw)
+
+    def test_completion_card_renders_terminal_agents_without_leaking_result_and_preserves_failure(self) -> None:
+        secret_result = "RAW_AGENT_RESULT_SECRET_XYZ"
+        project = WorkflowProject(
+            name="wf-done",
+            status=WorkflowStatus.FAILED,
+            error="All pool fallbacks exhausted: codex 503",
+            phases=[
+                PhaseProgress(
+                    title="Verification",
+                    agents=[
+                        AgentProgress(
+                            agent_id="A1",
+                            label="verifier-agent",
+                            tool="claude",
+                            model="sonnet",
+                            effort="xhigh",
+                            role="verifier",
+                            status=AgentStatus.FAILED,
+                            duration_s=4.5,
+                            error="codex 503",
+                            result=secret_result,
+                        )
+                    ],
+                )
+            ],
+            result=json.dumps(
+                {
+                    "card_summary": {
+                        "verdict": "failed",
+                        "conclusion": "独立评审发现 OAuth state 可重放。",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+        )
+        card = render_completion_card(project)
+        raw = json.dumps(card, ensure_ascii=False)
+        self.assertIn("xhigh", raw)
+        self.assertIn("verifier", raw)
+        self.assertIn("独立评审发现 OAuth state 可重放", raw)
+        self.assertNotIn(secret_result, raw)
+
+
 def _markdown_content(element) -> str | None:
     """Best-effort extract of the markdown text inside a render element."""
     if not isinstance(element, dict):

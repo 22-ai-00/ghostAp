@@ -58,6 +58,41 @@ WORKFLOW_AGENT_SELECTION_ACTIONS = frozenset(
     }
 )
 
+# Interactive Teamwork /wf_config Card 2.0 actions (F7/F10)
+WF_OPEN_CONFIG = "wf_open_config"
+WF_SELECT_PRESET = "wf_select_preset"
+WF_SELECT_AGENT = "wf_select_agent"
+WF_SELECT_ROLE = "wf_select_role"
+WF_SELECT_TOOL = "wf_select_tool"
+WF_SELECT_MODEL = "wf_select_model"
+WF_SELECT_PROFILE = "wf_select_profile"
+WF_SELECT_EFFORT = "wf_select_effort"
+WF_ADD_OR_UPDATE_AGENT = "wf_add_or_update_agent"
+WF_REMOVE_AGENT = "wf_remove_agent"
+WF_SET_ORCHESTRATOR = "wf_set_orchestrator"
+WF_SAVE_TEAM = "wf_save_team"
+WF_RESET_TEAM = "wf_reset_team"
+WF_START_WORKFLOW = "wf_start_workflow"
+
+WF_CONFIG_ACTIONS = frozenset(
+    {
+        WF_OPEN_CONFIG,
+        WF_SELECT_PRESET,
+        WF_SELECT_AGENT,
+        WF_SELECT_ROLE,
+        WF_SELECT_TOOL,
+        WF_SELECT_MODEL,
+        WF_SELECT_PROFILE,
+        WF_SELECT_EFFORT,
+        WF_ADD_OR_UPDATE_AGENT,
+        WF_REMOVE_AGENT,
+        WF_SET_ORCHESTRATOR,
+        WF_SAVE_TEAM,
+        WF_RESET_TEAM,
+        WF_START_WORKFLOW,
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Explicit ACP model selection actions
 # ---------------------------------------------------------------------------

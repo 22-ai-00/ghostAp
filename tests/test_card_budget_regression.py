@@ -116,3 +116,46 @@ def test_many_active_tool_lines_paginate_under_official_element_limit():
     for i, page in enumerate(pages):
         nodes = count_tagged_nodes(page._card_json)
         assert nodes <= 200, f"page {i} has {nodes} nodes > 200"
+
+
+def test_workflow_config_card_extreme_8_member_50_model_within_budget():
+    from src.card.builders.workflow import WorkflowConfigEditorState, build_workflow_config_card
+    from src.workflow_engine.agent_pool import WorkflowAgentBinding
+    from src.workflow_engine.tool_registry import ToolCapability
+
+    caps = {
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=tuple(f"gpt-model-{i}" for i in range(50)),
+            efforts_by_model={"gpt-model-0": ("low", "medium", "high", "xhigh")},
+        )
+    }
+    members = tuple(
+        WorkflowAgentBinding(
+            agent_id=f"A{i + 1}",
+            tool_name="codex",
+            model_name="gpt-model-0",
+            display_name=f"Member {i + 1}",
+            effort=("low", "medium", "high", "xhigh")[i % 4],
+            role=("scout", "planner", "worker", "verifier")[i % 4],
+        )
+        for i in range(8)
+    )
+    card = build_workflow_config_card(
+        WorkflowConfigEditorState(
+            preset_id="custom",
+            members=members,
+            orchestrator_agent_id="A1",
+            selected_agent_id="A1",
+            editor_tool="codex",
+            editor_model="gpt-model-0",
+            editor_effort="xhigh",
+        ),
+        caps,
+    )
+    assert count_tagged_nodes(card) <= 180
+    assert len(json.dumps(card, ensure_ascii=False).encode("utf-8")) <= 27 * 1024

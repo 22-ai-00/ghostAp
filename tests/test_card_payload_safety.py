@@ -105,5 +105,114 @@ class TestDefaultBudgetTruncation(unittest.TestCase):
         assert result == content
 
 
+class TestWorkflowPayloadWhitelistSafety(unittest.TestCase):
+    def test_stop_running_payload_remains_strict_three_keys(self):
+        from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
+        from src.card.events.payloads import filter_workflow_button_value
+
+        cleaned = filter_workflow_button_value(
+            {
+                "action": WORKFLOW_STOP_RUNNING,
+                "chat_id": "oc_1",
+                "project_id": "p_1",
+                "effort": "high",
+                "agent_id": "A1",
+                "confirmed": True,
+                "admin": True,
+            }
+        )
+        self.assertEqual(
+            cleaned,
+            {"action": WORKFLOW_STOP_RUNNING, "chat_id": "oc_1", "project_id": "p_1"},
+        )
+
+    def test_wf_config_payload_allows_bounded_fields_and_strips_forged(self):
+        from src.card.actions.dispatch import WF_SELECT_EFFORT
+        from src.card.events.payloads import filter_workflow_button_value
+
+        raw = {
+            "action": WF_SELECT_EFFORT,
+            "chat_id": "oc_1",
+            "project_id": "p_1",
+            "config_session_id": "cfg_1",
+            "preset_id": "collaborative",
+            "agent_id": "A2",
+            "orchestrator_agent_id": "A1",
+            "role": "worker",
+            "tool_name": "traex",
+            "model_name": "openai/gpt-4o",
+            "profile": "max",
+            "effort": "xhigh",
+            "_option": "xhigh",
+            "_options": ["low", "xhigh", "bad\nctrl"],
+            "confirmed": True,
+            "admin": True,
+            "override_budget": 99999,
+            "shell_cmd": "rm -rf /",
+            "bad_ctrl": "abc\x00def",
+            "tool_name_bad_type": 123,
+        }
+        cleaned = filter_workflow_button_value(raw)
+        self.assertEqual(cleaned["action"], WF_SELECT_EFFORT)
+        self.assertEqual(cleaned["effort"], "xhigh")
+        self.assertEqual(cleaned["model_name"], "openai/gpt-4o")
+        self.assertEqual(cleaned["_options"], ["low", "xhigh"])
+        for bad in ("confirmed", "admin", "override_budget", "shell_cmd", "bad_ctrl", "tool_name_bad_type"):
+            self.assertNotIn(bad, cleaned)
+
+    def test_invalid_action_or_oversized_fields_rejected(self):
+        from src.card.events.payloads import filter_workflow_button_value
+
+        self.assertEqual(filter_workflow_button_value({"action": "bad action\n"}), {})
+        cleaned = filter_workflow_button_value(
+            {
+                "action": "wf_select_model",
+                "model_name": "x" * 300,
+                "agent_id": "A1\n",
+                "effort": "high",
+            }
+        )
+        self.assertEqual(cleaned, {"action": "wf_select_model", "effort": "high"})
+
+    def test_lone_surrogates_rejected_in_workflow_button_value(self):
+        from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
+        from src.card.events.payloads import filter_workflow_button_value
+
+        cleaned = filter_workflow_button_value(
+            {
+                "action": "wf_select_model",
+                "model_name": "bad\ud800model",
+                "display_name": "bad\udfffname",
+                "_option": "opt\ud800",
+                "_options": ["valid", "bad\ud800opt"],
+                "agent_id": "A1\ud800",
+                "effort": "high",
+            }
+        )
+        self.assertEqual(
+            cleaned,
+            {
+                "action": "wf_select_model",
+                "_options": ["valid"],
+                "effort": "high",
+            },
+        )
+
+        stop_cleaned = filter_workflow_button_value(
+            {
+                "action": WORKFLOW_STOP_RUNNING,
+                "chat_id": "oc_\ud800_1",
+                "project_id": "p_1",
+            }
+        )
+        self.assertEqual(
+            stop_cleaned,
+            {
+                "action": WORKFLOW_STOP_RUNNING,
+                "project_id": "p_1",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

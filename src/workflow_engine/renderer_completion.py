@@ -28,6 +28,10 @@ from .models import AgentStatus, WorkflowProject, WorkflowStatus
 from .renderer_elements import (
     _LABEL_TRUNCATION_LIMIT,
     _WORKFLOW_FRAGMENT_MAX_BYTES,
+    STATUS_ICONS,
+    _binding_config_markdown,
+    _binding_model_parts,
+    _binding_role_markdown,
     _card_text_for_agent_output,
     _collapsible_panel,
     _column,
@@ -47,6 +51,9 @@ from .renderer_execution_pages import (
     _render_agent_execution_cards,
 )
 from .result_brief import (
+    _CANCELLED_FALLBACK_CONCLUSION,
+    _FAILED_FALLBACK_CONCLUSION,
+    _NEUTRAL_CONCLUSION,
     BriefItem,
     BriefSeverity,
     BriefVerdict,
@@ -222,23 +229,69 @@ def _safe_terminal_error(
     )
 
 
+_MAX_COMPLETION_PROCESS_AGENT_ROWS = 24
+_FAILED_CONCLUSION_MAX_BYTES = 850
+
+
+def _trim_utf8_bytes(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    budget = max(1, max_bytes - len("…".encode("utf-8")))
+    trimmed = encoded[:budget].decode("utf-8", errors="ignore").rstrip()
+    return f"{trimmed}…" if trimmed else "…"
+
+
 def _brief_for_workflow_status(
     brief: WorkflowResultBrief,
     status: WorkflowStatus,
+    *,
+    error: str | None = None,
+    failed_agent_errors: tuple[str, ...] | list[str] = (),
 ) -> WorkflowResultBrief:
     """Make the persisted Workflow terminal status authoritative in UI copy."""
     if status == WorkflowStatus.FAILED:
+        raw_conclusion = str(brief.conclusion or "").strip()
+        trustworthy = (
+            brief.verdict in {BriefVerdict.FAILED, BriefVerdict.NEEDS_ATTENTION}
+            and bool(raw_conclusion)
+            and raw_conclusion != _NEUTRAL_CONCLUSION
+            and raw_conclusion != _FAILED_FALLBACK_CONCLUSION
+            and "任务已完成" not in raw_conclusion
+        )
+        raw_error = str(error or "").strip()
+        if not raw_error:
+            raw_error = next(
+                (str(item).strip() for item in failed_agent_errors if str(item or "").strip()),
+                "",
+            )
+        safe_error = (
+            _safe_terminal_error(raw_error, default="", max_chars=240)
+            if raw_error
+            else ""
+        )
+        if trustworthy:
+            conclusion = (
+                raw_conclusion
+                if "任务未完成" in raw_conclusion
+                else f"任务未完成：{raw_conclusion}"
+            )
+        elif safe_error:
+            conclusion = f"任务未完成：{safe_error}"
+        else:
+            conclusion = _FAILED_FALLBACK_CONCLUSION
+        conclusion = _trim_utf8_bytes(conclusion, _FAILED_CONCLUSION_MAX_BYTES)
         return brief.model_copy(
             update={
                 "verdict": BriefVerdict.FAILED,
-                "conclusion": "任务未完成，请根据错误信息处理后重试。",
+                "conclusion": conclusion,
             }
         )
     if status == WorkflowStatus.CANCELLED:
         return brief.model_copy(
             update={
                 "verdict": BriefVerdict.UNKNOWN,
-                "conclusion": "任务已取消，未生成完整最终结果。",
+                "conclusion": _CANCELLED_FALLBACK_CONCLUSION,
             }
         )
     return brief
@@ -272,7 +325,10 @@ def _completion_process_markdown(
 
     lines = [" · ".join(stats_parts)]
 
-    # Phase rows — compact, no bullets
+    total_agent_rows = sum(len(phase.agents) for phase in project.phases)
+    rendered_rows = 0
+
+    # Phase rows + bounded terminal agent/reviewer entries (never reads agent.result)
     for idx, phase in enumerate(project.phases, 1):
         agents = phase.agents
         total = len(agents)
@@ -298,6 +354,59 @@ def _completion_process_markdown(
             one_line=True,
         )
         lines.append(f"{icon} 阶段 {idx}: {phase_title} — {state}{duration}")
+
+        for agent in agents:
+            if rendered_rows >= _MAX_COMPLETION_PROCESS_AGENT_ROWS:
+                break
+            rendered_rows += 1
+            display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
+            raw_aid = str(getattr(agent, "agent_id", "") or "").strip()
+            agent_id = _safe_dynamic_markdown(raw_aid, one_line=True) if raw_aid else ""
+            label = _safe_dynamic_markdown(
+                agent.label or "agent",
+                limit=_LABEL_TRUNCATION_LIMIT,
+                one_line=True,
+            )
+            id_label = (
+                f"`{agent_id}` · {label}"
+                if agent_id and raw_aid not in str(agent.label or "")
+                else label
+            )
+            role_md = _binding_role_markdown(agent)
+            role_suffix = f" · {role_md}" if role_md else ""
+            if agent.tool:
+                config_md = _binding_config_markdown(
+                    agent,
+                    include_role=False,
+                    default_tool="未指定工具",
+                    default_model="默认模型",
+                )
+            else:
+                _, _, prof, eff = _binding_model_parts(
+                    agent,
+                    default_tool="未指定工具",
+                    default_model="默认模型",
+                )
+                cfg_parts = ["`未指定工具`"]
+                if prof:
+                    cfg_parts.append(f"Profile `{_safe_dynamic_markdown(prof, one_line=True)}`")
+                if eff:
+                    cfg_parts.append(f"Effort `{_safe_dynamic_markdown(eff, one_line=True)}`")
+                config_md = " · ".join(cfg_parts)
+            dur = f" · {format_duration(agent.duration_s)}" if agent.duration_s > 0 else ""
+            ag_icon = STATUS_ICONS.get(agent.status, "·")
+            err_suffix = ""
+            if agent.status == AgentStatus.FAILED and agent.error:
+                safe_err = _safe_terminal_error(agent.error, default="执行失败", max_chars=120)
+                if safe_err:
+                    err_suffix = f" · 原因：{_escape_md(safe_err)}"
+            lines.append(
+                f"  {ag_icon} #{display_index} {id_label}{role_suffix} — {config_md}{dur}{err_suffix}"
+            )
+
+    remaining_rows = total_agent_rows - rendered_rows
+    if remaining_rows > 0:
+        lines.append(f"- 另有 {remaining_rows} 条代理记录，详见完整报告")
 
     return "\n".join(lines)
 
@@ -356,8 +465,19 @@ def render_completion_card(
     """Render a result-first completion card without slicing result items."""
     status = project.status
     metrics = project.metrics
+    failed_agent_errors = [
+        agent.error
+        for phase in project.phases
+        for agent in phase.agents
+        if agent.status == AgentStatus.FAILED and agent.error
+    ]
     brief = fit_result_brief(
-        _brief_for_workflow_status(_safe_result_brief(project.result), status)
+        _brief_for_workflow_status(
+            _safe_result_brief(project.result),
+            status,
+            error=project.error,
+            failed_agent_errors=failed_agent_errors,
+        )
     )
     _card_text_for_result_brief(brief)
 

@@ -1,0 +1,541 @@
+"""Tests for pure Card JSON 2.0 Workflow config/help/launch builders."""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+from src.acp.options import ACPModelOption, ACPModelSelectionVariant
+from src.card.actions import dispatch as action_ids
+from src.card.builders.workflow import (
+    WORKFLOW_PRESET_CATALOG,
+    WORKFLOW_ROLE_CATALOG,
+    WorkflowConfigEditorState,
+    _cap_options_preserving,
+    build_workflow_config_card,
+    build_workflow_help_card,
+    build_workflow_preset_launch_card,
+    capability_to_acp_options,
+)
+from src.card.schema import require_card_json_2
+from src.card.shared.truncation import count_markdown_table_blocks, count_tagged_nodes
+from src.workflow_engine.agent_pool import WorkflowAgentBinding
+from src.workflow_engine.tool_registry import ToolCapability
+
+
+def _walk_dicts(node: object):
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+def _assert_card_2_valid(card: dict) -> None:
+    require_card_json_2(card)
+    payload_bytes = len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
+    assert payload_bytes <= 27 * 1024
+    assert count_tagged_nodes(card) <= 180
+    table_count = sum(
+        count_markdown_table_blocks(str(d.get("content") or ""))
+        for d in _walk_dicts(card)
+        if d.get("tag") == "markdown"
+    ) + sum(1 for d in _walk_dicts(card) if d.get("tag") == "table")
+    assert table_count <= 5
+
+    summary = ((card.get("config") or {}).get("summary") or {}).get("content")
+    assert isinstance(summary, str)
+    assert 8 <= len(summary) <= 60
+
+    for d in _walk_dicts(card):
+        if d.get("tag") == "button":
+            assert d.get("behaviors") == [{"type": "callback", "value": d["value"]}]
+        if d.get("tag") == "select_static":
+            assert "width" not in d
+            assert d.get("behaviors") == [{"type": "callback", "value": d["value"]}]
+
+
+def _sample_capabilities() -> dict[str, ToolCapability]:
+    return {
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("gpt-5.4", "gpt-5.3-codex"),
+            efforts_by_model={
+                "gpt-5.4": ("low", "medium", "high", "xhigh"),
+                "gpt-5.3-codex": ("low", "medium", "high"),
+            },
+            default_effort="high",
+        ),
+        "claude": ToolCapability(
+            tool_name="claude",
+            display_name="Claude",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("sonnet", "opus"),
+            efforts_by_model={"sonnet": ("low", "medium", "high", "xhigh", "max")},
+            default_effort="high",
+        ),
+        "traex": ToolCapability(
+            tool_name="traex",
+            display_name="Traex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("c_o_new_thinking", "kimi-k2"),
+            profiles_by_model={"c_o_new_thinking": ("standard", "max")},
+            efforts_by_model={"c_o_new_thinking": ("low", "medium", "high", "xhigh", "max")},
+            default_effort="high",
+        ),
+        "coco": ToolCapability(
+            tool_name="coco",
+            display_name="Coco",
+            available=True,
+            supports_model=True,
+            supports_effort=False,
+            models=("openai/gpt-4o", "default"),
+        ),
+    }
+
+
+def test_config_card_multi_effort_coexistence_and_card2_invariants() -> None:
+    members = (
+        WorkflowAgentBinding(
+            agent_id="A1",
+            tool_name="codex",
+            model_name="gpt-5.4",
+            display_name="Scout",
+            effort="low",
+            role="scout",
+        ),
+        WorkflowAgentBinding(
+            agent_id="A2",
+            tool_name="codex",
+            model_name="gpt-5.4",
+            display_name="Worker",
+            effort="xhigh",
+            role="worker",
+        ),
+        WorkflowAgentBinding(
+            agent_id="A3",
+            tool_name="claude",
+            model_name="sonnet",
+            display_name="Verifier",
+            effort="high",
+            role="verifier",
+        ),
+    )
+    state = WorkflowConfigEditorState(
+        config_session_id="cfg_1",
+        chat_id="oc_test",
+        project_id="proj_1",
+        preset_id="collaborative",
+        members=members,
+        orchestrator_agent_id="A2",
+        selected_agent_id="A2",
+        editor_role="worker",
+        editor_tool="codex",
+        editor_model="gpt-5.4",
+        editor_effort="xhigh",
+        requirement="Refactor auth module",
+    )
+    card = build_workflow_config_card(state, _sample_capabilities())
+    _assert_card_2_valid(card)
+
+    raw = json.dumps(card, ensure_ascii=False)
+    assert "A1" in raw and "A2" in raw and "A3" in raw
+    assert "low" in raw and "xhigh" in raw and "high" in raw
+    assert "★ 主编排" in raw
+    assert "[正在编辑]" in raw
+    assert action_ids.WF_START_WORKFLOW in raw
+    assert action_ids.WF_SAVE_TEAM in raw
+    assert len(WORKFLOW_PRESET_CATALOG) >= 4
+    assert len(WORKFLOW_ROLE_CATALOG) >= 4
+
+
+def test_config_card_cold_cache_effort_tool_and_model_only_tool() -> None:
+    caps = {
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=(),
+        ),
+        "coco": ToolCapability(
+            tool_name="coco",
+            display_name="Coco",
+            available=True,
+            supports_model=True,
+            supports_effort=False,
+            models=(),
+        ),
+    }
+
+    # Cold-cache effort-capable tool still gets Effort select_static
+    codex_card = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="codex", editor_effort="xhigh"),
+        caps,
+    )
+    _assert_card_2_valid(codex_card)
+    codex_selects = [d for d in _walk_dicts(codex_card) if d.get("tag") == "select_static"]
+    assert any(s.get("name") == "effort" for s in codex_selects)
+    effort_sel = next(s for s in codex_selects if s.get("name") == "effort")
+    assert effort_sel.get("initial_option") == "xhigh"
+
+    # Model-only tool omits Effort select_static and preserves OpenRouter slash model name
+    opts = capability_to_acp_options(caps["coco"], current_model="openai/gpt-4o")
+    assert [o.name for o in opts] == ["openai/gpt-4o"]
+    coco_card = build_workflow_config_card(
+        WorkflowConfigEditorState(editor_tool="coco", editor_model="openai/gpt-4o"),
+        caps,
+    )
+    _assert_card_2_valid(coco_card)
+    coco_selects = [d for d in _walk_dicts(coco_card) if d.get("tag") == "select_static"]
+    assert not any(s.get("name") == "effort" for s in coco_selects)
+    assert "不支持 Effort" in json.dumps(coco_card, ensure_ascii=False)
+    assert action_ids.WF_START_WORKFLOW not in json.dumps(coco_card, ensure_ascii=False)
+
+
+def test_config_card_traex_profile_and_extreme_8_member_60_model_budget() -> None:
+    many_models = tuple(f"model-{i}" for i in range(60))
+    caps = {
+        "traex": ToolCapability(
+            tool_name="traex",
+            display_name="Traex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=many_models,
+            profiles_by_model={"model-55": ("standard", "max")},
+            efforts_by_model={"model-55": ("low", "medium", "high", "xhigh", "max")},
+        )
+    }
+    members = tuple(
+        WorkflowAgentBinding(
+            agent_id=f"A{i + 1}",
+            tool_name="traex",
+            model_name="model-55",
+            display_name=f"Member {i + 1}",
+            profile="max" if i >= 4 else "standard",
+            effort=("low", "medium", "high", "xhigh")[i % 4],
+            role=("scout", "planner", "worker", "verifier")[i % 4],
+        )
+        for i in range(8)
+    )
+    state = WorkflowConfigEditorState(
+        preset_id="custom",
+        members=members,
+        orchestrator_agent_id="A1",
+        selected_agent_id="A8",
+        editor_tool="traex",
+        editor_model="model-55",
+        editor_profile="max",
+        editor_effort="xhigh",
+        requirement="Audit <at id=all></at> & run checks",
+        status_notice="Updated\nnotice <font color='red'>x</font>",
+    )
+    card = build_workflow_config_card(state, caps)
+    _assert_card_2_valid(card)
+
+    selects = {s["name"]: s for s in _walk_dicts(card) if s.get("tag") == "select_static"}
+    assert "profile" in selects and "effort" in selects
+    assert len(selects["model_name"]["options"]) <= 25
+    assert selects["model_name"].get("initial_option") == "model-55"
+    raw = json.dumps(card, ensure_ascii=False)
+    assert "<at" not in raw
+    assert "<font" not in raw
+
+
+def test_help_and_preset_launch_cards_are_valid_card2() -> None:
+    help_card = build_workflow_help_card(
+        node_requirement_text="Node.js >= 20.0.0",
+        project_id="proj_1",
+        chat_id="oc_1",
+    )
+    _assert_card_2_valid(help_card)
+    assert action_ids.WF_OPEN_CONFIG in json.dumps(help_card, ensure_ascii=False)
+
+    launch_card = build_workflow_preset_launch_card(
+        requirement="Build feature",
+        preset_id="collaborative",
+        members=(
+            WorkflowAgentBinding(
+                agent_id="A1",
+                tool_name="codex",
+                model_name="gpt-5.4",
+                display_name="Codex",
+                effort="xhigh",
+                role="worker",
+            ),
+        ),
+        orchestrator_agent_id="A1",
+        chat_id="oc_1",
+        project_id="proj_1",
+    )
+    _assert_card_2_valid(launch_card)
+    assert action_ids.WORKFLOW_STOP_RUNNING in json.dumps(launch_card, ensure_ascii=False)
+
+
+def test_workflow_builder_import_boundary_clean() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "card" / "builders" / "workflow.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                assert "delivery" not in parts and "session" not in parts and "feishu" not in parts
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            parts = node.module.split(".")
+            assert "delivery" not in parts and "session" not in parts and "feishu" not in parts
+
+
+def test_workflow_cards_sanitize_lone_surrogates_for_strict_utf8() -> None:
+    caps = _sample_capabilities()
+    surrogate_member = WorkflowAgentBinding(
+        agent_id="A1",
+        tool_name="codex",
+        model_name="gpt-5.4\ud800",
+        display_name="Scout\udfff",
+        profile="std\ud800",
+        effort="low\ud800",
+        role="worker",
+    )
+    state = WorkflowConfigEditorState(
+        config_session_id="cfg_\ud800_1",
+        chat_id="oc_\ud800_chat",
+        project_id="proj_\ud800_1",
+        thread_root_id="om_\ud800_root",
+        preset_id="collaborative_\ud800_z",
+        members=(surrogate_member,),
+        orchestrator_agent_id="A1\ud800",
+        selected_agent_id="A1\ud800",
+        editor_role="worker",
+        editor_tool="codex",
+        editor_model="gpt-5.4\ud800",
+        editor_profile="std\ud800",
+        editor_effort="low\ud800",
+        requirement="Fix\ud800bug",
+        status_notice="Notice\udfff",
+    )
+    cfg_card = build_workflow_config_card(state, caps)
+    _assert_card_2_valid(cfg_card)
+    json.dumps(cfg_card, ensure_ascii=False).encode("utf-8", errors="strict")
+
+    launch_card = build_workflow_preset_launch_card(
+        requirement="Req\ud800",
+        preset_id="collaborative_\ud800_z",
+        members=(surrogate_member,),
+        orchestrator_agent_id="A1\ud800",
+        chat_id="oc_\ud800_1",
+        project_id="proj_\ud800_1",
+    )
+    _assert_card_2_valid(launch_card)
+    json.dumps(launch_card, ensure_ascii=False).encode("utf-8", errors="strict")
+
+    help_card = build_workflow_help_card(
+        node_requirement_text="Node\ud800>=20",
+        project_id="proj_\ud800_1",
+        chat_id="oc_\ud800_1",
+    )
+    _assert_card_2_valid(help_card)
+    json.dumps(help_card, ensure_ascii=False).encode("utf-8", errors="strict")
+
+
+def test_cap_options_preserving_retains_multiple_keep_items_beyond_limit() -> None:
+    items = [f"m{i}" for i in range(30)]
+    capped = _cap_options_preserving(items, keep=("m28", "m29"), limit=25)
+    assert len(capped) == 25
+    assert "m28" in capped
+    assert "m29" in capped
+
+    # Tail-overlap regression: keep item at boundary index 24 + item beyond limit
+    capped_overlap = _cap_options_preserving(items, keep=("m24", "m28"), limit=25)
+    assert len(capped_overlap) <= 25
+    assert len(capped_overlap) == 25
+    assert len(set(capped_overlap)) == 25
+    assert "m24" in capped_overlap
+    assert "m28" in capped_overlap
+
+    cap = ToolCapability(
+        tool_name="codex",
+        display_name="Codex",
+        available=True,
+        supports_model=True,
+        supports_effort=True,
+        models=tuple(f"m-{i}" for i in range(28)) + ("base-m", "base-m/high"),
+    )
+    opts = capability_to_acp_options(cap, current_model="base-m/high")
+    opt_names = [opt.name for opt in opts]
+    assert len(opt_names) <= 25
+    assert "base-m" in opt_names
+    assert "base-m/high" in opt_names
+
+
+def test_config_card_clears_stale_effort_when_custom_options_have_no_efforts() -> None:
+    caps = {
+        "codex": ToolCapability(
+            tool_name="codex",
+            display_name="Codex",
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=("plain-model",),
+        )
+    }
+    custom_options = {
+        "codex": [
+            ACPModelOption(
+                name="plain-model",
+                is_default=True,
+                selection_variants=(
+                    ACPModelSelectionVariant(
+                        name="plain-model",
+                        model="plain-model",
+                        is_default=True,
+                    ),
+                ),
+            )
+        ]
+    }
+    card = build_workflow_config_card(
+        WorkflowConfigEditorState(
+            editor_tool="codex",
+            editor_model="plain-model",
+            editor_effort="xhigh",
+        ),
+        caps,
+        model_options_by_tool=custom_options,
+    )
+    _assert_card_2_valid(card)
+    selects = [d for d in _walk_dicts(card) if d.get("tag") == "select_static"]
+    assert not any(s.get("name") == "effort" for s in selects)
+    for d in _walk_dicts(card):
+        if "value" in d and isinstance(d["value"], dict) and "action" in d["value"]:
+            assert "effort" not in d["value"]
+
+
+def test_config_card_clears_stale_profile_when_cascade_profiles_empty() -> None:
+    caps = _sample_capabilities()
+    card = build_workflow_config_card(
+        WorkflowConfigEditorState(
+            chat_id="oc_1",
+            preset_id="collaborative",
+            editor_role="worker",
+            editor_tool="codex",
+            editor_model="gpt-5.4",
+            editor_profile="max",
+            editor_effort="xhigh",
+            requirement="Implement feature X",
+        ),
+        caps,
+    )
+    _assert_card_2_valid(card)
+    selects = [d for d in _walk_dicts(card) if d.get("tag") == "select_static"]
+    assert not any(s.get("name") == "profile" for s in selects)
+    interactive = [
+        d for d in _walk_dicts(card) if d.get("tag") in {"button", "select_static"}
+    ]
+    assert interactive
+    for elem in interactive:
+        assert "profile" not in elem["value"]
+        assert "profile" not in elem["behaviors"][0]["value"]
+
+
+def test_deep_collab_preset_ui_and_ux_preview_parity() -> None:
+    preset_ids = [pid for pid, _label, _desc in WORKFLOW_PRESET_CATALOG]
+    assert "deep_collab" in preset_ids
+
+    caps = _sample_capabilities()
+    card = build_workflow_config_card(
+        WorkflowConfigEditorState(
+            config_session_id="cfg_deep",
+            chat_id="oc_1",
+            preset_id="deep_collab",
+            editor_tool="codex",
+            editor_model="gpt-5.4",
+            editor_effort="high",
+        ),
+        caps,
+    )
+    _assert_card_2_valid(card)
+    selects = {s["name"]: s for s in _walk_dicts(card) if s.get("tag") == "select_static"}
+    assert any(opt.get("value") == "deep_collab" for opt in selects["preset_id"]["options"])
+    assert selects["preset_id"].get("initial_option") == "deep_collab"
+
+    help_card = build_workflow_help_card(node_requirement_text="Node.js >= 20", chat_id="oc_1")
+    assert "deep_collab" in json.dumps(help_card, ensure_ascii=False)
+
+    ux_html = (
+        Path(__file__).resolve().parents[1] / "ux" / "workflow-team-config.html"
+    ).read_text(encoding="utf-8")
+    for pid in preset_ids:
+        assert f'data-preset="{pid}"' in ux_html
+        assert f'value="{pid}"' in ux_html
+    assert "deep_collab:" in ux_html
+
+
+def test_capability_to_acp_options_preserves_openrouter_slash_model_id() -> None:
+    from src.card.render.model_cascade import resolve_model_cascade
+
+    models = tuple(f"org/model-{idx}" for idx in range(28)) + ("anthropic/claude-sonnet",)
+    cap = ToolCapability(
+        tool_name="traex",
+        display_name="Traex",
+        available=True,
+        supports_model=True,
+        supports_effort=True,
+        models=models,
+        efforts_by_model={"anthropic/claude-sonnet": ("low", "high")},
+        profiles_by_model={"anthropic/claude-sonnet": ("standard", "max")},
+        default_effort="high",
+    )
+
+    opts = capability_to_acp_options(
+        cap,
+        current_model="anthropic/claude-sonnet/max/high",
+    )
+    opt_names = [opt.name for opt in opts]
+    assert len(opt_names) <= 25
+    assert "anthropic/claude-sonnet" in opt_names
+    assert "anthropic" not in opt_names
+
+    cascade = resolve_model_cascade(
+        opts,
+        current_model="anthropic/claude-sonnet/max/high",
+        selected_model="anthropic/claude-sonnet",
+        selected_profile="max",
+        selected_effort="high",
+    )
+    assert cascade.selected_model == "anthropic/claude-sonnet"
+    assert cascade.selected_profile == "max"
+    assert cascade.selected_effort == "high"
+
+    # Codex/Claude/AGY slash-bearing OpenRouter IDs also retain provider prefix
+    for tool_name in ("codex", "claude", "agy"):
+        other_cap = ToolCapability(
+            tool_name=tool_name,
+            display_name=tool_name.upper(),
+            available=True,
+            supports_model=True,
+            supports_effort=True,
+            models=models,
+            efforts_by_model={"anthropic/claude-sonnet": ("low", "high")},
+        )
+        other_opts = capability_to_acp_options(
+            other_cap,
+            current_model="anthropic/claude-sonnet/high",
+        )
+        other_names = [opt.name for opt in other_opts]
+        assert "anthropic/claude-sonnet" in other_names
+        assert "anthropic" not in other_names
+

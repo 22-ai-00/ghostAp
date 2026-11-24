@@ -596,8 +596,62 @@
         <p class="eyebrow">GhostAP / Workflow</p>
         <h1>消息卡片状态预览</h1>
       </div>
-      <p class="page-intro">一张 Workflow 主卡承载进度与终态；Agent 文本、思考和工具过程合并进入一条原生 COT 过程消息，完整结果由 HTML 报告附件兜底。</p>
+      <p class="page-intro">一张 Workflow 主卡承载进度与终态（生成编排阶段同卡原位切换）；Agent 文本、思考和工具过程合并进入一条原生 COT 过程消息，完整结果由 HTML 报告附件兜底。</p>
     </header>
+
+    <section class="preview-section" aria-labelledby="generation-title">
+      <div class="section-head">
+        <h2 id="generation-title">0. 生成编排中（Generation Card）</h2>
+        <p>锁定 Agent Pool（含 model + effort + role）并展示停止生成按钮</p>
+      </div>
+      <article class="card" aria-label="Workflow 生成编排中卡片">
+        <header class="card-header">
+          <div class="title-wrap">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="header-title">Workflow · 生成编排中</span>
+          </div>
+          <span class="header-meta">Agent Pool 已锁定</span>
+        </header>
+        <div class="card-body">
+          <div class="current-step" style="margin-top:0">
+            <span class="current-marker" aria-hidden="true"></span>
+            <div>
+              <strong>当前阶段 · 生成并验证编排脚本</strong>
+              <p>A2 正在生成并验证 Workflow 编排脚本 · ① 生成脚本（进行中） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果</p>
+            </div>
+            <span class="current-time">⏱ 已等待 00:04</span>
+          </div>
+
+          <section class="block" aria-labelledby="locked-pool-title">
+            <div class="block-heading">
+              <h3 id="locked-pool-title">已锁定 Agent Pool · 3 个</h3>
+              <span>支持同模型多 Effort 共存</span>
+            </div>
+            <ol class="result-list">
+              <li class="result-item">
+                <span class="result-index">A1</span>
+                <div class="result-owner"><strong>codex · gpt-5.4 · low · scout</strong><span>侦察与边界扫描</span></div>
+                <p class="result-copy"><code>codex</code> · 模型 <code>gpt-5.4</code> · Effort <code>low</code> · 角色 <code>scout</code></p>
+              </li>
+              <li class="result-item">
+                <span class="result-index">A2</span>
+                <div class="result-owner"><strong>codex · gpt-5.4 · xhigh · worker · ★ 主编排</strong><span>主实现与编排</span></div>
+                <p class="result-copy"><code>codex</code> · 模型 <code>gpt-5.4</code> · Effort <code>xhigh</code> · 角色 <code>worker</code> · 主编排</p>
+              </li>
+              <li class="result-item">
+                <span class="result-index">A3</span>
+                <div class="result-owner"><strong>claude · sonnet · high · verifier</strong><span>独立验证复核</span></div>
+                <p class="result-copy"><code>claude</code> · 模型 <code>sonnet</code> · Effort <code>high</code> · 角色 <code>verifier</code></p>
+              </li>
+            </ol>
+          </section>
+
+          <div class="card-actions">
+            <button class="stop-button" type="button" data-action="workflow_stop_running">⏹️ 停止生成</button>
+          </div>
+        </div>
+      </article>
+    </section>
 
     <section class="preview-section" aria-labelledby="running-title">
       <div class="section-head">
@@ -633,24 +687,25 @@
             <ol class="result-list">
               <li class="result-item" data-result-index="001">
                 <span class="result-index">#001</span>
-                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span></div>
+                <div class="result-owner"><strong>A1 · structure-agent</strong><span>codex · gpt-5.4 · low · scout</span></div>
                 <p class="result-copy">确认认证入口集中在 auth/service.py，现有 session 写入存在两条重复路径。</p>
               </li>
               <li class="result-item" data-result-index="002">
                 <span class="result-index">#002</span>
-                <div class="result-owner"><strong>security-agent</strong><span>Agent · Traex</span></div>
+                <div class="result-owner"><strong>A2 · security-agent</strong><span>traex · kimi-k2 · max · high · worker</span></div>
                 <p class="result-copy">发现 OAuth state 缺少一次性消费校验，风险边界和兼容修复点已定位。</p>
               </li>
               <li class="result-item" data-result-index="003">
                 <span class="result-index">#003</span>
-                <div class="result-owner"><strong>design-review</strong><span>Reviewer · Claude</span></div>
+                <div class="result-owner"><strong>A3 · design-review</strong><span>claude · sonnet · high · verifier</span></div>
                 <p class="result-copy">方案通过结构评审；要求保留旧 token 的单次迁移读取，避免存量会话失效。</p>
               </li>
             </ol>
+            <p class="slot-note">注：生产主卡按状态分组折叠（执行中 / 失败 / 已完成 / 缓存 / 待执行），每行展示 model + effort + role。</p>
           </section>
 
           <div class="card-actions">
-            <button class="stop-button" type="button">停止 Workflow</button>
+            <button class="stop-button" type="button" data-action="workflow_stop_running">停止 Workflow</button>
           </div>
         </div>
       </article>
@@ -663,7 +718,7 @@
             <span class="status-dot" aria-hidden="true"></span>
             <span class="header-title">Workflow 执行过程 · COT</span>
           </div>
-          <span class="header-meta">A2 / Codex · 执行中</span>
+          <span class="header-meta">A2 / codex · gpt-5.4 · xhigh · worker · 执行中</span>
         </header>
         <div class="card-body">
           <section class="execution-call" role="status" aria-live="polite" aria-label="跨 Agent 合并执行流">
@@ -671,7 +726,7 @@
               <span class="agent-badge">A2</span>
               <span class="execution-title">
                 <strong>#004 · implementation-agent</strong>
-                <span>codex / gpt-5.2-codex · attempt 1</span>
+                <span>codex · gpt-5.4 · xhigh · worker · attempt 1</span>
               </span>
               <span class="execution-state">● 执行中 · 01:18</span>
             </header>
@@ -802,22 +857,22 @@
             <ol class="result-list">
               <li class="result-item" data-result-index="001">
                 <span class="result-index">#001</span>
-                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A1 · structure-agent</strong><span>codex · gpt-5.4 · low · scout</span><em class="result-state">完成</em></div>
                 <p class="result-copy">完成认证边界盘点，确认服务层为唯一需要收敛的写入入口。</p>
               </li>
               <li class="result-item" data-result-index="002">
                 <span class="result-index">#002</span>
-                <div class="result-owner"><strong>implementation-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A2 · implementation-agent</strong><span>codex · gpt-5.4 · xhigh · worker</span><em class="result-state">完成</em></div>
                 <p class="result-copy">合并 session 写入路径，补齐 OAuth state 校验并保留旧 token 迁移读取。</p>
               </li>
               <li class="result-item" data-result-index="003">
                 <span class="result-index">#003</span>
-                <div class="result-owner"><strong>test-agent</strong><span>Agent · Traex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A3 · test-agent</strong><span>traex · kimi-k2 · max · high · worker</span><em class="result-state">完成</em></div>
                 <p class="result-copy">新增 18 项回归测试，覆盖重放、重复登录、迁移读取和失败回滚，全部通过。</p>
               </li>
               <li class="result-item" data-result-index="004">
                 <span class="result-index">#004</span>
-                <div class="result-owner"><strong>final-review</strong><span>Reviewer · Claude</span><em class="result-state">通过</em></div>
+                <div class="result-owner"><strong>A4 · final-review</strong><span>claude · sonnet · high · verifier</span><em class="result-state">通过</em></div>
                 <p class="result-copy">独立评审通过，接口兼容与失败回滚证据完整，无高风险遗留。</p>
               </li>
             </ol>
@@ -889,7 +944,7 @@
             <span class="header-meta">3 成功 · 1 失败</span>
           </header>
           <div class="card-body">
-            <p class="terminal-summary error">实现与测试已完成，但独立安全评审发现 OAuth state 仍可重复消费，本次结果不可发布。</p>
+            <p class="terminal-summary error"><strong>结论：</strong>任务未完成：实现与测试已完成，但独立安全评审发现 OAuth state 仍可重复消费（All pool fallbacks exhausted: codex 503）。</p>
             <div class="block-heading">
               <h3>Agent / Reviewer 最终结果</h3>
               <span>失败结果同样完整保留</span>
@@ -897,25 +952,28 @@
             <ol class="result-list">
               <li class="result-item" data-result-index="001">
                 <span class="result-index">#001</span>
-                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A1 · structure-agent</strong><span>codex · gpt-5.4 · low · scout</span><em class="result-state">完成</em></div>
                 <p class="result-copy">完成认证调用边界盘点，定位 session 写入与 OAuth 回调入口。</p>
               </li>
               <li class="result-item" data-result-index="002">
                 <span class="result-index">#002</span>
-                <div class="result-owner"><strong>implementation-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A2 · implementation-agent</strong><span>codex · gpt-5.4 · xhigh · worker</span><em class="result-state">完成</em></div>
                 <p class="result-copy">完成 session 写入收敛，但 OAuth state 的消费标记未进入同一事务。</p>
               </li>
               <li class="result-item" data-result-index="003">
                 <span class="result-index">#003</span>
-                <div class="result-owner"><strong>test-agent</strong><span>Agent · Traex</span><em class="result-state">完成</em></div>
+                <div class="result-owner"><strong>A3 · test-agent</strong><span>traex · kimi-k2 · max · high · worker</span><em class="result-state">完成</em></div>
                 <p class="result-copy">17 项用例通过，新增的并发重放用例失败并稳定复现重复消费。</p>
               </li>
               <li class="result-item" data-result-index="004">
                 <span class="result-index">#004</span>
-                <div class="result-owner"><strong>security-review</strong><span>Reviewer · Claude</span><em class="result-state error">未通过</em></div>
+                <div class="result-owner"><strong>A4 · security-review</strong><span>claude · sonnet · high · verifier</span><em class="result-state error">未通过</em></div>
                 <p class="result-copy">评审拒绝：OAuth state 校验与消费不是原子操作，并发请求仍可通过两次。</p>
               </li>
             </ol>
+            <div class="terminal-summary error" style="margin-top:12px;margin-bottom:0">
+              <strong>❌ 错误：</strong>All pool fallbacks exhausted: codex 503
+            </div>
             <div class="detail-grid">
               <section class="detail-block validation error">
                 <h3>验证</h3>

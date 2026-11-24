@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow 团队与模型配置 Preview (/wf_config)</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --surface: #f7f8fa;
+      --border: #d9dde3;
+      --line-soft: #edf0f3;
+      --text: #1f2329;
+      --muted: #646a73;
+      --blue: #1456f0;
+      --blue-soft: #e8efff;
+      --green-soft: #e6f4ea;
+      --green: #1a7f37;
+      --amber-soft: #fff8eb;
+      --amber: #a65d05;
+      --red: #c9352b;
+      --red-soft: #fff3f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    }
+    main { max-width: 860px; margin: 28px auto; padding: 0 16px 48px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(31, 35, 41, 0.06);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 18px;
+      background: var(--blue);
+      color: #fff;
+    }
+    .header-title { font-size: 16px; font-weight: 700; }
+    .header-sub {
+      font-size: 12px;
+      padding: 2px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      white-space: nowrap;
+    }
+    .body { padding: 18px; }
+    .req-bar {
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: var(--blue-soft);
+      color: #143c9e;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+    .section {
+      border-top: 1px solid var(--line-soft);
+      padding-top: 14px;
+      margin-top: 14px;
+    }
+    .section-title {
+      font-size: 13px;
+      font-weight: 700;
+      margin: 0 0 8px;
+      color: var(--text);
+    }
+    .preset-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .pill {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 4px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .pill.active {
+      border-color: var(--blue);
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 700;
+    }
+    .roster {
+      list-style: none;
+      margin: 0 0 10px;
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .roster-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      cursor: pointer;
+    }
+    .roster-item:last-child { border-bottom: 0; }
+    .roster-item.editing { background: var(--blue-soft); }
+    .roster-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .badge.effort { background: var(--green-soft); border-color: #b7e0c2; color: var(--green); font-weight: 600; }
+    .badge.orch { background: var(--amber-soft); border-color: #f3d19e; color: var(--amber); font-weight: 700; }
+    .badge.role { background: var(--blue-soft); border-color: #bfd3ff; color: var(--blue); font-weight: 600; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 14px;
+    }
+    label {
+      display: block;
+      margin: 0 0 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+    .warn { color: var(--red); font-size: 12px; margin: 8px 0 0; display: none; }
+    .button-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    button.action-btn {
+      min-height: 36px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 7px 14px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary { border-color: var(--blue); background: var(--blue); color: #fff; }
+    button.danger { border-color: #e3aaa5; color: var(--red); background: var(--red-soft); }
+    pre.payload-preview {
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #1f2329;
+      color: #e6edf3;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-x: auto;
+    }
+    @media (max-width: 600px) {
+      .grid { grid-template-columns: 1fr; }
+      .button-row { flex-direction: column; }
+      button.action-btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="hint">
+      Card JSON 2.0 <code>/wf</code> &amp; <code>/wf_config</code> 交互预览 · 对齐生产构建器 <code>src/card/builders/workflow.py</code>（<code>build_workflow_config_card</code>）与动作白名单 <code>wf_*</code>。
+    </p>
+
+    <div class="card">
+      <div class="header">
+        <span class="header-title">⚡ Workflow 团队与模型配置</span>
+        <span class="header-sub" id="pool-count-badge">3/8 成员 · 同模型多 Effort 共存</span>
+      </div>
+      <div class="body">
+        <div class="req-bar" id="req-bar">
+          <strong>待启动需求：</strong>修复认证竞态并补充多端集成测试（配置保存后点击「立即启动」或发送 <code>/wf &lt;需求&gt;</code>）
+        </div>
+
+        <div>
+          <div class="section-title">协作预设（Preset）</div>
+          <div class="preset-pills" id="preset-pills">
+            <button type="button" class="pill active" data-preset="collaborative">推荐协作组 (collaborative)</button>
+            <button type="button" class="pill" data-preset="quick">快速双人 (quick)</button>
+            <button type="button" class="pill" data-preset="review_team">深度复核 (review_team)</button>
+            <button type="button" class="pill" data-preset="deep_collab">深度协作 (deep_collab)</button>
+            <button type="button" class="pill" data-preset="auto">自动推荐 (auto)</button>
+            <button type="button" class="pill" data-preset="custom">自定义 (custom)</button>
+          </div>
+          <label for="preset-select">Preset 下拉（Card 2.0 <code>select_static</code> · <code>wf_select_preset</code>）</label>
+          <select id="preset-select">
+            <option value="collaborative" selected>推荐协作组 — Planner + Workers + Verifier + Synthesizer</option>
+            <option value="quick">快速双人 — Worker + Verifier</option>
+            <option value="review_team">深度复核 — 多模型交叉审查</option>
+            <option value="deep_collab">深度协作 — Scout + Planner + Workers + 对抗复核 + 汇总</option>
+            <option value="auto">自动推荐 — 自动分配可用工具</option>
+            <option value="custom">自定义 — 逐个定制 tool / model / effort</option>
+          </select>
+        </div>
+
+        <div class="section">
+          <div class="section-title">当前团队成员（A1..AN · 点击成员载入下方编辑器）</div>
+          <ul class="roster" id="roster-list"></ul>
+          <label for="agent-select">当前编辑成员（<code>wf_select_agent</code>）</label>
+          <select id="agent-select"></select>
+        </div>
+
+        <div class="section">
+          <div class="section-title">成员配置（Role × Tool × Model × Profile × Effort）</div>
+          <div class="grid">
+            <div>
+              <label for="role-select">角色 (Role · <code>wf_select_role</code>)</label>
+              <select id="role-select">
+                <option value="scout">scout · 侦察/调研</option>
+                <option value="planner">planner · 规划/拆解</option>
+                <option value="worker">worker · 实现/执行</option>
+                <option value="verifier">verifier · 校验/复核</option>
+                <option value="synthesizer">synthesizer · 汇总/收口</option>
+              </select>
+            </div>
+            <div>
+              <label for="tool-select">工具 (Tool · <code>wf_select_tool</code>)</label>
+              <select id="tool-select">
+                <option value="codex">codex (OpenAI Codex)</option>
+                <option value="claude">claude (Claude CLI)</option>
+                <option value="traex">traex (TRAE CLI)</option>
+                <option value="agy">agy (Google Antigravity)</option>
+                <option value="dsh">dsh (DeepSeek Harness)</option>
+                <option value="coco">coco (ByteDance AI · 无 Effort)</option>
+                <option value="gemini">gemini (Gemini CLI · 无 Effort)</option>
+                <option value="grok">grok (xAI Grok · 无 Effort)</option>
+                <option value="aiden">aiden (Aiden CLI · 无 Effort)</option>
+              </select>
+            </div>
+            <div>
+              <label for="model-select">模型 (Model · <code>wf_select_model</code>)</label>
+              <select id="model-select"></select>
+            </div>
+            <div id="profile-wrap">
+              <label for="profile-select">Profile (<code>wf_select_profile</code>)</label>
+              <select id="profile-select"></select>
+            </div>
+            <div id="effort-wrap">
+              <label for="effort-select">Effort (<code>wf_select_effort</code>)</label>
+              <select id="effort-select"></select>
+            </div>
+          </div>
+          <p class="hint" id="effort-hint" style="display:none;"></p>
+          <p class="warn" id="validation-warn"></p>
+
+          <div class="button-row">
+            <button type="button" class="action-btn primary" id="btn-upsert">添加/更新成员 (wf_add_or_update_agent)</button>
+            <button type="button" class="action-btn" id="btn-orch">设为编排器 (wf_set_orchestrator)</button>
+            <button type="button" class="action-btn danger" id="btn-remove">移除成员 (wf_remove_agent)</button>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="button-row">
+            <button type="button" class="action-btn primary" id="btn-save">保存为项目默认 (wf_save_team)</button>
+            <button type="button" class="action-btn" id="btn-reset">重置默认 (wf_reset_team)</button>
+            <button type="button" class="action-btn primary" id="btn-start">立即启动 (wf_start_workflow)</button>
+          </div>
+          <p class="hint">Card JSON 2.0 Callback Payload 预览：</p>
+          <pre class="payload-preview" id="payload-preview"></pre>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const TOOL_CAPS = {
+      codex: { supportsEffort: true, models: ["gpt-5.4", "gpt-5.3-codex", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh"] },
+      claude: { supportsEffort: true, models: ["sonnet", "opus", "haiku", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh", "max"] },
+      traex: { supportsEffort: true, models: ["c_o_new_thinking", "kimi-k2", "doubao-seed-2.1-pro"], profiles: ["standard", "max"], efforts: ["low", "medium", "high", "xhigh", "max"] },
+      agy: { supportsEffort: true, models: ["gemini-2.5-pro", "agy-orchestrator", "default"], profiles: ["low", "medium", "high"], efforts: ["low", "medium", "high", "xhigh"] },
+      dsh: { supportsEffort: true, models: ["deepseek/deepseek-reasoner", "default"], profiles: [], efforts: ["low", "medium", "high", "xhigh"] },
+      coco: { supportsEffort: false, models: ["default", "openai/gpt-4o"], profiles: [], efforts: [] },
+      gemini: { supportsEffort: false, models: ["gemini-2.5-pro", "default"], profiles: [], efforts: [] },
+      grok: { supportsEffort: false, models: ["grok-3", "default"], profiles: [], efforts: [] },
+      aiden: { supportsEffort: false, models: ["default"], profiles: [], efforts: [] }
+    };
+
+    const PRESETS = {
+      collaborative: [
+        { agent_id: "A1", role: "scout", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "low" },
+        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
+        { agent_id: "A3", role: "verifier", tool_name: "claude", model_name: "sonnet", profile: null, effort: "high" }
+      ],
+      quick: [
+        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "high" },
+        { agent_id: "A2", role: "verifier", tool_name: "claude", model_name: "sonnet", profile: null, effort: "medium" }
+      ],
+      review_team: [
+        { agent_id: "A1", role: "planner", tool_name: "traex", model_name: "c_o_new_thinking", profile: "max", effort: "high" },
+        { agent_id: "A2", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
+        { agent_id: "A3", role: "verifier", tool_name: "claude", model_name: "opus", profile: null, effort: "high" },
+        { agent_id: "A4", role: "synthesizer", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "medium" }
+      ],
+      deep_collab: [
+        { agent_id: "A1", role: "scout", tool_name: "traex", model_name: "c_o_new_thinking", profile: "standard", effort: "medium" },
+        { agent_id: "A2", role: "planner", tool_name: "claude", model_name: "opus", profile: null, effort: "high" },
+        { agent_id: "A3", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "xhigh" },
+        { agent_id: "A4", role: "verifier", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "low" }
+      ],
+      auto: [
+        { agent_id: "A1", role: "worker", tool_name: "codex", model_name: "gpt-5.4", profile: null, effort: "high" }
+      ]
+    };
+
+    let state = {
+      preset_id: "collaborative",
+      members: JSON.parse(JSON.stringify(PRESETS.collaborative)),
+      orchestrator_agent_id: "A2",
+      selected_agent_id: "A2"
+    };
+
+    const presetSelect = document.getElementById("preset-select");
+    const agentSelect = document.getElementById("agent-select");
+    const roleSelect = document.getElementById("role-select");
+    const toolSelect = document.getElementById("tool-select");
+    const modelSelect = document.getElementById("model-select");
+    const profileSelect = document.getElementById("profile-select");
+    const effortSelect = document.getElementById("effort-select");
+    const profileWrap = document.getElementById("profile-wrap");
+    const effortWrap = document.getElementById("effort-wrap");
+    const effortHint = document.getElementById("effort-hint");
+    const warnEl = document.getElementById("validation-warn");
+
+    function fillSelect(sel, values, selected) {
+      sel.innerHTML = "";
+      values.forEach(v => {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = v;
+        if (v === selected) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+
+    function syncEditorFromSelected() {
+      const m = state.members.find(item => item.agent_id === state.selected_agent_id);
+      if (m) {
+        roleSelect.value = m.role;
+        toolSelect.value = m.tool_name;
+        syncToolDependencies(m.model_name, m.profile, m.effort);
+      } else {
+        roleSelect.value = "worker";
+        syncToolDependencies();
+      }
+    }
+
+    function syncToolDependencies(preferredModel, preferredProfile, preferredEffort) {
+      const cap = TOOL_CAPS[toolSelect.value];
+      fillSelect(modelSelect, cap.models, preferredModel && cap.models.includes(preferredModel) ? preferredModel : cap.models[0]);
+      if (cap.profiles.length) {
+        profileWrap.style.display = "block";
+        fillSelect(profileSelect, cap.profiles, preferredProfile && cap.profiles.includes(preferredProfile) ? preferredProfile : cap.profiles[0]);
+      } else {
+        profileWrap.style.display = "none";
+        profileSelect.innerHTML = "";
+      }
+      if (cap.supportsEffort) {
+        effortWrap.style.display = "block";
+        effortHint.style.display = "none";
+        fillSelect(effortSelect, cap.efforts, preferredEffort && cap.efforts.includes(preferredEffort) ? preferredEffort : cap.efforts[0]);
+      } else {
+        effortWrap.style.display = "none";
+        effortHint.style.display = "block";
+        effortHint.textContent = `工具 ${toolSelect.value} 仅支持模型选择，不支持 Effort。`;
+        effortSelect.innerHTML = "";
+      }
+      renderPayload("wf_select_tool");
+    }
+
+    function renderRoster() {
+      const ul = document.getElementById("roster-list");
+      ul.innerHTML = "";
+      state.members.forEach(m => {
+        const li = document.createElement("li");
+        li.className = "roster-item" + (m.agent_id === state.selected_agent_id ? " editing" : "");
+        const left = document.createElement("div");
+        left.className = "roster-meta";
+        left.innerHTML = `<strong>${m.agent_id}</strong>`
+          + `<span class="badge role">${m.role}</span>`
+          + `<span><code>${m.tool_name}</code> / <code>${m.model_name}</code></span>`
+          + (m.profile ? `<span class="badge">profile: ${m.profile}</span>` : "")
+          + (m.effort ? `<span class="badge effort">effort: ${m.effort}</span>` : "")
+          + (m.agent_id === state.orchestrator_agent_id ? `<span class="badge orch">★ 主编排</span>` : "");
+        li.appendChild(left);
+        if (m.agent_id === state.selected_agent_id) {
+          const tag = document.createElement("span");
+          tag.className = "badge";
+          tag.textContent = "正在编辑";
+          li.appendChild(tag);
+        }
+        li.addEventListener("click", () => {
+          state.selected_agent_id = m.agent_id;
+          renderAll();
+        });
+        ul.appendChild(li);
+      });
+
+      agentSelect.innerHTML = "";
+      state.members.forEach(m => {
+        const opt = document.createElement("option");
+        opt.value = m.agent_id;
+        opt.textContent = `${m.agent_id} · ${m.role} · ${m.tool_name}${m.effort ? " (" + m.effort + ")" : ""}`;
+        if (m.agent_id === state.selected_agent_id) opt.selected = true;
+        agentSelect.appendChild(opt);
+      });
+      if (state.members.length < 8) {
+        const addOpt = document.createElement("option");
+        addOpt.value = "__new__";
+        addOpt.textContent = "+ 新增成员";
+        if (state.selected_agent_id === "__new__") addOpt.selected = true;
+        agentSelect.appendChild(addOpt);
+      }
+      document.getElementById("pool-count-badge").textContent = `${state.members.length}/8 成员 · 同模型多 Effort 共存`;
+    }
+
+    function renderPayload(action) {
+      const cap = TOOL_CAPS[toolSelect.value];
+      const payload = {
+        action,
+        chat_id: "oc_preview",
+        project_id: "proj_demo",
+        config_session_id: "cfg_preview_1",
+        preset_id: state.preset_id,
+        agent_id: state.selected_agent_id,
+        orchestrator_agent_id: state.orchestrator_agent_id,
+        role: roleSelect.value,
+        tool_name: toolSelect.value,
+        model_name: modelSelect.value,
+        ...(cap.profiles.length && profileSelect.value ? { profile: profileSelect.value } : {}),
+        ...(cap.supportsEffort && effortSelect.value ? { effort: effortSelect.value } : {})
+      };
+      document.getElementById("payload-preview").textContent = JSON.stringify(payload, null, 2);
+    }
+
+    function renderAll() {
+      presetSelect.value = state.preset_id;
+      document.querySelectorAll(".pill").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.preset === state.preset_id);
+      });
+      renderRoster();
+      syncEditorFromSelected();
+    }
+
+    document.getElementById("preset-pills").addEventListener("click", (e) => {
+      const btn = e.target.closest(".pill");
+      if (!btn) return;
+      state.preset_id = btn.dataset.preset;
+      if (PRESETS[state.preset_id]) {
+        state.members = JSON.parse(JSON.stringify(PRESETS[state.preset_id]));
+        state.selected_agent_id = state.members[0].agent_id;
+        state.orchestrator_agent_id = state.members[0].agent_id;
+      }
+      warnEl.style.display = "none";
+      renderAll();
+      renderPayload("wf_select_preset");
+    });
+
+    presetSelect.addEventListener("change", () => {
+      state.preset_id = presetSelect.value;
+      if (PRESETS[state.preset_id]) {
+        state.members = JSON.parse(JSON.stringify(PRESETS[state.preset_id]));
+        state.selected_agent_id = state.members[0].agent_id;
+        state.orchestrator_agent_id = state.members[0].agent_id;
+      }
+      renderAll();
+      renderPayload("wf_select_preset");
+    });
+
+    agentSelect.addEventListener("change", () => {
+      state.selected_agent_id = agentSelect.value;
+      renderAll();
+      renderPayload("wf_select_agent");
+    });
+
+    toolSelect.addEventListener("change", () => syncToolDependencies());
+    roleSelect.addEventListener("change", () => renderPayload("wf_select_role"));
+    modelSelect.addEventListener("change", () => renderPayload("wf_select_model"));
+    profileSelect.addEventListener("change", () => renderPayload("wf_select_profile"));
+    effortSelect.addEventListener("change", () => renderPayload("wf_select_effort"));
+
+    document.getElementById("btn-upsert").addEventListener("click", () => {
+      warnEl.style.display = "none";
+      const cap = TOOL_CAPS[toolSelect.value];
+      const next = {
+        agent_id: state.selected_agent_id === "__new__" ? `A${state.members.length + 1}` : state.selected_agent_id,
+        role: roleSelect.value,
+        tool_name: toolSelect.value,
+        model_name: modelSelect.value,
+        profile: cap.profiles.length ? profileSelect.value : null,
+        effort: cap.supportsEffort ? effortSelect.value : null
+      };
+      const dup = state.members.find(m =>
+        m.agent_id !== next.agent_id &&
+        m.tool_name === next.tool_name &&
+        (m.model_name || "") === (next.model_name || "") &&
+        (m.profile || "") === (next.profile || "") &&
+        (m.effort || "") === (next.effort || "")
+      );
+      if (dup) {
+        warnEl.textContent = `重复绑定：${dup.agent_id} 已占用相同 tool/model/profile/effort，请调整 Effort 或模型。`;
+        warnEl.style.display = "block";
+        return;
+      }
+      const idx = state.members.findIndex(m => m.agent_id === next.agent_id);
+      if (idx >= 0) {
+        state.members[idx] = next;
+      } else if (state.members.length < 8) {
+        state.members.push(next);
+      }
+      state.selected_agent_id = next.agent_id;
+      state.preset_id = "custom";
+      renderAll();
+      renderPayload("wf_add_or_update_agent");
+    });
+
+    document.getElementById("btn-orch").addEventListener("click", () => {
+      if (state.selected_agent_id !== "__new__") {
+        state.orchestrator_agent_id = state.selected_agent_id;
+        renderAll();
+        renderPayload("wf_set_orchestrator");
+      }
+    });
+
+    document.getElementById("btn-remove").addEventListener("click", () => {
+      if (state.members.length <= 1) {
+        warnEl.textContent = "团队至少需要保留 1 个成员。";
+        warnEl.style.display = "block";
+        return;
+      }
+      state.members = state.members.filter(m => m.agent_id !== state.selected_agent_id);
+      state.selected_agent_id = state.members[0].agent_id;
+      if (!state.members.some(m => m.agent_id === state.orchestrator_agent_id)) {
+        state.orchestrator_agent_id = state.members[0].agent_id;
+      }
+      renderAll();
+      renderPayload("wf_remove_agent");
+    });
+
+    document.getElementById("btn-save").addEventListener("click", () => renderPayload("wf_save_team"));
+    document.getElementById("btn-reset").addEventListener("click", () => {
+      state = {
+        preset_id: "collaborative",
+        members: JSON.parse(JSON.stringify(PRESETS.collaborative)),
+        orchestrator_agent_id: "A2",
+        selected_agent_id: "A2"
+      };
+      renderAll();
+      renderPayload("wf_reset_team");
+    });
+    document.getElementById("btn-start").addEventListener("click", () => renderPayload("wf_start_workflow"));
+
+    renderAll();
+  </script>
+</body>
+</html>

@@ -15,6 +15,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 _NEUTRAL_CONCLUSION = "任务已完成，完整结果见报告。"
+_FAILED_FALLBACK_CONCLUSION = "任务未完成，请根据错误信息处理后重试。"
+_CANCELLED_FALLBACK_CONCLUSION = "任务已取消，未生成完整最终结果。"
 _TEXT_KEYS = ("text", "claim", "description", "issue", "summary", "name", "path")
 
 
@@ -112,7 +114,11 @@ def fit_result_brief(
     omitted = dict(brief.omitted_counts)
     conclusion = brief.conclusion
     if _byte_len(conclusion) > max_item_bytes:
-        conclusion = _NEUTRAL_CONCLUSION
+        conclusion = (
+            _FAILED_FALLBACK_CONCLUSION
+            if brief.verdict == BriefVerdict.FAILED
+            else _NEUTRAL_CONCLUSION
+        )
         omitted["conclusion"] = omitted.get("conclusion", 0) + 1
 
     used = _byte_len(conclusion)
@@ -223,11 +229,14 @@ def _brief_from_payload(
     *,
     source: Literal["contract", "legacy"],
 ) -> WorkflowResultBrief:
+    verdict = _derive_verdict(payload)
     conclusion = ""
     for key in ("conclusion", "summary"):
         conclusion = _first_text(payload.get(key))
         if conclusion:
             break
+    if not conclusion and verdict == BriefVerdict.FAILED:
+        conclusion = _first_text(payload.get("error"))
 
     findings: list[BriefItem] = []
     for key in ("findings", "issues", "risks"):
@@ -241,9 +250,14 @@ def _brief_from_payload(
     for key in ("next_steps", "recommendations"):
         next_steps.extend(_normalize_items(payload.get(key), kind="next_step"))
 
+    fallback_conclusion = (
+        _FAILED_FALLBACK_CONCLUSION
+        if verdict == BriefVerdict.FAILED
+        else _NEUTRAL_CONCLUSION
+    )
     return WorkflowResultBrief(
-        verdict=_derive_verdict(payload),
-        conclusion=conclusion or _NEUTRAL_CONCLUSION,
+        verdict=verdict,
+        conclusion=conclusion or fallback_conclusion,
         findings=_sort_findings(findings),
         verification=verification,
         deliverables=deliverables,

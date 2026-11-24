@@ -456,3 +456,68 @@ def test_phase_collapsible_panel_headers_are_structured_with_border_colors() -> 
                 )
     for expected_prefix in expected_colors:
         assert expected_prefix in found_labels, f"Missing panel for {expected_prefix!r}"
+
+
+def test_failed_brief_preserves_actionable_root_cause_and_rejects_passed_verdict() -> None:
+    from src.workflow_engine.renderer_completion import _brief_for_workflow_status
+    from src.workflow_engine.result_brief import (
+        _FAILED_FALLBACK_CONCLUSION,
+        _NEUTRAL_CONCLUSION,
+        BriefVerdict,
+        WorkflowResultBrief,
+        build_result_brief,
+        fit_result_brief,
+    )
+
+    # 1. Preserves actionable failed brief conclusion
+    brief = WorkflowResultBrief(
+        verdict=BriefVerdict.FAILED,
+        conclusion="独立安全评审发现 OAuth state 仍可重复消费。",
+    )
+    updated = _brief_for_workflow_status(brief, WorkflowStatus.FAILED)
+    assert updated.verdict == BriefVerdict.FAILED
+    assert "OAuth state 仍可重复消费" in updated.conclusion
+    assert "任务未完成" in updated.conclusion
+
+    # 2. Rejects contradictory PASSED verdict and falls back to sanitized agent error
+    contradictory = WorkflowResultBrief(
+        verdict=BriefVerdict.PASSED,
+        conclusion="ALL GOOD",
+    )
+    secret = "sk-1234567890abcdefghijklmnop"
+    overridden = _brief_for_workflow_status(
+        contradictory,
+        WorkflowStatus.FAILED,
+        failed_agent_errors=(f"codex 503 {secret} <at id=all></at>",),
+    )
+    assert "ALL GOOD" not in overridden.conclusion
+    assert "codex 503" in overridden.conclusion
+    assert secret not in overridden.conclusion
+    assert "<at" not in overridden.conclusion
+
+    # 3. fit_result_brief never reverts FAILED verdict to _NEUTRAL_CONCLUSION ("任务已完成...")
+    oversized = WorkflowResultBrief(
+        verdict=BriefVerdict.FAILED,
+        conclusion="x" * 1500,
+    )
+    fitted = fit_result_brief(oversized, max_item_bytes=900)
+    assert fitted.conclusion == _FAILED_FALLBACK_CONCLUSION
+    assert fitted.conclusion != _NEUTRAL_CONCLUSION
+
+    # 4. build_result_brief with {"error": "..."} uses error instead of _NEUTRAL_CONCLUSION
+    err_brief = build_result_brief(json.dumps({"error": "All pool fallbacks exhausted: codex 503"}))
+    assert err_brief.verdict == BriefVerdict.FAILED
+    assert "codex 503" in err_brief.conclusion
+
+    # 5. card_summary with verdict="failed" and no conclusion surfaces failed_agent_errors instead of generic fallback
+    no_conclusion_failed = build_result_brief(
+        json.dumps({"card_summary": {"verdict": "failed"}})
+    )
+    assert no_conclusion_failed.conclusion == _FAILED_FALLBACK_CONCLUSION
+    surfaced = _brief_for_workflow_status(
+        no_conclusion_failed,
+        WorkflowStatus.FAILED,
+        failed_agent_errors=("verifier timed out after 120s",),
+    )
+    assert "verifier timed out after 120s" in surfaced.conclusion
+    assert surfaced.conclusion != _FAILED_FALLBACK_CONCLUSION

@@ -37,6 +37,7 @@ from .models import AgentProgress, AgentStatus, WorkflowProject
 from .renderer_elements import (
     _WORKFLOW_FRAGMENT_MAX_BYTES,
     _WORKFLOW_FRAGMENT_MAX_NODES,
+    _binding_model_parts,
     _card_text_for_agent_output,
     _resolve_renderer_attr,
     _safe_dynamic_text,
@@ -71,8 +72,10 @@ def _identified_direct_agents(
             {
                 "agent_id": str(getattr(agent, "agent_id", None) or ""),
                 "call_index": int(getattr(agent, "call_index", 0) or 0),
+                "effort": str(getattr(agent, "effort", None) or ""),
                 "label": str(getattr(agent, "label", "") or ""),
                 "model": str(getattr(agent, "model", None) or ""),
+                "profile": str(getattr(agent, "profile", None) or ""),
                 "role": str(getattr(agent, "role", None) or ""),
                 "started_at": getattr(agent, "started_at", None),
                 "tool": str(getattr(agent, "tool", "") or ""),
@@ -283,6 +286,7 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
             one_line=True,
         )
         label = _safe_dynamic_text(agent.label or "agent", one_line=True)
+        role = _safe_dynamic_text(getattr(agent, "role", None) or "", one_line=True)
         terminal = _execution_terminal(agent)
         header_template = _execution_header_template(agent)
         mode_name = _safe_dynamic_text(agent.tool or "Agent", one_line=True)
@@ -291,10 +295,26 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
             if agent.tool
             else None
         )
-        model_name = (
-            _safe_dynamic_text(agent.model, one_line=True)
-            if agent.model
-            else None
+        _, clean_model, profile, effort = _binding_model_parts(
+            agent,
+            default_tool="Agent",
+            default_model="",
+        )
+        if clean_model or profile or effort:
+            base_model = clean_model or "default"
+            suffix_parts = [part for part in (profile, effort) if part]
+            raw_display_model = (
+                f"{base_model} ({' / '.join(suffix_parts)})"
+                if suffix_parts
+                else base_model
+            )
+            model_name: str | None = _safe_dynamic_text(raw_display_model, one_line=True)
+        else:
+            model_name = None
+        unit_label = (
+            f"{agent_id} · {role} · {label}"
+            if role
+            else f"{agent_id} · {label}"
         )
         elapsed = max(0.0, float(agent.duration_s or 0.0))
         if elapsed <= 0 and agent.started_at:
@@ -307,6 +327,9 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
             display_index,
             agent_id,
             label,
+            role,
+            profile or "",
+            effort or "",
             terminal,
             header_template,
             agent.status == AgentStatus.FAILED,
@@ -335,7 +358,7 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
                 blocks=wire_blocks,
                 terminal=terminal,
                 header=HeaderState(
-                    title=f"#{display_index} · {agent_id} · {label}",
+                    title=f"#{display_index} · {unit_label}",
                     template=header_template,
                 ),
                 metadata=CardMetadata(
@@ -345,7 +368,7 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
                     model_name=model_name,
                     unit_id=str(display_index),
                     unit_kind="workflow_agent",
-                    unit_label=f"{agent_id} · {label}",
+                    unit_label=unit_label,
                     card_sequence=display_index,
                     session_started_at=agent.started_at,
                     programming_text_sections=True,

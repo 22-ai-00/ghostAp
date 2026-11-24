@@ -184,5 +184,66 @@ class TestRouterAndRegistryWiring(unittest.TestCase):
         )
 
 
+class TestGenerationRendererStopButton(unittest.TestCase):
+    def test_generation_renderer_includes_stop_button_and_no_duplicate(self):
+        from src.card.schema import require_card_json_2
+        from src.feishu.handlers.workflow import WorkflowHandler
+        from src.workflow_engine.agent_pool import WorkflowAgentBinding
+        from src.workflow_engine.renderer import WorkflowGenerationRenderer
+
+        pool = (
+            WorkflowAgentBinding(
+                agent_id="A1",
+                tool_name="codex",
+                model_name="gpt-5.4",
+                display_name="Codex",
+                effort="xhigh",
+                role="worker",
+            ),
+        )
+        active = WorkflowGenerationRenderer(
+            requirement="Build",
+            agent_pool=pool,
+            orchestrator_agent_id="A1",
+            chat_id="chat-1",
+            project_id="proj-1",
+        ).render()
+        require_card_json_2(active)
+        buttons = []
+        stack = [active]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                if cur.get("tag") == "button":
+                    buttons.append(cur)
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["behaviors"][0]["value"]["action"], WORKFLOW_STOP_RUNNING)
+
+        handler = WorkflowHandler.__new__(WorkflowHandler)
+        handler._inject_workflow_stop_button(active, "chat-1", "proj-1", is_running=True)
+        # No duplicate stop button injected into Card 2.0 body.elements
+        recounted = []
+        stack = [active]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                if cur.get("tag") == "button":
+                    recounted.append(cur)
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+        self.assertEqual(len(recounted), 1)
+
+        cancelled = WorkflowGenerationRenderer(
+            requirement="Build",
+            agent_pool=pool,
+            orchestrator_agent_id="A1",
+        ).render(terminal_status="cancelled")
+        self.assertNotIn(WORKFLOW_STOP_RUNNING, str(cancelled))
+
+
 if __name__ == "__main__":
     unittest.main()

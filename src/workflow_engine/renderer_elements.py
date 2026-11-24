@@ -417,38 +417,87 @@ def _binding_value(binding: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
-def _binding_model_parts(binding: Any) -> tuple[str, str, str | None, str | None]:
+def _binding_model_parts(
+    binding: Any,
+    *,
+    default_tool: str = "?",
+    default_model: str = "default",
+) -> tuple[str, str, str | None, str | None]:
     """Return a display-only tool/model/profile/effort tuple without duplication."""
-    tool_name = str(
-        _binding_value(binding, "tool_name", "toolName", "tool", default="?")
-    )
+    raw_tool = str(
+        _binding_value(binding, "tool_name", "toolName", "tool", default="") or ""
+    ).strip()
+    tool_name = raw_tool or default_tool
     profile_value = _binding_value(binding, "profile")
     effort_value = _binding_value(binding, "effort")
-    profile = str(profile_value) if profile_value else None
-    effort = str(effort_value) if effort_value else None
+    profile = str(profile_value).strip() or None if profile_value else None
+    effort = str(effort_value).strip() or None if effort_value else None
     raw_model = str(
         _binding_value(
             binding,
             "model_name",
             "modelName",
             "model",
-            default="default",
+            default=default_model,
         )
-        or "default"
-    )
+        or default_model
+    ).strip()
 
     # ACP model selections may encode profile/effort in model_name while also
     # exposing the structured fields. Strip only the exact structured suffix;
     # model families that legitimately contain slashes remain untouched.
     structured_suffix = "/".join(value for value in (profile, effort) if value)
     suffix = f"/{structured_suffix}" if structured_suffix else ""
-    model_name = raw_model[: -len(suffix)] if suffix and raw_model.endswith(suffix) else raw_model
-    return tool_name, model_name or "default", profile, effort
+    model_name = (
+        raw_model[: -len(suffix)]
+        if suffix and raw_model.endswith(suffix)
+        else raw_model
+    )
+    return tool_name, model_name or default_model, profile, effort
 
 
-def _binding_config_markdown(binding: Any) -> str:
-    """Format a binding's tool, model, profile, and effort as safe inline Markdown."""
-    tool_name, model_name, profile, effort = _binding_model_parts(binding)
+def _binding_roles(binding: Any) -> tuple[str, ...]:
+    """Return deduplicated normalized role strings from ``role`` and ``roles``."""
+    collected: list[str] = []
+    primary = _binding_value(binding, "role")
+    if isinstance(primary, str) and primary.strip():
+        collected.append(primary.strip())
+    raw_roles = _binding_value(binding, "roles")
+    if isinstance(raw_roles, str):
+        if raw_roles.strip():
+            collected.append(raw_roles.strip())
+    elif raw_roles is not None:
+        try:
+            for item in raw_roles:
+                text = str(item or "").strip()
+                if text:
+                    collected.append(text)
+        except TypeError:
+            pass
+    return tuple(dict.fromkeys(collected))
+
+
+def _binding_role_markdown(binding: Any) -> str | None:
+    """Format a binding's role(s) as safe inline Markdown, or ``None`` if absent."""
+    roles = _binding_roles(binding)
+    if not roles:
+        return None
+    return f"角色 `{_safe_dynamic_markdown('/'.join(roles), one_line=True)}`"
+
+
+def _binding_config_markdown(
+    binding: Any,
+    *,
+    include_role: bool = True,
+    default_tool: str = "?",
+    default_model: str = "default",
+) -> str:
+    """Format a binding's tool, model, profile, effort, and optional role as Markdown."""
+    tool_name, model_name, profile, effort = _binding_model_parts(
+        binding,
+        default_tool=default_tool,
+        default_model=default_model,
+    )
     parts = [
         f"`{_safe_dynamic_markdown(tool_name, one_line=True)}`",
         f"模型 `{_safe_dynamic_markdown(model_name, one_line=True)}`",
@@ -457,4 +506,8 @@ def _binding_config_markdown(binding: Any) -> str:
         parts.append(f"Profile `{_safe_dynamic_markdown(profile, one_line=True)}`")
     if effort:
         parts.append(f"Effort `{_safe_dynamic_markdown(effort, one_line=True)}`")
+    if include_role:
+        role_md = _binding_role_markdown(binding)
+        if role_md:
+            parts.append(role_md)
     return " · ".join(parts)
