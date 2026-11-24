@@ -413,21 +413,9 @@ class WorkflowGenerationRenderer:
                     "content": UI_TEXT.get("workflow_btn_stop_generation", "⏹️ 停止生成"),
                 },
                 "type": "danger",
+                "size": "medium",
                 "value": stop_value,
                 "behaviors": [{"type": "callback", "value": dict(stop_value)}],
-                "confirm": {
-                    "title": {
-                        "tag": "plain_text",
-                        "content": UI_TEXT.get("workflow_btn_confirm_stop_title", "确认停止 Workflow？"),
-                    },
-                    "text": {
-                        "tag": "plain_text",
-                        "content": UI_TEXT.get(
-                            "workflow_btn_confirm_stop_body",
-                            "正在执行的步骤将中断，已完成的部分不受影响。",
-                        ),
-                    },
-                },
             }
             elements.append({"tag": "hr"})
             elements.extend(build_responsive_button_row([stop_button]))
@@ -460,6 +448,7 @@ class WorkflowGenerationRenderer:
             "config": {
                 "compact_width": False,
                 "wide_screen_mode": True,
+                "update_multi": True,
                 "summary": {"content": summary_content},
             },
             "header": {

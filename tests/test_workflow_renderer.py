@@ -971,6 +971,19 @@ class TestWorkflowEffortAndRoleVisibility(unittest.TestCase):
         )
         active = renderer.render(current_activity="规划节点中", elapsed_seconds=4)
         require_card_json_2(active)
+        self.assertTrue(active["config"]["update_multi"])
+        stop_buttons = [
+            node
+            for node in TestWorkflowProgressRenderer._walk_card_nodes(active["body"]["elements"])
+            if node.get("tag") == "button"
+        ]
+        self.assertEqual(len(stop_buttons), 1)
+        self.assertEqual(stop_buttons[0]["size"], "medium")
+        self.assertEqual(
+            stop_buttons[0]["behaviors"],
+            [{"type": "callback", "value": stop_buttons[0]["value"]}],
+        )
+        self.assertNotIn("confirm", stop_buttons[0])
         raw = json.dumps(active, ensure_ascii=False)
         self.assertIn("low", raw)
         self.assertIn("xhigh", raw)

@@ -37,6 +37,7 @@ from .ws_card_action_handler import (
     _extract_behavior_value,
     bind_managed_trust_revisions,
 )
+from .ws_trust_access import can_dispatch_card_trust
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("ghostap.audit")
@@ -453,14 +454,34 @@ class WSCardPipelineMixin:
                 if task_ctx and hasattr(task_ctx, "spec")
                 else getattr(getattr(data.event, "context", None), "chat_type", None) == "p2p"
             )
+            is_known_managed_fn = getattr(self, "_is_known_managed_group", None)
+            if callable(is_known_managed_fn) and is_known_managed_fn(open_chat_id):
+                _card_is_p2p = False
             current_trust = self._resolve_effective_trust(
                 sender_id=_operator_id,
                 chat_id=open_chat_id,
                 chat_type=("p2p" if _card_is_p2p else "group"),
             )
-            current_decision = self._managed_trust_access_decision(current_trust)
-            if current_decision is not None and not current_decision.allowed:
-                return
+            async_trust_gate = getattr(self, "_is_card_async_trust_allowed", None)
+            if callable(async_trust_gate):
+                if not async_trust_gate(
+                    current_trust,
+                    operator_id=_operator_id,
+                    open_chat_id=open_chat_id,
+                    open_message_id=open_message_id,
+                    card_is_p2p=_card_is_p2p,
+                ):
+                    hash_fn = getattr(self, "_access_identifier_hash", None)
+                    audit_logger.warning(
+                        "CARD_ACTION_ASYNC_TRUST_DENIED chat_hash=%s msg=%s",
+                        hash_fn(open_chat_id) if callable(hash_fn) else "",
+                        open_message_id,
+                    )
+                    return
+            else:
+                current_decision = self._managed_trust_access_decision(current_trust)
+                if current_decision is not None and not current_decision.allowed:
+                    return
             if effective_trust is not None and current_trust != effective_trust:
                 audit_logger.warning(
                     "MANAGED_CARD_CURRENT_REVISION_DENIED chat_hash=%s",
@@ -572,7 +593,21 @@ class WSCardPipelineMixin:
                 return
 
             # --- Exact dispatch against the authoritative action table ---
-            if not self._current_trust_can_dispatch(current_trust):
+            if not can_dispatch_card_trust(
+                self,
+                current_trust,
+                is_p2p=_card_is_p2p,
+                sender_id=_operator_id,
+                chat_id=open_chat_id,
+                message_id=open_message_id,
+            ):
+                hash_fn = getattr(self, "_access_identifier_hash", None)
+                audit_logger.warning(
+                    "CARD_ACTION_DISPATCH_TRUST_DENIED chat_hash=%s msg=%s action=%s",
+                    hash_fn(open_chat_id) if callable(hash_fn) else "",
+                    open_message_id,
+                    action_type,
+                )
                 return
             handler = self._action_handlers.get(action_type)
             if handler is None:

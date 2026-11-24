@@ -201,7 +201,6 @@ class WorkflowScriptMixin:
         """
         from ...card.actions.dispatch import WORKFLOW_STOP_RUNNING
         from ...card.render.buttons import build_responsive_button_row
-        from ...card.ui_text import UI_TEXT
 
         if not is_running or not isinstance(card_data, dict):
             return
@@ -209,11 +208,6 @@ class WorkflowScriptMixin:
         if not isinstance(elements, list):
             return
 
-        confirm_title = UI_TEXT.get("workflow_btn_confirm_stop_title", "确认停止 Workflow？")
-        confirm_body = UI_TEXT.get(
-            "workflow_btn_confirm_stop_body",
-            "正在执行的步骤将中断，已完成的部分不受影响。",
-        )
         stop_value = {
             "action": WORKFLOW_STOP_RUNNING,
             "chat_id": chat_id,
@@ -223,12 +217,9 @@ class WorkflowScriptMixin:
             "tag": "button",
             "text": {"tag": "plain_text", "content": "⏹️ 停止 Workflow"},
             "type": "danger",
+            "size": "medium",
             "value": stop_value,
             "behaviors": [{"type": "callback", "value": stop_value}],
-            "confirm": {
-                "title": {"tag": "plain_text", "content": confirm_title},
-                "text": {"tag": "plain_text", "content": confirm_body},
-            },
         }
 
         elements.append({"tag": "hr"})

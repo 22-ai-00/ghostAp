@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from ..project import ProjectContext
@@ -39,6 +40,38 @@ _BOOTSTRAP_ACCESS_OPERATIONS = frozenset(
         AccessOperation.BOOTSTRAP_ADMIN,
     }
 )
+
+
+def can_dispatch_card_trust(
+    client: Any,
+    trust: EffectiveTrust | None,
+    *,
+    is_p2p: bool,
+    sender_id: str,
+    chat_id: str,
+    message_id: str,
+) -> bool:
+    """Invoke ``_current_trust_can_dispatch`` safely across real and stub clients."""
+    gate = client._current_trust_can_dispatch
+    try:
+        params = inspect.signature(gate).parameters
+        accepts_card_ctx = "is_p2p" in params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_card_ctx = False
+    if accepts_card_ctx:
+        return bool(
+            gate(
+                trust,
+                is_p2p=is_p2p,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        )
+    return bool(gate(trust))
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,21 +323,166 @@ class WSTrustAccessMixin:
             return True
         return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
 
+    def _is_known_managed_group(self, chat_id: str) -> bool:
+        """Return whether *chat_id* has an active or tombstoned managed record."""
+        if not chat_id:
+            return False
+        registry = getattr(self, "_managed_group_registry", None)
+        return (
+            type(registry) is ManagedGroupRegistry
+            and registry.record(chat_id) is not None
+        )
+
+    def _non_managed_card_fallback_allowed(
+        self,
+        effective_trust: EffectiveTrust | None,
+        *,
+        operator_id: str,
+        open_chat_id: str,
+        open_message_id: str,
+        card_is_p2p: bool,
+    ) -> bool:
+        """Evaluate non-managed card callback access via ingress policy."""
+        if self._is_known_managed_group(open_chat_id):
+            return False
+        registry = getattr(self, "_managed_group_registry", None)
+        if (
+            type(registry) is ManagedGroupRegistry
+            and registry.active_record(open_chat_id) is not None
+        ):
+            return False
+        chat_type = "p2p" if card_is_p2p else "group"
+        msg_decision = self._message_trust_access_decision(
+            effective_trust,
+            chat_type=chat_type,
+        )
+        if msg_decision is None or (
+            card_is_p2p
+            and effective_trust is not None
+            and effective_trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+        ):
+            policy_decision = self._decide_ingress_access(
+                message_id=open_message_id,
+                sender_id=operator_id,
+                chat_id=open_chat_id,
+                chat_type=chat_type,
+                command_match=None,
+            )
+            return bool(policy_decision.allowed)
+        return False
+
+    def _resolve_card_trust_and_access(
+        self,
+        *,
+        operator_id: str,
+        open_chat_id: str,
+        open_message_id: str,
+    ) -> tuple[EffectiveTrust | None, bool, bool]:
+        """Resolve trust zone, verified DM provenance, and allow/deny for a card callback."""
+        effective_trust = self._resolve_effective_trust(
+            sender_id=operator_id,
+            chat_id=open_chat_id,
+            chat_type="group",
+        )
+        trust_decision = self._managed_trust_access_decision(effective_trust)
+        if trust_decision is None or trust_decision.allowed:
+            return effective_trust, False, True
+
+        registry = getattr(self, "_managed_group_registry", None)
+        is_registry = type(registry) is ManagedGroupRegistry
+        active_group = registry.active_record(open_chat_id) if is_registry else None
+        known_managed = (
+            registry.record(open_chat_id) is not None if is_registry else False
+        )
+        if known_managed or active_group is not None:
+            return effective_trust, False, False
+
+        card_is_p2p = False
+        try:
+            origin = (
+                self._message_linker.resolve_origin(reply_message_id=open_message_id)
+                or open_message_id
+            )
+            card_is_p2p = self._resolve_card_is_p2p(
+                origin_message_id=origin,
+                open_chat_id=open_chat_id,
+                operator_id=operator_id,
+            )
+        except (RuntimeError, OSError, TypeError, ValueError):
+            card_is_p2p = False
+
+        if card_is_p2p:
+            effective_trust = self._resolve_effective_trust(
+                sender_id=operator_id,
+                chat_id=open_chat_id,
+                chat_type="p2p",
+            )
+            trust_decision = self._managed_trust_access_decision(effective_trust)
+            if trust_decision is None or trust_decision.allowed:
+                return effective_trust, True, True
+
+        allowed = self._non_managed_card_fallback_allowed(
+            effective_trust,
+            operator_id=operator_id,
+            open_chat_id=open_chat_id,
+            open_message_id=open_message_id,
+            card_is_p2p=card_is_p2p,
+        )
+        return effective_trust, card_is_p2p, allowed
+
+    def _is_card_async_trust_allowed(
+        self,
+        current_trust: EffectiveTrust | None,
+        *,
+        operator_id: str,
+        open_chat_id: str,
+        open_message_id: str,
+        card_is_p2p: bool,
+    ) -> bool:
+        """Re-check card callback trust on the async scheduler worker path."""
+        current_decision = self._managed_trust_access_decision(current_trust)
+        if current_decision is None or current_decision.allowed:
+            return True
+        return self._non_managed_card_fallback_allowed(
+            current_trust,
+            operator_id=operator_id,
+            open_chat_id=open_chat_id,
+            open_message_id=open_message_id,
+            card_is_p2p=card_is_p2p,
+        )
+
     def _current_trust_can_dispatch(
         self,
         trust: EffectiveTrust | None,
         *,
         project=None,
+        is_p2p: bool = False,
+        sender_id: str = "",
+        chat_id: str = "",
+        message_id: str = "",
     ) -> bool:
         """Re-validate that trust revisions and project bindings have not drifted."""
         if trust is None:
             return True
-        if (
-            trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
-            and self._current_ingress_access_policy().mode
-            is IngressAccessMode.LEGACY_ALLOW_ALL
-        ):
-            return True
+        if trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP:
+            if self._is_known_managed_group(chat_id):
+                return False
+            if (
+                self._current_ingress_access_policy().mode
+                is IngressAccessMode.LEGACY_ALLOW_ALL
+            ):
+                return True
+            if is_p2p:
+                return bool(
+                    self._decide_ingress_access(
+                        message_id=message_id,
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        chat_type="p2p",
+                        command_match=None,
+                    ).allowed
+                )
+            return False
         current_group_revision = None
         current_grant_revision = None
         if trust.managed_group is not None:
@@ -332,7 +510,8 @@ class WSTrustAccessMixin:
                 return False
         if trust.zone is TrustZone.OWNER_P2P:
             return (
-                trust.actor is ActorKind.OWNER
+                not self._is_known_managed_group(chat_id)
+                and trust.actor is ActorKind.OWNER
                 and trust.managed_group is None
                 and trust.group_revision is None
                 and trust.grant_revision is None

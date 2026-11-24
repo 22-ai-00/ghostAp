@@ -121,10 +121,15 @@ class TestInjectWorkflowStopButton(unittest.TestCase):
         found = self._find_stop_button(elements)
         self.assertIsNotNone(found, "stop button not found in card elements")
         self.assertEqual(found["type"], "danger")
+        self.assertEqual(found["size"], "medium")
         self.assertEqual(found["value"]["action"], WORKFLOW_STOP_RUNNING)
         self.assertEqual(found["value"]["chat_id"], "chat-1")
         self.assertEqual(found["value"]["project_id"], "proj-1")
-        self.assertIn("confirm", found)
+        self.assertEqual(
+            found["behaviors"],
+            [{"type": "callback", "value": found["value"]}],
+        )
+        self.assertNotIn("confirm", found)
 
     def test_no_elements_is_noop(self):
         """Missing/invalid elements list must not raise."""
@@ -219,8 +224,11 @@ class TestGenerationRendererStopButton(unittest.TestCase):
                 stack.extend(cur.values())
             elif isinstance(cur, list):
                 stack.extend(cur)
+        self.assertTrue(active["config"]["update_multi"])
         self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["size"], "medium")
         self.assertEqual(buttons[0]["behaviors"][0]["value"]["action"], WORKFLOW_STOP_RUNNING)
+        self.assertNotIn("confirm", buttons[0])
 
         handler = WorkflowHandler.__new__(WorkflowHandler)
         handler._inject_workflow_stop_button(active, "chat-1", "proj-1", is_running=True)

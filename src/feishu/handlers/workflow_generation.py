@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_GENERATION_PROGRESS_DEBOUNCE_S = 8.0
+
 
 def _workflow_module():
     """Return the workflow handler module for runtime-patchable symbols."""
@@ -225,17 +227,22 @@ class WorkflowGenerationMixin:
             (getattr(project, "project_id", "") if project else "")
             or str(generation_context.get("project_id") or "")
         )
+        last_delivered_key: tuple[str, int] | None = None
 
         def _owner_can_deliver() -> bool:
             return self._generation_owner_is_active(engine, owner)
 
         def _deliver_generation_card(status_hint: str = "") -> None:
             """Update the generating card only while this owner is live."""
+            nonlocal last_delivered_key
             with owner.delivery_lock:
                 if generation_terminal_fence.is_set() or not _owner_can_deliver():
                     return
                 elapsed = int(_workflow_module().time.time() - heartbeat_start)
                 status = status_hint or "正在生成编排脚本..."
+                delivery_key = (status, elapsed // 8)
+                if delivery_key == last_delivered_key:
+                    return
                 progress_card_data = self._workflow_generation_card_data(
                     requirement=requirement,
                     agent_pool=generation_context["agent_pool"],
@@ -251,12 +258,14 @@ class WorkflowGenerationMixin:
                     project_id=card_project_id,
                 )
                 if gen_msg_id:
-                    self.update_card(
+                    updated = self.update_card(
                         gen_msg_id,
                         self._build_workflow_card_from_renderer_data(
                             progress_card_data
                         ),
                     )
+                    if updated is not False:
+                        last_delivered_key = delivery_key
 
         def _heartbeat_update(status_hint: str = "") -> None:
             if progress_coalescer is not None:
@@ -266,7 +275,7 @@ class WorkflowGenerationMixin:
 
         def _heartbeat_loop() -> None:
             while not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
-                owner.heartbeat_stop_event.wait(8.0)
+                owner.heartbeat_stop_event.wait(10.0)
                 if not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
                     try:
                         _heartbeat_update()
@@ -316,13 +325,20 @@ class WorkflowGenerationMixin:
             with owner.delivery_lock:
                 if not _owner_can_deliver():
                     return
-                gen_msg_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=message_id,
-                    chat_id=chat_id,
-                    card_data=gen_card_data,
-                    origin_message_id=origin_message_id,
-                ) or message_id
-                object.__setattr__(owner, "card_message_id", gen_msg_id)
+                if (
+                    not use_preset_fastpath
+                    and message_id
+                    and owner.card_message_id == message_id
+                ):
+                    gen_msg_id = message_id
+                else:
+                    gen_msg_id = self._replace_or_send_workflow_rendered_card(
+                        card_message_id=message_id,
+                        chat_id=chat_id,
+                        card_data=gen_card_data,
+                        origin_message_id=origin_message_id,
+                    ) or message_id
+                    object.__setattr__(owner, "card_message_id", gen_msg_id)
             if not _owner_can_deliver():
                 return
 
@@ -360,12 +376,11 @@ class WorkflowGenerationMixin:
                     with open(script_path, "w", encoding="utf-8") as file:
                         file.write(script_content)
             else:
-                from ...workflow_engine.constants import PROGRESS_DEBOUNCE_S
                 from ...workflow_engine.progress_coalescer import ProgressCoalescer
 
                 progress_coalescer = ProgressCoalescer(
                     on_progress=_deliver_generation_card,
-                    debounce_s=PROGRESS_DEBOUNCE_S,
+                    debounce_s=_GENERATION_PROGRESS_DEBOUNCE_S,
                 )
                 heartbeat_thread = _workflow_module().threading.Thread(
                     target=_heartbeat_loop,

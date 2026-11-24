@@ -128,6 +128,7 @@ from .ws_slash_identity import WSSlashIdentityMixin
 from .ws_trust_access import (
     _BOOTSTRAP_ACCESS_OPERATIONS,
     WSTrustAccessMixin,
+    can_dispatch_card_trust,
 )
 
 
@@ -1538,49 +1539,24 @@ class FeishuWSClient(
         _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
         tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
 
-        effective_trust = self._resolve_effective_trust(
-            sender_id=operator_id,
-            chat_id=open_chat_id,
-            chat_type="group",
+        effective_trust, card_is_p2p, trust_allowed = self._resolve_card_trust_and_access(
+            operator_id=operator_id,
+            open_chat_id=open_chat_id,
+            open_message_id=open_message_id,
         )
-        trust_decision = self._managed_trust_access_decision(effective_trust)
-        card_is_p2p = False
-        if trust_decision is not None and not trust_decision.allowed:
-            registry = getattr(self, "_managed_group_registry", None)
-            active_group = (
-                registry.active_record(open_chat_id)
-                if type(registry) is ManagedGroupRegistry
-                else None
+        if not trust_allowed:
+            denied_action = ""
+            try:
+                denied_action = CardActionInspector.action_type(data.event.action)
+            except (AttributeError, TypeError, ValueError):
+                denied_action = ""
+            logger.warning(
+                "卡片回调被信任策略拒绝: chat_hash=%s msg=%s action=%s",
+                self._access_identifier_hash(open_chat_id),
+                open_message_id,
+                denied_action,
             )
-            # A current managed group with an unknown actor is never a DM.
-            # Only the configured Owner may use durable origin provenance to
-            # distinguish an actual P2P callback from an external group.
-            if (
-                active_group is None
-                and operator_id == getattr(self, "_managed_group_owner_id", "")
-            ):
-                try:
-                    origin = self._message_linker.resolve_origin(
-                        reply_message_id=open_message_id
-                    ) or open_message_id
-                    card_is_p2p = self._resolve_card_is_p2p(
-                        origin_message_id=origin,
-                        open_chat_id=open_chat_id,
-                        operator_id=operator_id,
-                    )
-                except (RuntimeError, OSError, TypeError, ValueError):
-                    card_is_p2p = False
-                if card_is_p2p:
-                    effective_trust = self._resolve_effective_trust(
-                        sender_id=operator_id,
-                        chat_id=open_chat_id,
-                        chat_type="p2p",
-                    )
-                    trust_decision = self._managed_trust_access_decision(
-                        effective_trust
-                    )
-            if not card_is_p2p:
-                return empty_card_action_response()
+            return empty_card_action_response()
 
         if (
             effective_trust is not None
@@ -1750,7 +1726,11 @@ class FeishuWSClient(
         except (RuntimeError, OSError, TypeError, ValueError):
             origin_lookup_failed = True
         origin_message_id = origin_message_id or open_message_id
-        if not card_is_p2p and not origin_lookup_failed:
+        if (
+            not card_is_p2p
+            and not origin_lookup_failed
+            and not self._is_known_managed_group(open_chat_id)
+        ):
             card_is_p2p = self._resolve_card_is_p2p(
                 origin_message_id=origin_message_id,
                 open_chat_id=open_chat_id,
@@ -1766,7 +1746,20 @@ class FeishuWSClient(
             action_type_preview in WF_CONFIG_ACTIONS
             and action_type_preview != WF_START_WORKFLOW
         ):
-            if not self._current_trust_can_dispatch(effective_trust):
+            if not can_dispatch_card_trust(
+                self,
+                effective_trust,
+                is_p2p=card_is_p2p,
+                sender_id=operator_id,
+                chat_id=open_chat_id,
+                message_id=open_message_id,
+            ):
+                logger.warning(
+                    "卡片同步回调被派发信任检查拒绝: chat_hash=%s msg=%s action=%s",
+                    self._access_identifier_hash(open_chat_id),
+                    open_message_id,
+                    action_type_preview,
+                )
                 return empty_card_action_response()
             if self._chat_lock_gate.check_card_action(
                 open_chat_id,

@@ -156,6 +156,7 @@ class WorkflowExecutionMixin(
         project: Optional["ProjectContext"] = None,
         *,
         terminal_is_noop: bool = False,
+        clicked_card_message_id: str | None = None,
     ) -> None:
         """Stop the running workflow for the current project.
 
@@ -174,6 +175,9 @@ class WorkflowExecutionMixin(
 
         current_user = get_current_sender_id()
         admin_ids: list[str] = getattr(self.ctx.settings, "admin_user_ids", []) or []
+        effective_clicked_card_id = clicked_card_message_id or (
+            message_id if terminal_is_noop else None
+        )
         error: tuple[str, str] | None = None
         delivery_owners: list[_WorkflowLifecycleOwner] = []
         cancel_card_message_ids: list[str] = []
@@ -276,6 +280,11 @@ class WorkflowExecutionMixin(
                     ):
                         if artifact:
                             artifacts_to_remove.append(artifact)
+                if (
+                    effective_clicked_card_id
+                    and effective_clicked_card_id not in cancel_card_message_ids
+                ):
+                    cancel_card_message_ids.append(effective_clicked_card_id)
                 if (
                     live_generation_owner is not None
                     and live_generation_owner.active_generation_session is None
