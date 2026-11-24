@@ -497,6 +497,7 @@ def _build_card_2_shell(
         "config": {
             "compact_width": False,
             "wide_screen_mode": True,
+            "update_multi": True,
             "summary": {"content": _strip_surrogates(summary_content)},
         },
         "header": header,
@@ -595,6 +596,7 @@ def build_workflow_config_card(
         return _clean_callback_payload(payload)
 
     elements: list[dict[str, Any]] = []
+    is_launch_card = bool(cfg.requirement)
 
     if cfg.status_notice:
         elements.append(
@@ -605,35 +607,20 @@ def build_workflow_config_card(
         )
 
     req_text = (
-        f"**待启动需求**：{_escape_md(cfg.requirement, limit=240)}"
-        if cfg.requirement
+        f"**任务需求**：{_escape_md(cfg.requirement, limit=240)}"
+        if is_launch_card
         else "**待启动需求**：未指定任务，保存后发送 `/wf <需求>` 启动"
     )
     if cfg.saved_as_default:
         req_text += " · ✅ 已保存为项目默认"
     elements.append({"tag": "markdown", "content": req_text})
-    elements.append({"tag": "hr"})
 
-    # 1. Preset quick-select bar
-    preset_options = [
-        (pid, f"{label} — {desc}" if len(desc) <= 22 else label)
-        for pid, label, desc in WORKFLOW_PRESET_CATALOG
-    ]
-    elements.append({"tag": "markdown", "content": "**协作预设（Preset）**"})
-    elements.append(
-        _select_static(
-            name="preset_id",
-            placeholder="选择预设模板",
-            options=preset_options,
-            selected=cfg.preset_id,
-            callback_value=cb_for(action_ids.WF_SELECT_PRESET),
-        )
+    roster_title = (
+        f"**当前协作团队（{len(members)}/{MAX_WORKFLOW_AGENT_POOL_SIZE} · 预设 `{_escape_md(cfg.preset_id, limit=32)}` · 支持同模型多 Effort 共存）**"
+        if is_launch_card
+        else f"**当前团队成员（{len(members)}/{MAX_WORKFLOW_AGENT_POOL_SIZE} · 支持同模型多 Effort 共存）**"
     )
-
-    # 2. Current Team Roster (compact single Markdown + member selector)
-    roster_lines = [
-        f"**当前团队成员（{len(members)}/{MAX_WORKFLOW_AGENT_POOL_SIZE} · 支持同模型多 Effort 共存）**"
-    ]
+    roster_lines = [roster_title]
     if members:
         for member in members:
             roster_lines.append(
@@ -645,8 +632,11 @@ def build_workflow_config_card(
             )
     else:
         roster_lines.append("- 暂无成员，请在下方配置并点击「添加/更新成员」")
-    elements.append({"tag": "markdown", "content": "\n".join(roster_lines)})
 
+    preset_options = [
+        (pid, f"{label} — {desc}" if len(desc) <= 22 else label)
+        for pid, label, desc in WORKFLOW_PRESET_CATALOG
+    ]
     agent_options: list[tuple[str, str]] = [
         (
             m.agent_id,
@@ -658,16 +648,74 @@ def build_workflow_config_card(
     if len(members) < MAX_WORKFLOW_AGENT_POOL_SIZE:
         agent_options.append(("__new__", "+ 新增成员"))
 
-    elements.append(
-        _select_static(
-            name="agent_id",
-            placeholder="选择要编辑的成员",
-            options=agent_options,
-            selected=selected_agent_id,
-            callback_value=cb_for(action_ids.WF_SELECT_AGENT),
+    if is_launch_card:
+        elements.append({"tag": "markdown", "content": "\n".join(roster_lines)})
+        quick_launch_buttons = [
+            build_callback_button(
+                text="🚀 按当前团队立即开始",
+                action=cb_for(action_ids.WF_START_WORKFLOW),
+                button_type="primary",
+            ),
+            build_callback_button(
+                text="💾 保存为默认团队",
+                action=cb_for(action_ids.WF_SAVE_TEAM),
+                button_type="default",
+            ),
+        ]
+        elements.extend(build_responsive_layout(quick_launch_buttons, layout="desktop"))
+        elements.append({"tag": "hr"})
+
+        # 1. Preset quick-select bar
+        elements.append({"tag": "markdown", "content": "**协作预设（Preset）**"})
+        elements.append(
+            _select_static(
+                name="preset_id",
+                placeholder="选择预设模板",
+                options=preset_options,
+                selected=cfg.preset_id,
+                callback_value=cb_for(action_ids.WF_SELECT_PRESET),
+            )
         )
-    )
-    elements.append({"tag": "hr"})
+
+        # 2. Member selector
+        elements.append({"tag": "markdown", "content": "**选择要编辑的成员**"})
+        elements.append(
+            _select_static(
+                name="agent_id",
+                placeholder="选择要编辑的成员",
+                options=agent_options,
+                selected=selected_agent_id,
+                callback_value=cb_for(action_ids.WF_SELECT_AGENT),
+            )
+        )
+        elements.append({"tag": "hr"})
+    else:
+        elements.append({"tag": "hr"})
+
+        # 1. Preset quick-select bar
+        elements.append({"tag": "markdown", "content": "**协作预设（Preset）**"})
+        elements.append(
+            _select_static(
+                name="preset_id",
+                placeholder="选择预设模板",
+                options=preset_options,
+                selected=cfg.preset_id,
+                callback_value=cb_for(action_ids.WF_SELECT_PRESET),
+            )
+        )
+
+        # 2. Current Team Roster (compact single Markdown + member selector)
+        elements.append({"tag": "markdown", "content": "\n".join(roster_lines)})
+        elements.append(
+            _select_static(
+                name="agent_id",
+                placeholder="选择要编辑的成员",
+                options=agent_options,
+                selected=selected_agent_id,
+                callback_value=cb_for(action_ids.WF_SELECT_AGENT),
+            )
+        )
+        elements.append({"tag": "hr"})
 
     # 3. Member Editor Cascade (Role / Tool / Model / Profile / Effort)
     elements.append({"tag": "markdown", "content": "**成员配置（Role × Tool × Model × Effort）**"})
@@ -784,34 +832,45 @@ def build_workflow_config_card(
     elements.append({"tag": "hr"})
 
     # 4. Footer actions
-    footer_buttons = [
-        build_callback_button(
-            text="保存为项目默认",
-            action=cb_for(action_ids.WF_SAVE_TEAM),
-            button_type="primary",
-        ),
-        build_callback_button(
-            text="重置默认",
-            action=cb_for(action_ids.WF_RESET_TEAM),
-        ),
-    ]
-    if cfg.requirement:
-        footer_buttons.append(
+    if is_launch_card:
+        footer_buttons = [
             build_callback_button(
-                text="立即启动",
+                text="重置默认",
+                action=cb_for(action_ids.WF_RESET_TEAM),
+            ),
+            build_callback_button(
+                text="🚀 按当前团队立即开始",
                 action=cb_for(action_ids.WF_START_WORKFLOW),
                 button_type="primary",
-            )
-        )
+            ),
+        ]
+    else:
+        footer_buttons = [
+            build_callback_button(
+                text="保存为项目默认",
+                action=cb_for(action_ids.WF_SAVE_TEAM),
+                button_type="primary",
+            ),
+            build_callback_button(
+                text="重置默认",
+                action=cb_for(action_ids.WF_RESET_TEAM),
+            ),
+        ]
     elements.extend(build_responsive_layout(footer_buttons, layout="desktop"))
 
     summary = _fit_summary(
         f"Workflow 团队配置 · {len(members)} 成员 · {cfg.preset_id}",
         default="Workflow 团队配置与模型档位编辑器",
     )
+    card_title = "⚡ Workflow · 配置团队并启动" if is_launch_card else "⚡ Workflow 团队与模型配置"
+    card_subtitle = (
+        "可直接按当前配置启动，或在下方灵活调整 工具 + 模型 + Effort"
+        if is_launch_card
+        else f"{len(members)}/{MAX_WORKFLOW_AGENT_POOL_SIZE} 成员 · 同模型多 Effort 共存"
+    )
     card = _build_card_2_shell(
-        title="⚡ Workflow 团队与模型配置",
-        subtitle=f"{len(members)}/{MAX_WORKFLOW_AGENT_POOL_SIZE} 成员 · 同模型多 Effort 共存",
+        title=card_title,
+        subtitle=card_subtitle,
         template="blue",
         summary_content=summary,
         elements=elements,
@@ -833,8 +892,9 @@ def build_workflow_help_card(
             "tag": "markdown",
             "content": (
                 "**🚀 快速入口与命令**\n"
-                "- `/wf <需求>`（`/workflow`）：自动绑定可用推荐 Agent Pool（1–8 个成员）并立即启动\n"
-                "- `/wf` / `/wf_config`（`/workflow_config`）：打开交互式团队与 `tool + model + effort` 配置卡\n"
+                "- `/wf <需求>`（`/workflow`）：打开团队与 `tool + model + effort` 交互配置卡（预填已保存/推荐团队，支持 1 键启动或灵活微调后启动）\n"
+                "- `/wf --auto <需求>` / `/wf --preset <预设> <需求>`：跳过配置卡，直接按默认或指定预设团队极速启动\n"
+                "- `/wf` / `/wf_config`（`/workflow_config`）：配置当前聊天+项目的默认协作团队\n"
                 "- `/wf_status`（`/workflow_status`）：查看当前 Workflow 池、计划与执行进度\n"
                 "- `/stop_wf`（`/stop_workflow`）：停止当前运行或生成中的 Workflow\n"
                 "- `/wf_help`（`/workflow_help`）：查看本帮助"
@@ -845,7 +905,7 @@ def build_workflow_help_card(
             "tag": "markdown",
             "content": (
                 "**🧩 Teamwork 协作预设与角色**\n"
-                "- 自动绑定与保存：未配置时自动绑定推荐工具，已保存团队按项目+会话自动沿用\n"
+                "- 自动绑定与保存：未配置时自动绑定推荐 Agent Pool（1–8 个成员），已保存团队按项目+会话自动沿用\n"
                 "- 预设：`collaborative`（推荐协作组） · `quick`（快速双人） · `review_team`（深度复核） · `deep_collab`（深度协作） · `auto` · `custom`\n"
                 "- 角色：`scout` · `planner` · `worker` · `verifier` · `synthesizer`\n"
                 "- 同模型多档位：支持同一 `tool + model` 搭配不同 `effort`（如 `low` + `xhigh`）共存\n"
@@ -917,23 +977,25 @@ def build_workflow_preset_launch_card(
             ),
         },
         {"tag": "hr"},
-        *build_responsive_layout(
-            [
-                build_callback_button(
-                    text="⏹️ 停止 Workflow",
-                    action=_clean_callback_payload(
-                        {
-                            "action": action_ids.WORKFLOW_STOP_RUNNING,
-                            "chat_id": chat_id,
-                            "project_id": project_id,
-                        }
-                    ),
-                    button_type="danger",
-                )
-            ],
-            layout="mobile",
-        ),
     ]
+    stop_button = build_callback_button(
+        text="⏹️ 停止 Workflow",
+        action=_clean_callback_payload(
+            {
+                "action": action_ids.WORKFLOW_STOP_RUNNING,
+                "chat_id": chat_id,
+                "project_id": project_id,
+            }
+        ),
+        button_type="danger",
+    )
+    stop_button["size"] = "medium"
+    elements.extend(
+        build_responsive_layout(
+            [stop_button],
+            layout="mobile",
+        )
+    )
     card = _build_card_2_shell(
         title="⚡ Workflow · 预设团队启动中",
         subtitle=f"{preset_id} · {len(members)} 成员",

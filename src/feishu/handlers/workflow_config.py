@@ -362,11 +362,17 @@ class WorkflowConfigMixin:
             (name for name, cap in capabilities.items() if cap.available),
             next(iter(capabilities), "codex"),
         )
+        raw_thread_root_id = get_current_thread_id()
+        safe_thread_root_id = (
+            raw_thread_root_id
+            if isinstance(raw_thread_root_id, str) and raw_thread_root_id
+            else None
+        )
         state = WorkflowConfigEditorState(
             config_session_id=config_session_id or uuid.uuid4().hex[:16],
             chat_id=chat_id,
             project_id=(project.project_id if project else None),
-            thread_root_id=get_current_thread_id(),
+            thread_root_id=safe_thread_root_id,
             preset_id=preset_id,
             members=members,
             orchestrator_agent_id=orchestrator_id,
@@ -726,6 +732,20 @@ class WorkflowConfigMixin:
                     state = replace(state, editor_effort=str(value["effort"]).strip().lower())
                 if value.get("role"):
                     state = replace(state, editor_role=_ui_role(str(value["role"])))
+
+        if (
+            state is not None
+            and not state.requirement
+            and cfg_sid
+            and action == action_ids.WF_START_WORKFLOW
+        ):
+            restored_req = self._get_pending_workflow_requirement(
+                project,
+                chat_id,
+                cfg_sid,
+            )
+            if restored_req:
+                state = replace(state, requirement=restored_req)
 
         state = replace(state, status_notice=None)
         toast_type = "info"
@@ -1192,7 +1212,9 @@ class WorkflowConfigMixin:
         value: dict[str, Any],
     ) -> None:
         """Async/direct action_registry handler for ``WF_CONFIG_ACTIONS``."""
-        card, _toast_type, _toast_content, launch_spec = self._apply_config_transition(
+        from ...card.actions import dispatch as action_ids
+
+        card, toast_type, _toast_content, launch_spec = self._apply_config_transition(
             message_id,
             chat_id,
             project_id,
@@ -1207,7 +1229,11 @@ class WorkflowConfigMixin:
                 preset_id=launch_spec["preset_id"],
                 override_pool=launch_spec["members"],
                 override_orchestrator_id=launch_spec["orchestrator_agent_id"],
+                reuse_card_message_id=message_id,
             )
+            return
+        action = str((value or {}).get("action") or "")
+        if action == action_ids.WF_START_WORKFLOW and toast_type == "warning":
             return
         if card is not None:
             if not (message_id and self.update_card(message_id, card)):

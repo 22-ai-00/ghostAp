@@ -98,7 +98,16 @@ def test_tier2_validate_binding_rejects_invalid_effort_value(
     assert err is not None
 
 
-@pytest.mark.parametrize("bad_req", ["/wf ab", "/wf " + ("x" * 4001)])
+@pytest.mark.parametrize(
+    "bad_req",
+    [
+        "/wf ab",
+        "/wf " + ("x" * 4001),
+        "/wf --auto",
+        "/wf --auto ab",
+        "/wf --auto " + ("x" * 4001),
+    ],
+)
 def test_tier2_wf_command_rejects_short_and_oversized_requirements(
     tmp_path: Path,
     monkeypatch,
@@ -112,7 +121,7 @@ def test_tier2_wf_command_rejects_short_and_oversized_requirements(
         for idx, c in enumerate(cards):
             assert_card_2_invariants(c, label=f"bad-req-{idx}")
         txt = extract_card_text(cards[-1])
-        assert "过短" in txt or "过长" in txt
+        assert "过短" in txt or "过长" in txt or "请提供任务需求" in txt
     finally:
         graph.close()
 

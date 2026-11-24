@@ -110,9 +110,21 @@ class TestWorkflowCommandAliases(unittest.TestCase):
         cases = (
             (
                 "/workflow\t实现登录",
+                "show_workflow_config",
+                ("msg_1", "chat_1", project),
+                {"requirement": "实现登录"},
+            ),
+            (
+                "/workflow --auto\t实现登录",
                 "start_workflow",
                 ("msg_1", "chat_1", "实现登录", project),
                 {},
+            ),
+            (
+                "/workflow_config",
+                "show_workflow_config",
+                ("msg_1", "chat_1", project),
+                {"preset_id": None, "requirement": None},
             ),
             (
                 "/workflow_status",
@@ -134,31 +146,34 @@ class TestWorkflowCommandAliases(unittest.TestCase):
             ),
         )
 
-        for text, target_name, expected_args, expected_kwargs in cases:
-            with self.subTest(text=text):
-                handler = _make_workflow_handler()
-                handler.start_workflow = MagicMock()
-                handler.show_workflow_status = MagicMock()
-                handler.show_workflow_help = MagicMock()
-                handler.stop_workflow = MagicMock()
-                handler._reply_workflow_error = MagicMock()
+        with patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True):
+            for text, target_name, expected_args, expected_kwargs in cases:
+                with self.subTest(text=text):
+                    handler = _make_workflow_handler()
+                    handler._ensure_topic_engine_context = MagicMock()
+                    handler.start_workflow = MagicMock()
+                    handler.show_workflow_config = MagicMock()
+                    handler.show_workflow_status = MagicMock()
+                    handler.show_workflow_help = MagicMock()
+                    handler.stop_workflow = MagicMock()
+                    handler._reply_workflow_error = MagicMock()
 
-                handler.handle_workflow_command(
-                    "msg_1",
-                    "chat_1",
-                    text,
-                    project,
-                )
+                    handler.handle_workflow_command(
+                        "msg_1",
+                        "chat_1",
+                        text,
+                        project,
+                    )
 
-                getattr(handler, target_name).assert_called_once_with(
-                    *expected_args,
-                    **expected_kwargs,
-                )
-                handler._reply_workflow_error.assert_not_called()
+                    getattr(handler, target_name).assert_called_once_with(
+                        *expected_args,
+                        **expected_kwargs,
+                    )
+                    handler._reply_workflow_error.assert_not_called()
 
 
 def test_workflow_help_card_describes_auto_bound_agent_pool_contract():
-    """完整帮助卡应展示自动绑定 Agent Pool 契约且不保留旧确认门。"""
+    """完整帮助卡应展示交互启动与自动绑定 Agent Pool 契约且不保留旧确认门。"""
     handler = _make_workflow_handler()
     handler.reply_card = MagicMock()
 
@@ -167,6 +182,9 @@ def test_workflow_help_card_describes_auto_bound_agent_pool_contract():
     card = handler.reply_card.call_args.args[1]
     rendered = str(card)
     assert "/workflow_help" in rendered
+    assert "--auto" in rendered
+    assert "--preset" in rendered
+    assert "交互配置卡" in rendered
     assert "1–8" in rendered
     assert "Agent Pool" in rendered
     assert "自动绑定" in rendered

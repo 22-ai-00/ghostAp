@@ -242,6 +242,7 @@ def test_wf_config_cache_miss_rehydration_preserves_orchestrator_on_save_and_sta
     handler.start_workflow.assert_called_once()
     assert handler.start_workflow.call_args.args[2] == "Launch check via real flow"
     assert handler.start_workflow.call_args.kwargs["override_orchestrator_id"] == "A2"
+    assert handler.start_workflow.call_args.kwargs["reuse_card_message_id"] == "om_reply_card"
 
     # Pending requirement is consumed on launch so replay after cache eviction does not relaunch
     assert get_project_workflow_pending_requirement(reloaded_proj, cfg_sid, "oc_orch") is None

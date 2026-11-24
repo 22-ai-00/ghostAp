@@ -50,6 +50,7 @@ def _assert_card_2_valid(card: dict) -> None:
     summary = ((card.get("config") or {}).get("summary") or {}).get("content")
     assert isinstance(summary, str)
     assert 8 <= len(summary) <= 60
+    assert (card.get("config") or {}).get("update_multi") is True
 
     for d in _walk_dicts(card):
         if d.get("tag") == "button":
@@ -284,6 +285,15 @@ def test_help_and_preset_launch_cards_are_valid_card2() -> None:
     )
     _assert_card_2_valid(launch_card)
     assert action_ids.WORKFLOW_STOP_RUNNING in json.dumps(launch_card, ensure_ascii=False)
+    stop_buttons = [
+        d
+        for d in _walk_dicts(launch_card)
+        if d.get("tag") == "button"
+        and (d.get("value") or {}).get("action") == action_ids.WORKFLOW_STOP_RUNNING
+    ]
+    assert len(stop_buttons) == 1
+    assert stop_buttons[0].get("size") == "medium"
+    assert "confirm" not in stop_buttons[0]
 
 
 def test_workflow_builder_import_boundary_clean() -> None:
@@ -538,4 +548,84 @@ def test_capability_to_acp_options_preserves_openrouter_slash_model_id() -> None
         other_names = [opt.name for opt in other_opts]
         assert "anthropic/claude-sonnet" in other_names
         assert "anthropic" not in other_names
+
+
+def test_launch_config_card_places_header_and_quick_launch_cta_before_selectors() -> None:
+    members = (
+        WorkflowAgentBinding(
+            agent_id="A1",
+            tool_name="codex",
+            model_name="gpt-5.4",
+            display_name="Codex",
+            effort="low",
+            role="scout",
+        ),
+        WorkflowAgentBinding(
+            agent_id="A2",
+            tool_name="claude",
+            model_name="sonnet",
+            display_name="Claude",
+            effort="high",
+            role="worker",
+        ),
+    )
+    card = build_workflow_config_card(
+        WorkflowConfigEditorState(
+            config_session_id="cfg_launch",
+            chat_id="oc_1",
+            project_id="proj_1",
+            preset_id="collaborative",
+            members=members,
+            orchestrator_agent_id="A1",
+            selected_agent_id="A1",
+            editor_role="scout",
+            editor_tool="codex",
+            editor_model="gpt-5.4",
+            editor_effort="low",
+            requirement="分析项目并提出优化方案",
+        ),
+        _sample_capabilities(),
+    )
+    _assert_card_2_valid(card)
+    assert card["header"]["title"]["content"] == "⚡ Workflow · 配置团队并启动"
+    assert (
+        card["header"]["subtitle"]["content"]
+        == "可直接按当前配置启动，或在下方灵活调整 工具 + 模型 + Effort"
+    )
+
+    elements = card["body"]["elements"]
+    req_idx = next(
+        i
+        for i, el in enumerate(elements)
+        if el.get("tag") == "markdown" and "任务需求" in el.get("content", "")
+    )
+    roster_idx = next(
+        i
+        for i, el in enumerate(elements)
+        if el.get("tag") == "markdown" and "当前协作团队" in el.get("content", "")
+    )
+    cta_idx = next(
+        i
+        for i, el in enumerate(elements)
+        if action_ids.WF_START_WORKFLOW in json.dumps(el, ensure_ascii=False)
+        and "按当前团队立即开始" in json.dumps(el, ensure_ascii=False)
+    )
+    save_top_idx = next(
+        i
+        for i, el in enumerate(elements)
+        if action_ids.WF_SAVE_TEAM in json.dumps(el, ensure_ascii=False)
+    )
+    first_select_idx = next(
+        i for i, el in enumerate(elements) if el.get("tag") == "select_static"
+    )
+    assert req_idx < roster_idx < cta_idx < first_select_idx
+    assert save_top_idx == cta_idx
+
+    cta_cols = elements[cta_idx]["columns"]
+    first_btn = cta_cols[0]["elements"][0]
+    second_btn = cta_cols[1]["elements"][0]
+    assert first_btn["type"] == "primary"
+    assert first_btn["value"]["action"] == action_ids.WF_START_WORKFLOW
+    assert second_btn["type"] == "default"
+    assert second_btn["value"]["action"] == action_ids.WF_SAVE_TEAM
 

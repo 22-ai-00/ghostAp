@@ -117,8 +117,8 @@ handler -> session -> render
 
 `WorkflowHandler` 负责自然语言 Workflow。当前交互和执行契约如下：
 
-1. `/wf <需求>` 自动绑定可用推荐 Agent Pool 并开始编排；已发出的旧选择卡仍只允许发起者在同一 chat/project/session 中修改。
-2. 池必须包含 1–8 个 `tool+model` Agent，并使用稳定 `A1`、`A2` 标识。同一 tool 可选择不同 model；完全相同的 tool/model 组合拒绝。
+1. `/wf <需求>` 打开预填当前聊天+项目已保存团队或推荐 Agent Pool 的交互配置卡（支持 1 键启动或调整 `tool + model + profile + effort + role` 后原位启动）；`/wf --auto <需求>` 与 `/wf --preset <预设> <需求>` 跳过配置卡，直接绑定团队并立即开始编排；`/wf`（无参数）或 `/wf_config` 配置当前聊天+项目的默认协作团队。配置卡仅允许同一 chat/project 中操作；已发出的旧选择卡仍只允许发起者在同一 chat/project/session 中修改。
+2. 池必须包含 1–8 个 `tool+model` Agent，并使用稳定 `A1`、`A2` 标识。同一 tool+model 支持不同 `effort`/`profile` 组合；完全相同的 `tool/model/profile/effort` 组合拒绝。
 3. 编排器默认由系统从绑定池中择优，也可指定池内成员。
 4. 池和编排器绑定后冻结，脚本生成、验证与执行全自动完成，不要求用户确认或继续批准。
 
@@ -141,7 +141,10 @@ handler -> session -> render
 
 | 命令 | 用途 |
 | --- | --- |
-| `/wf <需求描述>` | 自动使用推荐 Agent Pool 并启动 Workflow |
+| `/wf <需求描述>` | 打开预填团队配置卡，支持 1 键启动或调整后启动 Workflow |
+| `/wf --auto <需求描述>` | 跳过配置卡，直接按默认/已保存团队极速启动 Workflow |
+| `/wf --preset <预设> <需求描述>` | 跳过配置卡，直接按指定预设团队启动 Workflow |
+| `/wf` / `/wf_config` | 配置当前聊天+项目的默认协作团队 |
 | `/stop_wf` | 中止当前 Workflow |
 | `/wf_status` | 查看池、计划和执行进度 |
 | `/wf_help` | 查看 Workflow 帮助 |

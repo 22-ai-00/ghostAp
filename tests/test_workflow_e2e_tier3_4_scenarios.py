@@ -183,6 +183,13 @@ export default async function main() {
             assert saved_state is not None and getattr(saved_state, "workflow_team_config", None)
             graph.client._project_manager = reloaded
             graph.send_text("/wf 使用已保存的协作团队执行构建")
+            launch_id = graph.fake_im.latest_card_message_id()
+            launch_card = graph.fake_im.latest_card()
+            assert launch_id and launch_card
+            assert "traex" in extract_card_text(launch_card).lower()
+            start_btn = find_card_button(launch_card, action_tokens=("wf_start_workflow",))
+            assert start_btn is not None
+            click_card_element(graph, message_id=launch_id, element=start_btn)
 
         assert recorder.invocations
         assert any(inv.agent_type == "traex" for inv in recorder.invocations)
@@ -507,7 +514,7 @@ export default async function main() {
             "src.workflow_engine.tool_registry.get_available_tools",
             return_value={"codex": "Codex", "claude": "Claude"},
         ):
-            graph.send_text("/wf 快速修复登录超时问题")
+            graph.send_text("/wf --auto 快速修复登录超时问题")
             graph.send_text("/wf_config")
             cfg_id = graph.fake_im.latest_card_message_id()
             cfg_card = graph.fake_im.latest_card()

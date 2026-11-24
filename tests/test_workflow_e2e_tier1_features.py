@@ -512,6 +512,13 @@ def test_tier1_teamwork_preset_executes_without_ai_codegen_roundtrip(
             saved_state = graph.project.chat_states.get("oc_e2e")
             assert saved_state is not None and getattr(saved_state, "workflow_team_config", None)
             graph.send_text("/wf Audit auth flow")
+            launch_cfg_id = graph.fake_im.latest_card_message_id()
+            launch_cfg_card = graph.fake_im.latest_card()
+            assert launch_cfg_id and launch_cfg_card
+            assert "配置团队并启动" in extract_card_text(launch_cfg_card)
+            start_btn = find_card_button(launch_cfg_card, action_tokens=("wf_start_workflow",))
+            assert start_btn is not None
+            click_card_element(graph, message_id=launch_cfg_id, element=start_btn)
 
         assert not any("Workflow Script Generation Task" in inv.prompt for inv in recorder.invocations)
         cards = graph.fake_im.all_cards()
@@ -539,7 +546,7 @@ def test_tier1_quick_launch_wf_with_requirement_auto_binds_and_completes(tmp_pat
     graph = build_workflow_e2e_graph(tmp_path, monkeypatch)
     try:
         with patch("src.workflow_engine.tool_registry.get_available_tools", return_value={"codex": "Codex", "claude": "Claude"}):
-            graph.send_text("/wf 深入分析并优化缓存模块")
+            graph.send_text("/wf --auto 深入分析并优化缓存模块")
 
         cards = graph.fake_im.all_cards()
         assert len(cards) >= 2
@@ -548,6 +555,90 @@ def test_tier1_quick_launch_wf_with_requirement_auto_binds_and_completes(tmp_pat
         assert not any("操作失败" in extract_card_text(c) for c in cards)
         assert recorder.invocations
         assert {inv.agent_type for inv in recorder.invocations}.issubset({"codex", "claude"})
+        engine = graph.client._handler_ctx.workflow_engine_manager.get("oc_e2e", str(graph.repo_dir))
+        assert engine is not None and engine.project.status == WorkflowStatus.COMPLETED
+    finally:
+        graph.close()
+
+
+def test_tier1_interactive_wf_opens_config_adjusts_and_launches_inplace(tmp_path: Path, monkeypatch) -> None:
+    def _resolve(inv: SessionInvocation) -> ScriptedRule:
+        lowered = inv.prompt.lower()
+        if "approve" in lowered or "issues" in lowered or "verify" in lowered:
+            return ScriptedRule(output=json.dumps({"approve": True, "issues": []}))
+        return ScriptedRule(output=f"interactive-ok:{inv.agent_type}:{inv.model_name}")
+
+    recorder = WorkflowSessionRecorder(_resolve).patch(monkeypatch)
+    graph = build_workflow_e2e_graph(tmp_path, monkeypatch)
+    try:
+        with patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"codex": "Codex", "claude": "Claude", "traex": "Traex"},
+        ):
+            graph.send_text("/wf 重构缓存与认证模块")
+            assert not recorder.invocations, "/wf <需求> must open config card instead of auto-starting"
+            cfg_id = graph.fake_im.latest_card_message_id()
+            cfg_card = graph.fake_im.latest_card()
+            assert cfg_id is not None and cfg_card is not None
+            assert_card_2_invariants(cfg_card, label="interactive-wf-launch-card")
+            assert cfg_card["header"]["title"]["content"] == "⚡ Workflow · 配置团队并启动"
+            start_btn = find_card_button(cfg_card, action_tokens=("wf_start_workflow",))
+            assert start_btn is not None
+            assert "按当前团队立即开始" in (start_btn.get("text") or {}).get("content", "")
+
+            # Adjust A1 to traex + high effort via card callbacks, apply, then launch in-place
+            tool_sel = find_card_select(cfg_card, option_values=("traex",), name_tokens=("tool",))
+            assert tool_sel is not None
+            _, _, cfg_card = click_card_element(graph, message_id=cfg_id, element=tool_sel, option="traex")
+            effort_sel = find_card_select(cfg_card, option_values=("high",), name_tokens=("effort",))
+            if effort_sel is not None:
+                _, _, cfg_card = click_card_element(graph, message_id=cfg_id, element=effort_sel, option="high")
+            apply_btn = find_card_button(cfg_card, action_tokens=("wf_add_or_update_agent",))
+            assert apply_btn is not None
+            _, _, cfg_card = click_card_element(graph, message_id=cfg_id, element=apply_btn)
+            assert cfg_card is not None
+
+            before_sends = sum(
+                1 for d in graph.fake_im.deliveries if d.op in {"send", "reply"} and d.msg_type == "interactive"
+            )
+            start_btn_after = find_card_button(cfg_card, action_tokens=("wf_start_workflow",))
+            assert start_btn_after is not None
+            click_card_element(graph, message_id=cfg_id, element=start_btn_after)
+            after_sends = sum(
+                1 for d in graph.fake_im.deliveries if d.op in {"send", "reply"} and d.msg_type == "interactive"
+            )
+
+        assert after_sends == before_sends, "Launching from config card must patch in-place without sending a second message"
+        assert recorder.invocations
+        assert any(inv.agent_type == "traex" for inv in recorder.invocations)
+        assert any(d.op == "patch" and d.message_id == cfg_id for d in graph.fake_im.deliveries)
+        final_on_same_msg = graph.fake_im.latest_card(cfg_id)
+        assert final_on_same_msg is not None
+        assert "Workflow — 完成" in extract_card_text(final_on_same_msg)
+        engine = graph.client._handler_ctx.workflow_engine_manager.get("oc_e2e", str(graph.repo_dir))
+        assert engine is not None and engine.project.status == WorkflowStatus.COMPLETED
+    finally:
+        graph.close()
+
+
+def test_tier1_preset_flag_bypasses_config_card_and_executes_immediately(tmp_path: Path, monkeypatch) -> None:
+    recorder = WorkflowSessionRecorder(
+        lambda inv: ScriptedRule(
+            output=json.dumps({"approve": True, "issues": []})
+            if ("approve" in inv.prompt.lower() or "verify" in inv.prompt.lower())
+            else f"preset-flag-ok:{inv.agent_type}"
+        )
+    ).patch(monkeypatch)
+    graph = build_workflow_e2e_graph(tmp_path, monkeypatch)
+    try:
+        with patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"codex": "Codex", "claude": "Claude"},
+        ):
+            graph.send_text("/wf --preset quick 检查缓存失效问题")
+
+        assert recorder.invocations
+        assert not any("配置团队并启动" in extract_card_text(c) for c in graph.fake_im.all_cards())
         engine = graph.client._handler_ctx.workflow_engine_manager.get("oc_e2e", str(graph.repo_dir))
         assert engine is not None and engine.project.status == WorkflowStatus.COMPLETED
     finally:
@@ -593,6 +684,12 @@ def test_tier1_teamwork_role_affinity_assigns_preferred_tools_to_matching_roles(
             click_card_element(graph, message_id=cfg_id, element=save_btn)
             assert getattr(state, "workflow_team_config", None)
             graph.send_text("/wf 审查并修复边界问题")
+            launch_cfg_id = graph.fake_im.latest_card_message_id()
+            launch_cfg_card = graph.fake_im.latest_card()
+            assert launch_cfg_id and launch_cfg_card
+            start_btn = find_card_button(launch_cfg_card, action_tokens=("wf_start_workflow",))
+            assert start_btn is not None
+            click_card_element(graph, message_id=launch_cfg_id, element=start_btn)
         engine = graph.client._handler_ctx.workflow_engine_manager.get("oc_e2e", str(graph.repo_dir))
         assert engine is not None and engine.project.status == WorkflowStatus.COMPLETED
         assert {"traex", "codex", "claude"}.issubset({inv.agent_type for inv in recorder.invocations})

@@ -175,7 +175,7 @@ class WorkflowHandler(
 
     @staticmethod
     def _parse_wf_launch_args(args: str) -> tuple[str | None, str, str | None]:
-        """Parse optional leading ``--preset <id>`` or ``--preset=<id>`` from `/wf` args.
+        """Parse optional leading ``--auto``, ``--quick``, or ``--preset <id>`` from `/wf` args.
 
         Returns ``(preset_id, remaining_requirement, error_message)``.
         """
@@ -185,10 +185,15 @@ class WorkflowHandler(
         parts = raw.split(None, 1)
         head = parts[0]
         rest = parts[1].strip() if len(parts) > 1 else ""
+        head_lower = head.lower()
+        if head_lower == "--auto":
+            return "__auto__", rest, None
+        if head_lower == "--quick":
+            return "quick", rest, None
         raw_preset: str | None = None
-        if head.startswith("--preset="):
+        if head_lower.startswith("--preset="):
             raw_preset = head.split("=", 1)[1].strip()
-        elif head == "--preset":
+        elif head_lower == "--preset":
             if not rest:
                 return None, "", "请指定预设名称，例如：`/wf --preset collaborative 实现用户认证`"
             subparts = rest.split(None, 1)
@@ -218,6 +223,13 @@ class WorkflowHandler(
         match = SlashCommandParser.parse(text)
         command = match.command if match else ""
         args = match.args if match else ""
+        command = {
+            "/workflow": "/wf",
+            "/workflow_config": "/wf_config",
+            "/workflow_status": "/wf_status",
+            "/workflow_help": "/wf_help",
+            "/stop_workflow": "/stop_wf",
+        }.get(command, command)
 
         if command == "/stop_wf":
             self.stop_workflow(message_id, chat_id, project)
@@ -234,7 +246,7 @@ class WorkflowHandler(
                 message_id,
                 chat_id,
                 project,
-                preset_id=preset_id,
+                preset_id=("auto" if preset_id == "__auto__" else preset_id),
                 requirement=(req or None),
             )
         elif command == "/wf":
@@ -243,7 +255,16 @@ class WorkflowHandler(
                 if err:
                     self._reply_workflow_error(message_id, "invalid_argument", detail=err)
                     return
-                if preset_id is not None:
+                if preset_id == "__auto__":
+                    if req:
+                        self.start_workflow(message_id, chat_id, req, project)
+                    else:
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_argument",
+                            detail="请提供任务需求，例如：`/wf --auto 帮我分析项目优化点`",
+                        )
+                elif preset_id is not None:
                     if req:
                         self.start_workflow(
                             message_id,
@@ -260,7 +281,73 @@ class WorkflowHandler(
                             preset_id=preset_id,
                         )
                 else:
-                    self.start_workflow(message_id, chat_id, args, project)
+                    project = self._ensure_project(message_id, chat_id, project)
+                    if not project:
+                        return
+                    root_path = project.root_path if project else self.get_working_dir(chat_id)
+                    from ...workflow_engine.models import WorkflowStatus
+
+                    existing = self.ctx.workflow_engine_manager.get(chat_id, root_path)
+                    existing_status = (
+                        getattr(getattr(existing, "project", None), "status", None)
+                        if existing
+                        else None
+                    )
+                    if existing and (
+                        existing.is_running is True
+                        or existing_status == WorkflowStatus.GENERATING_SCRIPT
+                    ):
+                        detail = (
+                            "当前项目已有 Workflow 正在生成编排脚本。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。"
+                            if existing_status == WorkflowStatus.GENERATING_SCRIPT
+                            else "当前项目已有 Workflow 任务在执行中。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。"
+                        )
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_state",
+                            detail=detail,
+                        )
+                        return
+
+                    from ...workflow_engine.bridge import RuntimeBridge
+                    from ...workflow_engine.engine import _node_version_required_text
+
+                    if not RuntimeBridge.check_node_available():
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_argument",
+                            detail=_node_version_required_text(),
+                        )
+                        return
+
+                    req_stripped = (req or args).strip()
+                    if len(req_stripped) < 4:
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_argument",
+                            detail="需求描述过短，请提供更详细的说明（至少 4 个字符）。",
+                        )
+                        return
+                    if len(req_stripped) > 4000:
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_argument",
+                            detail="需求描述过长（超过 4000 字符），请精简后重试。",
+                        )
+                        return
+
+                    self._ensure_topic_engine_context(
+                        mode="workflow",
+                        message_id=message_id,
+                        chat_id=chat_id,
+                        project=project,
+                    )
+                    self.show_workflow_config(
+                        message_id,
+                        chat_id,
+                        project,
+                        requirement=req_stripped,
+                    )
             else:
                 self.show_workflow_config(message_id, chat_id, project)
         else:
@@ -269,7 +356,8 @@ class WorkflowHandler(
                 "invalid_argument",
                 detail=(
                     "未知命令。可用命令列表:\n"
-                    "• `/wf <需求>` — 基于需求生成编排脚本并执行\n"
+                    "• `/wf <需求>` — 打开团队配置卡并确认启动 Workflow\n"
+                    "• `/wf --auto <需求>` — 跳过配置卡，按默认团队极速启动\n"
                     "• `/wf_config` — 打开团队与 `tool + model + effort` 配置\n"
                     "• `/wf_status` — 查看当前 Workflow 进度\n"
                     "• `/wf_help` — 查看完整帮助\n"
@@ -310,6 +398,7 @@ class WorkflowHandler(
         preset_id: str | None = None,
         override_pool: tuple[Any, ...] | None = None,
         override_orchestrator_id: str | None = None,
+        reuse_card_message_id: str | None = None,
     ) -> None:
         """Start a workflow and use the default auto policy to launch generation.
 
@@ -401,9 +490,15 @@ class WorkflowHandler(
         self.add_reaction(message_id, EmojiReaction.on_multi_task_start())
 
         # Bind engine mode to topic for auto-routing
+        topic_anchor_id = message_id
+        if reuse_card_message_id:
+            try:
+                topic_anchor_id = self._resolve_origin(message_id) or message_id
+            except Exception:
+                topic_anchor_id = message_id
         self._ensure_topic_engine_context(
             mode="workflow",
-            message_id=message_id,
+            message_id=topic_anchor_id,
             chat_id=chat_id,
             project=project,
         )
@@ -419,6 +514,7 @@ class WorkflowHandler(
             preset_id=preset_id,
             override_pool=override_pool,
             override_orchestrator_id=override_orchestrator_id,
+            reuse_card_message_id=reuse_card_message_id,
         )
 
     def handle_workflow_agent_action(
@@ -449,6 +545,7 @@ class WorkflowHandler(
         preset_id: str | None = None,
         override_pool: tuple[Any, ...] | None = None,
         override_orchestrator_id: str | None = None,
+        reuse_card_message_id: str | None = None,
     ) -> None:
         """Auto-bind available tools or saved chat/project Teamwork pool and launch."""
         from ...project import get_project_workflow_team_config
@@ -679,7 +776,7 @@ class WorkflowHandler(
             )
             with generation_owner.delivery_lock:
                 generation_card_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=None,
+                    card_message_id=reuse_card_message_id,
                     chat_id=chat_id,
                     card_data=card_data,
                     origin_message_id=origin_message_id,
@@ -758,13 +855,15 @@ class WorkflowHandler(
         # Header color by category
         header_template = "red"  # default for errors
 
-        return CoreBuilder._wrap_card(
+        card = CoreBuilder._wrap_card(
             header_title=title,
             header_template=header_template,
             elements=[
                 {"tag": "markdown", "content": body},
             ],
         )
+        card.setdefault("config", {})["update_multi"] = True
+        return card
 
     def _reply_workflow_error(
         self,
@@ -847,6 +946,7 @@ class WorkflowHandler(
             "config": {
                 "compact_width": False,
                 "wide_screen_mode": True,
+                "update_multi": True,
                 "summary": {"content": summary_content},
             },
             "header": header,

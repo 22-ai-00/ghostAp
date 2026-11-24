@@ -195,15 +195,27 @@
 
     <div class="card">
       <div class="header">
-        <span class="header-title">⚡ Workflow 团队与模型配置</span>
+        <div>
+          <div class="header-title">⚡ Workflow · 配置团队并启动</div>
+          <div style="font-size: 12px; opacity: 0.9; margin-top: 2px;">可直接按当前配置启动，或在下方灵活调整 工具 + 模型 + Effort</div>
+        </div>
         <span class="header-sub" id="pool-count-badge">3/8 成员 · 同模型多 Effort 共存</span>
       </div>
       <div class="body">
         <div class="req-bar" id="req-bar">
-          <strong>待启动需求：</strong>修复认证竞态并补充多端集成测试（配置保存后点击「立即启动」或发送 <code>/wf &lt;需求&gt;</code>）
+          <strong>任务需求：</strong>修复认证竞态并补充多端集成测试
         </div>
 
         <div>
+          <div class="section-title">当前协作团队（A1..AN · 角色 · 工具 · 模型 · Effort）</div>
+          <ul class="roster" id="roster-list"></ul>
+          <div class="button-row" style="margin-top: 10px;">
+            <button type="button" class="action-btn primary" id="btn-start">🚀 按当前团队立即开始 (wf_start_workflow)</button>
+            <button type="button" class="action-btn" id="btn-save">💾 保存为默认团队 (wf_save_team)</button>
+          </div>
+        </div>
+
+        <div class="section">
           <div class="section-title">协作预设（Preset）</div>
           <div class="preset-pills" id="preset-pills">
             <button type="button" class="pill active" data-preset="collaborative">推荐协作组 (collaborative)</button>
@@ -225,8 +237,7 @@
         </div>
 
         <div class="section">
-          <div class="section-title">当前团队成员（A1..AN · 点击成员载入下方编辑器）</div>
-          <ul class="roster" id="roster-list"></ul>
+          <div class="section-title">选择要编辑的成员（点击上方成员或下拉切换）</div>
           <label for="agent-select">当前编辑成员（<code>wf_select_agent</code>）</label>
           <select id="agent-select"></select>
         </div>
@@ -283,9 +294,8 @@
 
         <div class="section">
           <div class="button-row">
-            <button type="button" class="action-btn primary" id="btn-save">保存为项目默认 (wf_save_team)</button>
             <button type="button" class="action-btn" id="btn-reset">重置默认 (wf_reset_team)</button>
-            <button type="button" class="action-btn primary" id="btn-start">立即启动 (wf_start_workflow)</button>
+            <button type="button" class="action-btn primary" id="btn-start-footer">🚀 按当前团队立即开始 (wf_start_workflow)</button>
           </div>
           <p class="hint">Card JSON 2.0 Callback Payload 预览：</p>
           <pre class="payload-preview" id="payload-preview"></pre>
@@ -540,7 +550,6 @@
         state.members.push(next);
       }
       state.selected_agent_id = next.agent_id;
-      state.preset_id = "custom";
       renderAll();
       renderPayload("wf_add_or_update_agent");
     });
@@ -580,6 +589,7 @@
       renderPayload("wf_reset_team");
     });
     document.getElementById("btn-start").addEventListener("click", () => renderPayload("wf_start_workflow"));
+    document.getElementById("btn-start-footer").addEventListener("click", () => renderPayload("wf_start_workflow"));
 
     renderAll();
   </script>

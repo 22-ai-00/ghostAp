@@ -159,11 +159,51 @@ def test_f10_commands_and_wf_preset_flag_parsing(tmp_path: Path) -> None:
     handler.handle_workflow_command("m1", "oc_1", "/wf", project)
     handler.show_workflow_config.assert_called_once_with("m1", "oc_1", project)
 
-    # /wf_config opens config editor (with optional --preset)
+    # /wf <req> opens interactive team launch/config card without auto-starting immediately
+    handler.show_workflow_config.reset_mock()
+    handler.start_workflow.reset_mock()
+    with patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True):
+        handler.handle_workflow_command("m_int", "oc_1", "/wf Build API", project)
+    handler.show_workflow_config.assert_called_once_with(
+        "m_int", "oc_1", project, requirement="Build API"
+    )
+    handler.start_workflow.assert_not_called()
+
+    # /wf --auto <req> (case-insensitive) bypasses config card and launches immediately
+    handler.show_workflow_config.reset_mock()
+    handler.start_workflow.reset_mock()
+    handler.handle_workflow_command("m_auto", "oc_1", "/wf --AUTO Build API", project)
+    handler.start_workflow.assert_called_once_with("m_auto", "oc_1", "Build API", project)
+    handler.show_workflow_config.assert_not_called()
+
+    # /wf --auto without requirement replies invalid_argument
+    handler._reply_workflow_error.reset_mock()
+    handler.handle_workflow_command("m_auto_empty", "oc_1", "/wf --auto", project)
+    handler._reply_workflow_error.assert_called_once()
+    assert handler._reply_workflow_error.call_args.args[:2] == ("m_auto_empty", "invalid_argument")
+
+    # /wf --quick <req> and /wf --quick without requirement
+    handler.start_workflow.reset_mock()
+    handler.handle_workflow_command("m_quick", "oc_1", "/wf --quick Build API", project)
+    handler.start_workflow.assert_called_once_with(
+        "m_quick", "oc_1", "Build API", project, preset_id="quick"
+    )
+    handler.show_workflow_config.reset_mock()
+    handler.handle_workflow_command("m_quick_cfg", "oc_1", "/wf --quick", project)
+    handler.show_workflow_config.assert_called_once_with(
+        "m_quick_cfg", "oc_1", project, preset_id="quick"
+    )
+
+    # /wf_config opens config editor (with optional --preset / --auto)
     handler.show_workflow_config.reset_mock()
     handler.handle_workflow_command("m2", "oc_1", "/wf_config --preset quick", project)
     handler.show_workflow_config.assert_called_once_with(
         "m2", "oc_1", project, preset_id="quick", requirement=None
+    )
+    handler.show_workflow_config.reset_mock()
+    handler.handle_workflow_command("m2b", "oc_1", "/wf_config --auto", project)
+    handler.show_workflow_config.assert_called_once_with(
+        "m2b", "oc_1", project, preset_id="auto", requirement=None
     )
 
     # /wf --preset <id> with no requirement opens config editor preselected to preset
@@ -174,12 +214,14 @@ def test_f10_commands_and_wf_preset_flag_parsing(tmp_path: Path) -> None:
     )
 
     # /wf --preset <id> <req> launches start_workflow with explicit preset_id
+    handler.start_workflow.reset_mock()
     handler.handle_workflow_command("m4", "oc_1", "/wf --preset=collaborative Build API", project)
     handler.start_workflow.assert_called_once_with(
         "m4", "oc_1", "Build API", project, preset_id="collaborative"
     )
 
     # Invalid preset rejected cleanly
+    handler._reply_workflow_error.reset_mock()
     handler.handle_workflow_command("m5", "oc_1", "/wf --preset invalid_preset Build API", project)
     handler._reply_workflow_error.assert_called_once()
     assert handler._reply_workflow_error.call_args.args[:2] == ("m5", "invalid_argument")
@@ -1412,4 +1454,212 @@ def test_override_pool_rejected_when_get_available_tools_returns_empty(tmp_path:
     assert handler._reply_workflow_error.call_args.args[:2] == ("om_launch_empty", "invalid_argument")
     assert admission_owner.done_event.is_set()
     engine.release_lifecycle_owner.assert_called_once_with(admission_owner)
+
+
+def test_wf_start_workflow_double_click_does_not_overwrite_live_card(tmp_path: Path) -> None:
+    mgr = ProjectManager(str(tmp_path / "projects.json"))
+    ok, _, proj = mgr.create_project("p1", "Proj1", str(tmp_path / "repo"), chat_id="oc_dbl")
+    assert ok and proj is not None
+
+    handler = _make_workflow_handler()
+    handler.ctx.project_manager = mgr
+    handler.start_workflow = MagicMock()
+
+    with patch(
+        "src.workflow_engine.tool_registry.get_available_tools",
+        return_value={"codex": "Codex", "claude": "Claude"},
+    ):
+        handler.show_workflow_config("om_init", "oc_dbl", proj, requirement="Double click safety")
+        handler.update_card.reset_mock()
+        handler.reply_card.reset_mock()
+
+        # Click 1 consumes requirement and launches in-place
+        handler.handle_workflow_config_action(
+            "om_reply_card",
+            "oc_dbl",
+            "p1",
+            {"action": action_ids.WF_START_WORKFLOW},
+        )
+        handler.start_workflow.assert_called_once()
+        assert handler.start_workflow.call_args.kwargs["reuse_card_message_id"] == "om_reply_card"
+
+        # Click 2 (duplicate click) must NOT overwrite the live generation/running card
+        handler.start_workflow.reset_mock()
+        handler.handle_workflow_config_action(
+            "om_reply_card",
+            "oc_dbl",
+            "p1",
+            {"action": action_ids.WF_START_WORKFLOW},
+        )
+        handler.start_workflow.assert_not_called()
+        handler.update_card.assert_not_called()
+        handler.reply_card.assert_not_called()
+
+
+def test_generation_patch_coalescing_8s_bucket_and_skip_redundant_initial_patch(tmp_path: Path) -> None:
+    from src.feishu.handlers import workflow_generation as wf_gen_mod
+    from src.workflow_engine.engine import WorkflowEngine
+    from src.workflow_engine.models import PendingWorkflow
+
+    assert wf_gen_mod._GENERATION_PROGRESS_DEBOUNCE_S == 8.0
+
+    script_path = tmp_path / "generated.js"
+    script_path.write_text(
+        "export const meta = { name: 'gen', tools: ['codex'] };\n",
+        encoding="utf-8",
+    )
+    pool = (
+        WorkflowAgentBinding(
+            agent_id="A1",
+            tool_name="codex",
+            model_name="gpt-5.4",
+            display_name="Codex",
+            effort="high",
+            role="worker",
+        ),
+    )
+    engine = WorkflowEngine(chat_id="oc_gen", root_path=str(tmp_path))
+    owner = _WorkflowLifecycleOwner(
+        session_key="sess_gen",
+        initiator_user_id="ou_1",
+        chat_id="oc_gen",
+        project_id="p_1",
+        root_path=str(tmp_path),
+        source_script_path=str(script_path),
+        card_message_id="om_already_sent",
+    )
+    engine._script_generation_owner = owner
+    engine._project = WorkflowProject(
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        requirement="Calm generation patches",
+        pending=PendingWorkflow(
+            requirement="Calm generation patches",
+            engine_session_key="sess_gen",
+            initiator_user_id="ou_1",
+            project_id="p_1",
+            selected_tools=["codex"],
+            agent_pool=pool,
+            orchestrator_agent_id="A1",
+            preset_id="custom",
+        ),
+    )
+
+    handler = _make_workflow_handler()
+    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
+    handler._remove_owned_workflow_artifact = MagicMock()
+    handler._queue_generated_workflow = MagicMock(
+        side_effect=lambda **_kw: setattr(engine.project, "status", WorkflowStatus.RUNNING)
+    )
+
+    clock = [100.0]
+    coalescer_kwargs: list[dict] = []
+
+    class FakeCoalescer:
+        def __init__(self, *, on_progress, debounce_s):
+            coalescer_kwargs.append({"on_progress": on_progress, "debounce_s": debounce_s})
+            self._on_progress = on_progress
+
+        def enqueue(self, hint: str = ""):
+            self._on_progress(hint)
+
+        def stop(self):
+            return None
+
+    def fake_codegen(*_args, progress_callback=None, **_kwargs):
+        # Same bucket (elapsed 1s -> 0) and same status -> delivered once
+        clock[0] = 101.0
+        progress_callback("正在生成编排脚本...")
+        clock[0] = 103.0
+        progress_callback("正在生成编排脚本...")
+        # Different status text -> delivered even within same 8s bucket
+        clock[0] = 104.0
+        progress_callback("正在校验脚本结构...")
+        # Same status within same 8s bucket -> skipped
+        clock[0] = 106.0
+        progress_callback("正在校验脚本结构...")
+        # Next 8s bucket (elapsed 10s -> 1) -> delivered
+        clock[0] = 110.0
+        progress_callback("正在校验脚本结构...")
+        return str(script_path), {"name": "gen", "tools": ["codex"]}
+
+    handler._generate_script_via_ai = MagicMock(side_effect=fake_codegen)
+    proj = ProjectContext(project_id="p_1", project_name="P1", root_path=str(tmp_path))
+
+    with (
+        patch("src.feishu.handlers.workflow.time.time", side_effect=lambda: clock[0]),
+        patch("src.workflow_engine.progress_coalescer.ProgressCoalescer", FakeCoalescer),
+        patch("src.feishu.handlers.workflow.threading.Thread"),
+    ):
+        handler._generate_and_start_workflow(
+            message_id="om_already_sent",
+            chat_id="oc_gen",
+            requirement="Calm generation patches",
+            project=proj,
+            root_path=str(tmp_path),
+            selected_tools=["codex"],
+            expected_session_key="sess_gen",
+        )
+
+    assert coalescer_kwargs and coalescer_kwargs[0]["debounce_s"] == 8.0
+    # 0 redundant initial PATCH + 3 non-duplicate progress updates = 3 PATCHes (not 6)
+    assert len(handler.update_card.call_args_list) == 3
+    for call in handler.update_card.call_args_list:
+        assert call.args[0] == "om_already_sent"
+        assert call.args[1]["config"]["update_multi"] is True
+
+
+def test_stop_during_generation_transitions_clicked_card_inplace(tmp_path: Path) -> None:
+    from src.workflow_engine.engine import WorkflowEngine
+    from src.workflow_engine.models import PendingWorkflow
+
+    handler = _make_workflow_handler()
+    pool = (
+        WorkflowAgentBinding(
+            agent_id="A1",
+            tool_name="codex",
+            model_name="gpt-5.4",
+            display_name="Codex",
+            effort="high",
+            role="worker",
+        ),
+    )
+    engine = WorkflowEngine("oc_stop_gen", str(tmp_path))
+    engine._project = WorkflowProject(
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        requirement="Stop gen inplace",
+        pending=PendingWorkflow(
+            requirement="Stop gen inplace",
+            initiator_user_id="ou_1",
+            engine_session_key="sess_stop_gen",
+            project_id="p1",
+            agent_pool=pool,
+            orchestrator_agent_id="A1",
+        ),
+    )
+    owner = _WorkflowLifecycleOwner(
+        session_key="sess_stop_gen",
+        initiator_user_id="ou_1",
+        chat_id="oc_stop_gen",
+        project_id="p1",
+        root_path=str(tmp_path),
+        card_message_id=None,
+    )
+    engine._script_generation_owner = owner
+    handler.ctx.workflow_engine_manager.get.return_value = engine
+    proj = ProjectContext(project_id="p1", project_name="P1", root_path=str(tmp_path))
+    handler._resolve_project_from_id = MagicMock(return_value=proj)
+
+    with patch("src.thread.get_current_sender_id", return_value="ou_1"):
+        handler.handle_workflow_stop_running(
+            "om_clicked_card",
+            "oc_stop_gen",
+            "p1",
+            {"action": action_ids.WORKFLOW_STOP_RUNNING, "chat_id": "oc_stop_gen", "project_id": "p1"},
+        )
+
+    assert engine.project.status == WorkflowStatus.CANCELLED
+    handler.update_card.assert_called_once()
+    assert handler.update_card.call_args.args[0] == "om_clicked_card"
+    assert "Workflow · 已取消" in json.dumps(handler.update_card.call_args.args[1], ensure_ascii=False)
+    handler.send_card_to_chat.assert_not_called()
 
