@@ -112,25 +112,29 @@ class TestWorkflowCommandAliases(unittest.TestCase):
                 "/workflow\t实现登录",
                 "start_workflow",
                 ("msg_1", "chat_1", "实现登录", project),
+                {},
             ),
             (
                 "/workflow_status",
                 "show_workflow_status",
                 ("msg_1", "chat_1", project),
+                {},
             ),
             (
                 "/workflow_help",
                 "show_workflow_help",
                 ("msg_1",),
+                {"chat_id": "chat_1", "project": project},
             ),
             (
                 "/stop_workflow",
                 "stop_workflow",
                 ("msg_1", "chat_1", project),
+                {},
             ),
         )
 
-        for text, target_name, expected_args in cases:
+        for text, target_name, expected_args, expected_kwargs in cases:
             with self.subTest(text=text):
                 handler = _make_workflow_handler()
                 handler.start_workflow = MagicMock()
@@ -148,6 +152,7 @@ class TestWorkflowCommandAliases(unittest.TestCase):
 
                 getattr(handler, target_name).assert_called_once_with(
                     *expected_args,
+                    **expected_kwargs,
                 )
                 handler._reply_workflow_error.assert_not_called()
 

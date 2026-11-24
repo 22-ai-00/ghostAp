@@ -362,6 +362,51 @@ class ProjectManager:
             project.restore_acp_configuration(previous)
             return False
 
+    def commit_workflow_team_configuration(
+        self,
+        project: ProjectContext,
+        config: Optional[dict[str, Any]],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """Persist a per-chat Workflow team configuration with rollback on failure."""
+        with self._lock:
+            if self._projects.get(project.project_id) is not project:
+                return False
+            previous = project.replace_workflow_team_config_for_chat(
+                config,
+                chat_id=chat_id,
+            )
+            if self._save_projects():
+                return True
+            project.restore_workflow_team_config(previous)
+            return False
+
+    def commit_workflow_pending_requirement(
+        self,
+        project: ProjectContext,
+        config_session_id: str,
+        requirement: Optional[str],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """Persist or clear a per-chat Workflow config-session requirement with rollback."""
+        with self._lock:
+            if self._projects.get(project.project_id) is not project:
+                return False
+            has_req = isinstance(requirement, str) and bool(requirement.strip())
+            if not has_req and project.get_workflow_pending_requirement(config_session_id, chat_id) is None:
+                return True
+            previous = project.replace_workflow_pending_requirement_for_chat(
+                config_session_id,
+                requirement,
+                chat_id=chat_id,
+            )
+            if self._save_projects():
+                return True
+            project.restore_workflow_pending_requirement(previous)
+            return False
+
     @staticmethod
     def _is_visible(ctx: ProjectContext, chat_id: Optional[str]) -> bool:
         """Check if a project is visible to the given chat_id.

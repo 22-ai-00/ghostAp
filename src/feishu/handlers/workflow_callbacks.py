@@ -50,15 +50,23 @@ class WorkflowCallbacksMixin:
         )
         if orchestrator_agent is None:
             raise ValueError("Workflow orchestrator is outside its confirmed Agent Pool")
+        effective_orch_model = (
+            orchestrator_agent.effective_model_name()
+            or orchestrator_agent.model_name
+        )
         orchestrator = ReviewAgentBinding(
             provider="workflow",
             tool_name=orchestrator_agent.tool_name,
             display_name=orchestrator_agent.display_name,
             agent_type=orchestrator_agent.tool_name,
-            model_name=orchestrator_agent.model_name,
+            model_name=effective_orch_model,
             model_display_name=orchestrator_agent.model_name,
             selection_key=orchestrator_agent.agent_id,
-            use_default_model=orchestrator_agent.model_name is None,
+            use_default_model=(
+                orchestrator_agent.model_name is None
+                and orchestrator_agent.effort is None
+                and orchestrator_agent.profile is None
+            ),
         )
         allowed_tools = list(
             dict.fromkeys(binding.tool_name for binding in agent_pool)
@@ -456,8 +464,13 @@ class WorkflowCallbacksMixin:
         def on_log(msg: str) -> None:
             logger.debug("[WorkflowHandler] log: %s", msg)
 
-        def on_agent_start(label: str, tool: str) -> None:
-            process_stream.agent_started(label, tool)
+        def on_agent_start(
+            label: str,
+            tool: str,
+            *,
+            meta: dict[str, Any] | None = None,
+        ) -> None:
+            process_stream.agent_started(label, tool, meta=meta)
 
         def on_agent_event(label: str, event: Any) -> None:
             process_stream.emit(label, event)

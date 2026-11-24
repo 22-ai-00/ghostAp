@@ -1,9 +1,10 @@
+import copy
 import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 from ..mode.backends import ALL_BACKEND_METAS
 from ..utils.lock_order import LockLevel, ordered_lock
@@ -31,6 +32,10 @@ class SessionSnapshot:
     is_resumable: bool = True
 
 
+_MAX_WORKFLOW_PENDING_REQUIREMENTS = 32
+_MAX_WORKFLOW_PENDING_REQ_CHARS = 8192
+
+
 @dataclass
 class ChatProjectState:
     """Per-chat isolated ACP tool/model configuration, mode flags, and snapshots."""
@@ -40,6 +45,8 @@ class ChatProjectState:
     has_acp_config: bool = False
     active_modes: set[str] = field(default_factory=set)
     session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict)
+    workflow_team_config: Optional[dict[str, Any]] = None
+    workflow_pending_requirements: OrderedDict[str, str] = field(default_factory=OrderedDict)
 
     def clone(self) -> "ChatProjectState":
         return ChatProjectState(
@@ -60,6 +67,8 @@ class ChatProjectState:
                 )
                 for mode, snap in self.session_snapshots.items()
             },
+            workflow_team_config=copy.deepcopy(self.workflow_team_config),
+            workflow_pending_requirements=OrderedDict(self.workflow_pending_requirements),
         )
 
 
@@ -235,6 +244,37 @@ class ProjectContext:
             if state is not None and state.has_acp_config:
                 return state.acp_tool_name, state.acp_model_name
             return self.acp_tool_name, self.acp_model_name
+
+    def get_workflow_team_config(
+        self,
+        chat_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return a deep copy of the per-chat saved Workflow team config, if any."""
+        cid = self._normalized_chat_id(chat_id)
+        if not cid:
+            return None
+        with self._chat_lock:
+            state = self.chat_states.get(cid)
+            if state is None or state.workflow_team_config is None:
+                return None
+            return copy.deepcopy(state.workflow_team_config)
+
+    def get_workflow_pending_requirement(
+        self,
+        config_session_id: str,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the per-chat pending `/wf_config <requirement>` string for *config_session_id*."""
+        cid = self._normalized_chat_id(chat_id)
+        sid = str(config_session_id or "").strip()
+        if not cid or not sid:
+            return None
+        with self._chat_lock:
+            state = self.chat_states.get(cid)
+            if state is None:
+                return None
+            req = state.workflow_pending_requirements.get(sid)
+            return req if isinstance(req, str) and req else None
 
     def get_programming_mode(
         self,
@@ -645,6 +685,90 @@ class ProjectContext:
             object.__setattr__(self, "acp_tool_name", previous["acp_tool_name"])
             object.__setattr__(self, "acp_model_name", previous["acp_model_name"])
 
+    def replace_workflow_team_config_for_chat(
+        self,
+        config: Optional[dict[str, Any]],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        """Replace saved Workflow team config scoped to *chat_id* with full rollback."""
+        cid = self._normalized_chat_id(chat_id)
+        normalized: Optional[dict[str, Any]]
+        if config is None:
+            normalized = None
+        else:
+            normalized = self.normalize_workflow_team_config(config)
+            if normalized is None:
+                raise ValueError("Invalid workflow_team_config")
+        with self._chat_lock:
+            existing_state = self.chat_states.get(cid) if cid else None
+            previous: dict[str, object] = {
+                "chat_id": cid,
+                "had_chat_state": existing_state is not None,
+                "chat_state": existing_state.clone() if existing_state is not None else None,
+            }
+            if cid:
+                state = self._ensure_chat_state_unlocked(cid)
+                state.workflow_team_config = copy.deepcopy(normalized)
+            return previous
+
+    def restore_workflow_team_config(self, previous: dict[str, object]) -> None:
+        """Restore rollback data from a failed persisted Workflow team config change."""
+        with self._chat_lock:
+            cid = self._normalized_chat_id(previous.get("chat_id"))  # type: ignore[arg-type]
+            if cid:
+                if previous.get("had_chat_state"):
+                    prev_state = previous.get("chat_state")
+                    if isinstance(prev_state, ChatProjectState):
+                        self.chat_states[cid] = prev_state.clone()
+                else:
+                    self.chat_states.pop(cid, None)
+
+    def replace_workflow_pending_requirement_for_chat(
+        self,
+        config_session_id: str,
+        requirement: Optional[str],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        """Set or clear a bounded pending `/wf_config` requirement scoped to *chat_id*."""
+        cid = self._normalized_chat_id(chat_id)
+        sid = str(config_session_id or "").strip()
+        req = (
+            requirement.strip()[:_MAX_WORKFLOW_PENDING_REQ_CHARS]
+            if isinstance(requirement, str) and requirement.strip()
+            else None
+        )
+        with self._chat_lock:
+            existing_state = self.chat_states.get(cid) if cid else None
+            previous: dict[str, object] = {
+                "chat_id": cid,
+                "had_chat_state": existing_state is not None,
+                "chat_state": existing_state.clone() if existing_state is not None else None,
+            }
+            if cid and sid and len(sid) <= 128:
+                if req is not None:
+                    state = self._ensure_chat_state_unlocked(cid)
+                    state.workflow_pending_requirements[sid] = req
+                    state.workflow_pending_requirements.move_to_end(sid)
+                    while len(state.workflow_pending_requirements) > _MAX_WORKFLOW_PENDING_REQUIREMENTS:
+                        state.workflow_pending_requirements.popitem(last=False)
+                elif existing_state is not None:
+                    existing_state.workflow_pending_requirements.pop(sid, None)
+            return previous
+
+    def restore_workflow_pending_requirement(self, previous: dict[str, object]) -> None:
+        """Restore rollback data from a failed persisted pending-requirement mutation."""
+        with self._chat_lock:
+            cid = self._normalized_chat_id(previous.get("chat_id"))  # type: ignore[arg-type]
+            if cid:
+                if previous.get("had_chat_state"):
+                    prev_state = previous.get("chat_state")
+                    if isinstance(prev_state, ChatProjectState):
+                        self.chat_states[cid] = prev_state.clone()
+                else:
+                    self.chat_states.pop(cid, None)
+
     def restore_acp_programming_activation(self, previous: dict[str, object]) -> None:
         """Restore rollback data from a failed persisted ACP activation."""
         with self._chat_lock:
@@ -729,6 +853,20 @@ class ProjectContext:
                             for mode_key, snap in st.session_snapshots.items()
                             if snap is not None
                         },
+                        **(
+                            {"workflow_team_config": copy.deepcopy(st.workflow_team_config)}
+                            if st.workflow_team_config is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "workflow_pending_requirements": dict(
+                                    st.workflow_pending_requirements
+                                )
+                            }
+                            if st.workflow_pending_requirements
+                            else {}
+                        ),
                     }
                     for cid, st in self.chat_states.items()
                 }
@@ -762,6 +900,149 @@ class ProjectContext:
 
         get_providers()
         return name if tool_registry.get_provider(name) else None
+
+    @classmethod
+    def normalize_workflow_team_config(cls, raw: Any) -> Optional[dict[str, Any]]:
+        """Validate and sanitize a persisted ``workflow_team_config`` payload.
+
+        Corrupt, non-dict, stale-tool, or invalid-effort payloads recover cleanly
+        to either a sanitized subset or ``None`` without ever raising.
+        """
+        if not isinstance(raw, dict):
+            return None
+        raw_bindings = raw.get("bindings")
+        if not isinstance(raw_bindings, list) or not raw_bindings:
+            return None
+
+        try:
+            from ..workflow_engine.agent_pool import (
+                WorkflowAgentBinding,
+                freeze_agent_pool,
+            )
+            from ..workflow_engine.constants import MAX_WORKFLOW_AGENT_POOL_SIZE
+            from ..workflow_engine.teamwork import PRESET_ALIASES, TEAMWORK_PRESETS
+            from ..workflow_engine.tool_registry import (
+                get_tool_capabilities,
+                validate_agent_binding_spec,
+            )
+        except Exception:
+            return None
+
+        raw_preset = (
+            str(raw.get("preset_id") or raw.get("preset") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        valid_presets = set(TEAMWORK_PRESETS) | {"auto", "custom"}
+        if raw_preset in valid_presets:
+            preset_id = raw_preset
+        elif raw_preset in PRESET_ALIASES:
+            preset_id = PRESET_ALIASES[raw_preset]
+        else:
+            preset_id = "recommended"
+
+        try:
+            capabilities = get_tool_capabilities()
+        except Exception:
+            capabilities = {}
+
+        cleaned: list[WorkflowAgentBinding] = []
+        seen_ids: set[str] = set()
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for item in raw_bindings[:64]:
+            binding = WorkflowAgentBinding.from_dict(item)
+            if binding is None:
+                continue
+            norm_tool = cls.normalize_acp_tool_name(binding.tool_name)
+            if not norm_tool:
+                continue
+
+            candidate: WorkflowAgentBinding | None = None
+            attempts = (
+                (binding.model_name, binding.profile, binding.effort),
+                (binding.model_name, None, None),
+                (None, None, None),
+            )
+            for cand_model, cand_profile, cand_effort in attempts:
+                ok, _ = validate_agent_binding_spec(
+                    norm_tool,
+                    model_name=cand_model,
+                    profile=cand_profile,
+                    effort=cand_effort,
+                    available_tools={norm_tool: norm_tool},
+                    capabilities=capabilities or None,
+                )
+                if ok:
+                    candidate = WorkflowAgentBinding(
+                        agent_id=binding.agent_id,
+                        tool_name=norm_tool,
+                        model_name=cand_model,
+                        display_name=binding.display_name,
+                        profile=cand_profile,
+                        effort=cand_effort,
+                        role=binding.role,
+                        roles=binding.roles,
+                    )
+                    break
+
+            if candidate is None:
+                continue
+            if candidate.agent_id in seen_ids or candidate.binding_key in seen_keys:
+                continue
+            seen_ids.add(candidate.agent_id)
+            seen_keys.add(candidate.binding_key)
+            cleaned.append(candidate)
+            if len(cleaned) >= MAX_WORKFLOW_AGENT_POOL_SIZE:
+                break
+
+        if not cleaned:
+            return None
+
+        try:
+            frozen = freeze_agent_pool(cleaned, require_nonempty=False)
+        except ValueError:
+            return None
+        if not frozen:
+            return None
+
+        valid_ids = {b.agent_id for b in frozen}
+        raw_orch = str(raw.get("orchestrator_agent_id") or "").strip()
+        orch_id = raw_orch if raw_orch in valid_ids else frozen[0].agent_id
+
+        raw_ts = raw.get("updated_at")
+        updated_at = (
+            float(raw_ts)
+            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool)
+            else 0.0
+        )
+        return {
+            "version": 1,
+            "preset_id": preset_id,
+            "orchestrator_agent_id": orch_id,
+            "bindings": [b.to_dict() for b in frozen],
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def normalize_workflow_pending_requirements(raw: Any) -> OrderedDict[str, str]:
+        """Sanitize and bound persisted `(config_session_id -> requirement)` entries."""
+        out: OrderedDict[str, str] = OrderedDict()
+        if not isinstance(raw, dict):
+            return out
+        for raw_sid, raw_req in raw.items():
+            if not isinstance(raw_sid, str) or not isinstance(raw_req, str):
+                continue
+            sid = raw_sid.strip()
+            req = raw_req.strip()
+            if not sid or len(sid) > 128 or not req:
+                continue
+            out[sid] = req[:_MAX_WORKFLOW_PENDING_REQ_CHARS]
+            out.move_to_end(sid)
+            while len(out) > _MAX_WORKFLOW_PENDING_REQUIREMENTS:
+                out.popitem(last=False)
+        return out
 
     @classmethod
     def from_snapshot(cls, data: dict) -> "ProjectContext":
@@ -826,12 +1107,23 @@ class ProjectContext:
                                 last_query=sdata["last_query"],
                                 is_resumable=sdata.get("is_resumable", True),
                             )
+                try:
+                    wf_team_cfg = cls.normalize_workflow_team_config(
+                        raw_state.get("workflow_team_config")
+                    )
+                except Exception:
+                    wf_team_cfg = None
+                wf_pending_reqs = cls.normalize_workflow_pending_requirements(
+                    raw_state.get("workflow_pending_requirements")
+                )
                 ctx.chat_states[cid] = ChatProjectState(
                     acp_tool_name=chat_tool,
                     acp_model_name=chat_model,
                     has_acp_config=raw_has_cfg,
                     active_modes=active_modes,
                     session_snapshots=snapshots,
+                    workflow_team_config=wf_team_cfg,
+                    workflow_pending_requirements=wf_pending_reqs,
                 )
         return ctx
 
@@ -946,3 +1238,30 @@ def get_project_programming_mode(
     if pair is None:
         return False
     return getattr(project, pair[0], False) is True
+
+
+def get_project_workflow_team_config(
+    project: object,
+    chat_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Read *project*'s saved Workflow team configuration scoped to *chat_id*."""
+    if project is None or not chat_id:
+        return None
+    getter = getattr(type(project), "get_workflow_team_config", None)
+    if callable(getter):
+        return project.get_workflow_team_config(chat_id)  # type: ignore[attr-defined]
+    return None
+
+
+def get_project_workflow_pending_requirement(
+    project: object,
+    config_session_id: str,
+    chat_id: Optional[str] = None,
+) -> Optional[str]:
+    """Read *project*'s pending `/wf_config` requirement scoped to *chat_id* and *config_session_id*."""
+    if project is None or not chat_id or not config_session_id:
+        return None
+    getter = getattr(type(project), "get_workflow_pending_requirement", None)
+    if callable(getter):
+        return project.get_workflow_pending_requirement(config_session_id, chat_id)  # type: ignore[attr-defined]
+    return None

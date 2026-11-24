@@ -126,6 +126,12 @@ class WorkflowGenerationMixin:
             ):
                 if current_owner.session_key == expected_session_key:
                     owner = current_owner
+                    if owner.source_script_path is None:
+                        object.__setattr__(
+                            owner,
+                            "source_script_path",
+                            self._new_workflow_script_path(root_path),
+                        )
                 else:
                     previous_owner = current_owner
             if previous_owner is not None:
@@ -184,6 +190,11 @@ class WorkflowGenerationMixin:
                     if existing_pending is not None
                     else None
                 ),
+                "preset_id": (
+                    getattr(existing_pending, "preset_id", None)
+                    if existing_pending is not None
+                    else None
+                ),
                 "recommended_agents": (
                     list(existing_pending.recommended_agents)
                     if existing_pending is not None
@@ -198,6 +209,8 @@ class WorkflowGenerationMixin:
                 pass
 
         heartbeat_thread: threading.Thread | None = None
+        progress_coalescer: Any = None
+        generation_terminal_fence = _workflow_module().threading.Event()
         try:
             origin_message_id = self._resolve_origin(message_id)
         except Exception:
@@ -208,14 +221,18 @@ class WorkflowGenerationMixin:
             origin_message_id = message_id
         gen_msg_id: str | None = None
         heartbeat_start = _workflow_module().time.time()
+        card_project_id = (
+            (getattr(project, "project_id", "") if project else "")
+            or str(generation_context.get("project_id") or "")
+        )
 
         def _owner_can_deliver() -> bool:
             return self._generation_owner_is_active(engine, owner)
 
-        def _heartbeat_update(status_hint: str = "") -> None:
+        def _deliver_generation_card(status_hint: str = "") -> None:
             """Update the generating card only while this owner is live."""
             with owner.delivery_lock:
-                if not _owner_can_deliver():
+                if generation_terminal_fence.is_set() or not _owner_can_deliver():
                     return
                 elapsed = int(_workflow_module().time.time() - heartbeat_start)
                 status = status_hint or "正在生成编排脚本..."
@@ -230,6 +247,8 @@ class WorkflowGenerationMixin:
                     ],
                     current_activity=status,
                     elapsed_seconds=elapsed,
+                    chat_id=chat_id,
+                    project_id=card_project_id,
                 )
                 if gen_msg_id:
                     self.update_card(
@@ -238,6 +257,12 @@ class WorkflowGenerationMixin:
                             progress_card_data
                         ),
                     )
+
+        def _heartbeat_update(status_hint: str = "") -> None:
+            if progress_coalescer is not None:
+                progress_coalescer.enqueue(status_hint)
+            else:
+                _deliver_generation_card(status_hint)
 
         def _heartbeat_loop() -> None:
             while not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
@@ -248,24 +273,46 @@ class WorkflowGenerationMixin:
                     except Exception:
                         pass
 
-        def _stop_heartbeat() -> None:
+        def _stop_heartbeat(*, discard_pending: bool = False) -> None:
+            if discard_pending:
+                generation_terminal_fence.set()
             owner.heartbeat_stop_event.set()
             if heartbeat_thread is not None:
                 heartbeat_thread.join(timeout=2.0)
+            if progress_coalescer is not None:
+                progress_coalescer.stop()
 
         script_path: str
         meta: dict[str, Any] | None = None
+        preset_id = str(generation_context.get("preset_id") or "").strip().lower()
+        use_preset_fastpath = bool(preset_id and preset_id != "custom")
         try:
-            gen_card_data = self._workflow_generation_card_data(
-                requirement=requirement,
-                agent_pool=generation_context["agent_pool"],
-                orchestrator_agent_id=(
-                    generation_context["orchestrator_agent_id"] or ""
-                ),
-                orchestrator_was_auto=generation_context[
-                    "orchestrator_was_auto"
-                ],
-            )
+            if use_preset_fastpath:
+                from ...card.builders.workflow import build_workflow_preset_launch_card
+
+                gen_card_data = build_workflow_preset_launch_card(
+                    requirement=requirement,
+                    preset_id=preset_id,
+                    members=generation_context["agent_pool"],
+                    orchestrator_agent_id=(
+                        generation_context["orchestrator_agent_id"] or ""
+                    ),
+                    chat_id=chat_id,
+                    project_id=card_project_id or None,
+                )
+            else:
+                gen_card_data = self._workflow_generation_card_data(
+                    requirement=requirement,
+                    agent_pool=generation_context["agent_pool"],
+                    orchestrator_agent_id=(
+                        generation_context["orchestrator_agent_id"] or ""
+                    ),
+                    orchestrator_was_auto=generation_context[
+                        "orchestrator_was_auto"
+                    ],
+                    chat_id=chat_id,
+                    project_id=card_project_id,
+                )
             with owner.delivery_lock:
                 if not _owner_can_deliver():
                     return
@@ -279,24 +326,65 @@ class WorkflowGenerationMixin:
             if not _owner_can_deliver():
                 return
 
-            heartbeat_thread = _workflow_module().threading.Thread(
-                target=_heartbeat_loop,
-                name="wf-gen-heartbeat",
-                daemon=True,
-            )
-            heartbeat_thread.start()
+            if use_preset_fastpath:
+                from ...workflow_engine.script_gen import (
+                    extract_meta_from_script,
+                    validate_generated_script,
+                )
+                from ...workflow_engine.teamwork import generate_teamwork_script
 
-            script_path, meta = self._generate_script_via_ai(
-                requirement,
-                root_path,
-                selected_tools,
-                engine,
-                progress_callback=_heartbeat_update,
-                output_path=owner.source_script_path,
-                cancel_event=owner.stop_event,
-                artifact_lock=owner.delivery_lock,
-            )
-            _stop_heartbeat()
+                confirmed_pool = tuple(generation_context["agent_pool"])
+                if not confirmed_pool:
+                    raise RuntimeError("Workflow generation lost its confirmed Agent Pool")
+                script_content = generate_teamwork_script(
+                    requirement,
+                    agent_pool=confirmed_pool,
+                    preset=preset_id,
+                    orchestrator_agent_id=generation_context["orchestrator_agent_id"],
+                )
+                is_valid, errors = validate_generated_script(
+                    script_content,
+                    review_agents=[],
+                    agent_pool=confirmed_pool,
+                )
+                if not is_valid:
+                    raise ValueError("; ".join(errors[:3]) or "preset script validation failed")
+                meta = extract_meta_from_script(script_content) or {}
+                script_path = owner.source_script_path or self._new_workflow_script_path(root_path)
+                with owner.delivery_lock:
+                    if not _owner_can_deliver():
+                        raise _workflow_module()._WorkflowGenerationCancelled(
+                            "Workflow generation cancelled"
+                        )
+                    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+                    with open(script_path, "w", encoding="utf-8") as file:
+                        file.write(script_content)
+            else:
+                from ...workflow_engine.constants import PROGRESS_DEBOUNCE_S
+                from ...workflow_engine.progress_coalescer import ProgressCoalescer
+
+                progress_coalescer = ProgressCoalescer(
+                    on_progress=_deliver_generation_card,
+                    debounce_s=PROGRESS_DEBOUNCE_S,
+                )
+                heartbeat_thread = _workflow_module().threading.Thread(
+                    target=_heartbeat_loop,
+                    name="wf-gen-heartbeat",
+                    daemon=True,
+                )
+                heartbeat_thread.start()
+
+                script_path, meta = self._generate_script_via_ai(
+                    requirement,
+                    root_path,
+                    selected_tools,
+                    engine,
+                    progress_callback=_heartbeat_update,
+                    output_path=owner.source_script_path,
+                    cancel_event=owner.stop_event,
+                    artifact_lock=owner.delivery_lock,
+                )
+                _stop_heartbeat()
 
             script_tools = list(dict.fromkeys((meta or {}).get("tools", [])))
             confirmed_pool = tuple(generation_context["agent_pool"])
@@ -335,6 +423,7 @@ class WorkflowGenerationMixin:
                 orchestrator_agent_id=generation_context["orchestrator_agent_id"],
                 orchestrator_was_auto=generation_context["orchestrator_was_auto"],
                 project_id=generation_context["project_id"],
+                preset_id=generation_context.get("preset_id"),
                 recommended_agents=generation_context["recommended_agents"],
             )
             if not self._commit_generated_workflow_if_current(
@@ -363,6 +452,7 @@ class WorkflowGenerationMixin:
             if not started and _owner_can_deliver():
                 raise RuntimeError("Workflow 自动启动失败")
         except _workflow_module()._WorkflowGenerationCancelled as exc:
+            _stop_heartbeat(discard_pending=True)
             safe_error = self._sanitize_generation_error(exc)
             with owner.delivery_lock:
                 with engine._lock:
@@ -400,6 +490,8 @@ class WorkflowGenerationMixin:
                         current_activity=safe_error,
                         elapsed_seconds=int(_workflow_module().time.time() - heartbeat_start),
                         terminal_status="cancelled",
+                        chat_id=chat_id,
+                        project_id=card_project_id,
                     )
                     target_message_id = (
                         gen_msg_id or owner.card_message_id or message_id
@@ -419,6 +511,7 @@ class WorkflowGenerationMixin:
                         final_message_id,
                     )
         except Exception as exc:
+            _stop_heartbeat(discard_pending=True)
             logger.error(
                 "Workflow script generation failed: %s",
                 exc,
@@ -623,6 +716,11 @@ class WorkflowGenerationMixin:
                             ),
                             current_activity=self._sanitize_generation_error(exc),
                             terminal_status="cancelled",
+                            chat_id=chat_id,
+                            project_id=(
+                                (getattr(project, "project_id", "") if project else "")
+                                or str(getattr(cancelled_pending, "project_id", "") or "")
+                            ),
                         )
                         final_message_id = (
                             self._replace_or_send_workflow_rendered_card(

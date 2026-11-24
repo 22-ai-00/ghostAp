@@ -15,7 +15,7 @@ DEFAULT_WORKFLOW_STORAGE_ROOT = "~/.ghostap/workflow"
 def workflow_storage_root(storage_root: str | None = None) -> str:
     """Return the absolute root for all Workflow-owned artifacts."""
     root = storage_root or DEFAULT_WORKFLOW_STORAGE_ROOT
-    return os.path.abspath(os.path.expanduser(root))
+    return os.path.realpath(os.path.abspath(os.path.expanduser(root)))
 
 
 def workflow_project_storage_root(
@@ -27,7 +27,7 @@ def workflow_project_storage_root(
     Mirroring the full path keeps projects with the same basename isolated
     while leaving the project tree itself untouched.
     """
-    abs_project = os.path.abspath(os.path.expanduser(root_path or "."))
+    abs_project = os.path.realpath(os.path.abspath(os.path.expanduser(root_path or ".")))
     drive, tail = os.path.splitdrive(abs_project)
     parts = [part for part in Path(tail).parts if part not in (os.sep, "")]
     if drive:
@@ -81,7 +81,7 @@ def remove_owned_workflow_artifact(
         and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
     )
     confirmed_copy = (
-        basename.startswith("ghostap-confirmed-")
+        basename.startswith(("ghostap-verified-", "ghostap-confirmed-"))
         and basename.endswith(".js")
         and os.path.commonpath((candidate, temp_root)) == temp_root
     )

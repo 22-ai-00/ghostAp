@@ -138,11 +138,13 @@ def _workflow_pending_statuses():
     }
 
 
+from .workflow_config import WorkflowConfigMixin  # noqa: E402
 from .workflow_execution import WorkflowExecutionMixin  # noqa: E402
 from .workflow_script import WorkflowScriptMixin  # noqa: E402
 
 
 class WorkflowHandler(
+    WorkflowConfigMixin,
     WorkflowExecutionMixin,
     WorkflowScriptMixin,
     BaseEngineHandler,
@@ -171,13 +173,48 @@ class WorkflowHandler(
             return
         self.start_workflow(message_id, chat_id, text_stripped, project)
 
+    @staticmethod
+    def _parse_wf_launch_args(args: str) -> tuple[str | None, str, str | None]:
+        """Parse optional leading ``--preset <id>`` or ``--preset=<id>`` from `/wf` args.
+
+        Returns ``(preset_id, remaining_requirement, error_message)``.
+        """
+        raw = (args or "").strip()
+        if not raw:
+            return None, "", None
+        parts = raw.split(None, 1)
+        head = parts[0]
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        raw_preset: str | None = None
+        if head.startswith("--preset="):
+            raw_preset = head.split("=", 1)[1].strip()
+        elif head == "--preset":
+            if not rest:
+                return None, "", "请指定预设名称，例如：`/wf --preset collaborative 实现用户认证`"
+            subparts = rest.split(None, 1)
+            raw_preset = subparts[0].strip()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+        if raw_preset is None:
+            return None, raw, None
+
+        cleaned = raw_preset.lower().replace("-", "_")
+        if cleaned in {"auto", "custom"}:
+            return cleaned, rest, None
+        from ...workflow_engine.teamwork import resolve_teamwork_preset
+
+        try:
+            preset = resolve_teamwork_preset(cleaned)
+        except ValueError:
+            return None, rest, f"未知预设 `{raw_preset}`，可选：`collaborative`、`quick`、`review_team`、`deep_collab`、`auto`、`custom`"
+        return preset.preset_id, rest, None
+
     # ------------------------------------------------------------------
     # Command router
     # ------------------------------------------------------------------
     def handle_workflow_command(
         self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None
     ):
-        """Route /wf, /workflow, /stop_wf, /wf_status commands."""
+        """Route /wf, /workflow, /wf_config, /stop_wf, /wf_status, /wf_help commands."""
         match = SlashCommandParser.parse(text)
         command = match.command if match else ""
         args = match.args if match else ""
@@ -187,12 +224,45 @@ class WorkflowHandler(
         elif command == "/wf_status":
             self.show_workflow_status(message_id, chat_id, project)
         elif command == "/wf_help":
-            self.show_workflow_help(message_id)
+            self.show_workflow_help(message_id, chat_id=chat_id, project=project)
+        elif command == "/wf_config":
+            preset_id, req, err = self._parse_wf_launch_args(args)
+            if err:
+                self._reply_workflow_error(message_id, "invalid_argument", detail=err)
+                return
+            self.show_workflow_config(
+                message_id,
+                chat_id,
+                project,
+                preset_id=preset_id,
+                requirement=(req or None),
+            )
         elif command == "/wf":
             if args:
-                self.start_workflow(message_id, chat_id, args, project)
+                preset_id, req, err = self._parse_wf_launch_args(args)
+                if err:
+                    self._reply_workflow_error(message_id, "invalid_argument", detail=err)
+                    return
+                if preset_id is not None:
+                    if req:
+                        self.start_workflow(
+                            message_id,
+                            chat_id,
+                            req,
+                            project,
+                            preset_id=preset_id,
+                        )
+                    else:
+                        self.show_workflow_config(
+                            message_id,
+                            chat_id,
+                            project,
+                            preset_id=preset_id,
+                        )
+                else:
+                    self.start_workflow(message_id, chat_id, args, project)
             else:
-                self.show_workflow_help(message_id)
+                self.show_workflow_config(message_id, chat_id, project)
         else:
             self._reply_workflow_error(
                 message_id,
@@ -200,6 +270,7 @@ class WorkflowHandler(
                 detail=(
                     "未知命令。可用命令列表:\n"
                     "• `/wf <需求>` — 基于需求生成编排脚本并执行\n"
+                    "• `/wf_config` — 打开团队与 `tool + model + effort` 配置\n"
                     "• `/wf_status` — 查看当前 Workflow 进度\n"
                     "• `/wf_help` — 查看完整帮助\n"
                     "• `/stop_wf` — 停止正在执行的 Workflow\n"
@@ -235,6 +306,10 @@ class WorkflowHandler(
         chat_id: str,
         requirement: str,
         project: Optional["ProjectContext"] = None,
+        *,
+        preset_id: str | None = None,
+        override_pool: tuple[Any, ...] | None = None,
+        override_orchestrator_id: str | None = None,
     ) -> None:
         """Start a workflow and use the default auto policy to launch generation.
 
@@ -341,6 +416,9 @@ class WorkflowHandler(
             root_path=root_path,
             engine=admission_engine,
             admission_owner=admission_owner,
+            preset_id=preset_id,
+            override_pool=override_pool,
+            override_orchestrator_id=override_orchestrator_id,
         )
 
     def handle_workflow_agent_action(
@@ -368,8 +446,12 @@ class WorkflowHandler(
         root_path: str,
         engine: Any,
         admission_owner: _WorkflowLifecycleOwner | None,
+        preset_id: str | None = None,
+        override_pool: tuple[Any, ...] | None = None,
+        override_orchestrator_id: str | None = None,
     ) -> None:
-        """Auto-bind available recommended tools as the frozen pool and launch."""
+        """Auto-bind available tools or saved chat/project Teamwork pool and launch."""
+        from ...project import get_project_workflow_team_config
         from ...spec_engine.models import ReviewAgentBinding
         from ...thread import get_current_sender_id
         from ...workflow_engine.agent_pool import (
@@ -382,49 +464,143 @@ class WorkflowHandler(
             WorkflowProject,
             WorkflowStatus,
         )
-        from ...workflow_engine.tool_registry import get_available_tools
+        from ...workflow_engine.tool_registry import (
+            get_available_tools,
+            validate_agent_binding_spec,
+        )
 
         available_tools = get_available_tools(require_available=True)
-        preferred_order = (
-            "traex",
-            "claude",
-            "codex",
-            "grok",
-            "dsh",
-            "agy",
-            "aiden",
-            "gemini",
-            "coco",
-        )
-        selected_names = [t for t in preferred_order if t in available_tools][:3]
-        if not selected_names:
-            selected_names = list(available_tools)[:3]
-        if not selected_names:
-            if admission_owner is not None:
-                admission_owner.done_event.set()
-                release_owner = getattr(engine, "release_lifecycle_owner", None)
-                if callable(release_owner):
-                    release_owner(admission_owner)
-            self._reply_workflow_error(
-                message_id,
-                "invalid_state",
-                detail="当前环境未检测到可执行的 Workflow 工具。",
-            )
-            return
+        resolved_preset = preset_id
+        agent_pool: tuple[WorkflowAgentBinding, ...] = ()
+        orchestrator_binding: WorkflowAgentBinding | None = None
+        orchestrator_was_auto = True
 
-        agent_pool = freeze_agent_pool(
-            WorkflowAgentBinding(
-                agent_id=f"A{idx}",
-                tool_name=name,
-                model_name=None,
-                display_name=str(available_tools[name] or name),
+        if override_pool:
+            valid_override: list[WorkflowAgentBinding] = []
+            for binding in override_pool:
+                ok_b, err_b = validate_agent_binding_spec(
+                    binding.tool_name,
+                    model_name=binding.model_name,
+                    profile=binding.profile,
+                    effort=binding.effort,
+                    available_tools=available_tools,
+                )
+                if not ok_b:
+                    if admission_owner is not None:
+                        admission_owner.done_event.set()
+                        release_owner = getattr(engine, "release_lifecycle_owner", None)
+                        if callable(release_owner):
+                            release_owner(admission_owner)
+                    self._reply_workflow_error(
+                        message_id,
+                        "invalid_argument",
+                        detail=f"{binding.agent_id}: {err_b or '工具或参数不可用'}",
+                    )
+                    return
+                valid_override.append(binding)
+            try:
+                agent_pool = freeze_agent_pool(valid_override, require_nonempty=True)
+            except ValueError as exc:
+                if admission_owner is not None:
+                    admission_owner.done_event.set()
+                    release_owner = getattr(engine, "release_lifecycle_owner", None)
+                    if callable(release_owner):
+                        release_owner(admission_owner)
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_argument",
+                    detail=str(exc),
+                )
+                return
+            if override_orchestrator_id:
+                orchestrator_binding = next(
+                    (b for b in agent_pool if b.agent_id == override_orchestrator_id),
+                    None,
+                )
+            if orchestrator_binding is None:
+                orchestrator_binding = select_auto_orchestrator(agent_pool)
+            else:
+                orchestrator_was_auto = False
+        else:
+            saved_cfg = get_project_workflow_team_config(project, chat_id)
+            if saved_cfg:
+                raw_bindings = saved_cfg.get("bindings") or []
+                valid_saved: list[WorkflowAgentBinding] = []
+                for item in raw_bindings:
+                    b = WorkflowAgentBinding.from_dict(item)
+                    if b is None:
+                        continue
+                    ok_b, _ = validate_agent_binding_spec(
+                        b.tool_name,
+                        model_name=b.model_name,
+                        profile=b.profile,
+                        effort=b.effort,
+                        available_tools=available_tools,
+                    )
+                    if ok_b:
+                        valid_saved.append(b)
+                if valid_saved:
+                    agent_pool = freeze_agent_pool(valid_saved, require_nonempty=True)
+                    saved_orch_id = str(saved_cfg.get("orchestrator_agent_id") or "").strip()
+                    orchestrator_binding = next(
+                        (b for b in agent_pool if b.agent_id == saved_orch_id),
+                        None,
+                    )
+                    if orchestrator_binding is None:
+                        orchestrator_binding = select_auto_orchestrator(agent_pool)
+                    else:
+                        orchestrator_was_auto = False
+                    if resolved_preset is None:
+                        resolved_preset = str(saved_cfg.get("preset_id") or "").strip() or None
+
+        if not agent_pool:
+            preferred_order = (
+                "traex",
+                "claude",
+                "codex",
+                "grok",
+                "dsh",
+                "agy",
+                "aiden",
+                "gemini",
+                "coco",
             )
-            for idx, name in enumerate(selected_names, start=1)
-        )
-        orchestrator_binding = select_auto_orchestrator(agent_pool)
+            selected_names = [t for t in preferred_order if t in available_tools][:3]
+            if not selected_names:
+                selected_names = list(available_tools)[:3]
+            if not selected_names:
+                if admission_owner is not None:
+                    admission_owner.done_event.set()
+                    release_owner = getattr(engine, "release_lifecycle_owner", None)
+                    if callable(release_owner):
+                        release_owner(admission_owner)
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_state",
+                    detail="当前环境未检测到可执行的 Workflow 工具。",
+                )
+                return
+
+            agent_pool = freeze_agent_pool(
+                WorkflowAgentBinding(
+                    agent_id=f"A{idx}",
+                    tool_name=name,
+                    model_name=None,
+                    display_name=str(available_tools[name] or name),
+                )
+                for idx, name in enumerate(selected_names, start=1)
+            )
+            orchestrator_binding = select_auto_orchestrator(agent_pool)
+            orchestrator_was_auto = True
+
+        assert orchestrator_binding is not None
         initiator_user_id = get_current_sender_id() or ""
         workflow_project_id = uuid.uuid4().hex
         selected_tools = [binding.tool_name for binding in agent_pool]
+        effective_orch_model = (
+            orchestrator_binding.effective_model_name()
+            or orchestrator_binding.model_name
+        )
 
         with engine._lock:
             wf_project = engine.project
@@ -445,6 +621,7 @@ class WorkflowHandler(
                 chat_id=chat_id,
                 project_id=workflow_project_id,
                 root_path=root_path,
+                source_script_path=self._new_workflow_script_path(root_path),
             )
             engine._script_generation_owner = generation_owner
             wf_project.pending = PendingWorkflow(
@@ -458,17 +635,26 @@ class WorkflowHandler(
                     tool_name=orchestrator_binding.tool_name,
                     display_name=orchestrator_binding.display_name,
                     agent_type=orchestrator_binding.tool_name,
-                    model_name=orchestrator_binding.model_name,
+                    model_name=effective_orch_model,
                     model_display_name=orchestrator_binding.model_name,
-                    use_default_model=(orchestrator_binding.model_name is None),
+                    use_default_model=(
+                        orchestrator_binding.model_name is None
+                        and orchestrator_binding.effort is None
+                        and orchestrator_binding.profile is None
+                    ),
                 ),
                 review_agents=[],
                 auto_reviewer=True,
                 agent_pool=agent_pool,
                 orchestrator_agent_id=orchestrator_binding.agent_id,
-                orchestrator_was_auto=True,
+                orchestrator_was_auto=orchestrator_was_auto,
                 project_id=workflow_project_id,
+                preset_id=resolved_preset,
             )
+            clear_renderer = getattr(engine, "clear_stale_renderer_for_generation", None)
+            if callable(clear_renderer):
+                clear_renderer()
+            engine._renderer_wf = None
             wf_project.status = WorkflowStatus.GENERATING_SCRIPT
 
         if admission_owner is not None:
@@ -487,7 +673,9 @@ class WorkflowHandler(
                 requirement=requirement,
                 agent_pool=agent_pool,
                 orchestrator_agent_id=orchestrator_binding.agent_id,
-                orchestrator_was_auto=True,
+                orchestrator_was_auto=orchestrator_was_auto,
+                chat_id=chat_id,
+                project_id=(project.project_id if project else workflow_project_id),
             )
             with generation_owner.delivery_lock:
                 generation_card_id = self._replace_or_send_workflow_rendered_card(
@@ -737,6 +925,8 @@ class WorkflowHandler(
         current_activity: str | None = None,
         elapsed_seconds: int = 0,
         terminal_status: str | None = None,
+        chat_id: str = "",
+        project_id: str = "",
     ) -> dict[str, Any]:
         from ...workflow_engine.renderer import WorkflowGenerationRenderer
 
@@ -745,6 +935,8 @@ class WorkflowHandler(
             agent_pool=agent_pool,
             orchestrator_agent_id=orchestrator_agent_id,
             orchestrator_was_auto=orchestrator_was_auto,
+            chat_id=chat_id,
+            project_id=project_id,
         ).render(
             current_activity=current_activity,
             elapsed_seconds=elapsed_seconds,
@@ -771,13 +963,43 @@ class WorkflowHandler(
     # Status
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _live_workflow_card_message_id(engine: Any) -> str | None:
+        from ...workflow_engine.models import WorkflowStatus
+
+        def _pick_card_id() -> str | None:
+            wf_project = getattr(engine, "project", None) or getattr(
+                engine, "workflow_project", None
+            )
+            if getattr(wf_project, "status", None) == WorkflowStatus.GENERATING_SCRIPT:
+                owner = vars(engine).get("_script_generation_owner")
+                card_id = getattr(owner, "card_message_id", None)
+                if isinstance(card_id, str) and card_id:
+                    return card_id
+                return None
+            for attr in ("_workflow_start_owner", "_script_generation_owner"):
+                owner = vars(engine).get(attr)
+                card_id = getattr(owner, "card_message_id", None)
+                if isinstance(card_id, str) and card_id:
+                    return card_id
+            return None
+
+        lock = getattr(engine, "_lock", None)
+        if lock is not None:
+            with lock:
+                return _pick_card_id()
+        return _pick_card_id()
+
     def show_workflow_status(
         self,
         message_id: str,
         chat_id: str,
         project: Optional["ProjectContext"] = None,
     ) -> None:
-        """Show current workflow progress."""
+        """Show current workflow progress, patching the live card without spamming duplicates."""
+        from ...workflow_engine.models import WorkflowStatus
+        from .workflow_card_pages import _without_page_key
+
         root_path = self._get_root_path(chat_id, project)
         engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
 
@@ -785,17 +1007,107 @@ class WorkflowHandler(
             self.reply_text(message_id, "当前没有 Workflow 任务。")
             return
 
+        wf_project = None
+        lock = getattr(engine, "_lock", None)
+        if lock is not None:
+            with lock:
+                wf_project = getattr(engine, "project", None) or getattr(
+                    engine, "workflow_project", None
+                )
+        else:
+            wf_project = getattr(engine, "project", None) or getattr(
+                engine, "workflow_project", None
+            )
+
+        live_card_id = self._live_workflow_card_message_id(engine)
+        project_id = getattr(project, "project_id", "") or ""
+
+        if getattr(wf_project, "status", None) == WorkflowStatus.GENERATING_SCRIPT:
+            pending = getattr(wf_project, "pending", None)
+            req = (
+                (getattr(pending, "requirement", None) if pending is not None else None)
+                or getattr(wf_project, "requirement", "")
+                or ""
+            )
+            pool = tuple(getattr(pending, "agent_pool", ()) or ()) if pending is not None else ()
+            orch_id = (getattr(pending, "orchestrator_agent_id", None) if pending is not None else None) or ""
+            orch_auto = bool(getattr(pending, "orchestrator_was_auto", False)) if pending is not None else False
+            created_at = getattr(pending, "created_at", None) if pending is not None else None
+            elapsed_seconds = (
+                max(0, int(time.time() - created_at))
+                if isinstance(created_at, (int, float))
+                else 0
+            )
+            gen_status_text = (
+                f"⏳ Workflow 正在生成编排脚本…（已耗时 {elapsed_seconds}s）"
+                if elapsed_seconds > 0
+                else "⏳ Workflow 正在生成编排脚本…"
+            )
+            if live_card_id:
+                gen_card_data = self._workflow_generation_card_data(
+                    requirement=req,
+                    agent_pool=pool,
+                    orchestrator_agent_id=orch_id,
+                    orchestrator_was_auto=orch_auto,
+                    current_activity="正在生成并验证 Workflow 编排脚本…",
+                    elapsed_seconds=elapsed_seconds,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                )
+                origin_message_id = self._resolve_origin(message_id)
+                delivered = self._replace_or_send_workflow_rendered_card(
+                    card_message_id=live_card_id,
+                    chat_id=chat_id,
+                    card_data=gen_card_data,
+                    origin_message_id=origin_message_id,
+                    fallback_to_new=False,
+                )
+                if not delivered:
+                    self.reply_text(message_id, gen_status_text)
+                return
+            self.reply_text(message_id, gen_status_text)
+            return
+
         status_text = engine.get_status_text()
         card_pages = engine.get_progress_cards()
+        is_running = self._workflow_is_running_for_card(chat_id, project)
 
         if card_pages:
             origin_message_id = self._resolve_origin(message_id)
+            if live_card_id:
+                primary_page = _without_page_key(card_pages[0])
+                if is_running:
+                    self._inject_workflow_stop_button(
+                        primary_page,
+                        chat_id,
+                        project_id,
+                        is_running=True,
+                    )
+                delivered = self._replace_or_send_workflow_rendered_card(
+                    card_message_id=live_card_id,
+                    chat_id=chat_id,
+                    card_data=primary_page,
+                    origin_message_id=origin_message_id,
+                    fallback_to_new=False,
+                )
+                if not delivered:
+                    self.reply_text(message_id, status_text)
+                return
+
+            if getattr(wf_project, "status", None) in {
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.CANCELLED,
+            }:
+                self.reply_text(message_id, status_text)
+                return
+
             failed_pages: list[int] = []
             for page_index, card_data in enumerate(card_pages):
                 delivered = self._replace_or_send_workflow_rendered_card(
                     card_message_id=None,
                     chat_id=chat_id,
-                    card_data=card_data,
+                    card_data=_without_page_key(card_data),
                     origin_message_id=origin_message_id,
                 )
                 if not delivered:
@@ -806,75 +1118,24 @@ class WorkflowHandler(
                     message_id,
                     f"Workflow 结果页重投仍不完整（失败页：{pages}），可再次发送 `/wf_status` 重试。",
                 )
-        else:
-            self.reply_text(message_id, status_text)
+            return
 
-    def show_workflow_help(self, message_id: str) -> None:
-        """Show the Workflow usage guide as a structured Feishu card."""
-        from ...card.builders.core import CoreBuilder
-        from ...card.themes import PANEL_STYLES
+        self.reply_text(message_id, status_text)
 
-        # Pull the authoritative Node-version text so the full help keeps the
-        # same contract as engine.run_workflow() and the card-entry messages.
+    def show_workflow_help(
+        self,
+        message_id: str,
+        chat_id: str = "",
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Show the Workflow usage guide as a structured Card JSON 2.0 card."""
+        from ...card.builders.workflow import build_workflow_help_card
         from ...workflow_engine.engine import _node_version_required_text
 
-        sections = [
-            (
-                "📚 命令列表",
-                "`/wf <需求描述>`（`/workflow`） · 自动绑定推荐 Agent Pool 并启动编排\n"
-                "`/wf_status`（`/workflow_status`） · 查看当前 Workflow 进度\n"
-                "`/wf_help`（`/workflow_help`） · 显示本帮助\n"
-                "`/stop_wf`（`/stop_workflow`） · 停止正在执行的 Workflow",
-            ),
-            (
-                "🧭 执行流程",
-                "**① 自动绑定** · 自动选取可用推荐工具构建 1–8 个 `tool+model` Agent Pool 并锁定主编排器\n"
-                "**② 自动推进** · 绑定后全自动生成、验证并执行脚本，无需手动确认或批准继续",
-            ),
-            (
-                "✨ 核心能力",
-                "• 多工具并行调度（coco / claude / aiden / codex / gemini / traex / grok / dsh / agy）\n"
-                "• 工具 Agent 可继续拆分 subagent 并行工作\n"
-                "• Agent 按任务动态规划角色分工\n"
-                "• Journal 缓存避免重复执行\n"
-                "• 子任务自动拆分与依赖编排\n"
-            ),
-        ]
-
-        elements = [
-            {
-                "tag": "markdown",
-                "content": "Workflow 通过 AI 编排脚本，将复杂需求拆解为多阶段、多 Agent 协同任务。",
-            },
-            {
-                "tag": "markdown",
-                "content": f"**运行要求**\n{_node_version_required_text()}",
-            },
-            {"tag": "hr"},
-        ]
-        for index, (title, body) in enumerate(sections):
-            elements.append(
-                {
-                    "tag": "collapsible_panel",
-                    "expanded": index == 0,
-                    "header": {
-                        "title": {"tag": "markdown", "content": f"**{title}**"},
-                        "vertical_align": "center",
-                    },
-                    "border": {
-                        "color": PANEL_STYLES["border_normal"],
-                        "corner_radius": PANEL_STYLES["corner_radius"],
-                    },
-                    "vertical_spacing": PANEL_STYLES["vertical_spacing"],
-                    "padding": PANEL_STYLES["padding_standard"],
-                    "elements": [{"tag": "markdown", "content": body}],
-                }
-            )
-
-        card = CoreBuilder._wrap_card(
-            header_title="⚡ Workflow 使用帮助",
-            header_template="turquoise",
-            elements=elements,
+        card = build_workflow_help_card(
+            node_requirement_text=_node_version_required_text(),
+            project_id=(project.project_id if project else None),
+            chat_id=chat_id,
         )
         self.reply_card(message_id, card)
 

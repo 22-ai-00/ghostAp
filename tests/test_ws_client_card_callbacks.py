@@ -514,3 +514,65 @@ def test_rejected_cross_chat_callback_cannot_rewrite_trusted_provenance(
         assert mock_ws_client._message_linker.query("msg_origin")["chat_id"] == "chat_dm"
 
     mock_ws_client._get_api_client.assert_not_called()
+
+
+def test_wf_config_sync_callback_operational_error_returns_toast_and_resets_context(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.card.actions import dispatch as action_ids
+    from src.thread import get_current_sender_id, get_current_thread_id
+
+    wf_handler = MagicMock()
+    wf_handler.handle_workflow_config_callback_sync.side_effect = RuntimeError("store offline")
+    mock_ws_client._handler_ctx.handlers["workflow"] = wf_handler
+    mock_ws_client._chat_lock_gate.check_card_action = MagicMock(return_value=False)
+
+    data = _card_action_data(
+        event_id="evt_wf_sync_err",
+        message_id="msg_wf_card",
+        chat_id="chat_wf",
+        operator_id="ou_admin",
+    )
+    data.event.action.value = {
+        "action": action_ids.WF_SAVE_TEAM,
+        "chat_id": "chat_wf",
+        "project_id": "proj_wf",
+    }
+
+    resp = mock_ws_client._handle_card_action(data)
+
+    assert resp.toast.type == "error"
+    assert "配置更新失败" in resp.toast.content
+    assert "store offline" in resp.toast.content
+    assert get_current_thread_id() is None
+    assert get_current_sender_id() is None
+
+
+def test_wf_config_sync_callback_programming_bug_propagates(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.card.actions import dispatch as action_ids
+    from src.thread import get_current_sender_id, get_current_thread_id
+
+    wf_handler = MagicMock()
+    wf_handler.handle_workflow_config_callback_sync.side_effect = ZeroDivisionError("bug")
+    mock_ws_client._handler_ctx.handlers["workflow"] = wf_handler
+    mock_ws_client._chat_lock_gate.check_card_action = MagicMock(return_value=False)
+
+    data = _card_action_data(
+        event_id="evt_wf_sync_bug",
+        message_id="msg_wf_card_bug",
+        chat_id="chat_wf",
+        operator_id="ou_admin",
+    )
+    data.event.action.value = {
+        "action": action_ids.WF_SAVE_TEAM,
+        "chat_id": "chat_wf",
+        "project_id": "proj_wf",
+    }
+
+    with pytest.raises(ZeroDivisionError, match="bug"):
+        mock_ws_client._handle_card_action(data)
+
+    assert get_current_thread_id() is None
+    assert get_current_sender_id() is None

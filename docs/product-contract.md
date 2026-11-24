@@ -23,6 +23,10 @@ environment.
   1-8 `tool+model` Agents and freezes the pool and orchestrator immediately;
   script generation, validation and execution advance automatically without any
   confirmation or continuation gate.
+- Users may configure per-chat/project Teamwork presets (`collaborative`,
+  `quick`, `review_team`, `deep_collab`, `auto`, `custom`) and per-member
+  `tool + model + profile + effort + role` bindings via `/wf` (no args) or
+  `/wf_config`, or override per run via `/wf [--preset <id>] <requirement>`.
 - Users retain explicit stop and configuration controls. Tool permissions and
   execution safety are delegated to the selected Agent backend.
 - The standalone Autonomous Manager and Employee Department surfaces are retired.

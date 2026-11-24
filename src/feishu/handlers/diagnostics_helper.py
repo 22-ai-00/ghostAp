@@ -77,8 +77,15 @@ class DiagnosticsHelper:
                     done_phases = sum(
                         1
                         for ph in phases
-                        if getattr(getattr(ph, "status", None), "value", getattr(ph, "status", ""))
-                        == "completed"
+                        if (
+                            getattr(ph, "finished_at", None) is not None
+                            or getattr(
+                                getattr(ph, "status", None),
+                                "value",
+                                getattr(ph, "status", ""),
+                            )
+                            == "completed"
+                        )
                     )
                     parts = [status_val]
                     if phases:

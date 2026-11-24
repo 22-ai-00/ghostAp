@@ -304,36 +304,69 @@ def _retired_status_page(
     }
 
 
+def _is_stop_button_node(node: dict[str, Any]) -> bool:
+    if node.get("tag") != "button":
+        return False
+    value = node.get("value")
+    if isinstance(value, dict) and value.get("action") == _STOP_ACTION:
+        return True
+    behaviors = node.get("behaviors")
+    if isinstance(behaviors, list):
+        for beh in behaviors:
+            if (
+                isinstance(beh, dict)
+                and isinstance(beh.get("value"), dict)
+                and beh["value"].get("action") == _STOP_ACTION
+            ):
+                return True
+    return False
+
+
 def _without_stop_actions(card: dict[str, Any]) -> dict[str, Any]:
-    cleaned = _clean_node(copy.deepcopy(card))
+    cleaned, _ = _clean_node(copy.deepcopy(card))
     return cleaned if isinstance(cleaned, dict) else {}
 
 
-def _clean_node(node: Any) -> Any:
+def _clean_node(node: Any) -> tuple[Any, bool]:
     if isinstance(node, list):
-        cleaned_items = []
+        cleaned_items: list[Any] = []
+        removed_any = False
         for item in node:
-            cleaned = _clean_node(item)
+            cleaned, removed = _clean_node(item)
+            if removed:
+                removed_any = True
             if cleaned is not None:
                 cleaned_items.append(cleaned)
-        return cleaned_items
+            elif (
+                removed
+                and cleaned_items
+                and isinstance(cleaned_items[-1], dict)
+                and cleaned_items[-1].get("tag") == "hr"
+            ):
+                # Remove the dangling divider immediately preceding a pruned stop row.
+                cleaned_items.pop()
+        return cleaned_items, removed_any
 
     if not isinstance(node, dict):
-        return node
+        return node, False
 
-    value = node.get("value")
-    if (
-        node.get("tag") == "button"
-        and isinstance(value, dict)
-        and value.get("action") == _STOP_ACTION
-    ):
-        return None
+    if _is_stop_button_node(node):
+        return None, True
 
-    cleaned_node = {
-        key: cleaned
-        for key, raw_value in node.items()
-        if (cleaned := _clean_node(raw_value)) is not None
-    }
-    if cleaned_node.get("tag") == "action" and not cleaned_node.get("actions"):
-        return None
-    return cleaned_node
+    cleaned_node: dict[str, Any] = {}
+    removed_child = False
+    for key, raw_value in node.items():
+        cleaned, removed = _clean_node(raw_value)
+        if removed:
+            removed_child = True
+        if cleaned is not None:
+            cleaned_node[key] = cleaned
+
+    tag = cleaned_node.get("tag")
+    if tag == "action" and not cleaned_node.get("actions"):
+        return None, True
+    if tag == "column" and not cleaned_node.get("elements"):
+        return None, True
+    if tag == "column_set" and not cleaned_node.get("columns"):
+        return None, True
+    return cleaned_node, removed_child

@@ -48,6 +48,11 @@ from ..access_control import (
 from ..acp.manager import ACPSessionManager
 from ..acp.telemetry import build_idle_health_config_for_manager
 from ..agent.intent_recognizer import IntentRecognizer
+from ..card.actions.dispatch import (
+    WF_CONFIG_ACTIONS,
+    WF_START_WORKFLOW,
+    WORKFLOW_STOP_RUNNING,
+)
 from ..card.ui_text import UI_TEXT
 from ..config import get_settings
 from ..config.env_file_store import AtomicEnvFileStore
@@ -70,6 +75,12 @@ from ..tasking import (
 from ..thread import (
     get_current_tenant_key,
     get_thread_manager,
+    set_current_is_p2p,
+    set_current_sender_id,
+    set_current_sender_name,
+    set_current_sender_union_id,
+    set_current_tenant_key,
+    set_current_thread_id,
 )
 from ..trust.models import TrustZone
 from ..trust.registry import ManagedGroupRegistry, single_owner_id
@@ -99,6 +110,8 @@ from .message_cache import MessageCache
 from .slash_command_parser import SlashCommandParser
 from .ws_card_action_handler import (
     CardActionInspector,
+    _extract_behavior_value,
+    bind_managed_trust_revisions,
     classify_card_action_error,
 )
 from .ws_card_pipeline import (
@@ -1749,6 +1762,130 @@ class FeishuWSClient(
 
         is_system = CardActionInspector.is_system_action(data.event.action)
 
+        if (
+            action_type_preview in WF_CONFIG_ACTIONS
+            and action_type_preview != WF_START_WORKFLOW
+        ):
+            if not self._current_trust_can_dispatch(effective_trust):
+                return empty_card_action_response()
+            if self._chat_lock_gate.check_card_action(
+                open_chat_id,
+                operator_id,
+                open_message_id,
+                action_type=action_type_preview,
+            ):
+                return empty_card_action_response()
+            wf_handler = self._handler_ctx.handlers.get("workflow")
+            sync_fn = (
+                getattr(wf_handler, "handle_workflow_config_callback_sync", None)
+                if wf_handler is not None
+                else None
+            )
+            if callable(sync_fn):
+                action_obj = data.event.action
+                value_raw = getattr(action_obj, "value", None)
+                behaviors = getattr(action_obj, "behaviors", None)
+                if isinstance(behaviors, list) and behaviors:
+                    behavior_value = _extract_behavior_value(behaviors[0])
+                    if behavior_value is not None:
+                        value_raw = behavior_value
+                if isinstance(value_raw, dict):
+                    sync_value = dict(value_raw)
+                elif isinstance(value_raw, str):
+                    try:
+                        parsed_val = json.loads(value_raw)
+                        sync_value = (
+                            parsed_val
+                            if isinstance(parsed_val, dict)
+                            else {"action": value_raw}
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        sync_value = {"action": value_raw}
+                else:
+                    sync_value = {"action": str(value_raw)}
+                for attr, key in (
+                    ("option", "_option"),
+                    ("options", "_options"),
+                    ("form_value", "_form_value"),
+                    ("input_value", "_input_value"),
+                ):
+                    extra_val = getattr(action_obj, attr, None)
+                    if extra_val is not None:
+                        sync_value[key] = extra_val
+                if project_id:
+                    sync_value["project_id"] = project_id
+
+                set_current_thread_id(None)
+                try:
+                    set_current_sender_id(operator_id)
+                    set_current_sender_union_id(operator_union_id or None)
+                    set_current_sender_name(operator_id[:8] if operator_id else "")
+                    set_current_is_p2p(card_is_p2p)
+                    set_current_tenant_key(tenant_key or None)
+                    card_thread_id = sync_value.get("thread_root_id")
+                    if (
+                        isinstance(card_thread_id, str)
+                        and card_thread_id
+                        and self.settings.thread_programming_enabled
+                    ):
+                        thread_ctx = self._thread_manager.get(card_thread_id)
+                        if (
+                            thread_ctx is not None
+                            and thread_ctx.chat_id == open_chat_id
+                            and thread_ctx.project_id == (project_id or "")
+                        ):
+                            set_current_thread_id(thread_ctx.thread_root_id)
+                    with TraceContext(request_id):
+                        updated_card, toast_type, toast_content = sync_fn(
+                            open_message_id,
+                            open_chat_id,
+                            project_id,
+                            sync_value,
+                        )
+                except (
+                    AttributeError,
+                    KeyError,
+                    OSError,
+                    RuntimeError,
+                    TimeoutError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    classification = classify_card_action_error(exc, phase="dispatch")
+                    logger.error(
+                        "Workflow 配置卡片同步回调失败 (action=%s): %s",
+                        classification.action.value,
+                        exc,
+                        exc_info=True,
+                    )
+                    return build_card_action_response(
+                        toast_type="error",
+                        toast_content=f"配置更新失败: {get_error_detail(exc)}"[:120],
+                    )
+                finally:
+                    set_current_thread_id(None)
+                    set_current_sender_id(None)
+                    set_current_sender_union_id(None)
+                    set_current_sender_name("")
+                    set_current_is_p2p(False)
+                    set_current_tenant_key(None)
+
+                if (
+                    updated_card is not None
+                    and effective_trust is not None
+                    and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+                ):
+                    updated_card = bind_managed_trust_revisions(
+                        updated_card,
+                        group_revision=effective_trust.group_revision,
+                        grant_revision=effective_trust.grant_revision,
+                    )
+                return build_card_action_response(
+                    toast_type=toast_type,
+                    toast_content=toast_content,
+                    card=updated_card,
+                )
+
         with TraceContext(request_id):
             spec = TaskSpec(
                 chat_id=open_chat_id,
@@ -1779,6 +1916,16 @@ class FeishuWSClient(
                 logger.debug(
                     "link_task失败(card_action): origin=%s, run_id=%s, err=%s", origin_message_id, handle.run_id, e
                 )
+        if action_type_preview == WF_START_WORKFLOW:
+            return build_card_action_response(
+                toast_type="info",
+                toast_content="正在启动 Workflow…",
+            )
+        if action_type_preview == WORKFLOW_STOP_RUNNING:
+            return build_card_action_response(
+                toast_type="info",
+                toast_content="正在停止 Workflow…",
+            )
         return empty_card_action_response()
 
 

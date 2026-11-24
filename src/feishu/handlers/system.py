@@ -1005,12 +1005,15 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         if wf_mgr is not None and wf_handler is not None and callable(getattr(wf_mgr, "get", None)):
             root_path = project.root_path if project else self.get_working_dir(chat_id)
             wf_engine = wf_mgr.get(chat_id, root_path)
-            if wf_engine is not None and getattr(getattr(wf_engine, "status", None), "value", None) not in {
-                "completed",
-                "failed",
-                "cancelled",
-                None,
-            }:
+            wf_project = (
+                getattr(wf_engine, "workflow_project", None)
+                or getattr(wf_engine, "project", None)
+            )
+            wf_status = getattr(getattr(wf_project, "status", None), "value", None)
+            if wf_engine is not None and (
+                getattr(wf_engine, "is_running", False) is True
+                or wf_status not in {"idle", "completed", "failed", "cancelled", None}
+            ):
                 wf_handler.stop_workflow(message_id, chat_id, project)
                 return
 

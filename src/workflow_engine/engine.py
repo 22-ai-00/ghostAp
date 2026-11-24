@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from typing import Any, Callable, Optional
 from src.card.events import CardEvent, CardEventType
 
 from ..engine_base import BaseEngine, EngineRunState
+from .agent_pool import resolve_effective_model_name
 from .bridge import RuntimeBridge
 from .constants import (
     DEFAULT_MAX_CONCURRENT,
@@ -150,6 +152,60 @@ def _agent_card_result_text(result: AgentCallResult) -> str:
         raw = json.dumps(result.parsed, ensure_ascii=False, default=str)
     text = _strip_internal_details(str(raw or ""))
     return text.replace("\x00", "").strip()
+
+
+_REVIEWER_ROLES = frozenset(
+    {"reviewer", "verifier", "adversarial_verifier", "auditor", "judge"}
+)
+
+
+def _is_reviewer_role(role: str | None) -> bool:
+    normalized = str(role or "").strip().lower()
+    return normalized in _REVIEWER_ROLES or normalized.startswith("verifier-")
+
+
+def _binding_roles(binding: Any) -> set[str]:
+    roles: set[str] = set()
+    primary = str(getattr(binding, "role", None) or "").strip().lower()
+    if primary:
+        roles.add(primary)
+    for item in getattr(binding, "roles", ()) or ():
+        text = str(item or "").strip().lower()
+        if text:
+            roles.add(text)
+    return roles
+
+
+def _is_startup_or_breaker_error(error: str | None) -> bool:
+    lowered = str(error or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "circuit breaker:",
+            "acpstartuperror",
+            "session creation",
+            "binary missing",
+            "failed to start",
+        )
+    )
+
+
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +827,7 @@ class WorkflowEngine(BaseEngine):
                     and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
                 ):
                     raise RuntimeError("Workflow cancelled")
+                artifact_dir = os.path.join(self._state_dir(), "artifacts", workflow_id)
                 self._bridge = RuntimeBridge(
                     script_path=script_path,
                     cwd=self.root_path,
@@ -782,6 +839,9 @@ class WorkflowEngine(BaseEngine):
                     cancel_event=self._cancel_event,
                     allowed_tools=selected_tools,
                     workflow_deadline_monotonic=run_spec.deadline,
+                    artifact_dir=artifact_dir,
+                    agent_pool=[b.to_dict() for b in run_spec.agent_pool],
+                    orchestrator_agent_id=run_spec.orchestrator_agent_id,
                 )
                 bridge = self._bridge
 
@@ -1095,81 +1155,99 @@ class WorkflowEngine(BaseEngine):
     # Bridge callbacks
     # ------------------------------------------------------------------
 
-    def _handle_agent_call(
+    def _build_auto_fallback_bindings(
+        self,
+        run_spec: WorkflowRunSpec,
+        primary_binding: Any,
+        *,
+        requested_role: str | None,
+        attempted_ids: set[str],
+        explicit_timeout: bool,
+    ) -> list[Any]:
+        """Select safe pool-only fallback candidates on startup/circuit-breaker failures."""
+        primary_roles = _binding_roles(primary_binding)
+        normalized_requested = str(requested_role or "").strip().lower()
+        is_reviewer = _is_reviewer_role(normalized_requested) or (
+            not normalized_requested and any(_is_reviewer_role(r) for r in primary_roles)
+        )
+        target_roles = {normalized_requested} if normalized_requested else primary_roles
+        candidates: list[tuple[int, int, Any]] = []
+        for idx, binding in enumerate(run_spec.agent_pool):
+            if binding.agent_id in attempted_ids:
+                continue
+            roles = _binding_roles(binding)
+            if is_reviewer:
+                # Never auto-fallback a reviewer/verifier onto a non-reviewer worker.
+                if not any(_is_reviewer_role(r) for r in roles):
+                    continue
+            probe_params = self._params_for_binding(
+                AgentCallParams(prompt="", agent_id=binding.agent_id),
+                binding,
+                run_spec,
+                explicit_timeout=explicit_timeout,
+            )
+            if callable(getattr(self._executor, "is_blacklisted", None)) and self._executor.is_blacklisted(probe_params):
+                continue
+            role_match = 0 if (target_roles and bool(target_roles & roles)) else 1
+            non_reviewer_bonus = 0 if (not is_reviewer and not any(_is_reviewer_role(r) for r in roles)) else 1
+            candidates.append((role_match * 10 + non_reviewer_bonus, idx, binding))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in candidates]
+
+    @staticmethod
+    def _params_for_binding(
+        base_params: AgentCallParams,
+        binding: Any,
+        run_spec: WorkflowRunSpec,
+        *,
+        explicit_timeout: bool = False,
+    ) -> AgentCallParams:
+        updated = base_params.model_copy(deep=True)
+        updated.agent_id = binding.agent_id
+        updated.tool = binding.tool_name
+        updated.model = binding.model_name
+        updated.profile = binding.profile
+        updated.effort = binding.effort
+        spec_effective = (
+            run_spec.binding_specs.get(binding.agent_id) or {}
+        ).get("effective_model")
+        updated.effective_model = spec_effective or binding.effective_model_name()
+        if not updated.role:
+            binding_role = getattr(binding, "role", None)
+            if binding_role:
+                updated.role = binding_role
+            else:
+                binding_roles = getattr(binding, "roles", ()) or ()
+                if len(binding_roles) == 1:
+                    updated.role = binding_roles[0]
+        del explicit_timeout
+        return updated
+
+    def _is_call_cancelled(
+        self,
+        result: AgentCallResult | None,
+        per_call_cancel: threading.Event | None,
+    ) -> bool:
+        if self._cancel_event.is_set():
+            return True
+        if per_call_cancel is not None and per_call_cancel.is_set():
+            return True
+        if result is not None and str(getattr(result, "stop_reason", "") or "").lower() == "cancelled":
+            return True
+        return False
+
+    def _execute_single_candidate(
         self,
         params: AgentCallParams,
         *,
-        cancel_event=None,
-        request_id=None,
-        deadline_monotonic: float | None = None,
-        allow_cache: bool = True,
+        count: int,
+        cancel_event: Any,
+        request_id: Any,
+        effective_deadline: float | None,
+        allow_cache: bool,
+        explicit_timeout: bool,
     ) -> AgentCallResult:
-        """Handle an agent() call from the JS runtime.
-
-        Flow:
-            1. Safety fuse check (MAX_TOTAL_AGENTS)
-            2. Resolve bound agent identity from confirmed agent_pool
-            3. Journal cache lookup
-            4. Execute via AgentExecutor (creates one-shot session)
-            5. Store result in journal
-            6. Fire progress callbacks
-        """
-        # Work on a private copy: the bridge/test caller may retain its params,
-        # but the confirmed run binding is authoritative for execution.
-        params = params.model_copy(deep=True)
-        with self._lock:
-            self._agent_call_count += 1
-            count = self._agent_call_count
         label = params.label or f"agent-{count}"
-        run_spec = getattr(self, "_run_spec", None)
-        if run_spec is not None:
-            try:
-                binding = run_spec.agent_binding(params.agent_id)
-            except ValueError as exc:
-                return AgentCallResult(
-                    error=str(exc),
-                    agent_id=params.agent_id,
-                    tool=params.tool,
-                    model=params.model,
-                )
-            params.agent_id = binding.agent_id
-            params.tool = binding.tool_name
-            params.model = binding.model_name
-
-        effective_deadline = deadline_monotonic
-        if run_spec is not None and run_spec.deadline is not None:
-            effective_deadline = (
-                min(effective_deadline, run_spec.deadline)
-                if effective_deadline is not None
-                else run_spec.deadline
-            )
-
-        # Legacy direct callers still resolve from the complete adapted project.
-        if run_spec is None and not params.model and params.tool and self._project:
-            params.model = self._resolve_model_for_tool(params.tool)
-
-        # Safety fuse
-        call_budget = run_spec.budget if run_spec is not None else MAX_TOTAL_AGENTS
-        if count > call_budget:
-            error_msg = f"Agent call limit exceeded ({call_budget})"
-            logger.warning("[WorkflowEngine] %s", error_msg)
-            return AgentCallResult(
-                error=error_msg,
-                agent_id=params.agent_id,
-                tool=params.tool,
-                model=params.model,
-            )
-        if effective_deadline is not None and time.monotonic() >= effective_deadline:
-            error_msg = "Workflow deadline exhausted before agent execution"
-            logger.warning("[WorkflowEngine] %s", error_msg)
-            return AgentCallResult(
-                error=error_msg,
-                agent_id=params.agent_id,
-                tool=params.tool,
-                model=params.model,
-            )
-
-        # Extract a short task summary from the prompt (first meaningful line, max 60 chars)
         task_summary = ""
         if params.prompt:
             for line in params.prompt.strip().splitlines():
@@ -1180,7 +1258,6 @@ class WorkflowEngine(BaseEngine):
                         task_summary += "..."
                     break
 
-        # Register agent in state manager
         if self._state_manager:
             label = self._state_manager.on_agent_started(
                 label,
@@ -1190,13 +1267,12 @@ class WorkflowEngine(BaseEngine):
                 model=params.model,
                 role=params.role,
                 agent_id=params.agent_id,
+                effort=params.effort,
+                profile=params.profile,
+                effective_model=params.effective_model,
             )
-            # Event callbacks originate inside AgentExecutor and only carry
-            # params.label. Use the disambiguated UI label so activity from a
-            # repeated generated label cannot update an earlier agent row.
             params.label = label
 
-        # Track request_id → effective label for abort-by-request-id lookup
         if request_id is not None:
             with self._request_to_label_lock:
                 self._request_to_label[request_id] = label
@@ -1204,12 +1280,13 @@ class WorkflowEngine(BaseEngine):
         cache_key = WorkflowJournal.compute_key(
             params.prompt,
             params.tool,
-            params.model,
+            params.effective_model or params.model,
             role=params.role,
             output_schema=params.output_schema,
+            effort=params.effort,
+            profile=params.profile,
         )
 
-        # Tool whitelist enforcement
         project = self._project
         if project and project.selected_tools and params.tool:
             if params.tool not in project.selected_tools:
@@ -1222,14 +1299,30 @@ class WorkflowEngine(BaseEngine):
                     agent_id=params.agent_id,
                     tool=params.tool,
                     model=params.model,
+                    role=params.role,
+                    effort=params.effort,
+                    profile=params.profile,
+                    effective_model=params.effective_model,
                 )
 
-        # Fire agent start callbacks
         if self._callbacks and self._callbacks.on_agent_start:
-            self._callbacks.on_agent_start(label, params.tool)
+            if _accepts_kwarg(self._callbacks.on_agent_start, "meta"):
+                self._callbacks.on_agent_start(
+                    label,
+                    params.tool,
+                    meta={
+                        "agent_id": params.agent_id,
+                        "model": params.model,
+                        "role": params.role,
+                        "effort": params.effort,
+                        "profile": params.profile,
+                        "effective_model": params.effective_model,
+                    },
+                )
+            else:
+                self._callbacks.on_agent_start(label, params.tool)
         self._fire_progress()
 
-        # Journal cache lookup
         if allow_cache and self._journal:
             cached = self._journal.get_cached(cache_key)
             if cached is not None:
@@ -1238,12 +1331,16 @@ class WorkflowEngine(BaseEngine):
                     output=cached.output,
                     parsed=cached.parsed,
                     stop_reason=cached.stop_reason,
-                    token_usage=0,  # No tokens consumed on cache hit
+                    token_usage=0,
                     duration_s=0.0,
                     cached=True,
                     agent_id=params.agent_id,
                     tool=params.tool,
                     model=params.model,
+                    role=params.role,
+                    effort=params.effort,
+                    profile=params.profile,
+                    effective_model=params.effective_model,
                 )
                 if self._state_manager:
                     self._state_manager.on_agent_done(
@@ -1263,6 +1360,10 @@ class WorkflowEngine(BaseEngine):
                             "agent_id": params.agent_id,
                             "tool": params.tool,
                             "model": cached_result.model,
+                            "role": params.role,
+                            "effort": params.effort,
+                            "profile": params.profile,
+                            "effective_model": params.effective_model,
                             "token_usage": 0,
                             "duration_s": 0.0,
                             "cached": True,
@@ -1272,25 +1373,29 @@ class WorkflowEngine(BaseEngine):
                 self._fire_progress()
                 return cached_result
 
-        # Execute via AgentExecutor (pass per-call cancel event for race/tournament abort)
-        result = self._executor.execute(
-            params,
-            cancel_event=cancel_event,
-            deadline_monotonic=effective_deadline,
-        )
+        exec_kwargs: dict[str, Any] = {
+            "cancel_event": cancel_event,
+            "deadline_monotonic": effective_deadline,
+        }
+        if explicit_timeout and _accepts_kwarg(self._executor.execute, "explicit_timeout"):
+            exec_kwargs["explicit_timeout"] = True
+
+        result = self._executor.execute(params, **exec_kwargs)
         result = result.model_copy(
             update={
                 "agent_id": params.agent_id,
                 "tool": params.tool,
                 "model": params.model,
+                "role": params.role,
+                "effort": params.effort,
+                "profile": params.profile,
+                "effective_model": params.effective_model,
             }
         )
 
-        # Store in journal (only on success)
         if allow_cache and result.error is None and self._journal:
             self._journal.store(cache_key, result)
 
-        # Update state
         if self._state_manager:
             if result.error:
                 self._state_manager.on_agent_failed(
@@ -1311,16 +1416,16 @@ class WorkflowEngine(BaseEngine):
                     },
                 )
 
-        # Fire agent done callback — AC4: only meta info, no output body.
         if self._callbacks and self._callbacks.on_agent_done:
-            # Hand-rolled payload: deliberately excludes output/parsed
-            # so callers cannot leak intermediate results into the main
-            # agent context.
             payload = {
                 "label": label,
                 "agent_id": params.agent_id,
                 "tool": params.tool,
                 "model": result.model if result else None,
+                "role": params.role,
+                "effort": params.effort,
+                "profile": params.profile,
+                "effective_model": params.effective_model,
                 "token_usage": result.token_usage if result else 0,
                 "duration_s": result.duration_s if result else 0.0,
                 "cached": bool(result.cached) if result else False,
@@ -1330,6 +1435,290 @@ class WorkflowEngine(BaseEngine):
 
         self._fire_progress()
         return result
+
+    def _handle_agent_call(
+        self,
+        params: AgentCallParams,
+        *,
+        cancel_event=None,
+        request_id=None,
+        deadline_monotonic: float | None = None,
+        allow_cache: bool = True,
+        fallback_agent_ids: list[str] | tuple[str, ...] | None = None,
+        explicit_timeout: bool = False,
+    ) -> AgentCallResult:
+        """Handle an agent() call from the JS runtime with pool validation & fallback."""
+        params = params.model_copy(deep=True)
+        use_explicit_timeout = bool(
+            explicit_timeout or getattr(params, "explicit_timeout", False)
+        )
+
+        raw_fallbacks: list[str] = []
+        for source in (fallback_agent_ids, getattr(params, "fallback_agent_ids", None)):
+            if isinstance(source, (list, tuple)):
+                for item in source:
+                    text = str(item or "").strip()
+                    if text and text not in raw_fallbacks:
+                        raw_fallbacks.append(text)
+
+        run_spec = getattr(self, "_run_spec", None)
+        if run_spec is None and raw_fallbacks:
+            return AgentCallResult(
+                error="Workflow agent_pool is required to resolve fallbackAgentIds",
+                agent_id=params.agent_id,
+                tool=params.tool,
+                model=params.model,
+                role=params.role,
+                effort=params.effort,
+                profile=params.profile,
+                effective_model=params.effective_model,
+            )
+
+        requested_role = params.role
+        candidate_bindings: list[Any] = []
+        if run_spec is not None:
+            try:
+                primary_binding = run_spec.agent_binding(params.agent_id)
+                candidate_bindings.append(primary_binding)
+                seen_ids = {primary_binding.agent_id}
+                primary_roles = _binding_roles(primary_binding)
+                normalized_requested = str(requested_role or "").strip().lower()
+                is_reviewer = _is_reviewer_role(normalized_requested) or (
+                    not normalized_requested and any(_is_reviewer_role(r) for r in primary_roles)
+                )
+                for fb_id in raw_fallbacks:
+                    fb_binding = run_spec.agent_binding(fb_id)
+                    if is_reviewer and not any(
+                        _is_reviewer_role(r) for r in _binding_roles(fb_binding)
+                    ):
+                        logger.warning(
+                            "[WorkflowEngine] Ignoring non-reviewer explicit fallback agent_id=%s for reviewer step primary=%s",
+                            fb_binding.agent_id,
+                            primary_binding.agent_id,
+                        )
+                        continue
+                    if fb_binding.agent_id not in seen_ids:
+                        candidate_bindings.append(fb_binding)
+                        seen_ids.add(fb_binding.agent_id)
+            except ValueError as exc:
+                return AgentCallResult(
+                    error=str(exc),
+                    agent_id=params.agent_id,
+                    tool=params.tool,
+                    model=params.model,
+                    role=params.role,
+                    effort=params.effort,
+                    profile=params.profile,
+                    effective_model=params.effective_model,
+                )
+            params = self._params_for_binding(
+                params,
+                candidate_bindings[0],
+                run_spec,
+                explicit_timeout=use_explicit_timeout,
+            )
+
+        effective_deadline = deadline_monotonic
+        if run_spec is not None and run_spec.deadline is not None:
+            effective_deadline = (
+                min(effective_deadline, run_spec.deadline)
+                if effective_deadline is not None
+                else run_spec.deadline
+            )
+
+        # Legacy direct callers without run_spec
+        if run_spec is None:
+            with self._lock:
+                self._agent_call_count += 1
+                count = self._agent_call_count
+            if not params.model and params.tool and self._project:
+                params.model = self._resolve_model_for_tool(params.tool)
+            if params.effective_model is None and params.tool and (
+                params.effort or params.profile or params.model
+            ):
+                params.effective_model = resolve_effective_model_name(
+                    params.tool,
+                    params.model,
+                    profile=params.profile,
+                    effort=params.effort,
+                )
+            if count > MAX_TOTAL_AGENTS:
+                error_msg = f"Agent call limit exceeded ({MAX_TOTAL_AGENTS})"
+                logger.warning("[WorkflowEngine] %s", error_msg)
+                return AgentCallResult(
+                    error=error_msg,
+                    agent_id=params.agent_id,
+                    tool=params.tool,
+                    model=params.model,
+                    role=params.role,
+                    effort=params.effort,
+                    profile=params.profile,
+                    effective_model=params.effective_model,
+                )
+            if effective_deadline is not None and time.monotonic() >= effective_deadline:
+                error_msg = "Workflow deadline exhausted before agent execution"
+                logger.warning("[WorkflowEngine] %s", error_msg)
+                return AgentCallResult(
+                    error=error_msg,
+                    agent_id=params.agent_id,
+                    tool=params.tool,
+                    model=params.model,
+                    role=params.role,
+                    effort=params.effort,
+                    profile=params.profile,
+                    effective_model=params.effective_model,
+                )
+            return self._execute_single_candidate(
+                params,
+                count=count,
+                cancel_event=cancel_event,
+                request_id=request_id,
+                effective_deadline=effective_deadline,
+                allow_cache=allow_cache,
+                explicit_timeout=use_explicit_timeout,
+            )
+
+        # Strict run_spec path with bounded cross-member fallback
+        call_budget = run_spec.budget
+        base_label = params.label
+        attempted_ids: set[str] = set()
+        auto_expanded = False
+        idx = 0
+        last_result: AgentCallResult | None = None
+
+        while idx < len(candidate_bindings):
+            binding = candidate_bindings[idx]
+            idx += 1
+            cand_params = self._params_for_binding(
+                params,
+                binding,
+                run_spec,
+                explicit_timeout=use_explicit_timeout,
+            )
+            if base_label:
+                cand_params.label = base_label
+
+            # Fast-skip already blacklisted binding ONLY if a healthy alternative exists
+            is_blacklisted_fn = getattr(self._executor, "is_blacklisted", None)
+            if callable(is_blacklisted_fn) and is_blacklisted_fn(cand_params):
+                if not raw_fallbacks and not auto_expanded:
+                    auto_expanded = True
+                    extra = self._build_auto_fallback_bindings(
+                        run_spec,
+                        binding,
+                        requested_role=requested_role,
+                        attempted_ids=attempted_ids | {binding.agent_id},
+                        explicit_timeout=use_explicit_timeout,
+                    )
+                    candidate_bindings.extend(extra)
+                has_healthy_remaining = any(
+                    not is_blacklisted_fn(
+                        self._params_for_binding(
+                            params,
+                            other,
+                            run_spec,
+                            explicit_timeout=use_explicit_timeout,
+                        )
+                    )
+                    for other in candidate_bindings[idx:]
+                )
+                if has_healthy_remaining:
+                    logger.info(
+                        "[WorkflowEngine] Skipping blacklisted agent_id=%s (%s) in favor of fallback",
+                        binding.agent_id,
+                        binding.tool_name,
+                    )
+                    attempted_ids.add(binding.agent_id)
+                    continue
+
+            if self._is_call_cancelled(last_result, cancel_event):
+                return last_result or AgentCallResult(
+                    error="Cancelled before execution",
+                    stop_reason="cancelled",
+                    agent_id=cand_params.agent_id,
+                    tool=cand_params.tool,
+                    model=cand_params.model,
+                    role=cand_params.role,
+                    effort=cand_params.effort,
+                    profile=cand_params.profile,
+                    effective_model=cand_params.effective_model,
+                )
+
+            if effective_deadline is not None and time.monotonic() >= effective_deadline:
+                if last_result is not None:
+                    return last_result
+                error_msg = "Workflow deadline exhausted before agent execution"
+                logger.warning("[WorkflowEngine] %s", error_msg)
+                return AgentCallResult(
+                    error=error_msg,
+                    agent_id=cand_params.agent_id,
+                    tool=cand_params.tool,
+                    model=cand_params.model,
+                    role=cand_params.role,
+                    effort=cand_params.effort,
+                    profile=cand_params.profile,
+                    effective_model=cand_params.effective_model,
+                )
+
+            with self._lock:
+                if self._agent_call_count >= call_budget:
+                    if last_result is not None:
+                        return last_result
+                    error_msg = f"Agent call limit exceeded ({call_budget})"
+                    logger.warning("[WorkflowEngine] %s", error_msg)
+                    return AgentCallResult(
+                        error=error_msg,
+                        agent_id=cand_params.agent_id,
+                        tool=cand_params.tool,
+                        model=cand_params.model,
+                        role=cand_params.role,
+                        effort=cand_params.effort,
+                        profile=cand_params.profile,
+                        effective_model=cand_params.effective_model,
+                    )
+                self._agent_call_count += 1
+                count = self._agent_call_count
+
+            attempted_ids.add(binding.agent_id)
+            result = self._execute_single_candidate(
+                cand_params,
+                count=count,
+                cancel_event=cancel_event,
+                request_id=request_id,
+                effective_deadline=effective_deadline,
+                allow_cache=allow_cache,
+                explicit_timeout=use_explicit_timeout,
+            )
+            last_result = result
+            if result.error is None:
+                return result
+
+            if self._is_call_cancelled(result, cancel_event):
+                return result
+            if effective_deadline is not None and time.monotonic() >= effective_deadline:
+                return result
+
+            if not raw_fallbacks and not auto_expanded and _is_startup_or_breaker_error(result.error):
+                auto_expanded = True
+                extra = self._build_auto_fallback_bindings(
+                    run_spec,
+                    binding,
+                    requested_role=requested_role,
+                    attempted_ids=attempted_ids,
+                    explicit_timeout=use_explicit_timeout,
+                )
+                candidate_bindings.extend(extra)
+
+        return last_result or AgentCallResult(
+            error="No eligible agent bindings remained for fallback",
+            agent_id=params.agent_id,
+            tool=params.tool,
+            model=params.model,
+            role=params.role,
+            effort=params.effort,
+            profile=params.profile,
+            effective_model=params.effective_model,
+        )
 
     def _handle_agent_activity(self, label: str, activity: str) -> None:
         """Update live activity hint for a running agent from ACP events.
@@ -1468,13 +1857,24 @@ class WorkflowEngine(BaseEngine):
         except Exception:
             logger.debug("on_progress callback failed", exc_info=True)
 
+    def clear_stale_renderer_for_generation(self) -> None:
+        """Clear any prior run's renderer and state manager before GENERATING_SCRIPT."""
+        with self._lock:
+            self._renderer_wf = None
+            self._state_manager = None
+
     def get_progress_cards(self) -> list[dict[str, Any]]:
         """Return status, direct-call execution streams, then result ledgers."""
-        if not self._renderer_wf:
+        with self._lock:
+            if self._project and self._project.status == WorkflowStatus.GENERATING_SCRIPT:
+                return []
+            renderer = self._renderer_wf
+            state_manager = self._state_manager
+        if not renderer:
             return []
-        if self._state_manager:
-            return self._renderer_wf.render_progress_cards(self._state_manager.snapshot())
-        return self._renderer_wf.render_progress_cards()
+        if state_manager:
+            return renderer.render_progress_cards(state_manager.snapshot())
+        return renderer.render_progress_cards()
 
     # ------------------------------------------------------------------
     # Progress heartbeat
@@ -1540,6 +1940,23 @@ class WorkflowEngine(BaseEngine):
 
     def get_status_text(self) -> str:
         """Return a compact one-line status string."""
-        if self._renderer_wf:
-            return self._renderer_wf.render_compact_status()
+        with self._lock:
+            project = self._project
+            renderer = self._renderer_wf
+        if project and project.status == WorkflowStatus.GENERATING_SCRIPT:
+            return "⏳ Workflow 正在生成编排脚本…"
+        if renderer:
+            return renderer.render_compact_status()
+        if project and project.status == WorkflowStatus.FAILED:
+            err = _strip_internal_details(project.error)
+            if err:
+                first_line = " ".join(err.splitlines()).strip()
+                if len(first_line) > 200:
+                    first_line = first_line[:199].rstrip() + "…"
+                return f"❌ Workflow 失败：{first_line}"
+            return "❌ Workflow 已失败"
+        if project and project.status == WorkflowStatus.CANCELLED:
+            return "🚫 Workflow 已取消"
+        if project and project.status == WorkflowStatus.COMPLETED:
+            return "✅ Workflow 已完成"
         return "Workflow: idle"

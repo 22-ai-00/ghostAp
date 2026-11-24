@@ -200,6 +200,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/spec_guide", "补充 Spec Engine 引导", "/spec_guide <引导>", protects_from_auto_activation=True),
     _action("/stop_spec", "停止 Spec Engine 任务", protects_from_auto_activation=True),
     _action("/wf", "启动多 Agent Workflow", "/wf <需求>", aliases=("/workflow",)),
+    _action("/wf_config", "配置 Workflow 团队与模型档位", "/wf_config", aliases=("/workflow_config",)),
     _action("/wf_status", "查看当前 Workflow 进度", aliases=("/workflow_status",)),
     _action("/wf_help", "查看 Workflow 使用帮助", aliases=("/workflow_help",)),
     _action("/stop_wf", "停止正在运行的 Workflow", aliases=("/stop_workflow",)),
@@ -225,7 +226,7 @@ HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     "/spec_status", "/spec_history", "/spec_metrics", "/spec_config",
     "/spec_export", "/spec_save", "/spec_guide", "/stop_spec",
     # Workflow auxiliaries
-    "/wf_status", "/wf_help", "/stop_wf",
+    "/wf_config", "/wf_status", "/wf_help", "/stop_wf",
     # hidden local CLI bridges — type explicitly, never advertised
     *(spec.slash_command for spec in ALL_BACKEND_METAS if not spec.visible_in_tools_list),
 })

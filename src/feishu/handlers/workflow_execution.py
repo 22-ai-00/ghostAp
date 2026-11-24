@@ -409,6 +409,11 @@ class WorkflowExecutionMixin(
                 orchestrator_was_auto=pending.orchestrator_was_auto,
                 current_activity="Workflow 任务已由用户停止",
                 terminal_status="cancelled",
+                chat_id=chat_id,
+                project_id=(
+                    (getattr(project, "project_id", "") if project else "")
+                    or str(getattr(pending, "project_id", "") or "")
+                ),
             )
             for card_message_id in cancel_card_message_ids:
                 self._replace_or_send_workflow_rendered_card(
@@ -783,97 +788,97 @@ class WorkflowExecutionMixin(
                     _abandon_start()
                 return
 
-            def run_workflow():
-                # Register the scheduler worker in the same engine critical
-                # section that cleanup uses to revoke the owner. Cleanup can
-                # now distinguish "never started" from "started, pre-claim"
-                # without forging completion for the latter.
-                with engine._lock:
-                    worker_admitted = bool(
-                        vars(engine).get("_workflow_start_owner") is start_owner
-                        and getattr(engine, "_closing", False) is not True
-                        and not start_owner.stop_event.is_set()
+        def run_workflow():
+            # Register the scheduler worker in the same engine critical
+            # section that cleanup uses to revoke the owner. Cleanup can
+            # now distinguish "never started" from "started, pre-claim"
+            # without forging completion for the latter.
+            with engine._lock:
+                worker_admitted = bool(
+                    vars(engine).get("_workflow_start_owner") is start_owner
+                    and getattr(engine, "_closing", False) is not True
+                    and not start_owner.stop_event.is_set()
+                )
+                if worker_admitted:
+                    start_owner.worker_started_event.set()
+                    object.__setattr__(
+                        start_owner,
+                        "worker_thread_id",
+                        _workflow_module().threading.get_ident(),
                     )
-                    if worker_admitted:
-                        start_owner.worker_started_event.set()
-                        object.__setattr__(
-                            start_owner,
-                            "worker_thread_id",
-                            _workflow_module().threading.get_ident(),
-                        )
-                if not worker_admitted:
-                    _abandon_start()
-                    return
+            if not worker_admitted:
+                _abandon_start()
+                return
 
-                def _executor():
-                    callbacks = self._build_workflow_callbacks(
-                        progress_card_message_id,
-                        chat_id,
-                        project,
-                        lifecycle_owner=start_owner,
-                        requirement=run_spec.task,
-                    )
-                    engine.execute_workflow(
-                        script_path=immutable_script_path,
-                        callbacks=callbacks,
-                        run_spec=run_spec,
-                        start_owner=start_owner,
-                        source_script_path=script_path,
-                    )
-
-                try:
-                    self._safe_execute_engine(
-                        executor_func=_executor,
-                        task_id=task_id,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        project=project,
-                        engine_name=engine_name,
-                        reporter=self.ctx.progress_reporter,
-                        request_id=self.ensure_request_id(
-                            message_id,
-                            chat_id=chat_id,
-                            project_id=project_id or None,
-                        ),
-                        action_prefix="workflow",
-                        command_text=f"/wf {requirement}",
-                        lifecycle_owner=start_owner,
-                        lifecycle_engine=engine,
-                    )
-                finally:
-                    if not start_owner.claimed_event.is_set():
-                        _abandon_start()
+            def _executor():
+                callbacks = self._build_workflow_callbacks(
+                    progress_card_message_id,
+                    chat_id,
+                    project,
+                    lifecycle_owner=start_owner,
+                    requirement=run_spec.task,
+                )
+                engine.execute_workflow(
+                    script_path=immutable_script_path,
+                    callbacks=callbacks,
+                    run_spec=run_spec,
+                    start_owner=start_owner,
+                    source_script_path=script_path,
+                )
 
             try:
-                self._submit_engine_task(
-                    run_workflow,
-                    chat_id,
-                    message_id,
-                    project,
-                    request_id=None,
+                self._safe_execute_engine(
+                    executor_func=_executor,
                     task_id=task_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    project=project,
+                    engine_name=engine_name,
+                    reporter=self.ctx.progress_reporter,
+                    request_id=self.ensure_request_id(
+                        message_id,
+                        chat_id=chat_id,
+                        project_id=project_id or None,
+                    ),
+                    action_prefix="workflow",
+                    command_text=f"/wf {requirement}",
+                    lifecycle_owner=start_owner,
+                    lifecycle_engine=engine,
                 )
-            except Exception as exc:
-                with start_owner.delivery_lock:
-                    with engine._lock:
-                        should_report = bool(
-                            vars(engine).get("_workflow_start_owner") is start_owner
-                            and not start_owner.stop_event.is_set()
+            finally:
+                if not start_owner.claimed_event.is_set():
+                    _abandon_start()
+
+        try:
+            self._submit_engine_task(
+                run_workflow,
+                chat_id,
+                message_id,
+                project,
+                request_id=None,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            with start_owner.delivery_lock:
+                with engine._lock:
+                    should_report = bool(
+                        vars(engine).get("_workflow_start_owner") is start_owner
+                        and not start_owner.stop_event.is_set()
+                    )
+                try:
+                    if should_report:
+                        error_card = self._build_error_card(
+                            "internal_error",
+                            detail=f"Workflow 任务提交失败: {exc}",
                         )
-                    try:
-                        if should_report:
-                            error_card = self._build_error_card(
-                                "internal_error",
-                                detail=f"Workflow 任务提交失败: {exc}",
-                            )
-                            self._replace_or_send_workflow_card(
-                                card_message_id=progress_card_message_id,
-                                chat_id=chat_id,
-                                card=error_card,
-                                origin_message_id=origin_message_id,
-                            )
-                    finally:
-                        _abandon_start()
+                        self._replace_or_send_workflow_card(
+                            card_message_id=progress_card_message_id,
+                            chat_id=chat_id,
+                            card=error_card,
+                            origin_message_id=origin_message_id,
+                        )
+                finally:
+                    _abandon_start()
 
     @staticmethod
     def _new_workflow_script_path(root_path: str) -> str:

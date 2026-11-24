@@ -332,7 +332,7 @@ class WorkflowAICodegenMixin:
                             f"workflow_script_gen_{captured_session_key}_{binding.agent_id}_"
                             f"{repair_attempt}"
                         ),
-                        model_name=binding.model_name,
+                        model_name=binding.effective_model_name(),
                         cancel_event=attempt_cancel_event,
                         # Member timeout/startup failure is an expected input
                         # to frozen-pool fallback, not an unhandled service

@@ -69,12 +69,41 @@ class WorkflowProcessStream:
         with self._lock:
             return self._ensure_started_locked()
 
-    def agent_started(self, label: str, tool: str) -> bool:
+    @staticmethod
+    def _format_meta_suffix(meta: dict | None) -> str:
+        if not isinstance(meta, dict):
+            return ""
+        parts: list[str] = []
+        agent_id = str(meta.get("agent_id") or "").strip()
+        role = str(meta.get("role") or "").strip()
+        model = str(meta.get("model") or meta.get("effective_model") or "").strip()
+        profile = str(meta.get("profile") or "").strip()
+        effort = str(meta.get("effort") or "").strip()
+        if agent_id:
+            parts.append(agent_id)
+        if role:
+            parts.append(role)
+        if model:
+            parts.append(model)
+        if profile:
+            parts.append(f"profile:{profile}")
+        if effort:
+            parts.append(f"effort:{effort}")
+        return f" ({' · '.join(parts)})" if parts else ""
+
+    def agent_started(
+        self,
+        label: str,
+        tool: str,
+        *,
+        meta: dict | None = None,
+    ) -> bool:
         """Start the process sidecar lazily and add a compact call boundary."""
         with self._lock:
             if not self._ensure_started_locked():
                 return False
-            return self._emit_marker_locked(f"▶ {label} · {tool or 'Agent'}")
+            suffix = self._format_meta_suffix(meta)
+            return self._emit_marker_locked(f"▶ {label} · {tool or 'Agent'}{suffix}")
 
     def emit(self, label: str, event: CardEvent) -> bool:
         """Emit one direct-call event, namespaced to its Workflow Agent."""
@@ -101,7 +130,8 @@ class WorkflowProcessStream:
                 return False
             state = "失败" if payload.get("error") else "完成"
             cached = " · 缓存命中" if payload.get("cached") else ""
-            return self._emit_marker_locked(f"{state} · {label}{cached}")
+            suffix = self._format_meta_suffix(payload)
+            return self._emit_marker_locked(f"{state} · {label}{suffix}{cached}")
 
     def complete(self, event: CardEvent) -> bool:
         """Close the process sidecar with the Workflow terminal outcome."""

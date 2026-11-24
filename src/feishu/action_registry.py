@@ -118,6 +118,8 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     actions[action_ids.WORKFLOW_STOP_RUNNING] = workflow.handle_workflow_stop_running
     for action in action_ids.WORKFLOW_AGENT_SELECTION_ACTIONS:
         actions[action] = workflow.handle_workflow_agent_action
+    for action in action_ids.WF_CONFIG_ACTIONS:
+        actions[action] = workflow.handle_workflow_config_action
 
     # System
     actions[action_ids.EXIT_PROGRAMMING_MODE] = (

@@ -17,6 +17,7 @@ ENGINE_DISPLAY_NAME: str = "WF"
 # Short-form commands (primary entry points)
 SHORT_COMMANDS: frozenset[str] = frozenset({
     "/wf",
+    "/wf_config",
     "/wf_status",
     "/wf_help",
     "/stop_wf",
@@ -25,6 +26,7 @@ SHORT_COMMANDS: frozenset[str] = frozenset({
 # Long-form commands (canonical aliases)
 LONG_COMMANDS: frozenset[str] = frozenset({
     "/workflow",
+    "/workflow_config",
     "/workflow_status",
     "/workflow_help",
     "/stop_workflow",
