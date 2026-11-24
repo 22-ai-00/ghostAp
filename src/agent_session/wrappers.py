@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
@@ -29,6 +30,14 @@ def __getattr__(name: str) -> Any:
 
         globals()["SyncACPSession"] = SyncACPSession
         return SyncACPSession
+    if name == "SyncAGYCLISession":
+        from .agy_cli import SyncAGYCLISession
+
+        return SyncAGYCLISession
+    if name == "resolve_agent_spec":
+        from ..acp.sync_adapter import resolve_agent_spec
+
+        return resolve_agent_spec
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -334,27 +343,313 @@ class ModelFailureAwareSession(_SessionWrapper):
                 )
 
     def _parse_failover_map(self) -> dict[str, str]:
-        """解析 failover 映射（from:to）。"""
+        """解析 failover 映射（from:to），兼容 JSON 数组模型值与 JSON 字典。"""
         raw = ""
         try:
             raw = str(getattr(self._settings, "model_failure_failover_map", "") or "")
         except Exception:
             logger.debug("ModelFailureAwareSession._parse_failover_map: settings read failed", exc_info=True)
             raw = ""
-        pairs = []
-        for chunk in raw.replace(",", " ").split():
-            s = (chunk or "").strip()
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                out: dict[str, str] = {}
+                for raw_k, raw_v in parsed.items():
+                    k = (
+                        json.dumps(raw_k, ensure_ascii=False, separators=(",", ":"))
+                        if isinstance(raw_k, list)
+                        else str(raw_k or "").strip()
+                    )
+                    v = (
+                        json.dumps(raw_v, ensure_ascii=False, separators=(",", ":"))
+                        if isinstance(raw_v, list)
+                        else str(raw_v or "").strip()
+                    )
+                    if k and v and k not in out:
+                        out[k] = v
+                if out:
+                    return out
+
+        chunks: list[str] = []
+        buf: list[str] = []
+        bracket_depth = 0
+        brace_depth = 0
+        in_quote: str | None = None
+        escaped = False
+        for ch in raw:
+            if escaped:
+                buf.append(ch)
+                escaped = False
+                continue
+            if in_quote is not None:
+                buf.append(ch)
+                if ch == "\\":
+                    escaped = True
+                elif ch == in_quote:
+                    in_quote = None
+                continue
+            if ch in {'"', "'"}:
+                in_quote = ch
+                buf.append(ch)
+                continue
+            if ch == "[":
+                bracket_depth += 1
+                buf.append(ch)
+                continue
+            if ch == "]":
+                if bracket_depth > 0:
+                    bracket_depth -= 1
+                buf.append(ch)
+                continue
+            if ch == "{":
+                brace_depth += 1
+                buf.append(ch)
+                continue
+            if ch == "}":
+                if brace_depth > 0:
+                    brace_depth -= 1
+                buf.append(ch)
+                continue
+            if (
+                bracket_depth == 0
+                and brace_depth == 0
+                and (ch in {",", ";"} or ch.isspace())
+            ):
+                if buf:
+                    chunks.append("".join(buf))
+                    buf.clear()
+                continue
+            buf.append(ch)
+        if buf:
+            chunks.append("".join(buf))
+
+        pairs: list[tuple[str, str]] = []
+        for chunk in chunks:
+            s = chunk.strip()
             if not s or ":" not in s:
                 continue
-            a, b = s.split(":", 1)
-            a, b = a.strip(), b.strip()
+            split_idx = -1
+            b_depth = 0
+            c_depth = 0
+            q_char: str | None = None
+            esc = False
+            for idx, ch in enumerate(s):
+                if esc:
+                    esc = False
+                    continue
+                if q_char is not None:
+                    if ch == "\\":
+                        esc = True
+                    elif ch == q_char:
+                        q_char = None
+                    continue
+                if ch in {'"', "'"}:
+                    q_char = ch
+                    continue
+                if ch == "[":
+                    b_depth += 1
+                    continue
+                if ch == "]":
+                    if b_depth > 0:
+                        b_depth -= 1
+                    continue
+                if ch == "{":
+                    c_depth += 1
+                    continue
+                if ch == "}":
+                    if c_depth > 0:
+                        c_depth -= 1
+                    continue
+                if ch == ":" and b_depth == 0 and c_depth == 0:
+                    split_idx = idx
+                    break
+            if split_idx <= 0:
+                continue
+            a, b = s[:split_idx].strip(), s[split_idx + 1 :].strip()
             if a and b:
                 pairs.append((a, b))
-        out: dict[str, str] = {}
+        out = {}
         for a, b in pairs:
             if a not in out:
                 out[a] = b
         return out
+
+    @staticmethod
+    def _strip_codex_model_flags(args: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur == "-c" and i + 1 < len(args):
+                nxt = str(args[i + 1] or "")
+                if nxt.startswith(("model.name=", "model=", "model_reasoning_effort=")):
+                    i += 2
+                    continue
+            if cur in {"-m", "--model"} and i + 1 < len(args):
+                i += 2
+                continue
+            if cur.startswith("--model="):
+                i += 1
+                continue
+            cleaned.append(args[i])
+            i += 1
+        return cleaned
+
+    @staticmethod
+    def _strip_codex_effort_flags(args: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur == "-c" and i + 1 < len(args):
+                nxt = str(args[i + 1] or "")
+                if nxt.startswith("model_reasoning_effort="):
+                    i += 2
+                    continue
+            cleaned.append(args[i])
+            i += 1
+        return cleaned
+
+    @staticmethod
+    def _replace_codex_effort_flags(args: list[str], effort: str) -> list[str]:
+        cleaned: list[str] = []
+        replaced = False
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur == "-c" and i + 1 < len(args):
+                nxt = str(args[i + 1] or "")
+                if nxt.startswith("model_reasoning_effort="):
+                    if not replaced:
+                        cleaned.extend(["-c", f'model_reasoning_effort="{effort}"'])
+                        replaced = True
+                    i += 2
+                    continue
+            cleaned.append(args[i])
+            i += 1
+        return cleaned
+
+    @staticmethod
+    def _strip_claude_model_flags(args: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur in {"-m", "--model"} and i + 1 < len(args):
+                i += 2
+                continue
+            if cur.startswith("--model="):
+                i += 1
+                continue
+            cleaned.append(args[i])
+            i += 1
+        return cleaned
+
+    @staticmethod
+    def _strip_claude_effort_flags(args: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur == "--effort" and i + 1 < len(args):
+                i += 2
+                continue
+            if cur.startswith("--effort="):
+                i += 1
+                continue
+            cleaned.append(args[i])
+            i += 1
+        return cleaned
+
+    @staticmethod
+    def _insert_before_double_dash(args: list[str], extra: list[str]) -> list[str]:
+        cleaned = list(args)
+        try:
+            idx = cleaned.index("--")
+        except ValueError:
+            return cleaned + extra
+        return cleaned[:idx] + extra + cleaned[idx:]
+
+    @classmethod
+    def _replace_claude_effort_flags(cls, args: list[str], effort: str) -> list[str]:
+        cleaned: list[str] = []
+        replaced = False
+        i = 0
+        while i < len(args):
+            cur = str(args[i] or "")
+            if cur == "--effort" and i + 1 < len(args):
+                if not replaced:
+                    cleaned.extend(["--effort", effort])
+                    replaced = True
+                i += 2
+                continue
+            if cur.startswith("--effort="):
+                if not replaced:
+                    cleaned.append(f"--effort={effort}")
+                    replaced = True
+                i += 1
+                continue
+            cleaned.append(args[i])
+            i += 1
+        if not replaced:
+            return cls._insert_before_double_dash(cleaned, ["--effort", effort])
+        return cleaned
+
+    def _failover_startup_timeout(self) -> float:
+        try:
+            timeout_s = float(getattr(self._settings, "acp_startup_timeout", 20) or 20)
+        except Exception:
+            logger.debug(
+                "ModelFailureAwareSession._do_failover: timeout_s conversion failed",
+                exc_info=True,
+            )
+            timeout_s = 20.0
+        return max(1.0, timeout_s)
+
+    @staticmethod
+    def _build_sync_acp_candidate(
+        *,
+        base: SyncSession,
+        agent_type: str,
+        cwd: str,
+        agent_cmd: str,
+        agent_args: list[str],
+        model_name: str,
+    ) -> SyncSession:
+        sync_acp_session_cls = getattr(sys.modules[__name__], "SyncACPSession")
+        explicit_env = getattr(base, "_explicit_env", None)
+        candidate_kwargs: dict[str, Any] = {
+            "agent_type": agent_type,
+            "cwd": cwd,
+            "agent_cmd": agent_cmd,
+            "agent_args": list(agent_args),
+            "model_name": model_name,
+            "capture_full_tool_content": bool(
+                getattr(base, "_capture_full_tool_content", False)
+            ),
+        }
+        if isinstance(explicit_env, dict):
+            candidate_kwargs["env"] = dict(explicit_env)
+        try:
+            return sync_acp_session_cls(**candidate_kwargs)
+        except TypeError:
+            fallback_kwargs = dict(candidate_kwargs)
+            if "env" in fallback_kwargs:
+                fallback_kwargs.pop("env", None)
+                try:
+                    return sync_acp_session_cls(**fallback_kwargs)
+                except TypeError:
+                    fallback_kwargs.pop("model_name", None)
+                    return sync_acp_session_cls(**fallback_kwargs)
+            fallback_kwargs.pop("model_name", None)
+            return sync_acp_session_cls(**fallback_kwargs)
 
     def _do_failover(self, *, from_model: str, to_model: str) -> bool:
         """执行一次 failover：切换到 to_model，并重建 session 后替换 self._inner。"""
@@ -364,36 +659,219 @@ class ModelFailureAwareSession(_SessionWrapper):
             return False
 
         base, rewrap = self._unwrap_rate_limit()
+        agent_type = str(getattr(base, "_agent_type", "") or "").strip()
+        agent_lower = agent_type.lower()
+        is_cli_session = getattr(base, "_cfg", None) is not None and callable(
+            getattr(base, "_build_args", None)
+        )
+        is_agy_cli = bool(getattr(base, "_is_agy_cli_session", False))
+        is_agy = agent_lower == "agy" or is_agy_cli
+
+        if is_agy:
+            agy_cwd = str(getattr(base, "_cwd", "") or "")
+            if not agy_cwd:
+                return False
+            timeout_s = self._failover_startup_timeout()
+            from ..acp.agy_selection import requires_agy_cli_orchestrator_session
+
+            if requires_agy_cli_orchestrator_session(to_model):
+                from .agy_cli import AGYCLIConfig
+
+                agy_cli_cls = getattr(sys.modules[__name__], "SyncAGYCLISession")
+                existing_cfg = getattr(base, "_cfg", None)
+                if isinstance(existing_cfg, AGYCLIConfig) or (
+                    existing_cfg is not None and is_agy_cli
+                ):
+                    cli_cfg = existing_cfg
+                else:
+                    base_cmd = str(getattr(base, "_agent_cmd", "") or "").strip()
+                    cli_cfg = (
+                        AGYCLIConfig(command=base_cmd) if base_cmd else AGYCLIConfig()
+                    )
+
+                def create_agy_cli_candidate() -> SyncSession:
+                    return agy_cli_cls(
+                        cwd=agy_cwd,
+                        config=cli_cfg,
+                        model_name=to_model,
+                    )
+
+                return self._replace_inner_strictly(
+                    base=base,
+                    rewrap=rewrap,
+                    candidate_factory=create_agy_cli_candidate,
+                    prepare_candidate=lambda candidate: candidate.start(
+                        startup_timeout=timeout_s
+                    ),
+                    operation="failover",
+                )
+
+            if is_cli_session or is_agy_cli:
+                try:
+                    resolver = getattr(sys.modules[__name__], "resolve_agent_spec")
+                    resolved_cmd, resolved_args = resolver("agy", model_name=to_model)
+                    agy_acp_cmd = str(resolved_cmd or "").strip()
+                    agy_acp_args = list(resolved_args or [])
+                except Exception:
+                    logger.debug(
+                        "ModelFailureAwareSession._do_failover: agy ACP provider resolution failed",
+                        exc_info=True,
+                    )
+                    return False
+                if not agy_acp_cmd and not agy_acp_args:
+                    return False
+                effective_agent_type = agent_type or "agy"
+
+                def create_agy_acp_candidate() -> SyncSession:
+                    return self._build_sync_acp_candidate(
+                        base=base,
+                        agent_type=effective_agent_type,
+                        cwd=agy_cwd,
+                        agent_cmd=agy_acp_cmd,
+                        agent_args=agy_acp_args,
+                        model_name=to_model,
+                    )
+
+                return self._replace_inner_strictly(
+                    base=base,
+                    rewrap=rewrap,
+                    candidate_factory=create_agy_acp_candidate,
+                    prepare_candidate=lambda candidate: candidate.start(
+                        startup_timeout=timeout_s
+                    ),
+                    operation="failover",
+                )
+
+        if is_cli_session:
+            cli_cwd = str(getattr(base, "_cwd", "") or "")
+            if not cli_cwd:
+                return False
+            timeout_s = self._failover_startup_timeout()
+            cli_cls = type(base)
+            cli_cfg = getattr(base, "_cfg")
+
+            def create_cli_candidate() -> SyncSession:
+                return cli_cls(cwd=cli_cwd, config=cli_cfg, model_name=to_model)
+
+            return self._replace_inner_strictly(
+                base=base,
+                rewrap=rewrap,
+                candidate_factory=create_cli_candidate,
+                prepare_candidate=lambda candidate: candidate.start(
+                    startup_timeout=timeout_s
+                ),
+                operation="failover",
+            )
+
         agent_cmd = str(getattr(base, "_agent_cmd", "") or "")
         agent_args = list(getattr(base, "_agent_args", []) or [])
-        agent_type = str(getattr(base, "_agent_type", "") or "")
         cwd = str(getattr(base, "_cwd", "") or "")
         if not agent_cmd and not agent_args:
             return False
         if not agent_type or not cwd:
             return False
 
-        new_args, replaced = _replace_model_in_agent_args(agent_args, to_model)
-        if not replaced:
+        argv_model = to_model
+        codex_effort: Optional[str] = None
+        claude_effort: Optional[str] = None
+        if agent_lower in {"codex", "codex_w"}:
+            try:
+                from ..acp.model_selection import (
+                    CODEX_DEFAULT_EFFORT_TOKEN,
+                    CODEX_DEFAULT_MODEL_TOKEN,
+                    split_codex_model_selection,
+                )
+
+                base_model, codex_effort = split_codex_model_selection(to_model)
+                if codex_effort == CODEX_DEFAULT_EFFORT_TOKEN:
+                    codex_effort = None
+                argv_model = (
+                    ""
+                    if (not base_model or base_model == CODEX_DEFAULT_MODEL_TOKEN)
+                    else base_model
+                )
+            except Exception:
+                argv_model = ""
+        elif agent_lower in {"claude", "claude_w"}:
+            try:
+                from ..acp.claude_capabilities import strip_1m_suffix
+                from ..acp.claude_selection import (
+                    CLAUDE_DEFAULT_EFFORT_TOKEN,
+                    CLAUDE_DEFAULT_MODEL_TOKEN,
+                    split_claude_model_selection,
+                )
+
+                base_model, claude_effort = split_claude_model_selection(to_model)
+                if claude_effort == CLAUDE_DEFAULT_EFFORT_TOKEN:
+                    claude_effort = None
+                argv_model = (
+                    ""
+                    if (not base_model or base_model == CLAUDE_DEFAULT_MODEL_TOKEN)
+                    else strip_1m_suffix(base_model)
+                )
+            except Exception:
+                argv_model = ""
+        else:
+            try:
+                from ..acp.providers import normalize_acp_model_name
+
+                argv_model = normalize_acp_model_name(agent_type, to_model) or to_model
+            except Exception:
+                argv_model = to_model
+
+        if agent_lower in {"codex", "codex_w"} and not argv_model:
+            had_effort_flag = any(
+                str(agent_args[i] or "") == "-c"
+                and i + 1 < len(agent_args)
+                and str(agent_args[i + 1] or "").startswith("model_reasoning_effort=")
+                for i in range(len(agent_args))
+            )
+            new_args = self._strip_codex_model_flags(agent_args)
+            if codex_effort and had_effort_flag:
+                new_args.extend(["-c", f'model_reasoning_effort="{codex_effort}"'])
+            replaced = False
+        elif agent_lower in {"claude", "claude_w"}:
+            if not argv_model:
+                new_args = self._strip_claude_model_flags(agent_args)
+                replaced = True
+            else:
+                new_args, replaced = _replace_model_in_agent_args(agent_args, argv_model)
+                if not replaced:
+                    new_args = self._insert_before_double_dash(
+                        new_args, ["--model", argv_model]
+                    )
+                    replaced = True
+            if claude_effort:
+                new_args = self._replace_claude_effort_flags(new_args, claude_effort)
+            else:
+                new_args = self._strip_claude_effort_flags(new_args)
+        else:
+            new_args, replaced = _replace_model_in_agent_args(agent_args, argv_model)
+            if agent_lower in {"codex", "codex_w"}:
+                if codex_effort:
+                    new_args = self._replace_codex_effort_flags(new_args, codex_effort)
+                else:
+                    new_args = self._strip_codex_effort_flags(new_args)
+        is_config_option_backend = agent_lower in {
+            "codex",
+            "codex_w",
+            "traex",
+            "dsh",
+            "agy",
+        } or bool(str(getattr(base, "_model_name", "") or "").strip())
+        if not replaced and not is_config_option_backend:
             return False
 
-        try:
-            timeout_s = float(getattr(self._settings, "acp_startup_timeout", 20) or 20)
-        except Exception:
-            logger.debug("ModelFailureAwareSession._do_failover_switch: timeout_s conversion failed", exc_info=True)
-            timeout_s = 20.0
-        timeout_s = max(1.0, timeout_s)
+        timeout_s = self._failover_startup_timeout()
 
         def create_candidate() -> SyncSession:
-            sync_acp_session_cls = getattr(sys.modules[__name__], "SyncACPSession")
-            return sync_acp_session_cls(
+            return self._build_sync_acp_candidate(
+                base=base,
                 agent_type=agent_type,
                 cwd=cwd,
                 agent_cmd=agent_cmd,
                 agent_args=list(new_args),
-                capture_full_tool_content=bool(
-                    getattr(base, "_capture_full_tool_content", False)
-                ),
+                model_name=to_model,
             )
 
         return self._replace_inner_strictly(
@@ -424,17 +902,50 @@ class ModelFailureAwareSession(_SessionWrapper):
             activity_predicate=activity_predicate,
         )
 
+        def _lookup_failover(fmap: dict[str, str], key: str) -> str:
+            k = str(key or "").strip()
+            if not k:
+                return ""
+            direct = fmap.get(k)
+            if direct:
+                return direct
+            if k.startswith("["):
+                try:
+                    compact_k = json.dumps(
+                        json.loads(k), ensure_ascii=False, separators=(",", ":")
+                    )
+                except (TypeError, ValueError):
+                    compact_k = ""
+                if compact_k:
+                    for map_k, map_v in fmap.items():
+                        if map_k.startswith("["):
+                            try:
+                                if (
+                                    json.dumps(
+                                        json.loads(map_k),
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    )
+                                    == compact_k
+                                ):
+                                    return map_v
+                            except (TypeError, ValueError):
+                                continue
+            return ""
+
         def _attempt_failover(failed_hint: object, reason: str, attempt_count: int) -> bool:
-            agent_args = list(
-                getattr(getattr(self._inner, "_inner", self._inner), "_agent_args", []) or []
-            )
-            failed = failed_hint or _extract_model_from_agent_args(agent_args)
+            base, _ = self._unwrap_rate_limit()
+            agent_args = list(getattr(base, "_agent_args", []) or [])
+            base_model = str(getattr(base, "_model_name", "") or "").strip()
+            failed = failed_hint or _extract_model_from_agent_args(agent_args) or base_model
             fmap = self._parse_failover_map()
             uses_config_c = any(
                 arg == "-c" or str(arg).startswith("model.name=") for arg in agent_args
             )
-            target = fmap.get(str(failed or "").strip()) or (
-                fmap.get("gpt-5.2") if uses_config_c else ""
+            target = (
+                _lookup_failover(fmap, str(failed or ""))
+                or (_lookup_failover(fmap, base_model) if base_model else "")
+                or (fmap.get("gpt-5.2", "") if uses_config_c else "")
             )
             ok = self._do_failover(from_model=str(failed or ""), to_model=str(target or ""))
             logger.warning(

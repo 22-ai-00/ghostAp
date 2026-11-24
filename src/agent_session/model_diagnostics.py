@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re as _re
 from typing import Callable, Optional
@@ -131,7 +132,7 @@ def _extract_model_from_agent_args(args: list[str]) -> str:
         logger.debug("_extract_model_from_agent_args: args conversion failed", exc_info=True)
         return ""
 
-    # coco: -c model.name=xxx
+    # coco: -c model.name=xxx or traex: -c model="xxx"
     for i, x in enumerate(xs):
         if not x:
             continue
@@ -139,6 +140,16 @@ def _extract_model_from_agent_args(args: list[str]) -> str:
             y = str(xs[i + 1] or "")
             if y.startswith("model.name="):
                 return y.split("=", 1)[1].strip()
+            if y.startswith("model="):
+                raw_val = y.split("=", 1)[1].strip()
+                if raw_val.startswith('"') and raw_val.endswith('"'):
+                    try:
+                        decoded = json.loads(raw_val)
+                        if isinstance(decoded, str):
+                            return decoded.strip()
+                    except Exception:
+                        pass
+                return raw_val.strip('"').strip()
         if "model.name=" in x:
             try:
                 return x.split("model.name=", 1)[1].strip()
@@ -146,10 +157,12 @@ def _extract_model_from_agent_args(args: list[str]) -> str:
                 logger.debug("_extract_model_from_agent_args: model.name= split failed", exc_info=True)
                 continue
 
-    # generic: first -m <value>
+    # generic: first -m <value> or --model <value> or --model=<value>
     for i, x in enumerate(xs):
-        if x == "-m" and i + 1 < len(xs):
+        if x in {"-m", "--model"} and i + 1 < len(xs):
             return str(xs[i + 1] or "").strip()
+        if x.startswith("--model="):
+            return x.split("=", 1)[1].strip()
     return ""
 
 
@@ -171,7 +184,7 @@ def _replace_model_in_agent_args(args: list[str], new_model: str) -> tuple[list[
     out = list(xs)
     replaced = False
 
-    # coco style: -c model.name=xxx
+    # coco style: -c model.name=xxx or traex style: -c model="xxx"
     for i, x in enumerate(out):
         if x == "-c" and i + 1 < len(out):
             y = str(out[i + 1] or "")
@@ -179,13 +192,20 @@ def _replace_model_in_agent_args(args: list[str], new_model: str) -> tuple[list[
                 out[i + 1] = f"model.name={new_model}"
                 replaced = True
                 break
+            if y.startswith("model="):
+                out[i + 1] = f"model={json.dumps(new_model)}"
+                replaced = True
+                break
     if replaced:
         return (out, True)
 
-    # generic: first -m <value>
+    # generic: first -m <value> or --model <value> or --model=<value>
     for i, x in enumerate(out):
-        if x == "-m" and i + 1 < len(out):
+        if x in {"-m", "--model"} and i + 1 < len(out):
             out[i + 1] = new_model
+            return (out, True)
+        if x.startswith("--model="):
+            out[i] = f"--model={new_model}"
             return (out, True)
 
     return (out, False)
@@ -239,16 +259,37 @@ def _apply_compaction_once(
         def builder(**kwargs):
             return SyncACPSession(**kwargs)
 
+    model_name = str(getattr(session, "_model_name", "") or "").strip() or None
+    explicit_env = getattr(session, "_explicit_env", None)
+    builder_kwargs: dict[str, object] = {
+        "agent_type": agent_type,
+        "cwd": cwd,
+        "agent_cmd": agent_cmd,
+        "agent_args": list(agent_args),
+        "capture_full_tool_content": bool(
+            getattr(session, "_capture_full_tool_content", False)
+        ),
+    }
+    if model_name is not None:
+        builder_kwargs["model_name"] = model_name
+    if isinstance(explicit_env, dict):
+        builder_kwargs["env"] = dict(explicit_env)
+
     try:
-        new_sess = builder(
-            agent_type=agent_type,
-            cwd=cwd,
-            agent_cmd=agent_cmd,
-            agent_args=list(agent_args),
-            capture_full_tool_content=bool(
-                getattr(session, "_capture_full_tool_content", False)
-            ),
-        )
+        try:
+            new_sess = builder(**builder_kwargs)
+        except TypeError:
+            fallback_kwargs = dict(builder_kwargs)
+            if "env" in fallback_kwargs:
+                fallback_kwargs.pop("env", None)
+                try:
+                    new_sess = builder(**fallback_kwargs)
+                except TypeError:
+                    fallback_kwargs.pop("model_name", None)
+                    new_sess = builder(**fallback_kwargs)
+            else:
+                fallback_kwargs.pop("model_name", None)
+                new_sess = builder(**fallback_kwargs)
         new_sess.start(startup_timeout=timeout_s)
         return new_sess
     except (RuntimeError, OSError, TimeoutError):

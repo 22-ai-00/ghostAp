@@ -718,6 +718,9 @@ class SyncACPSession(PromptGenerationTracker):
             for arg in (self._agent_args or [])
         )
 
+    def _uses_codex_acp(self) -> bool:
+        return (self._agent_type or "").strip().lower() == "codex"
+
     def _uses_traex_acp(self) -> bool:
         return (self._agent_type or "").strip().lower() == "traex"
 
@@ -751,11 +754,17 @@ class SyncACPSession(PromptGenerationTracker):
         """Apply a persisted Codex model/Effort selection over ACP config options."""
         if not self._acp_session:
             return False
-        from .model_selection import split_codex_model_selection
+        from .model_selection import CODEX_DEFAULT_MODEL_TOKEN, split_codex_model_selection
 
         model_id, reasoning_effort = split_codex_model_selection(selection)
         if not model_id:
             return False
+        if model_id == CODEX_DEFAULT_MODEL_TOKEN:
+            if reasoning_effort is None:
+                return True
+            return bool(
+                await self._acp_session.set_config_option("reasoning_effort", reasoning_effort)
+            )
         if reasoning_effort is None:
             return bool(await self._acp_session.set_model(model_id))
         return await self._apply_two_step_config("model", model_id, "reasoning_effort", reasoning_effort)
@@ -763,8 +772,26 @@ class SyncACPSession(PromptGenerationTracker):
     async def _apply_traex_selection(self, selection: str) -> bool:
         if not self._acp_session:
             return False
-        from .traex_selection import resolve_traex_runtime_selection
+        from .traex_selection import resolve_traex_runtime_selection, split_traex_model_selection
 
+        raw_model, profile, raw_effort = split_traex_model_selection(selection)
+        if raw_model == "default":
+            if profile not in {"standard", "max"}:
+                logger.warning("[ACP:TRAEX] invalid model selection: %s", selection)
+                return False
+            if profile != "standard":
+                if raw_effort is None:
+                    return bool(
+                        await self._acp_session.set_config_option("profile", profile)
+                    )
+                return await self._apply_two_step_config(
+                    "profile", profile, "reasoning_effort", raw_effort
+                )
+            if raw_effort is None:
+                return True
+            return bool(
+                await self._acp_session.set_config_option("reasoning_effort", raw_effort)
+            )
         try:
             resolved = resolve_traex_runtime_selection(selection)
         except ValueError as exc:
@@ -777,7 +804,39 @@ class SyncACPSession(PromptGenerationTracker):
     async def _apply_dsh_selection(self, selection: str) -> bool:
         if not self._acp_session:
             return False
-        from .dsh_selection import DSH_MODEL_CONFIG_ID, DSH_REASONING_CONFIG_ID, split_dsh_model_selection
+        from .dsh_selection import (
+            DSH_DEFAULT_REASONING,
+            DSH_MODEL_CONFIG_ID,
+            DSH_REASONING_CONFIG_ID,
+            split_dsh_model_selection,
+        )
+
+        if str(selection or "").strip().lower() in {"default", "default/default"}:
+            return True
+
+        try:
+            parsed = json.loads(str(selection or ""))
+        except (TypeError, ValueError):
+            parsed = None
+        if (
+            isinstance(parsed, list)
+            and len(parsed) in {2, 3}
+            and parsed[0] == "default"
+            and parsed[1] in {"", "default"}
+        ):
+            if len(parsed) == 2:
+                return True
+            effort = str(parsed[2] or "").strip().lower()
+            if not effort:
+                return True
+            reasoning_value = (
+                json.dumps([DSH_DEFAULT_REASONING], separators=(",", ":"))
+                if effort == DSH_DEFAULT_REASONING
+                else json.dumps(["effort", effort], ensure_ascii=False, separators=(",", ":"))
+            )
+            return bool(
+                await self._acp_session.set_config_option(DSH_REASONING_CONFIG_ID, reasoning_value)
+            )
 
         try:
             model_value, reasoning_value = split_dsh_model_selection(selection)
@@ -809,6 +868,12 @@ class SyncACPSession(PromptGenerationTracker):
         except ValueError as exc:
             logger.warning("[ACP:AGY] invalid model selection: %s", get_error_detail(exc))
             return False
+        if model_id == "default":
+            if thought_level is None:
+                return True
+            return bool(
+                await self._acp_session.set_config_option(AGY_THOUGHT_LEVEL_CONFIG_ID, thought_level)
+            )
         return await self._apply_two_step_config(
             AGY_MODEL_CONFIG_ID, model_id, AGY_THOUGHT_LEVEL_CONFIG_ID, thought_level
         )
@@ -849,11 +914,10 @@ class SyncACPSession(PromptGenerationTracker):
         )
         session_id = await self._acp_session.start()
 
-        # The official adapter intentionally does not parse Codex CLI ``-c``
-        # arguments. Apply an explicit selection over ACP before exposing this
-        # session as ready; otherwise a model card can claim one model while the
-        # first prompt silently uses the user's default model.
-        if self._uses_official_codex_acp() and self._model_name:
+        # Codex ACP (both official `@agentclientprotocol/codex-acp` and native
+        # `codex acp serve`) applies explicit model / reasoning_effort selection
+        # via session/set_config_option after new_session.
+        if self._uses_codex_acp() and self._model_name:
             applied = await self._apply_official_codex_selection(self._model_name)
             if not applied:
                 with contextlib.suppress(Exception):
@@ -1388,7 +1452,7 @@ class SyncACPSession(PromptGenerationTracker):
                 operation = self._apply_dsh_selection(model_id)
             elif self._uses_agy_acp():
                 operation = self._apply_agy_selection(model_id)
-            elif self._uses_official_codex_acp():
+            elif self._uses_codex_acp():
                 operation = self._apply_official_codex_selection(model_id)
             else:
                 operation = self._acp_session.set_model(model_id)

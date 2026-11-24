@@ -95,6 +95,9 @@ class WorkflowStateManager:
         model: str | None = None,
         role: str | None = None,
         agent_id: str | None = None,
+        effort: str | None = None,
+        profile: str | None = None,
+        effective_model: str | None = None,
     ) -> str:
         """Add an agent entry to the current (or matching) phase.
 
@@ -117,6 +120,9 @@ class WorkflowStateManager:
                 tool=tool,
                 model=model,
                 role=role,
+                effort=effort,
+                profile=profile,
+                effective_model=effective_model,
                 task_summary=task_summary,
                 status=AgentStatus.RUNNING,
                 started_at=now,
@@ -484,6 +490,9 @@ class WorkflowStateManager:
                             tool=agent.tool,
                             model=agent.model,
                             role=agent.role,
+                            effort=agent.effort,
+                            profile=agent.profile,
+                            effective_model=agent.effective_model,
                             task_summary=agent.task_summary,
                             status=agent.status,
                             token_usage=agent.token_usage,

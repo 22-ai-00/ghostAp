@@ -2,29 +2,57 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from src.spec_engine.models import ReviewAgentBinding
 
-from .agent_pool import WorkflowAgentBinding, freeze_agent_pool
+from .agent_pool import WorkflowAgentBinding, freeze_agent_pool, resolve_effective_model_name
 
 
 def _binding_model(binding: ReviewAgentBinding) -> str | None:
     return None if binding.use_default_model else binding.model_name
 
 
-def _review_binding(binding: WorkflowAgentBinding) -> ReviewAgentBinding:
+def _is_default_effective_sentinel(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text == "default" or text.startswith("default/"):
+        return True
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(parsed, list)
+            and len(parsed) >= 2
+            and parsed[0] == "default"
+            and parsed[1] in {"", "default"}
+        )
+    return False
+
+
+def _review_binding(
+    binding: WorkflowAgentBinding,
+    effective_model: str | None = None,
+) -> ReviewAgentBinding:
+    resolved_effective = (
+        effective_model if effective_model is not None else binding.effective_model_name()
+    )
+    resolved_model = resolved_effective or binding.model_name
     return ReviewAgentBinding(
         provider="workflow",
         tool_name=binding.tool_name,
         display_name=binding.display_name,
         agent_type=binding.tool_name,
-        model_name=binding.model_name,
+        model_name=resolved_model,
         model_display_name=binding.model_name,
         selection_key=binding.agent_id,
-        use_default_model=binding.model_name is None,
+        use_default_model=(resolved_effective is None and binding.model_name is None),
     )
 
 
@@ -46,6 +74,9 @@ class WorkflowRunSpec:
     enforce_tool_allowlist: bool = True
     agent_pool: tuple[WorkflowAgentBinding, ...] = ()
     orchestrator_agent_id: str | None = None
+    binding_specs: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     _agent_by_id: Mapping[str, WorkflowAgentBinding] = field(
         init=False,
         repr=False,
@@ -99,27 +130,86 @@ class WorkflowRunSpec:
         if set(requested_tools) != set(pool_tools):
             raise ValueError("Workflow allowed_tools must exactly match strict agent_pool tools")
 
+        effective_by_id: dict[str, str | None] = {}
+        raw_binding_specs = (
+            self.binding_specs if isinstance(self.binding_specs, Mapping) else {}
+        )
+        for binding in pool:
+            computed = binding.effective_model_name()
+            resolved_effective = computed
+            if binding.model_name is None and _is_default_effective_sentinel(computed):
+                raw_spec = raw_binding_specs.get(binding.agent_id)
+                saved = (
+                    raw_spec.get("effective_model")
+                    if isinstance(raw_spec, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(saved, str)
+                    and saved.strip()
+                    and not _is_default_effective_sentinel(saved.strip())
+                    and resolve_effective_model_name(
+                        binding.tool_name,
+                        saved.strip(),
+                        profile=binding.profile,
+                        effort=binding.effort,
+                    )
+                    == saved.strip()
+                ):
+                    resolved_effective = saved.strip()
+            effective_by_id[binding.agent_id] = resolved_effective
+
         for reviewer in reviewers:
-            reviewer_key = (reviewer.tool_name, _binding_model(reviewer))
-            if not any(binding.tool_model_key == reviewer_key for binding in pool):
+            reviewer_model = _binding_model(reviewer)
+            reviewer_id = str(getattr(reviewer, "selection_key", "") or "").strip()
+            require_agent_id = bool(reviewer_id and ":" not in reviewer_id)
+            if not any(
+                (not require_agent_id or binding.agent_id == reviewer_id)
+                and binding.tool_name == reviewer.tool_name
+                and reviewer_model in {binding.model_name, effective_by_id[binding.agent_id]}
+                for binding in pool
+            ):
                 raise ValueError("Workflow reviewer binding is outside agent_pool")
 
-        # The legacy map cannot represent two models for one tool. Preserve only
-        # unambiguous entries for audit; strict execution always resolves by ID.
-        models_by_tool: dict[str, set[str | None]] = {}
+        # The legacy map cannot represent two configs (model/profile/effort) for
+        # one tool. Preserve only unambiguous entries for audit; strict execution
+        # always resolves by agent_id via binding_specs / _agent_by_id.
+        configs_by_tool: dict[
+            str, dict[tuple[str | None, str | None, str | None], str | None]
+        ] = {}
         for binding in pool:
-            models_by_tool.setdefault(binding.tool_name, set()).add(binding.model_name)
+            config_key = (binding.model_name, binding.profile, binding.effort)
+            configs_by_tool.setdefault(binding.tool_name, {})[config_key] = (
+                effective_by_id[binding.agent_id]
+            )
         audit_map = {
-            tool: next(iter(models))
-            for tool, models in models_by_tool.items()
-            if len(models) == 1
+            tool: next(iter(configs.values()))
+            for tool, configs in configs_by_tool.items()
+            if len(configs) == 1
         }
+        frozen_binding_specs = MappingProxyType(
+            {
+                binding.agent_id: MappingProxyType(
+                    {
+                        **binding.to_dict(),
+                        "roles": tuple(binding.roles),
+                        "effective_model": effective_by_id[binding.agent_id],
+                    }
+                )
+                for binding in pool
+            }
+        )
 
         object.__setattr__(self, "agent_pool", pool)
         object.__setattr__(self, "orchestrator_agent_id", orchestrator_agent_id)
-        object.__setattr__(self, "orchestrator", _review_binding(orchestrator_binding))
+        object.__setattr__(
+            self,
+            "orchestrator",
+            _review_binding(orchestrator_binding, effective_by_id[orchestrator_agent_id]),
+        )
         object.__setattr__(self, "allowed_tools", requested_tools)
         object.__setattr__(self, "tool_model_map", MappingProxyType(audit_map))
+        object.__setattr__(self, "binding_specs", frozen_binding_specs)
         object.__setattr__(self, "_agent_by_id", MappingProxyType(by_id))
 
     def agent_binding(self, agent_id: str | None) -> WorkflowAgentBinding:
@@ -149,6 +239,13 @@ class WorkflowRunSpec:
             "enforce_tool_allowlist": self.enforce_tool_allowlist,
             "orchestrator_agent_id": self.orchestrator_agent_id,
             "agent_pool": [binding.to_dict() for binding in self.agent_pool],
+            "binding_specs": {
+                aid: {
+                    **dict(spec),
+                    "roles": list(spec.get("roles") or ()),
+                }
+                for aid, spec in self.binding_specs.items()
+            },
         }
 
     @classmethod
@@ -184,4 +281,5 @@ class WorkflowRunSpec:
             enforce_tool_allowlist=bool(data.get("enforce_tool_allowlist", True)),
             agent_pool=pool,
             orchestrator_agent_id=orchestrator_id,
+            binding_specs=dict(data.get("binding_specs") or {}),
         )

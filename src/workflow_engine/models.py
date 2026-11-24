@@ -104,6 +104,9 @@ class AgentCallParams(BaseModel):
     tool: str = ""
     model: Optional[str] = None
     role: Optional[str] = None
+    effort: Optional[str] = None
+    profile: Optional[str] = None
+    effective_model: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = Field(default=None, alias="schema")
     label: Optional[str] = None
     phase: Optional[str] = None
@@ -125,6 +128,10 @@ class AgentCallResult(BaseModel):
     agent_id: Optional[str] = None
     tool: str = ""
     model: Optional[str] = None
+    role: Optional[str] = None
+    effort: Optional[str] = None
+    profile: Optional[str] = None
+    effective_model: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +186,9 @@ class AgentProgress(BaseModel):
     tool: str = ""
     model: Optional[str] = None
     role: Optional[str] = None
+    effort: Optional[str] = None
+    profile: Optional[str] = None
+    effective_model: Optional[str] = None
     task_summary: str = ""
     status: AgentStatus = AgentStatus.PENDING
     token_usage: int = 0
@@ -239,6 +249,7 @@ class PendingWorkflow(BaseModel):
     orchestrator_agent_id: Optional[str] = None
     orchestrator_was_auto: bool = False
     project_id: Optional[str] = None
+    preset_id: Optional[str] = None
     next_agent_sequence: int = 1
     recommended_agents: list[dict[str, Any]] = Field(default_factory=list)
 

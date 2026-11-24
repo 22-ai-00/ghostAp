@@ -81,10 +81,16 @@ class WorkflowJournal:
         model: str | None,
         role: str | None = None,
         output_schema: dict | None = None,
+        effort: str | None = None,
+        profile: str | None = None,
     ) -> str:
-        """Compute cache key as sha256 hex of 'prompt|tool|model|role|schema'."""
+        """Compute cache key as sha256 hex of 'prompt|tool|model|role|schema[|profile|effort]'."""
         schema_part = json.dumps(output_schema, sort_keys=True) if output_schema else ""
+        norm_profile = str(profile or "").strip().lower()
+        norm_effort = str(effort or "").strip().lower()
         raw = f"{prompt}|{tool}|{model or ''}|{role or ''}|{schema_part}"
+        if norm_profile or norm_effort:
+            raw = f"{raw}|{norm_profile}|{norm_effort}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def get_cached(self, key: str) -> Optional[AgentCallResult]:

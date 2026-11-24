@@ -944,6 +944,53 @@ def _probe_blocking(
         return []
 
 
+def get_cached_acp_models(
+    tool_name: str,
+    cwd: str | None = None,
+    current_model: str | None = None,
+) -> list[ACPModelOption]:
+    """Return cached or static backend models without blocking on ACP probes.
+
+    CLI backends return their static option matrix immediately. ACP backends
+    return copies of warm cache entries only, returning ``[]`` on a cache miss
+    so capability discovery never spawns synchronous ACP subprocesses.
+    """
+    tool = str(tool_name or "").strip().lower()
+    if not tool:
+        return []
+
+    from ..agent_session.backend_resolver import is_cli_backend, is_codex_cli_backend
+
+    if is_cli_backend(tool):
+        if is_codex_cli_backend(tool):
+            return _codex_cli_fallback(current_model)
+        return _claude_cli_fallback(current_model)
+
+    key = _key(tool, cwd)
+    models, failed = _cached(key, tool)
+    if models is not None:
+        return _mark_default(models, current_model)
+    if failed:
+        return []
+
+    if cwd:
+        global_models, global_failed = _cached(_key(tool, None), tool)
+        if global_models is not None:
+            return _mark_default(global_models, current_model)
+        if global_failed:
+            return []
+    else:
+        now = time.time()
+        ttl = _CODEX_PROBE_TTL if tool == "codex" else _PROBE_TTL
+        with _cache_lock:
+            for (cached_tool, _cached_cwd), (cached_at, cached_models) in list(_probe_cache.items()):
+                if cached_tool != tool:
+                    continue
+                if now - cached_at <= ttl and cached_models:
+                    return _mark_default(_copy(cached_models), current_model)
+    return []
+
+
 def fetch_acp_models(
     tool_name: str,
     cwd: str | None,

@@ -282,9 +282,36 @@ class CodexACPProvider(GenericACPProvider):
     def check_availability(self) -> bool:
         return self._native_available() or self._fallback_available()
 
+    def normalize_model_name(self, model_name: Optional[str] = None) -> Optional[str]:
+        from ..model_selection import CODEX_DEFAULT_MODEL_TOKEN, split_codex_model_selection
+
+        m = str(model_name or "").strip()
+        if not m:
+            return None
+        base, effort = split_codex_model_selection(m)
+        if base == CODEX_DEFAULT_MODEL_TOKEN and effort is None:
+            return None
+        return m
+
     def get_serve_command(self, model_name: Optional[str] = None) -> tuple[str, list[str]]:
         if self._native_available():
-            return super().get_serve_command(model_name)
+            from ..model_selection import (
+                CODEX_DEFAULT_EFFORT_TOKEN,
+                CODEX_DEFAULT_MODEL_TOKEN,
+                split_codex_model_selection,
+            )
+
+            base, effort = split_codex_model_selection(model_name)
+            native_model = None if (not base or base == CODEX_DEFAULT_MODEL_TOKEN) else base
+            cmd, args = super().get_serve_command(native_model)
+            if (
+                effort
+                and effort != CODEX_DEFAULT_EFFORT_TOKEN
+                and self._config.help_blob_loader is not None
+                and _detect_model_arg_style(self._config.help_blob_loader()) == "config_c"
+            ):
+                args = list(args) + ["-c", f'model_reasoning_effort="{effort}"']
+            return cmd, args
         fallback = self.get_fallback_command(model_name)
         if fallback:
             return fallback

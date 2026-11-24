@@ -150,8 +150,10 @@ def _resolve_timeout_s(
     requested: float | int | None,
     configured: float | int,
     deadline_monotonic: float | None,
+    *,
+    explicit_timeout: bool = False,
 ) -> float:
-    """Apply the host floor, unlimited backstop, and remaining run budget."""
+    """Apply explicit script timeout or host floor, unlimited backstop, and run budget."""
     try:
         configured_s = float(configured)
     except (TypeError, ValueError):
@@ -161,7 +163,10 @@ def _resolve_timeout_s(
         requested_s = float(requested) if requested is not None else 0.0
     except (TypeError, ValueError):
         requested_s = 0.0
-    resolved = max(floor, requested_s) if requested_s > 0 else floor
+    if explicit_timeout and requested_s > 0:
+        resolved = max(1.0, requested_s)
+    else:
+        resolved = max(floor, requested_s) if requested_s > 0 else floor
     budget = _deadline_budget_s(deadline_monotonic)
     return resolved if budget is None else max(1.0, min(resolved, float(budget)))
 
@@ -206,32 +211,82 @@ class AgentExecutor:
         self._event_turn_seq = 0
         self._event_turn_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
+    @staticmethod
+    def _startup_breaker_key(params: AgentCallParams) -> str:
+        tool = str(params.tool or "").strip().lower()
+        if not tool:
+            return ""
+        agent_id = str(params.agent_id or "").strip()
+        model = str(params.effective_model or params.model or "").strip()
+        profile = str(params.profile or "").strip().lower()
+        effort = str(params.effort or "").strip().lower()
+        return f"{tool}|{agent_id}|{model}|{profile}|{effort}"
+
+    @staticmethod
+    def _resolve_session_model(params: AgentCallParams) -> str | None:
+        if params.effective_model is not None:
+            return params.effective_model
+        if params.effort or params.profile:
+            from .agent_pool import resolve_effective_model_name
+
+            return resolve_effective_model_name(
+                params.tool,
+                params.model,
+                profile=params.profile,
+                effort=params.effort,
+            )
+        return params.model
+
+    def is_blacklisted(self, params: AgentCallParams) -> bool:
+        """Return whether this binding's startup circuit breaker has tripped."""
+        breaker_key = self._startup_breaker_key(params)
+        if not breaker_key:
+            return False
+        with self._blacklist_lock:
+            return breaker_key in self._startup_blacklist
+
     def execute(
         self,
         params: AgentCallParams,
         *,
         cancel_event: Optional[threading.Event] = None,
         deadline_monotonic: float | None = None,
+        explicit_timeout: bool = False,
     ) -> AgentCallResult:
+        use_explicit_timeout = bool(
+            explicit_timeout or getattr(params, "explicit_timeout", False)
+        )
         start = time.monotonic()
         total_tokens = 0
         last_error: str | None = None
 
         def outcome(**values: Any) -> AgentCallResult:
             return AgentCallResult(
+                agent_id=params.agent_id,
                 tool=params.tool,
                 model=params.model,
+                role=params.role,
+                effort=params.effort,
+                profile=params.profile,
+                effective_model=params.effective_model,
                 duration_s=time.monotonic() - start,
                 **values,
             )
 
-        if params.tool:
+        breaker_key = self._startup_breaker_key(params)
+        if breaker_key:
             with self._blacklist_lock:
-                blocked = self._startup_blacklist.get(params.tool)
+                blocked = self._startup_blacklist.get(breaker_key)
             if blocked:
+                binding_desc = (
+                    params.agent_id
+                    or params.effective_model
+                    or params.model
+                    or "default"
+                )
                 return outcome(
                     error=(
-                        f"Circuit breaker: {params.tool} ACP startup failed earlier "
+                        f"Circuit breaker: {params.tool} ({binding_desc}) ACP startup failed earlier "
                         f"in this workflow ({blocked})"
                     )
                 )
@@ -284,6 +339,7 @@ class AgentExecutor:
                         params.timeout,
                         _settings_int("workflow_agent_call_timeout_s", AGENT_CALL_TIMEOUT_S),
                         deadline_monotonic,
+                        explicit_timeout=use_explicit_timeout,
                     ),
                     idle_timeout_s,
                     image_uploader=run_image_uploader,
@@ -320,6 +376,7 @@ class AgentExecutor:
                                 params.timeout,
                                 _settings_int("workflow_agent_call_timeout_s", AGENT_CALL_TIMEOUT_S),
                                 deadline_monotonic,
+                                explicit_timeout=use_explicit_timeout,
                             ),
                             idle_timeout_s,
                             image_uploader=run_image_uploader,
@@ -358,9 +415,9 @@ class AgentExecutor:
                     last_error,
                     exc_info=True,
                 )
-                if _exception_chain_has(exc, "ACPStartupError") and params.tool:
+                if _exception_chain_has(exc, "ACPStartupError") and breaker_key:
                     with self._blacklist_lock:
-                        self._startup_blacklist[params.tool] = last_error[:120]
+                        self._startup_blacklist[breaker_key] = last_error[:120]
                 timed_out = _exception_chain_has(exc, "TimeoutError")
                 if (
                     attempt < MAX_RETRIES
@@ -397,11 +454,12 @@ class AgentExecutor:
         if pool is None:
             raise RuntimeError("AgentExecutor is shut down")
         call_cancel = per_call_cancel or self.cancel_event
+        resolved_model = self._resolve_session_model(params)
         future = pool.submit(
             create_engine_session,
             agent_type=params.tool,
             cwd=self.cwd,
-            model_name=params.model,
+            model_name=resolved_model,
             cancel_event=call_cancel,
             capture_full_tool_content=True,
         )
