@@ -110,13 +110,19 @@ if (result && result.error) return { error: result.error, stage: "named-stage" }
 ```
 
 - 每个 agent() label 必须唯一；不要复用 task-analysis、analysis 或 worker 等通用 label。
-- 为每个 agent() 显式设置短超时：路由 60-90s，普通任务 120-180s，确需长推理才使用 300s。
+- 为每个 agent() 显式设置短超时：路由/探索 60-180s，普通/编码与复核任务 180-360s，长推理可使用 300-600s。
 - 检查 result.error 并提供 fallback；并行结果逐项过滤错误，全部失败时返回结构化失败。
 - 跨节点数据使用紧凑递归 `schema`；shape 失配不得继续传给下游。
 - 每个直接 agent()、descriptor worker 和原语内部 Agent 角色必须指定池内 agentId；不得写 tool/model 覆盖绑定。
 - 静态节点在 meta.agentPlan 写 agentId；运行时选择节点写 candidateAgentIds，且全部来自确认池。
 - 总 Agent 调用（含原语内部调用）不得超过 200；并发必须有上限。
 - 慢操作前和阶段里程碑调用 `log()`；不要记录完整 prompt、完整结果或敏感信息。
+
+### Teamwork Collaboration & Handoff
+
+- **Effort & Role Pairing**: 根据确认池成员的 `effort`、`profile` 与 `role`/`roles` 合理分工；优先将低/中 `effort` 或高并发成员分配给 `scout` 与并行 `worker`，将高 `effort` 或强推理成员分配给 `planner`、`verifier` 与 `synthesizer`，并尊重成员显式声明的 `role`/`roles`。
+- **Non-Self Independent Verification**: 池内存在多个成员时，`verify(..., { verifiers: [{ agentId: "<verifier-id>", role: "verifier" }], reviserAgentId: "<worker-id>" })` 应指定与执行 `worker` 不同的独立 `verifier`（优先跨工具或更高 `effort`），并将 `reviserAgentId` 指向执行 `worker`。
+- **5-Component Teamwork Handoff**: 要求中间 `worker` 与最终 `synthesizer` 返回结构化五要素交接信息（`observation`、`logic_chain`、`caveats`、`conclusion`、`verification`），以便 `fanout()` 与 `verify()` 无损传递完整上下文与验证证据。
 
 ## Output Format
 
@@ -177,6 +183,24 @@ def _binding_description(binding: Any, fallback_tool: str) -> str:
     return f"`{tool}` / " + ("backend default model" if use_default or not model else f"`{model}`")
 
 
+def _format_pool_member(binding: WorkflowAgentBinding) -> str:
+    parts = [
+        f"agentId=`{binding.agent_id}`",
+        f"tool=`{binding.tool_name}`",
+        f"model=`{binding.model_name or 'backend-default'}`",
+    ]
+    if binding.profile:
+        parts.append(f"profile=`{binding.profile}`")
+    if binding.effort:
+        parts.append(f"effort=`{binding.effort}`")
+    if binding.role:
+        parts.append(f"role=`{binding.role}`")
+    if binding.roles:
+        parts.append(f"roles=`{','.join(binding.roles)}`")
+    parts.append(f"display=`{binding.display_name}`")
+    return "- " + "; ".join(parts)
+
+
 def build_script_gen_prompt(
     requirement: str,
     available_tools: list[str] | dict[str, str],
@@ -190,13 +214,7 @@ def build_script_gen_prompt(
     """Build the compact, fully automatic Dynamic Workflow generation contract."""
     frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=False)
     if frozen_pool:
-        tools = "\n".join(
-            "- "
-            f"agentId=`{binding.agent_id}`; tool=`{binding.tool_name}`; "
-            f"model=`{binding.model_name or 'backend-default'}`; "
-            f"display=`{binding.display_name}`"
-            for binding in frozen_pool
-        )
+        tools = "\n".join(_format_pool_member(binding) for binding in frozen_pool)
         resolved_orchestrator_id = orchestrator_agent_id or frozen_pool[0].agent_id
         orchestrator_pool_binding = next(
             (binding for binding in frozen_pool if binding.agent_id == resolved_orchestrator_id),
@@ -755,6 +773,15 @@ def generate_simple_script(
         raise ValueError(
             "orchestrator_agent_id is outside confirmed agent_pool: "
             + selected_id
+        )
+    if len(frozen_pool) >= 2:
+        from .teamwork import generate_teamwork_script
+
+        return generate_teamwork_script(
+            requirement,
+            agent_pool=frozen_pool,
+            preset="recommended",
+            orchestrator_agent_id=selected_id,
         )
     tools = [binding.tool_name]
     binding_arguments = f"    agentId: {json.dumps(binding.agent_id)},\n"

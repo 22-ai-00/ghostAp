@@ -364,5 +364,50 @@ class TestPromptStructure(unittest.TestCase):
         )
 
 
+class TestTeamworkPoolFormattingAndGuidance(unittest.TestCase):
+    """Ensure confirmed agent_pool exposes effort/profile/role and Teamwork guidance."""
+
+    def test_pool_exposes_effort_profile_role_without_breaking_role_invariants(self):
+        from src.workflow_engine.agent_pool import WorkflowAgentBinding
+
+        pool = (
+            WorkflowAgentBinding(
+                agent_id="A1",
+                tool_name="traex",
+                model_name="kimi-k2",
+                display_name="Scout",
+                profile="standard",
+                effort="low",
+                role="scout",
+            ),
+            WorkflowAgentBinding(
+                agent_id="A2",
+                tool_name="codex",
+                model_name="gpt-5.4",
+                display_name="Reviewer",
+                effort="xhigh",
+                roles=("verifier", "synthesizer"),
+            ),
+        )
+        prompt = build_script_gen_prompt(
+            requirement="Audit multi-agent routing",
+            available_tools={"claude": "hidden"},
+            agent_pool=pool,
+            orchestrator_agent_id="A2",
+        )
+        self.assertIn("profile=`standard`", prompt)
+        self.assertIn("effort=`low`", prompt)
+        self.assertIn("effort=`xhigh`", prompt)
+        self.assertIn("role=`scout`", prompt)
+        self.assertIn("roles=`verifier,synthesizer`", prompt)
+        self.assertIn("Teamwork Collaboration & Handoff", prompt)
+        self.assertIn("5-Component Teamwork Handoff", prompt)
+        self.assertNotIn("claude", prompt)
+        self.assertNotIn("budget", prompt.lower())
+        self.assertNotIn("预算", prompt)
+        self.assertNotRegex(prompt, r"-\s*architect\b")
+        self.assertNotRegex(prompt, r"-\s*reviewer\b")
+
+
 if __name__ == "__main__":
     unittest.main()

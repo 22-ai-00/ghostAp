@@ -786,6 +786,7 @@ def _run_real_node_workflow(
     *,
     max_concurrent=4,
     on_agent_aborted=None,
+    **bridge_kwargs,
 ):
     import os
 
@@ -798,6 +799,7 @@ def _run_real_node_workflow(
         max_concurrent=max_concurrent,
         on_agent_call=on_agent_call,
         on_agent_aborted=on_agent_aborted,
+        **bridge_kwargs,
     )
     try:
         bridge.start()
@@ -1208,6 +1210,7 @@ def test_stderr_drain_reads_only_bounded_remainder(tmp_path):
     bridge = _make_bridge(tmp_path)
     try:
         proc = _attach_mock_process(bridge)
+        proc.poll.return_value = 1
         proc.stderr.read.return_value = "z" * (bridge_mod.STDERR_TOTAL_MAX_BYTES + 1)
 
         result = bridge._drain_stderr()
@@ -1217,3 +1220,297 @@ def test_stderr_drain_reads_only_bounded_remainder(tmp_path):
         assert bridge_mod.STDERR_TRUNCATION_MARKER in result
     finally:
         bridge.stop()
+
+
+def test_stderr_drain_skips_live_process_and_active_thread(tmp_path):
+    """_drain_stderr() must never call blocking stderr.read() while alive or draining."""
+    bridge = _make_bridge(tmp_path)
+    try:
+        proc = _attach_mock_process(bridge)
+        proc.poll.return_value = None
+        assert bridge._drain_stderr() == ""
+        proc.stderr.read.assert_not_called()
+
+        proc.poll.return_value = 1
+        active_thread = MagicMock()
+        active_thread.is_alive.return_value = True
+        bridge._stderr_thread = active_thread
+        assert bridge._drain_stderr() == ""
+        proc.stderr.read.assert_not_called()
+    finally:
+        bridge._stderr_thread = None
+        bridge.stop()
+
+
+def test_start_sends_m2_teamwork_and_timeout_init_fields(tmp_path, monkeypatch):
+    bridge = _make_bridge(
+        tmp_path,
+        artifact_dir=str(tmp_path / "artifacts"),
+        agent_pool=[{"agent_id": "A1", "tool_name": "codex", "effort": "high"}],
+        orchestrator_agent_id="A1",
+    )
+    sent_messages: list[dict] = []
+
+    class FakeStream:
+        def __iter__(self):
+            return iter([])
+
+        def readline(self):
+            return ""
+
+        def read(self, _size=-1):
+            return ""
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = MagicMock()
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
+            self.returncode = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(bridge_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(bridge_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(
+        bridge,
+        "_wait_for_notification",
+        lambda method, timeout=30.0: {"jsonrpc": "2.0", "method": "ready"},
+    )
+    monkeypatch.setattr(bridge, "_send", lambda msg: sent_messages.append(msg))
+
+    try:
+        bridge.start()
+    finally:
+        bridge.stop()
+
+    init_params = next(msg for msg in sent_messages if msg.get("method") == "init")["params"]
+    assert init_params["schema_retry_max"] == bridge_mod.SCHEMA_RETRY_MAX
+    assert init_params["artifact_dir"] == str(tmp_path / "artifacts")
+    assert init_params["agent_pool"] == [{"agent_id": "A1", "tool_name": "codex", "effort": "high"}]
+    assert init_params["orchestrator_agent_id"] == "A1"
+
+
+def test_cap_agent_timeout_honors_explicit_short_timeout_and_scales_schema(tmp_path):
+    bridge = _make_bridge(tmp_path)
+    bridge._workflow_agent_call_timeout_s = 600
+
+    explicit_short = bridge._cap_agent_timeout_to_remaining_budget(
+        {"prompt": "fast", "tool": "coco", "timeout": 30, "explicit_timeout": True}
+    )
+    assert explicit_short["timeout"] == 30
+    assert explicit_short["explicit_timeout"] is True
+
+    explicit_schema = bridge._cap_agent_timeout_to_remaining_budget(
+        {"prompt": "schema", "tool": "coco", "timeout": 10, "schema": {"ok": False}}
+    )
+    assert explicit_schema["timeout"] == 10 * (1 + bridge_mod.SCHEMA_RETRY_MAX)
+    assert explicit_schema["explicit_timeout"] is True
+
+    omitted = bridge._cap_agent_timeout_to_remaining_budget({"prompt": "default", "tool": "coco"})
+    assert omitted["timeout"] == 600
+    assert "explicit_timeout" not in omitted
+
+
+def test_handle_agent_call_forwards_m2_fields_and_keeps_one_arg_lambda_compatibility(tmp_path):
+    captured: list[tuple] = []
+
+    def full_handler(
+        params,
+        *,
+        cancel_event=None,
+        request_id=None,
+        deadline_monotonic=None,
+        fallback_agent_ids=None,
+        explicit_timeout=False,
+    ):
+        captured.append((params, fallback_agent_ids, explicit_timeout))
+        return AgentCallResult(
+            output="done",
+            agent_id=params.agent_id,
+            tool=params.tool,
+            model="gpt-5.4",
+            role=params.role,
+            effort=params.effort,
+            profile=params.profile,
+            effective_model="gpt-5.4/xhigh",
+        )
+
+    bridge = _make_bridge(tmp_path, on_agent_call=full_handler)
+    bridge._executor = ThreadPoolExecutor(max_workers=1)
+    responses: list[dict] = []
+    bridge._respond = lambda req_id, *, result: responses.append(result)
+    bridge._reject = lambda req_id, msg, **_kw: responses.append({"rejected": msg})
+
+    try:
+        bridge._handle_agent_call(
+            {
+                "prompt": "hello",
+                "agent_id": "A1",
+                "tool": "codex",
+                "role": "worker",
+                "effort": "xhigh",
+                "profile": "max",
+                "fallback_agent_ids": ["A2", "A3"],
+                "explicit_timeout": True,
+                "timeout": 45,
+            },
+            request_id=101,
+        )
+        assert bridge.wait_for_workers(timeout=5.0)
+    finally:
+        bridge._executor.shutdown(wait=True)
+
+    assert len(captured) == 1
+    p, fb_ids, exp_to = captured[0]
+    assert (p.effort, p.profile, p.role, fb_ids, exp_to) == (
+        "xhigh",
+        "max",
+        "worker",
+        ["A2", "A3"],
+        True,
+    )
+    assert responses[0]["role"] == "worker"
+    assert responses[0]["effort"] == "xhigh"
+    assert responses[0]["profile"] == "max"
+    assert responses[0]["effective_model"] == "gpt-5.4/xhigh"
+
+    # Legacy 1-arg lambda compatibility
+    simple_bridge = _make_bridge(
+        tmp_path,
+        on_agent_call=lambda p: AgentCallResult(output=f"simple:{p.prompt}", tool="coco"),
+    )
+    simple_bridge._executor = ThreadPoolExecutor(max_workers=1)
+    simple_responses: list[dict] = []
+    simple_bridge._respond = lambda req_id, *, result: simple_responses.append(result)
+    simple_bridge._reject = lambda req_id, msg, **_kw: simple_responses.append({"rejected": msg})
+    try:
+        simple_bridge._handle_agent_call({"prompt": "hi", "tool": "coco"}, request_id=102)
+        assert simple_bridge.wait_for_workers(timeout=5.0)
+    finally:
+        simple_bridge._executor.shutdown(wait=True)
+    assert simple_responses[0]["data"] == "simple:hi"
+
+
+def test_start_timeout_sanitizes_stderr(tmp_path, monkeypatch):
+    """RuntimeBridge.start() must sanitize secrets and internal paths in stderr on ready timeout."""
+    bridge = _make_bridge(tmp_path)
+
+    class FakeStream:
+        def __iter__(self):
+            return iter([])
+
+        def readline(self):
+            return ""
+
+        def read(self, _size=-1):
+            return ""
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = MagicMock()
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
+            self.returncode = 1
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(bridge_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(bridge_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(
+        bridge,
+        "_wait_for_notification",
+        lambda method, timeout=30.0: None,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_stderr_diagnostic",
+        lambda: '{"api_key": "pre_ready_secret_123"} at /home/u/app/index.js:10:5',
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="did not send 'ready'") as exc_info:
+            bridge.start()
+    finally:
+        bridge.stop()
+
+    msg = str(exc_info.value)
+    assert "pre_ready_secret_123" not in msg
+    assert "/home/u/app" not in msg
+    assert "<redacted>" in msg
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_start_ready_timeout_live_node_does_not_deadlock_and_sanitizes_stderr(
+    tmp_path, monkeypatch
+):
+    """Live Node subprocess ready-timeout must kill child before draining stderr."""
+    js = tmp_path / "hang.mjs"
+    js.write_text(
+        'process.stderr.write("api_key=sk-123 at /Users/dev/secret.py:12:3\\n");\n'
+        "setInterval(() => {}, 1000);\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(bridge_mod, "RUNTIME_JS_PATH", str(js))
+    bridge = _make_bridge(tmp_path, script_path=str(js))
+    spawned_procs: list[object] = []
+
+    def _fake_wait(method, timeout=30.0):
+        spawned_procs.append(bridge._process)
+        # Wait until the live Node child has actually written its stderr line
+        # (while remaining alive via setInterval), so slow CI never flakes.
+        wait_until = time.monotonic() + 2.0
+        while time.monotonic() < wait_until:
+            with bridge._stderr_tail_lock:
+                if bridge._stderr_tail:
+                    break
+            time.sleep(0.02)
+        return None
+
+    monkeypatch.setattr(bridge, "_wait_for_notification", _fake_wait)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="did not send 'ready'") as exc_info:
+            bridge.start()
+    finally:
+        bridge.stop()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, f"start() hung on ready timeout ({elapsed:.2f}s)"
+    assert len(spawned_procs) == 1
+    proc = spawned_procs[0]
+    assert proc is not None
+    assert proc.poll() is not None, "Live Node subprocess was not terminated"
+    assert bridge._process is None
+    assert bridge._stderr_thread is None or not bridge._stderr_thread.is_alive()
+
+    msg = str(exc_info.value)
+    assert "<redacted>" in msg
+    assert "sk-123" not in msg
+    assert "/Users/dev/secret.py" not in msg
+

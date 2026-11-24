@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import collections
+import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -96,6 +98,33 @@ def _parse_node_version(version_str: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts if p.isdigit())
 
 
+def _normalize_fallback_agent_ids(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    cleaned: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # RuntimeBridge
 # ---------------------------------------------------------------------------
@@ -122,6 +151,9 @@ class RuntimeBridge:
         allowed_tools: Optional[list[str]] = None,
         args: Optional[dict[str, Any]] = None,
         workflow_deadline_monotonic: float | None = None,
+        artifact_dir: Optional[str] = None,
+        agent_pool: Optional[list[dict[str, Any]]] = None,
+        orchestrator_agent_id: Optional[str] = None,
     ) -> None:
         self._script_path = script_path
         self._cwd = cwd
@@ -137,6 +169,9 @@ class RuntimeBridge:
         # the JS wall-clock representation exactly once in
         # _ensure_workflow_deadline().
         self._confirmed_deadline_monotonic = workflow_deadline_monotonic
+        self._artifact_dir = artifact_dir
+        self._agent_pool = list(agent_pool) if agent_pool else []
+        self._orchestrator_agent_id = orchestrator_agent_id or ""
 
         # Subprocess handle
         self._process: Optional[subprocess.Popen] = None
@@ -145,8 +180,9 @@ class RuntimeBridge:
         # Thread-safe stdin writes
         self._write_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
-        # Read loop thread
+        # Read loop and stderr drain threads
         self._reader_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
 
         # Bounded ring buffer of the most recent Node stderr lines. The
         # dedicated stderr drain thread continuously consumes the stderr pipe
@@ -346,6 +382,8 @@ class RuntimeBridge:
                     stderr=subprocess.PIPE,
                     cwd=self._cwd,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,  # Line-buffered
                     env=os.environ.copy(),
                 )
@@ -381,11 +419,29 @@ class RuntimeBridge:
         # Wait for the 'ready' notification
         ready = self._wait_for_notification("ready", timeout=30.0)
         if ready is None:
-            # Capture stderr BEFORE _kill_process() nulls out self._process,
-            # otherwise the diagnostic would be empty.
-            stderr_content = self._stderr_diagnostic()
+            # Terminate/kill the hung subprocess FIRST so the OS closes its
+            # stderr write end, allowing _stderr_reader to drain remaining lines
+            # into _stderr_tail and exit on EOF without deadlocking.
             self._kill_process()
-            raise RuntimeError(f"Node.js runtime did not send 'ready' within 30s. stderr: {stderr_content}")
+            stderr_thread = vars(self).get("_stderr_thread")
+            if (
+                stderr_thread is not None
+                and stderr_thread is not threading.current_thread()
+                and stderr_thread.is_alive()
+            ):
+                stderr_thread.join(timeout=1.0)
+            reader_thread = vars(self).get("_reader_thread")
+            if (
+                reader_thread is not None
+                and reader_thread is not threading.current_thread()
+                and reader_thread.is_alive()
+            ):
+                reader_thread.join(timeout=1.0)
+            stderr_content = self._stderr_diagnostic()
+            sanitized_stderr = _strip_internal_details(stderr_content)
+            raise RuntimeError(
+                f"Node.js runtime did not send 'ready' within 30s. stderr: {sanitized_stderr}"
+            )
 
         self._ensure_workflow_deadline()
 
@@ -404,6 +460,10 @@ class RuntimeBridge:
                     "deadline_unix_ms": self._workflow_deadline_unix_ms,
                     "total_timeout_s": self._workflow_total_timeout_s,
                     "agent_call_timeout_s": self._workflow_agent_call_timeout_s,
+                    "schema_retry_max": SCHEMA_RETRY_MAX,
+                    "artifact_dir": vars(self).get("_artifact_dir") or "",
+                    "agent_pool": vars(self).get("_agent_pool") or [],
+                    "orchestrator_agent_id": vars(self).get("_orchestrator_agent_id") or "",
                 },
             }
         )
@@ -411,13 +471,25 @@ class RuntimeBridge:
         # Publish both pools through the same submission gate used by stop().
         # If cancellation won while Node was becoming ready, no executor may
         # appear after the stop acknowledgement.
+        cancelled_during_start = False
         with self._request_lock:
             if self._shutdown_requested():
-                raise RuntimeError("RuntimeBridge cancelled during start")
-            self._executor = ThreadPoolExecutor(
-                max_workers=self._max_concurrent,
-                thread_name_prefix="RuntimeBridge-agent",
-            )
+                cancelled_during_start = True
+            else:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_concurrent,
+                    thread_name_prefix="RuntimeBridge-agent",
+                )
+        if cancelled_during_start:
+            self._kill_process()
+            reader_thread = vars(self).get("_reader_thread")
+            if (
+                reader_thread is not None
+                and reader_thread is not threading.current_thread()
+                and reader_thread.is_alive()
+            ):
+                reader_thread.join(timeout=1.0)
+            raise RuntimeError("RuntimeBridge cancelled during start")
 
 
         logger.info("Node.js runtime ready and initialized")
@@ -858,31 +930,26 @@ class RuntimeBridge:
         self,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Resolve the per-agent timeout, honoring the host floor and budget.
-
-        Two independent concerns are handled here:
-
-        1. Host config is the authoritative *floor*. The generated JS bakes a
-           small ``timeout`` (e.g. 180) into each agent() call; honoring that
-           verbatim was prematurely killing long-running coding tasks. So the
-           script value may only *raise* the timeout above the configured
-           ``workflow_agent_call_timeout_s`` floor, never lower it. A floor of
-           ``0`` means unlimited → a large finite backstop is used instead.
-        2. The total-workflow deadline is authoritative: when a total deadline
-           is in effect the resolved timeout is capped so one late agent()
-           cannot outlive the remaining run budget.
-        """
+        """Resolve the per-agent timeout, honoring explicit script values and budget."""
         default_timeout = self._workflow_agent_call_timeout_s
         # Configured floor (0 => unlimited => finite backstop).
         base_s = default_timeout if default_timeout > 0 else AGENT_UNLIMITED_BACKSTOP_S
 
         raw_timeout = params.get("timeout")
-        try:
-            requested_s = int(raw_timeout) if raw_timeout is not None else 0
-        except (TypeError, ValueError):
-            requested_s = 0
-        # Script value may only raise the effective timeout above the floor.
-        effective_s = max(base_s, requested_s) if requested_s > 0 else base_s
+        requested_s = 0
+        if raw_timeout is not None:
+            try:
+                numeric = float(raw_timeout)
+                if math.isfinite(numeric) and numeric > 0:
+                    requested_s = max(1, math.ceil(numeric))
+            except (TypeError, ValueError):
+                requested_s = 0
+
+        explicit_timeout = bool(params.get("explicit_timeout")) or requested_s > 0
+        if explicit_timeout and requested_s > 0:
+            effective_s = max(1, requested_s)
+        else:
+            effective_s = base_s
 
         # When an output_schema is specified, the Python executor may perform
         # up to SCHEMA_RETRY_MAX additional prompts on the same session. The JS
@@ -892,10 +959,12 @@ class RuntimeBridge:
             effective_s = effective_s * (1 + SCHEMA_RETRY_MAX)
 
         capped = dict(params)
+        if explicit_timeout and requested_s > 0:
+            capped["explicit_timeout"] = True
 
         remaining = self._remaining_workflow_budget_s()
         if remaining is None:
-            # Unlimited total deadline — no budget cap, floor logic stands.
+            # Unlimited total deadline — no budget cap.
             capped["timeout"] = max(1, effective_s)
             return capped
 
@@ -964,17 +1033,29 @@ class RuntimeBridge:
 
         def _execute() -> None:
             try:
+                explicit_timeout = bool(params.get("explicit_timeout"))
+                fallback_agent_ids = _normalize_fallback_agent_ids(
+                    params.get("fallback_agent_ids")
+                )
                 # Parse params into model
                 agent_params = AgentCallParams.model_validate(params)
                 # Resolve empty tool to the first allowed tool
                 if not agent_params.tool and self._allowed_tools:
                     agent_params.tool = self._allowed_tools[0]
-                result = self._on_agent_call(
-                    agent_params,
-                    cancel_event=pending.cancel_event,
-                    request_id=request_id,
-                    deadline_monotonic=self._workflow_deadline_monotonic,
-                )
+
+                call_kwargs: dict[str, Any] = {}
+                if _accepts_kwarg(self._on_agent_call, "cancel_event"):
+                    call_kwargs["cancel_event"] = pending.cancel_event
+                if _accepts_kwarg(self._on_agent_call, "request_id"):
+                    call_kwargs["request_id"] = request_id
+                if _accepts_kwarg(self._on_agent_call, "deadline_monotonic"):
+                    call_kwargs["deadline_monotonic"] = self._workflow_deadline_monotonic
+                if fallback_agent_ids and _accepts_kwarg(self._on_agent_call, "fallback_agent_ids"):
+                    call_kwargs["fallback_agent_ids"] = fallback_agent_ids
+                if explicit_timeout and _accepts_kwarg(self._on_agent_call, "explicit_timeout"):
+                    call_kwargs["explicit_timeout"] = explicit_timeout
+
+                result = self._on_agent_call(agent_params, **call_kwargs)
                 # Build response payload
                 response_data: dict[str, Any] = {}
                 if result.parsed is not None:
@@ -984,11 +1065,15 @@ class RuntimeBridge:
                 if result.error:
                     response_data["error"] = result.error
 
-                response_data["agent_id"] = result.agent_id
-                response_data["tool"] = result.tool
-                response_data["model"] = result.model
-                response_data["token_usage"] = result.token_usage
-                response_data["duration_s"] = result.duration_s
+                response_data["agent_id"] = getattr(result, "agent_id", None)
+                response_data["tool"] = getattr(result, "tool", "")
+                response_data["model"] = getattr(result, "model", None)
+                response_data["role"] = getattr(result, "role", None)
+                response_data["effort"] = getattr(result, "effort", None)
+                response_data["profile"] = getattr(result, "profile", None)
+                response_data["effective_model"] = getattr(result, "effective_model", None)
+                response_data["token_usage"] = getattr(result, "token_usage", 0)
+                response_data["duration_s"] = getattr(result, "duration_s", 0.0)
 
                 self._respond(request_id, result=response_data)
 
@@ -1206,31 +1291,48 @@ class RuntimeBridge:
     def _kill_process(self) -> None:
         """Terminate and clean up the subprocess."""
         with self._process_lock:
-            if self._process is None:
+            proc = self._process
+            if proc is None:
                 return
 
             try:
-                if self._process.poll() is None:
-                    self._process.terminate()
+                if proc.poll() is None:
+                    proc.terminate()
                     try:
-                        self._process.wait(timeout=5)
+                        proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait(timeout=5)
+                        proc.kill()
+                        proc.wait(timeout=5)
             except OSError:
                 pass
 
-            # Close handles
+            # Close stdin and stdout handles first so writer/reader paths unblock.
             for stream in (
-                self._process.stdin,
-                self._process.stdout,
-                self._process.stderr,
+                proc.stdin,
+                proc.stdout,
             ):
                 if stream:
                     try:
                         stream.close()
                     except OSError:
                         pass
+
+            # Let the stderr drain thread consume remaining buffered output up
+            # to EOF (the child is already dead) before closing stderr.
+            stderr_thread = vars(self).get("_stderr_thread")
+            if (
+                stderr_thread is not None
+                and stderr_thread is not threading.current_thread()
+                and stderr_thread.is_alive()
+            ):
+                stderr_thread.join(timeout=1.0)
+
+            stderr_stream = proc.stderr
+            if stderr_stream and (stderr_thread is None or not stderr_thread.is_alive()):
+                try:
+                    stderr_stream.close()
+                except OSError:
+                    pass
 
             self._process = None
 
@@ -1284,11 +1386,13 @@ class RuntimeBridge:
         for the unexpected-exit diagnostic even though the pipe itself is
         consumed here.
         """
-        assert self._process is not None
-        assert self._process.stderr is not None
+        proc = self._process
+        assert proc is not None
+        stderr = proc.stderr
+        assert stderr is not None
         try:
             while True:
-                line = self._process.stderr.readline()
+                line = stderr.readline()
                 if not line:
                     break  # EOF — process closed stderr
                 stripped, line_truncated = _clip_utf8(line.rstrip(), STDERR_LINE_MAX_BYTES)
@@ -1334,6 +1438,16 @@ class RuntimeBridge:
 
     def _stderr_diagnostic(self) -> str:
         """Best-effort combined stderr: buffered tail plus any pipe remainder."""
+        proc = self._process
+        stderr_thread = vars(self).get("_stderr_thread")
+        if (
+            (proc is None or proc.poll() is not None)
+            and stderr_thread is not None
+            and stderr_thread is not threading.current_thread()
+            and stderr_thread.is_alive()
+        ):
+            stderr_thread.join(timeout=1.0)
+
         parts: list[str] = []
         tail = self._stderr_tail_text()
         if tail:
@@ -1348,12 +1462,19 @@ class RuntimeBridge:
         return bounded
 
     def _drain_stderr(self) -> str:
-        """Read remaining stderr content from the subprocess."""
-        if self._process is None or self._process.stderr is None:
+        """Read remaining stderr content from an exited subprocess."""
+        proc = self._process
+        if proc is None or proc.stderr is None:
+            return ""
+        # Never block on stderr.read() while the subprocess is still alive or
+        # while the dedicated stderr reader thread is actively reading the pipe.
+        if proc.poll() is None:
+            return ""
+        stderr_thread = vars(self).get("_stderr_thread")
+        if stderr_thread is not None and stderr_thread.is_alive():
             return ""
         try:
-            # Non-blocking read of whatever is available
-            content = self._process.stderr.read(STDERR_TOTAL_MAX_BYTES + 1)
+            content = proc.stderr.read(STDERR_TOTAL_MAX_BYTES + 1)
             if not content:
                 return ""
             bounded, _ = _bound_stderr_text(content.strip())

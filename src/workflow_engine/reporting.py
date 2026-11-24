@@ -138,9 +138,30 @@ def _workflow_summary(project: WorkflowProject) -> str:
             if orchestrator.get("use_default_model", True)
             else orchestrator.get("model_name") or "default"
         )
+        orch_id = run_spec.get("orchestrator_agent_id")
+        orch_id_part = f" [{orch_id}]" if orch_id else ""
         lines.append(
-            f"- 主编排绑定: {orchestrator.get('tool_name') or '(none)'}/{orchestrator_model}"
+            f"- 主编排绑定:{orch_id_part} {orchestrator.get('tool_name') or '(none)'}/{orchestrator_model}"
         )
+    pool_entries = run_spec.get("agent_pool") or []
+    if pool_entries:
+        pool_parts: list[str] = []
+        for entry in pool_entries:
+            if not isinstance(entry, dict):
+                continue
+            aid = entry.get("agent_id") or entry.get("agentId") or "?"
+            tool = entry.get("tool_name") or entry.get("toolName") or "?"
+            model = entry.get("model_name") or entry.get("modelName") or "default"
+            meta_bits = [f"{aid}:{tool}/{model}"]
+            if entry.get("profile"):
+                meta_bits.append(f"profile={entry['profile']}")
+            if entry.get("effort"):
+                meta_bits.append(f"effort={entry['effort']}")
+            if entry.get("role"):
+                meta_bits.append(f"role={entry['role']}")
+            pool_parts.append(" ".join(meta_bits))
+        if pool_parts:
+            lines.append("- Agent Pool: " + "; ".join(pool_parts))
     if run_spec:
         lines.append(
             "- 评审模式: "
@@ -169,12 +190,22 @@ def _phase_process(project: WorkflowProject) -> str:
             display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
             agent_line = (
                 f"- Agent #{display_index} [{_status_text(agent.status)}] {agent.label or 'agent'}"
+            )
+            if getattr(agent, "agent_id", None):
+                agent_line += f" agent_id={agent.agent_id}"
+            agent_line += (
                 f" tool={agent.tool or '(none)'}"
                 f" model={agent.model or 'default'}"
                 f" attempt={max(1, int(getattr(agent, 'attempt', 1) or 1))}"
             )
+            if getattr(agent, "profile", None):
+                agent_line += f" profile={agent.profile}"
+            if getattr(agent, "effort", None):
+                agent_line += f" effort={agent.effort}"
             if agent.role:
                 agent_line += f" role={agent.role}"
+            if getattr(agent, "effective_model", None) and agent.effective_model != agent.model:
+                agent_line += f" effective_model={agent.effective_model}"
             if agent.duration_s:
                 agent_line += f" duration={format_duration(agent.duration_s)}"
             if agent.token_usage:
@@ -361,16 +392,24 @@ def _render_phases_html(project: WorkflowProject) -> str:
             }.get(a_status.lower(), "agent-pending")
             a_dur = f' <span class="agent-meta">{format_duration(agent.duration_s)}</span>' if agent.duration_s else ""
             a_tok = f' <span class="agent-meta">{agent.token_usage} tok</span>' if agent.token_usage else ""
+            a_id = f' <span class="agent-meta">[{html.escape(agent.agent_id)}]</span>' if getattr(agent, "agent_id", None) else ""
             a_tool = f' <span class="agent-tool">{html.escape(agent.tool or "")}</span>' if agent.tool else ""
             a_model = f' <span class="agent-tool">{html.escape(agent.model or "")}</span>' if agent.model else ""
-            a_role = f' <span class="agent-meta">{html.escape(agent.role or "")}</span>' if agent.role else ""
+            a_profile = f' <span class="agent-meta">profile={html.escape(agent.profile)}</span>' if getattr(agent, "profile", None) else ""
+            a_effort = f' <span class="agent-meta">effort={html.escape(agent.effort)}</span>' if getattr(agent, "effort", None) else ""
+            a_role = f' <span class="agent-meta">role={html.escape(agent.role)}</span>' if agent.role else ""
+            a_eff_model = (
+                f' <span class="agent-meta">effective={html.escape(agent.effective_model)}</span>'
+                if getattr(agent, "effective_model", None) and agent.effective_model != agent.model
+                else ""
+            )
             a_task = f'<div class="agent-task">{html.escape(agent.task_summary or "")}</div>' if agent.task_summary else ""
             a_err = f'<div class="agent-error">{html.escape(agent.error or "")}</div>' if agent.error else ""
             agent_rows.append(
                 f'<div class="agent-row {a_cls}">'
                 f'<span class="agent-status">{html.escape(a_status)}</span>'
                 f'<span class="agent-label">{html.escape(agent.label or "agent")}</span>'
-                f'{a_tool}{a_model}{a_role}{a_dur}{a_tok}'
+                f'{a_id}{a_tool}{a_model}{a_profile}{a_effort}{a_role}{a_eff_model}{a_dur}{a_tok}'
                 f'{a_task}{a_err}'
                 f'</div>'
             )

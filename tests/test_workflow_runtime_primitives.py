@@ -306,3 +306,197 @@ def test_race_abort_full_pipeline_under_5s(tmp_path):
 
     # Timing: state transition must be way under 5s
     assert state_elapsed_ms < 5000, f"state transition must be <5s, took {state_elapsed_ms:.0f}ms"
+
+
+def test_runtime_lossless_synthesis_and_artifact_spill(tmp_path) -> None:
+    """fanout() and tournament() preserve >3500-char 5-component handoffs and spill huge outputs cleanly."""
+    from src.workflow_engine.bridge import RuntimeBridge
+    from src.workflow_engine.models import AgentCallParams, AgentCallResult
+    from tests.test_workflow_bridge_transport import _run_real_node_workflow
+
+    if not RuntimeBridge.check_node_available():
+        raise RuntimeError("Node.js required")
+
+    artifact_dir = tmp_path / "artifacts"
+    synth_prompts: list[str] = []
+    judge_prompts: list[str] = []
+
+    def on_agent_call(params: AgentCallParams, **_kwargs) -> AgentCallResult:
+        if params.role == "synthesizer":
+            synth_prompts.append(params.prompt)
+            return AgentCallResult(output="synthesized-ok", tool="claude")
+        if params.role == "tournament_judge":
+            judge_prompts.append(params.prompt)
+            return AgentCallResult(
+                output=json.dumps({"winner": "A", "reasoning": "complete"}),
+                parsed={"winner": "A", "reasoning": "complete"},
+                tool="claude",
+            )
+        if params.label == "huge":
+            huge_text = "HEAD_MARKER_" + ("Z" * 20000) + "_TAIL_MARKER_HUGE"
+            return AgentCallResult(output=huge_text, tool="codex")
+        handoff = {
+            "observation": "OBS_" + ("A" * 1800) + "_OBS_END",
+            "logic_chain": "traced root cause",
+            "caveats": "none",
+            "conclusion": "done",
+            "verification": "VER_" + ("B" * 1800) + "_VER_END",
+        }
+        return AgentCallResult(output=json.dumps(handoff), tool="codex")
+
+    script = """
+export const meta = {
+  name: 'lossless-synthesis-test',
+  description: 'Verify lossless synthesis and artifact spill',
+  phases: [{ title: 'Work', detail: 'Run' }],
+};
+export default async function main() {
+  const f = await fanout('topic', [
+    { prompt: 'medium', agentId: 'A1', role: 'worker', label: 'med', timeout: 10 },
+    { prompt: 'huge', agentId: 'A1', role: 'worker', label: 'huge', timeout: 10 },
+  ], { synthesizerAgentId: 'A2', timeout: 10 });
+  const t = await tournament([
+    { prompt: 'c1', agentId: 'A1', label: 'c1', timeout: 10 },
+    { prompt: 'c2', agentId: 'A1', label: 'c2', timeout: 10 },
+  ], null, { judgeAgentId: 'A2', timeout: 10 });
+  return { f, t };
+}
+"""
+    result = _run_real_node_workflow(
+        tmp_path,
+        script,
+        on_agent_call,
+        artifact_dir=str(artifact_dir),
+    )
+    assert result["f"] == "synthesized-ok"
+    assert len(synth_prompts) == 1
+    assert "OBS_END" in synth_prompts[0] and "VER_END" in synth_prompts[0]
+    assert "HEAD_MARKER_" in synth_prompts[0] and "_TAIL_MARKER_HUGE" in synth_prompts[0]
+    assert "Full artifact saved at:" in synth_prompts[0]
+    assert list(artifact_dir.glob("*.txt"))
+    assert len(judge_prompts) == 1
+    assert "OBS_END" in judge_prompts[0] and "VER_END" in judge_prompts[0]
+
+
+def test_runtime_verify_allows_teamwork_keys_and_routes_reviser_to_pool_worker(tmp_path) -> None:
+    """verify() allows Teamwork issue keys, rejects bogus keys, and routes default reviser to worker."""
+    from src.workflow_engine.bridge import RuntimeBridge
+    from src.workflow_engine.models import AgentCallParams, AgentCallResult
+    from tests.test_workflow_bridge_transport import _run_real_node_workflow
+
+    if not RuntimeBridge.check_node_available():
+        raise RuntimeError("Node.js required")
+
+    calls: list[tuple[str | None, str | None, str | None, str | None]] = []
+    round_num = [0]
+
+    def on_agent_call(params: AgentCallParams, **_kwargs) -> AgentCallResult:
+        calls.append((params.agent_id, params.role, params.effort, params.profile))
+        if params.label and params.label.startswith("verify-"):
+            round_num[0] += 1
+            if round_num[0] == 1:
+                review = {
+                    "approve": False,
+                    "summary": "Found issue",
+                    "confidence": 0.9,
+                    "issues": [
+                        {
+                            "severity": "major",
+                            "description": "Missing guard",
+                            "evidence": "line 42 lacks null check",
+                            "observation": "checked fn()",
+                            "file": "app.py",
+                            "line": 42,
+                            "suggestion": "Add if (!x) return;",
+                        }
+                    ],
+                }
+                return AgentCallResult(output=json.dumps(review), parsed=review, tool="claude")
+            ok_review = {"approve": True, "issues": []}
+            return AgentCallResult(output=json.dumps(ok_review), parsed=ok_review, tool="claude")
+        return AgentCallResult(output="revised output", tool="codex")
+
+    script = """
+export const meta = {
+  name: 'verify-routing-test',
+  description: 'Verify Teamwork schema and default reviser routing',
+  phases: [{ title: 'Verify', detail: 'Run' }],
+};
+export default async function main() {
+  return verify('draft', {
+    verifiers: [{ agentId: 'A2', role: 'verifier', effort: 'high', profile: 'max' }],
+    reviseEffort: 'xhigh',
+    maxRounds: 2,
+    timeout: 10,
+  });
+}
+"""
+    pool = [
+        {"agent_id": "A1", "tool_name": "codex", "role": "worker", "roles": ["worker"]},
+        {"agent_id": "A2", "tool_name": "claude", "role": "reviewer", "roles": ["reviewer"]},
+    ]
+    result = _run_real_node_workflow(
+        tmp_path,
+        script,
+        on_agent_call,
+        agent_pool=pool,
+        orchestrator_agent_id="A2",
+    )
+    assert result["accepted"] is True
+    assert result["rounds"] == 2
+    assert calls == [
+        ("A2", "verifier", "high", "max"),
+        ("A1", "reviser", "xhigh", None),
+        ("A2", "verifier", "high", "max"),
+    ]
+
+
+def test_runtime_fanout_and_classify_preserve_dollar_replacement_tokens_verbatim(tmp_path) -> None:
+    """fanout() and classify() inject ${input} verbatim without JS String.replace $-expansion."""
+    from src.workflow_engine.bridge import RuntimeBridge
+    from src.workflow_engine.models import AgentCallParams, AgentCallResult
+    from tests.test_workflow_bridge_transport import _run_real_node_workflow
+
+    if not RuntimeBridge.check_node_available():
+        raise RuntimeError("Node.js required")
+
+    tricky_input = "TRAP_START ${input} $$ $& $` $' $1 TRAP_END"
+    recorded: dict[str, str] = {}
+
+    def on_agent_call(params: AgentCallParams, **_kwargs) -> AgentCallResult:
+        if params.label == "cls-classify":
+            return AgentCallResult(
+                output=json.dumps({"category": "bug"}),
+                parsed={"category": "bug"},
+                tool="codex",
+            )
+        if params.label:
+            recorded[params.label] = params.prompt
+        return AgentCallResult(output="ok", tool="codex")
+
+    script = f"""
+export const meta = {{
+  name: 'dollar-escape-test',
+  description: 'Verify verbatim ${{input}} substitution',
+  phases: [{{ title: 'Run', detail: 'Test' }}],
+}};
+export default async function main() {{
+  const payload = {json.dumps(tricky_input)};
+  const fan = await fanout(payload, [
+    {{ prompt: 'W1: ${{input}} | repeat: ${{input}}', label: 'w1', tool: 'codex' }},
+  ], {{ synthesize: false, timeout: 10 }});
+  const cls = await classify(payload, {{
+    bug: {{
+      description: 'Bug report',
+      handler: {{ prompt: 'Handler: ${{input}} | repeat: ${{input}}', label: 'cls-handler', tool: 'codex' }},
+    }},
+    feature: {{ description: 'Feature request' }},
+  }}, {{ label: 'cls', timeout: 10 }});
+  return {{ fan, cls }};
+}}
+"""
+    _run_real_node_workflow(tmp_path, script, on_agent_call)
+
+    assert recorded["w1"] == f"W1: {tricky_input} | repeat: {tricky_input}"
+    assert recorded["cls-handler"] == f"Handler: {tricky_input} | repeat: {tricky_input}"
+

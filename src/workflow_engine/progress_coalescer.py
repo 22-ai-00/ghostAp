@@ -40,7 +40,11 @@ class ProgressCoalescer:
 
         # Thread safety
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._delivery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock (serializes _on_progress callbacks)
         self._latest_snapshot: Optional[Any] = None
+        self._last_flush_at: Optional[float] = None
+        self._last_immediate_flush: Optional[float] = None
+        self._leading_coalesce_s: float = min(0.01, max(0.0, float(debounce_s) * 0.1))
         self._stop_event = threading.Event()
         self._has_work = threading.Event()
 
@@ -79,20 +83,24 @@ class ProgressCoalescer:
         if self._stop_event.is_set():
             return
 
-        with self._lock:
-            self._latest_snapshot = snapshot
-            self._has_work.set()
-
-        # Min-interval guard: skip if we just flushed within 200ms
         now = time.monotonic()
-        if hasattr(self, "_last_immediate_flush") and now - self._last_immediate_flush < 0.2:
-            return
-        self._last_immediate_flush = now
+        with self._lock:
+            # Min-interval guard: skip immediate delivery if we just flushed within 200ms,
+            # leaving the snapshot queued for the daemon thread's trailing edge.
+            if self._last_immediate_flush is not None and now - self._last_immediate_flush < 0.2:
+                self._latest_snapshot = snapshot
+                self._has_work.set()
+                return
+            self._last_immediate_flush = now
+            self._last_flush_at = now
+            self._latest_snapshot = None
+            self._has_work.clear()
 
-        try:
-            self._on_progress(snapshot)
-        except Exception:
-            logger.debug("ProgressCoalescer immediate flush failed", exc_info=True)
+        with self._delivery_lock:
+            try:
+                self._on_progress(snapshot)
+            except Exception:
+                logger.debug("ProgressCoalescer immediate flush failed", exc_info=True)
 
     def stop(self) -> None:
         """Stop the coalescer and force-flush any pending snapshot.
@@ -106,19 +114,19 @@ class ProgressCoalescer:
         self._stop_event.set()
         self._has_work.set()
 
-        # Force flush one last time before exiting
+        # Wait for the daemon thread to exit before flushing the final snapshot
+        self._thread.join(timeout=2.0)
+
         with self._lock:
             snapshot = self._latest_snapshot
             self._latest_snapshot = None
 
-        if snapshot:
-            try:
-                self._on_progress(snapshot)
-            except Exception:
-                logger.debug("ProgressCoalescer final flush failed", exc_info=True)
-
-        # Wait for the daemon thread to exit (should be fast since we set stop_event)
-        self._thread.join(timeout=2.0)
+        if snapshot is not None:
+            with self._delivery_lock:
+                try:
+                    self._on_progress(snapshot)
+                except Exception:
+                    logger.debug("ProgressCoalescer final flush failed", exc_info=True)
 
     def __enter__(self) -> "ProgressCoalescer":
         """Context manager entry — returns self."""
@@ -162,12 +170,22 @@ class ProgressCoalescer:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Main daemon thread loop: block until work arrives, then debounce and render."""
+        """Main daemon thread loop: leading-edge flush on idle->dirty, then trailing debounce."""
         while not self._stop_event.is_set():
             self._has_work.wait()
             if self._stop_event.is_set():
                 return
-            if self._stop_event.wait(timeout=self._debounce_s):
+
+            with self._lock:
+                last_flush = self._last_flush_at
+            if last_flush is None:
+                wait_s = self._leading_coalesce_s
+            else:
+                elapsed = time.monotonic() - last_flush
+                remaining = self._debounce_s - elapsed
+                wait_s = remaining if remaining > 0 else self._leading_coalesce_s
+
+            if wait_s > 0 and self._stop_event.wait(timeout=wait_s):
                 return
 
             # Grab the latest snapshot under lock and clear wakeup gate atomically
@@ -175,9 +193,12 @@ class ProgressCoalescer:
                 snapshot = self._latest_snapshot
                 self._latest_snapshot = None
                 self._has_work.clear()
+                if snapshot is not None:
+                    self._last_flush_at = time.monotonic()
 
             if snapshot is not None:
-                try:
-                    self._on_progress(snapshot)
-                except Exception:
-                    logger.debug("ProgressCoalescer callback failed", exc_info=True)
+                with self._delivery_lock:
+                    try:
+                        self._on_progress(snapshot)
+                    except Exception:
+                        logger.debug("ProgressCoalescer callback failed", exc_info=True)

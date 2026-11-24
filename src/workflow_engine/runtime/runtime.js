@@ -7,8 +7,9 @@
  */
 
 import { createInterface } from 'node:readline';
-import { resolve } from 'node:path';
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -54,6 +55,11 @@ let workflowTotalTimeoutMs = 0;
 // value of 0 means "unlimited" per-agent — the watchdog then relies only on
 // the total workflow deadline (or never fires if that is also unlimited).
 let workflowAgentCallTimeoutMs = 0;
+let schemaRetryMax = 2;
+let workflowArtifactDir = '';
+let artifactCounter = 0;
+let poolAgents = [];
+let orchestratorAgentId = '';
 const REQUEST_TIMEOUT_GRACE_MS = 10000;
 // Large finite backstop mirroring AGENT_UNLIMITED_BACKSTOP_S on the Python
 // side: even in "unlimited" mode a bounded timer eventually fires so a wedged
@@ -171,26 +177,23 @@ function workflowDeadlineError(label) {
   });
 }
 
-// Resolve the effective per-agent timeout in seconds, mirroring the Python
-// executor: the host floor (workflowAgentCallTimeoutMs) is authoritative and a
-// script-provided value may only RAISE it, never lower it. A floor of 0 means
-// unlimited → a large finite backstop is used so a timer still eventually
-// fires. The result is NOT yet capped by the remaining workflow deadline; that
-// happens in capTimeoutToDeadline / requestTimeoutMs where a live deadline
-// exists.
+// Resolve the effective per-agent timeout in seconds. When the script provides
+// an explicit positive timeout, honor it (>= 1s, rounded up for sub-second
+// values like race's 0.15s) so short explicit budgets are respected. When no
+// timeout is specified, fall back to the host-configured floor (or finite
+// backstop when configured as 0 = unlimited).
 function effectiveAgentTimeoutSeconds(requestedSeconds) {
+  const numeric = Number(requestedSeconds);
+  if (requestedSeconds != null && Number.isFinite(numeric) && numeric > 0) {
+    return Math.max(1, Math.ceil(numeric));
+  }
   const floorMs = workflowAgentCallTimeoutMs > 0
     ? workflowAgentCallTimeoutMs
     : AGENT_UNLIMITED_BACKSTOP_MS;
-  const floorSeconds = Math.max(1, Math.floor(floorMs / 1000));
-  const requested = Number(requestedSeconds) > 0 ? Math.floor(Number(requestedSeconds)) : 0;
-  return requested > 0 ? Math.max(floorSeconds, requested) : floorSeconds;
+  return Math.max(1, Math.floor(floorMs / 1000));
 }
 
 function capTimeoutToDeadline(timeoutSeconds) {
-  // Host floor is authoritative; script value may only raise it. This replaces
-  // the previous behavior of honoring the (often tiny) script timeout, which
-  // killed long-running agent() calls before the host's own deadline.
   const effective = effectiveAgentTimeoutSeconds(timeoutSeconds);
   const remainingMs = remainingWorkflowMs();
   if (!Number.isFinite(remainingMs)) return Math.max(1, effective);
@@ -207,9 +210,9 @@ function requestTimeoutMs(method, params) {
   const remainingMs = remainingWorkflowMs();
   let timeoutMs = 0;
   if (method === 'agent_call') {
-    // params.timeout is already the floor-aware effective value set by agent()
-    // via capTimeoutToDeadline; fall back to the host floor if it is missing.
-    const effectiveSeconds = effectiveAgentTimeoutSeconds(params && params.timeout);
+    const baseSeconds = effectiveAgentTimeoutSeconds(params && params.timeout);
+    const multiplier = (params && params.schema) ? (1 + schemaRetryMax) : 1;
+    const effectiveSeconds = baseSeconds * multiplier;
     timeoutMs = Math.max(1, Math.ceil(effectiveSeconds * 1000) + REQUEST_TIMEOUT_GRACE_MS);
   } else if (Number.isFinite(remainingMs)) {
     timeoutMs = Math.max(1, Math.floor(remainingMs));
@@ -474,6 +477,109 @@ function partitionResults(results) {
   return { successes, failures };
 }
 
+function normalizeFallbackAgentIds(raw) {
+  if (!Array.isArray(raw)) return undefined;
+  const cleaned = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const trimmed = item.trim();
+      if (trimmed && !cleaned.includes(trimmed)) {
+        cleaned.push(trimmed);
+      }
+    }
+  }
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function spillSynthesisArtifact(rawText, label) {
+  try {
+    const dir = workflowArtifactDir || join(tmpdir(), 'ghostap-workflow-artifacts');
+    mkdirSync(dir, { recursive: true });
+    artifactCounter += 1;
+    const safeLabel = String(label || 'item').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'item';
+    const filePath = join(dir, `${safeLabel.slice(0, 48)}-${artifactCounter}.txt`);
+    writeFileSync(filePath, rawText, 'utf-8');
+    return filePath;
+  } catch {
+    return '';
+  }
+}
+
+function formatSynthesisInput(value, { label = 'item', maxChars = 16000 } = {}) {
+  const rawText = typeof value === 'string'
+    ? value
+    : (value == null ? '' : JSON.stringify(value, null, 2));
+
+  let obj = isPlainObject(value) ? value : null;
+  if (!obj && typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (isPlainObject(parsed)) obj = parsed;
+      } catch {
+        // Keep raw string when not valid JSON
+      }
+    }
+  }
+
+  let formatted = rawText;
+  if (obj) {
+    const handoffKeys = [
+      'observation', 'logic_chain', 'logicChain', 'caveats', 'conclusion',
+      'verification', 'verificationMethod', 'summary', 'findings',
+      'deliverables', 'card_summary', 'result',
+    ];
+    const hasTeamwork = handoffKeys.some((k) => k in obj && obj[k] != null && obj[k] !== '');
+    if (hasTeamwork) {
+      const ordered = [
+        ['conclusion', obj.conclusion],
+        ['verification', obj.verification ?? obj.verificationMethod],
+        ['caveats', obj.caveats],
+        ['logic_chain', obj.logic_chain ?? obj.logicChain],
+        ['observation', obj.observation],
+        ['summary', obj.summary],
+        ['findings', obj.findings],
+        ['deliverables', obj.deliverables],
+      ];
+      const parts = [];
+      const seen = new Set(['logicChain', 'verificationMethod']);
+      for (const [k, v] of ordered) {
+        seen.add(k);
+        if (v == null || v === '') continue;
+        const valText = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+        if (valText.trim()) parts.push(`${k}: ${valText}`);
+      }
+      for (const [k, v] of Object.entries(obj)) {
+        if (seen.has(k) || v == null || v === '') continue;
+        const valText = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+        if (valText.trim()) parts.push(`${k}: ${valText}`);
+      }
+      if (parts.length > 0) {
+        formatted = parts.join('\n');
+      }
+    }
+  }
+
+  if (formatted.length <= maxChars) {
+    return formatted;
+  }
+
+  const artifactPath = spillSynthesisArtifact(rawText, label);
+  const headLen = Math.floor(maxChars * 0.6);
+  const tailLen = Math.max(200, maxChars - headLen);
+  const omitted = Math.max(0, formatted.length - headLen - tailLen);
+  let bounded = `${formatted.slice(0, headLen)}\n... [omitted middle ${omitted} chars; full output in artifact] ...\n${formatted.slice(-tailLen)}`;
+  if (artifactPath) {
+    bounded += `\n[Full artifact saved at: ${artifactPath}]`;
+  }
+  return bounded;
+}
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
@@ -496,6 +602,11 @@ async function agent(promptOrOpts, opts = {}) {
   }
 
   const agentId = typeof opts.agentId === 'string' ? opts.agentId.trim() : '';
+  const effort = typeof opts.effort === 'string' && opts.effort.trim() ? opts.effort.trim() : undefined;
+  const profile = typeof opts.profile === 'string' && opts.profile.trim() ? opts.profile.trim() : undefined;
+  const fallbackAgentIds = normalizeFallbackAgentIds(opts.fallbackAgentIds || opts.fallback_agent_ids);
+  const rawTimeoutNum = Number(opts.timeout);
+  const hasExplicitTimeout = opts.timeout != null && Number.isFinite(rawTimeoutNum) && rawTimeoutNum > 0;
 
   if (totalAgentCalls >= maxTotalAgents) {
     return {
@@ -518,9 +629,13 @@ async function agent(promptOrOpts, opts = {}) {
     ...(opts.tool && { tool: opts.tool }),
     ...(opts.model && { model: opts.model }),
     ...(opts.role && { role: opts.role }),
+    ...(effort && { effort }),
+    ...(profile && { profile }),
+    ...(fallbackAgentIds && { fallback_agent_ids: fallbackAgentIds }),
     ...(opts.schema && { schema: opts.schema }),
     ...(opts.label && { label: opts.label }),
     ...(opts.phase && { phase: opts.phase }),
+    ...(hasExplicitTimeout && { explicit_timeout: true }),
     timeout: effectiveTimeout,
   };
 
@@ -790,6 +905,9 @@ async function classify(input, categories, opts = {}) {
     agentId: opts.classifierAgentId || opts.agentId,
     tool: opts.classifierTool || opts.tool,
     model: opts.classifierModel || opts.model,
+    effort: opts.classifierEffort || opts.effort,
+    profile: opts.classifierProfile || opts.profile,
+    fallbackAgentIds: opts.classifierFallbackAgentIds || opts.fallbackAgentIds,
     role: 'classifier',
     label: opts.label ? `${opts.label}-classify` : 'classify',
     schema: opts.schema || { category: '' },
@@ -822,7 +940,7 @@ async function classify(input, categories, opts = {}) {
   if (typeof handler === 'object' && handler !== null && handler.prompt) {
     return agent({
       ...handler,
-      prompt: handler.prompt.replace('${input}', input),
+      prompt: String(handler.prompt).replaceAll('${input}', () => input),
       timeout: handler.timeout || opts.handlerTimeout || opts.timeout,
     });
   }
@@ -852,12 +970,15 @@ async function fanout(input, workers, opts = {}) {
   const tasks = workers.map((worker, idx) => {
     const prompt = typeof worker === 'string'
       ? worker
-      : (worker.prompt || '').replace('${input}', inputStr);
+      : String(worker.prompt || '').replaceAll('${input}', () => inputStr);
     return {
       prompt,
       agentId: worker.agentId || opts.workerAgentId || opts.agentId,
       tool: worker.tool || opts.defaultTool,
       model: worker.model,
+      effort: worker.effort || opts.workerEffort,
+      profile: worker.profile || opts.workerProfile,
+      fallbackAgentIds: worker.fallbackAgentIds || opts.workerFallbackAgentIds,
       role: worker.role || `worker-${idx}`,
       label: worker.label || `fanout-${idx}`,
       schema: worker.schema,
@@ -877,26 +998,26 @@ async function fanout(input, workers, opts = {}) {
     return { error: 'fanout(): all workers failed', stage: 'fanout', failures };
   }
 
-  const MAX_RESULT_LEN = 2000;
+  const maxItemChars = Number(opts.maxItemChars) > 0 ? Number(opts.maxItemChars) : 16000;
   const resultSummary = successes
     .map(({ index, value }) => {
-      const r = value;
-      const i = index;
-      const text = typeof r === 'string' ? r : JSON.stringify(r);
-      const truncated = text.length > MAX_RESULT_LEN
-        ? text.slice(0, MAX_RESULT_LEN) + `\n... [truncated ${text.length - MAX_RESULT_LEN} chars]`
-        : text;
-      return `[${workers[i].role || workers[i].label || `worker-${i}`}]:\n${truncated}`;
+      const workerMeta = typeof workers[index] === 'object' && workers[index] !== null ? workers[index] : {};
+      const workerName = workerMeta.role || workerMeta.label || `worker-${index}`;
+      const formatted = formatSynthesisInput(value, { label: workerName, maxChars: maxItemChars });
+      return `[${workerName}]:\n${formatted}`;
     })
     .join('\n\n---\n\n');
 
   const synthPrompt = opts.synthesizerPrompt ||
-    `You are a synthesizer. Combine and reconcile these parallel results into a unified, coherent output.\n\nOriginal input: ${inputStr}\n\nParallel results:\n${resultSummary}\n\nProvide a synthesized result that captures the best insights from all workers. Resolve any conflicts by choosing the most well-supported conclusion.`;
+    `You are a synthesizer. Combine and reconcile these parallel results into a unified, coherent output.\n\nOriginal input: ${inputStr}\n\nParallel results:\n${resultSummary}\n\nPreserve all Teamwork 5-component evidence (observation, logic_chain, caveats, conclusion, verification) and any artifact pointers. Resolve any conflicts by choosing the most well-supported conclusion.`;
 
   const synthesized = await agent(synthPrompt, {
     agentId: opts.synthesizerAgentId || opts.agentId || workers[0]?.agentId,
     tool: opts.synthesizerTool || opts.tool,
     model: opts.synthesizerModel || opts.model,
+    effort: opts.synthesizerEffort || opts.effort,
+    profile: opts.synthesizerProfile || opts.profile,
+    fallbackAgentIds: opts.synthesizerFallbackAgentIds || opts.fallbackAgentIds,
     role: opts.synthesizerRole || 'synthesizer',
     label: opts.label ? `${opts.label}-synthesize` : 'synthesize',
     schema: opts.synthesizerSchema,
@@ -926,17 +1047,32 @@ async function fanout(input, workers, opts = {}) {
  * @param {Object} opts - Options: { criteria, verifiers, judgeTool, maxRounds, onReject }
  * @returns {{ accepted: boolean, output: *, feedback: string, rounds: number }}
  */
+const ALLOWED_VERIFICATION_ISSUE_KEYS = new Set([
+  'severity', 'description', 'evidence',
+  'observation', 'logic_chain', 'caveats', 'conclusion', 'verification',
+  'location', 'file', 'line', 'suggestion', 'recommendation', 'fix',
+  'category', 'title', 'id', 'confidence', 'reasoning',
+]);
+
+const ALLOWED_VERIFICATION_TOP_LEVEL_KEYS = [
+  'observation', 'logic_chain', 'caveats', 'conclusion', 'verification',
+  'summary', 'confidence',
+];
+
 function normalizeVerificationReview(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (typeof value.approve !== 'boolean' || !Array.isArray(value.issues)) return null;
 
-  const requiredIssueKeys = ['description', 'evidence', 'severity'];
   const issues = [];
   for (const issue of value.issues) {
     if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return null;
-    const keys = Object.keys(issue).sort();
-    if (keys.length !== requiredIssueKeys.length ||
-        keys.some((key, index) => key !== requiredIssueKeys[index])) {
+    const keys = Object.keys(issue);
+    if (
+      !('severity' in issue) ||
+      !('description' in issue) ||
+      !('evidence' in issue) ||
+      keys.some((k) => !ALLOWED_VERIFICATION_ISSUE_KEYS.has(k))
+    ) {
       return null;
     }
     const severity = typeof issue.severity === 'string' ? issue.severity.trim().toLowerCase() : '';
@@ -945,10 +1081,76 @@ function normalizeVerificationReview(value) {
     if (!['critical', 'major', 'minor'].includes(severity) || !description || !evidence) {
       return null;
     }
-    issues.push({ severity, description, evidence });
+    const normalizedIssue = { severity, description, evidence };
+    for (const key of keys) {
+      if (key === 'severity' || key === 'description' || key === 'evidence') continue;
+      if (issue[key] !== undefined) {
+        normalizedIssue[key] = issue[key];
+      }
+    }
+    issues.push(normalizedIssue);
   }
   if (!value.approve && issues.length === 0) return null;
-  return { approve: value.approve, issues };
+  const result = { approve: value.approve, issues };
+  for (const key of ALLOWED_VERIFICATION_TOP_LEVEL_KEYS) {
+    if (key in value && value[key] !== undefined) {
+      result[key] = value[key];
+    }
+  }
+  return result;
+}
+
+function resolveDefaultReviserAgentId(verifiers, opts) {
+  if (opts.reviserAgentId) return opts.reviserAgentId;
+  if (opts.workerAgentId) return opts.workerAgentId;
+
+  const verifierIds = new Set(
+    (verifiers || []).map((v) => (v && typeof v.agentId === 'string' ? v.agentId.trim() : '')).filter(Boolean),
+  );
+  if (opts.agentId && !verifierIds.has(opts.agentId)) {
+    return opts.agentId;
+  }
+
+  const workerRoles = new Set([
+    'worker', 'implementer', 'developer', 'coder', 'executor', 'builder', 'reviser', 'focused-executor',
+  ]);
+  const reviewerRoles = new Set([
+    'verifier', 'reviewer', 'adversarial_verifier', 'auditor', 'judge',
+  ]);
+
+  const getRoles = (entry) => {
+    const out = [];
+    if (entry && typeof entry.role === 'string' && entry.role.trim()) {
+      out.push(entry.role.trim().toLowerCase());
+    }
+    if (entry && Array.isArray(entry.roles)) {
+      for (const r of entry.roles) {
+        if (typeof r === 'string' && r.trim()) out.push(r.trim().toLowerCase());
+      }
+    }
+    return out;
+  };
+
+  for (const entry of poolAgents) {
+    const aid = entry && typeof entry.agent_id === 'string' ? entry.agent_id.trim() : '';
+    if (!aid || verifierIds.has(aid)) continue;
+    const roles = getRoles(entry);
+    if (roles.some((r) => workerRoles.has(r))) return aid;
+  }
+  for (const entry of poolAgents) {
+    const aid = entry && typeof entry.agent_id === 'string' ? entry.agent_id.trim() : '';
+    if (!aid || verifierIds.has(aid)) continue;
+    const roles = getRoles(entry);
+    if (!roles.some((r) => reviewerRoles.has(r))) return aid;
+  }
+  if (orchestratorAgentId && !verifierIds.has(orchestratorAgentId)) {
+    return orchestratorAgentId;
+  }
+  for (const entry of poolAgents) {
+    const aid = entry && typeof entry.agent_id === 'string' ? entry.agent_id.trim() : '';
+    if (aid && !verifierIds.has(aid)) return aid;
+  }
+  return opts.agentId || (verifiers && verifiers[0] && verifiers[0].agentId);
 }
 
 async function verify(output, opts = {}) {
@@ -977,6 +1179,9 @@ async function verify(output, opts = {}) {
         prompt: `You are an adversarial verifier. Your job is to FIND PROBLEMS.\n\nCriteria: ${criteria}\nFocus: ${v.focus || criteria}\n\nOutput to verify:\n${outputStr}\n\nRules:\n- Only report REAL issues with concrete evidence\n- Rate severity: critical / major / minor\n- Be thorough but fair\n\nRespond with JSON:\n{ "issues": [{ "severity": "critical|major|minor", "description": "", "evidence": "" }], "approve": true/false }`,
         agentId: v.agentId || opts.verifierAgentId || opts.agentId,
         tool: v.tool,
+        effort: v.effort || opts.verifierEffort,
+        profile: v.profile || opts.verifierProfile,
+        fallbackAgentIds: v.fallbackAgentIds || opts.verifierFallbackAgentIds,
         role: v.role || `verifier-${idx}`,
         label: `verify-r${round}-${idx}`,
         schema: {
@@ -1010,12 +1215,18 @@ async function verify(output, opts = {}) {
       validReviews++;
       if (normalized.approve) approvals++;
       allIssues.push(...normalized.issues);
-      reviewLedger.push({
+      const ledgerEntry = {
         round,
         verifier: verifierName,
         approve: normalized.approve,
         issues: normalized.issues,
-      });
+      };
+      for (const key of ALLOWED_VERIFICATION_TOP_LEVEL_KEYS) {
+        if (key in normalized && normalized[key] !== undefined) {
+          ledgerEntry[key] = normalized[key];
+        }
+      }
+      reviewLedger.push(ledgerEntry);
       for (const issue of normalized.issues) {
         evidenceLedger.push({ round, verifier: verifierName, ...issue });
       }
@@ -1043,7 +1254,16 @@ async function verify(output, opts = {}) {
 
     lastFeedback = allIssues
       .filter(i => i.severity !== 'minor')
-      .map(i => `[${i.severity}] ${i.description}\nEvidence: ${i.evidence}`)
+      .map(i => {
+        const lines = [`[${i.severity}] ${i.description}`, `Evidence: ${i.evidence}`];
+        const loc = i.location || (i.file ? (i.line ? `${i.file}:${i.line}` : i.file) : '');
+        if (loc) lines.push(`Location: ${loc}`);
+        if (i.observation) lines.push(`Observation: ${i.observation}`);
+        if (i.suggestion || i.recommendation || i.fix) {
+          lines.push(`Suggestion: ${i.suggestion || i.recommendation || i.fix}`);
+        }
+        return lines.join('\n');
+      })
       .join('\n');
 
     if (round >= maxRounds) break;
@@ -1051,11 +1271,15 @@ async function verify(output, opts = {}) {
     if (typeof opts.onReject === 'function') {
       currentOutput = await opts.onReject(currentOutput, lastFeedback, round);
     } else {
+      const reviserId = resolveDefaultReviserAgentId(verifiers, opts);
       const revised = await agent(
         `Revise this output to address the following issues:\n\nCurrent output:\n${outputStr}\n\nIssues found:\n${lastFeedback}\n\nProvide a revised version that addresses ALL critical and major issues.`,
         {
-          agentId: opts.reviserAgentId || opts.agentId || verifiers[0]?.agentId,
+          agentId: reviserId,
           tool: opts.reviseTool || opts.tool,
+          effort: opts.reviseEffort || opts.effort,
+          profile: opts.reviseProfile || opts.profile,
+          fallbackAgentIds: opts.reviseFallbackAgentIds || opts.fallbackAgentIds,
           role: 'reviser',
           label: `revise-r${round}`,
           timeout: opts.reviseTimeout || opts.timeout,
@@ -1111,14 +1335,38 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
     if (typeof generatorFn === 'function') {
       const descriptor = generatorFn(i);
       if (typeof descriptor === 'string') {
-        tasks.push({ prompt: descriptor, agentId: opts.generatorAgentId || opts.agentId, label: `gen-${i}`, timeout: opts.generatorTimeout || opts.timeout });
+        tasks.push({
+          prompt: descriptor,
+          agentId: opts.generatorAgentId || opts.agentId,
+          effort: opts.generatorEffort || opts.effort,
+          profile: opts.generatorProfile || opts.profile,
+          fallbackAgentIds: opts.generatorFallbackAgentIds || opts.fallbackAgentIds,
+          label: `gen-${i}`,
+          timeout: opts.generatorTimeout || opts.timeout,
+        });
       } else if (typeof descriptor === 'object' && descriptor !== null) {
-        tasks.push({ ...descriptor, agentId: descriptor.agentId || opts.generatorAgentId || opts.agentId, label: descriptor.label || `gen-${i}`, timeout: descriptor.timeout || opts.generatorTimeout || opts.timeout });
+        tasks.push({
+          ...descriptor,
+          agentId: descriptor.agentId || opts.generatorAgentId || opts.agentId,
+          effort: descriptor.effort || opts.generatorEffort || opts.effort,
+          profile: descriptor.profile || opts.generatorProfile || opts.profile,
+          fallbackAgentIds: descriptor.fallbackAgentIds || opts.generatorFallbackAgentIds || opts.fallbackAgentIds,
+          label: descriptor.label || `gen-${i}`,
+          timeout: descriptor.timeout || opts.generatorTimeout || opts.timeout,
+        });
       } else {
         throw new TypeError(`generate() generatorFn must return a string or object, got ${typeof descriptor}`);
       }
     } else if (typeof generatorFn === 'object' && generatorFn !== null && generatorFn.prompt) {
-      tasks.push({ ...generatorFn, agentId: generatorFn.agentId || opts.generatorAgentId || opts.agentId, label: `gen-${i}`, timeout: generatorFn.timeout || opts.generatorTimeout || opts.timeout });
+      tasks.push({
+        ...generatorFn,
+        agentId: generatorFn.agentId || opts.generatorAgentId || opts.agentId,
+        effort: generatorFn.effort || opts.generatorEffort || opts.effort,
+        profile: generatorFn.profile || opts.generatorProfile || opts.profile,
+        fallbackAgentIds: generatorFn.fallbackAgentIds || opts.generatorFallbackAgentIds || opts.fallbackAgentIds,
+        label: `gen-${i}`,
+        timeout: generatorFn.timeout || opts.generatorTimeout || opts.timeout,
+      });
     } else {
       throw new TypeError('generate() generatorFn must be a function or object with .prompt');
     }
@@ -1136,8 +1384,9 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
   }
 
   const topK = Math.min(Math.max(Number(opts.topK) || 3, 1), successfulCandidates.length);
+  const maxItemChars = Number(opts.maxItemChars) > 0 ? Number(opts.maxItemChars) : 4000;
   const candidatesSummary = successfulCandidates
-    .map((c, i) => `[Candidate ${i}]: ${typeof c === 'string' ? c.slice(0, 500) : JSON.stringify(c).slice(0, 500)}`)
+    .map((c, i) => `[Candidate ${i}]: ${formatSynthesisInput(c, { label: `candidate-${i}`, maxChars: maxItemChars })}`)
     .join('\n\n');
 
   const filterPrompt = typeof filterFn === 'string' ? filterFn :
@@ -1146,6 +1395,9 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
   const filterResult = await agent(filterPrompt, {
     agentId: opts.filterAgentId || opts.agentId || tasks[0]?.agentId,
     tool: opts.filterTool || opts.tool,
+    effort: opts.filterEffort || opts.effort,
+    profile: opts.filterProfile || opts.profile,
+    fallbackAgentIds: opts.filterFallbackAgentIds || opts.fallbackAgentIds,
     role: 'filter',
     label: 'filter-rank',
     schema: { ranked: [], reasoning: '' },
@@ -1215,6 +1467,7 @@ async function tournament(contestants, judgeFn, opts = {}) {
     };
   }
 
+  const maxItemChars = Number(opts.maxItemChars) > 0 ? Number(opts.maxItemChars) : 16000;
   while (remaining.length > 1) {
     if (cancelled) throw new CancelledError();
     roundNum++;
@@ -1231,8 +1484,8 @@ async function tournament(contestants, judgeFn, opts = {}) {
 
     const judgeResults = await parallel(
       matchups.map(([a, b], mIdx) => {
-        const aStr = typeof a.solution === 'string' ? a.solution.slice(0, 1500) : JSON.stringify(a.solution).slice(0, 1500);
-        const bStr = typeof b.solution === 'string' ? b.solution.slice(0, 1500) : JSON.stringify(b.solution).slice(0, 1500);
+        const aStr = formatSynthesisInput(a.solution, { label: a.label || 'contestant-a', maxChars: maxItemChars });
+        const bStr = formatSynthesisInput(b.solution, { label: b.label || 'contestant-b', maxChars: maxItemChars });
 
         if (typeof judgeFn === 'function') {
           return () => judgeFn(a.solution, b.solution, a.label, b.label);
@@ -1244,6 +1497,9 @@ async function tournament(contestants, judgeFn, opts = {}) {
           prompt: `You are a judge in a tournament. Compare these two solutions for ${task}.\n\nCriteria: ${criteria}\n\n[Solution A - ${a.label}]:\n${aStr}\n\n[Solution B - ${b.label}]:\n${bStr}\n\nWhich is better? Respond with JSON: { "winner": "A" or "B", "reasoning": "brief explanation" }`,
           agentId: opts.judgeAgentId || opts.agentId || contestants[0]?.agentId,
           tool: opts.judgeTool || opts.tool || 'claude',
+          effort: opts.judgeEffort || opts.effort,
+          profile: opts.judgeProfile || opts.profile,
+          fallbackAgentIds: opts.judgeFallbackAgentIds || opts.fallbackAgentIds,
           role: 'tournament_judge',
           label: `judge-r${roundNum}-m${mIdx}`,
           schema: { winner: '', reasoning: '' },
@@ -1658,6 +1914,17 @@ async function main() {
   workflowAgentCallTimeoutMs = Number(initParams.agent_call_timeout_s) > 0
     ? Number(initParams.agent_call_timeout_s) * 1000
     : 0;
+  const hostSchemaRetries = Number(initParams.schema_retry_max);
+  schemaRetryMax = Number.isInteger(hostSchemaRetries) && hostSchemaRetries >= 0
+    ? hostSchemaRetries
+    : 2;
+  workflowArtifactDir = typeof initParams.artifact_dir === 'string'
+    ? initParams.artifact_dir.trim()
+    : '';
+  poolAgents = Array.isArray(initParams.agent_pool) ? initParams.agent_pool : [];
+  orchestratorAgentId = typeof initParams.orchestrator_agent_id === 'string'
+    ? initParams.orchestrator_agent_id.trim()
+    : '';
   if (!workflowDeadlineMs && workflowTotalTimeoutMs > 0) {
     workflowDeadlineMs = workflowStartedMs + workflowTotalTimeoutMs;
   }
