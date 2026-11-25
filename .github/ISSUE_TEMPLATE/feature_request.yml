@@ -1,0 +1,51 @@
+name: "Feature Request / 功能建议"
+description: "Propose a new capability, backend enhancement, or UX improvement / 提交新功能或体验改进建议"
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出改进建议！请先查阅 `docs/product-contract.md`，了解 GhostAP 的核心产品边界与运行模型。
+        Welcome! Please review `docs/product-contract.md` for GhostAP's core product boundaries before proposing changes.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Use Case & Problem / 使用场景与痛点"
+      description: "What workflow or operational problem does this solve? / 这项改进旨在解决什么研发或运维场景问题？"
+      placeholder: "Describe the scenario, friction point, or missing capability..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed Solution / 期望方案"
+      description: "Describe the desired command, Feishu Card 2.0 interaction, CLI flag, or configuration behavior."
+      placeholder: "e.g. New slash command behavior, `/wf` preset option, backend telemetry support..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "Target Area / 涉及模块"
+      options:
+        - "AI Coding Backends (ACP / CLI / 11 Backends)"
+        - "Teamwork Workflow (/wf JS Engine & Config Card)"
+        - "Deep / Spec Engine"
+        - "Feishu Card 2.0 / COT / Slash Commands"
+        - "CLI / Installer / Packaging (ghostap / install.sh / restart.sh)"
+        - "Access Control / Operations / Docs"
+        - "Other / 其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: "Cross-Platform & Backend Notes / 跨平台与后端兼容性补充（可选）"
+      description: "Note any Linux/macOS differences, backend-specific constraints, or alternative approaches considered."
+      placeholder: "Optional details on Linux/macOS parity or fallback behavior..."

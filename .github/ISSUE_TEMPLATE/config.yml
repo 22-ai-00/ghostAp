@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Security Vulnerability / 安全漏洞私密报告"
+    url: https://github.com/22-ai-00/ghostAp/blob/main/SECURITY.md
+    about: "Do not disclose security issues publicly. Read SECURITY.md for private reporting instructions. / 请勿公开披露安全漏洞，查看 SECURITY.md 了解私密报告流程。"
+  - name: "Product Contract & Architecture / 产品边界与架构文档"
+    url: https://github.com/22-ai-00/ghostAp/blob/main/docs/product-contract.md
+    about: "Check supported commands, trust boundaries, and design principles before opening an issue. / 提交前了解 GhostAP 的命令契约、受信主机模型与核心设计原则。"

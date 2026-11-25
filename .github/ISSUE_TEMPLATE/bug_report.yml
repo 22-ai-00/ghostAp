@@ -1,0 +1,96 @@
+name: "Bug Report / 问题反馈"
+description: "Report a bug or unexpected behavior in GhostAP / 反馈 GhostAP 的异常行为或缺陷"
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈 GhostAP 问题！请尽量完整填写以下信息以便快速定位。
+        Thanks for reporting an issue! Please include environment details and sanitized logs below.
+
+        > **安全提醒 / Security Notice**: 请勿在 Issue 中粘贴 `APP_SECRET`、API Key、Token、Cookie、私钥或 `.env` 敏感字段；如涉及安全漏洞，请通过 `SECURITY.md` 中的私密通道报告。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Bug Description & Reproduction Steps / 问题描述与复现步骤"
+      description: "Describe what happened and how to reproduce it. / 描述问题现象及复现步骤。"
+      placeholder: |
+        1. Executed command or Feishu action (e.g. `/wf ...`, `./restart.sh start`, `/settings`)
+        2. Observed error / card behavior
+        3. Expected behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating System / 操作系统"
+      description: "GhostAP supports Linux and macOS. / GhostAP 支持 Linux 与 macOS。"
+      options:
+        - "Linux (Ubuntu / Debian)"
+        - "Linux (RHEL / CentOS / Rocky / Fedora / Arch)"
+        - "macOS (Apple Silicon / arm64)"
+        - "macOS (Intel / x86_64)"
+        - "Other / 其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: runtime_versions
+    attributes:
+      label: "Runtime Versions / 运行环境版本"
+      description: "Run `ghostap --version`, `python3 --version`, `uv --version`, and `node -v` (required for `/wf`)."
+      placeholder: |
+        GhostAP version or git commit:
+        Python:
+        uv:
+        Node.js:
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: "Backend Tool & Execution Mode / 后端工具与执行模式"
+      options:
+        - "Smart / Host Shell (/sh)"
+        - "Coco (coco)"
+        - "Claude (claude / claude_w)"
+        - "Aiden (aiden)"
+        - "Codex (codex / codex_w)"
+        - "Gemini (gemini)"
+        - "Traex (traex)"
+        - "Grok (grok)"
+        - "DSH (dsh)"
+        - "AGY (agy)"
+        - "Deep Engine (/deep)"
+        - "Spec Engine (/spec)"
+        - "Teamwork Workflow (/wf)"
+        - "Feishu Card 2.0 / Slash Panel / Access Control"
+        - "Installer / Packaging / CLI (install.sh / restart.sh / ghostap)"
+        - "Other / 其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Logs & Validation Output / 日志片段（`[RESTART]`、`logs.log`、`--validate`）"
+      description: "Paste relevant `[RESTART]` lines, `logs.log` excerpts, or `APP_ID=ci_dummy APP_SECRET=ci_dummy uv run python -m src.main --validate` output (redact secrets first!)."
+      placeholder: |
+        # Sanitized [RESTART] or logs.log lines here (NEVER paste APP_SECRET or tokens)
+      render: text
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "Pre-submit Checklist / 提交前确认"
+      options:
+        - label: "I have redacted all secrets (`APP_SECRET`, tokens, API keys, `.env` values) from logs. / 我已对日志中的敏感凭据完成脱敏。"
+          required: true
+        - label: "I checked existing open/closed issues for duplicates. / 我已检索确认无重复 Issue。"
+          required: true
