@@ -1,0 +1,1412 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CLIProxyAPI 接入方式盘点 — Workflow 报告 (UX Preview)</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f9;
+      --panel: #ffffff;
+      --surface: #f7f8fa;
+      --surface-alt: #f0f4ff;
+      --text: #1f2329;
+      --text-secondary: #4e5969;
+      --muted: #646a73;
+      --quiet: #8f959e;
+      --line: #dfe3ea;
+      --line-soft: #edf0f5;
+      --accent: #245bdb;
+      --accent-deep: #173f9f;
+      --accent-soft: #eef3ff;
+      --ok: #15803d;
+      --ok-bg: #ecfdf3;
+      --ok-border: #abe0bd;
+      --warn: #a65d05;
+      --warn-bg: #fff8eb;
+      --warn-border: #f5d199;
+      --fail: #c9352b;
+      --fail-bg: #fff3f2;
+      --fail-border: #f5b8b4;
+      --info: #1d4ed8;
+      --info-bg: #eff6ff;
+      --info-border: #bfdbfe;
+      --purple: #6d28d9;
+      --code-bg: #f6f8fa;
+      --code-border: #e2e6ee;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 2px 8px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.04);
+      --mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.65 var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button { font: inherit; }
+
+    /* Hero header */
+    .page-header {
+      background: linear-gradient(135deg, #0f172a 0%, #172554 52%, #1e3a8a 100%);
+      color: #fff;
+      padding: 30px 0 26px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    .page-header .wrap {
+      max-width: 1140px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+    .hero-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .eyebrow {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #93c5fd;
+      margin-bottom: 6px;
+    }
+    .page-header h1 {
+      margin: 0 0 10px;
+      font-size: clamp(22px, 3vw, 28px);
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: -0.015em;
+    }
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 14px;
+      font-size: 12.5px;
+      color: rgba(255, 255, 255, 0.78);
+    }
+    .meta-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: #fff;
+    }
+    .status-ok { background: rgba(22, 163, 74, 0.24); border-color: rgba(134, 239, 172, 0.4); color: #bbf7d0; }
+    .status-fail { background: rgba(220, 38, 38, 0.26); border-color: rgba(252, 165, 165, 0.45); color: #fecaca; }
+    .status-cancel { background: rgba(148, 163, 184, 0.24); border-color: rgba(203, 213, 225, 0.35); color: #e2e8f0; }
+    .status-running { background: rgba(59, 130, 246, 0.28); border-color: rgba(147, 197, 253, 0.45); color: #dbeafe; }
+
+    .verdict-pill-ok { background: rgba(16, 185, 129, 0.24); border-color: rgba(110, 231, 183, 0.45); color: #a7f3d0; }
+    .verdict-pill-warn { background: rgba(245, 158, 11, 0.24); border-color: rgba(252, 211, 77, 0.48); color: #fde68a; }
+    .verdict-pill-fail { background: rgba(239, 68, 68, 0.26); border-color: rgba(252, 165, 165, 0.45); color: #fecaca; }
+    .verdict-pill-neutral { background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.24); color: #f1f5f9; }
+
+    /* Stats grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .stat-card {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 10px;
+      padding: 12px 12px;
+      text-align: center;
+      backdrop-filter: blur(4px);
+    }
+    .stat-value {
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: -0.01em;
+    }
+    .stat-label {
+      font-size: 11.5px;
+      color: rgba(255, 255, 255, 0.68);
+      margin-top: 3px;
+    }
+
+    /* Executive Banner above the fold */
+    .exec-banner {
+      margin-top: 18px;
+      background: rgba(255, 255, 255, 0.97);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      border: 1px solid rgba(255, 255, 255, 0.6);
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+    }
+    .exec-banner-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+    .exec-banner-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .exec-req {
+      font-size: 12.5px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .exec-req strong { color: var(--text-secondary); }
+    .pool-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line-soft);
+      align-items: center;
+    }
+    .pool-strip-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-right: 4px;
+    }
+    .pool-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .pool-chip .aid {
+      font-family: var(--mono);
+      font-weight: 700;
+      color: var(--accent-deep);
+    }
+    .pool-chip.orch {
+      background: var(--accent-soft);
+      border-color: #bfd3ff;
+      color: var(--accent-deep);
+    }
+
+    /* Sticky toolbar + categorized TOC */
+    .toolbar-wrap {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+    .toolbar {
+      max-width: 1140px;
+      margin: 0 auto;
+      padding: 10px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .toolbar-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .toolbar input[type="search"] {
+      flex: 1;
+      min-width: 220px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 7px 12px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .toolbar input[type="search"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(36, 91, 219, 0.12);
+    }
+    .filter-count {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .toolbar button {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .toolbar button:hover { background: var(--surface); border-color: #c8cfd8; }
+    .toolbar button.primary {
+      border-color: #bfd3ff;
+      background: var(--accent-soft);
+      color: var(--accent-deep);
+      font-weight: 600;
+    }
+    .toolbar button.primary:hover { background: #dfe9ff; }
+
+    .toc-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      align-items: center;
+    }
+    .toc-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .toc-group-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--quiet);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .toc-group a {
+      color: var(--accent-deep);
+      text-decoration: none;
+      border: 1px solid #d6e4ff;
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 12px;
+      background: #f5f8ff;
+      transition: background 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    .toc-group a:hover { background: #e0ebff; border-color: #adc5fa; }
+    .toc-group.toc-appendix a {
+      color: var(--muted);
+      border-color: var(--line);
+      background: var(--surface);
+    }
+    .toc-group.toc-appendix a:hover { color: var(--text); background: #ebedf2; }
+
+    /* Main container */
+    main {
+      max-width: 1140px;
+      margin: 0 auto;
+      padding: 22px 24px 68px;
+    }
+
+    .search-empty {
+      display: none;
+      margin: 18px 0;
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px dashed var(--line);
+      border-radius: var(--radius);
+    }
+
+    /* Report sections */
+    details.report-section {
+      margin: 14px 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      scroll-margin-top: 110px;
+    }
+    details[hidden],
+    .phase-block[hidden],
+    .agent-row[hidden],
+    .appendix-group[hidden],
+    .phases-section[hidden] {
+      display: none !important;
+    }
+    details.report-section > summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 18px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 15px;
+      user-select: none;
+      background: #fff;
+      border-bottom: 1px solid transparent;
+      list-style: none;
+      transition: background 0.12s;
+    }
+    details.report-section > summary::-webkit-details-marker { display: none; }
+    details.report-section > summary::before {
+      content: "▸";
+      display: inline-block;
+      color: var(--quiet);
+      font-size: 12px;
+      transition: transform 0.15s ease;
+    }
+    details.report-section[open] > summary::before {
+      transform: rotate(90deg);
+      color: var(--accent);
+    }
+    details.report-section[open] > summary {
+      border-bottom-color: var(--line-soft);
+      background: #fafbfd;
+    }
+    .section-title { flex: 1; min-width: 120px; }
+    .section-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 9px;
+      border-radius: 999px;
+      white-space: nowrap;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--muted);
+    }
+    .badge-ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok-border); }
+    .badge-warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn-border); }
+    .badge-fail { background: var(--fail-bg); color: var(--fail); border-color: var(--fail-border); }
+    .badge-info { background: var(--info-bg); color: var(--info); border-color: var(--info-border); }
+    .badge-pending, .badge-neutral { background: var(--surface); color: var(--muted); border-color: var(--line); }
+
+    .section-actions { display: flex; gap: 6px; }
+    .section-actions button {
+      font-size: 12px;
+      font-weight: 500;
+      padding: 3px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+      color: var(--muted);
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .section-actions button:hover {
+      color: var(--accent);
+      border-color: #bfd3ff;
+      background: var(--accent-soft);
+    }
+
+    .section-body-rich {
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Semantic blocks */
+    .semantic-block { min-width: 0; }
+    .block-title {
+      margin: 0 0 8px;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Markdown & Prose Typography */
+    .md-prose {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.7;
+      word-break: break-word;
+    }
+    .md-prose > :first-child { margin-top: 0; }
+    .md-prose > :last-child { margin-bottom: 0; }
+    .md-prose p { margin: 0 0 10px; }
+    .md-prose .md-h1, .md-prose .md-h2, .md-prose .md-h3,
+    .md-prose .md-h4, .md-prose .md-h5, .md-prose .md-h6 {
+      margin: 18px 0 8px;
+      font-weight: 700;
+      line-height: 1.35;
+      color: var(--text);
+    }
+    .md-prose .md-h1 { font-size: 18px; border-bottom: 1px solid var(--line-soft); padding-bottom: 6px; }
+    .md-prose .md-h2 { font-size: 16px; border-bottom: 1px solid var(--line-soft); padding-bottom: 4px; }
+    .md-prose .md-h3 { font-size: 14.5px; }
+    .md-prose .md-h4, .md-prose .md-h5, .md-prose .md-h6 { font-size: 13.5px; color: var(--text-secondary); }
+    .md-prose ul, .md-prose ol, .md-list { margin: 6px 0 12px; padding-left: 22px; }
+    .md-prose li, .md-list li { margin: 4px 0; }
+    .md-prose li > p, .md-list li > p { margin: 0 0 4px; }
+    .md-task-list { list-style: none; padding-left: 4px; }
+    .md-task-item { display: flex; align-items: flex-start; gap: 8px; }
+    .md-task-item input[type="checkbox"] { margin-top: 4px; accent-color: var(--accent); }
+    .md-prose hr, .md-hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+    .md-prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(36, 91, 219, 0.25); }
+    .md-prose a:hover { border-bottom-color: var(--accent); }
+    .md-inline-code {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: var(--code-bg);
+      border: 1px solid var(--code-border);
+      border-radius: 5px;
+      padding: 1px 5px;
+      color: #0f172a;
+      word-break: break-word;
+    }
+    .md-code-block {
+      margin: 10px 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    .md-code-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 12px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: #94a3b8;
+      text-transform: uppercase;
+    }
+    .md-code-block pre {
+      margin: 0;
+      padding: 12px 14px;
+      overflow-x: auto;
+      font: 12.5px/1.55 var(--mono);
+      white-space: pre;
+    }
+    .md-quote {
+      margin: 10px 0;
+      padding: 8px 14px;
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      color: var(--text-secondary);
+      border-radius: 0 6px 6px 0;
+    }
+    .md-alert {
+      margin: 10px 0;
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--info-border);
+      border-left-width: 4px;
+      background: var(--info-bg);
+    }
+    .md-alert-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: var(--text);
+    }
+    .md-alert-body > :first-child { margin-top: 0; }
+    .md-alert-body > :last-child { margin-bottom: 0; }
+    .md-alert-warning { border-color: var(--warn-border); border-left-color: var(--warn); background: var(--warn-bg); }
+    .md-alert-caution { border-color: var(--fail-border); border-left-color: var(--fail); background: var(--fail-bg); }
+    .md-alert-tip { border-color: var(--ok-border); border-left-color: var(--ok); background: var(--ok-bg); }
+    .md-alert-important { border-color: #ddd6fe; border-left-color: var(--purple); background: #f5f3ff; }
+
+    /* Responsive Tables */
+    .md-table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: #fff;
+      margin: 6px 0;
+    }
+    table.md-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    table.md-table thead th {
+      background: #f6f8fb;
+      color: var(--text-secondary);
+      font-weight: 700;
+      text-align: left;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    table.md-table tbody td {
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      vertical-align: top;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+    table.md-table td .md-list { margin: 2px 0; padding-left: 18px; }
+    table.md-table td p { margin: 0 0 4px; }
+    table.md-table td p:last-child { margin-bottom: 0; }
+    table.md-table tbody tr:nth-child(even) { background: #fafbfd; }
+    table.md-table tbody tr:last-child td { border-bottom: 0; }
+    table.md-table tbody tr:hover { background: #f3f7ff; }
+
+    /* KV Grid */
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px;
+    }
+    .kv-item {
+      background: var(--surface);
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      min-width: 0;
+    }
+    .kv-key {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    .kv-val {
+      font-size: 13px;
+      color: var(--text);
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+
+    /* Callout cards */
+    .callout-card {
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--info-border);
+      border-left-width: 4px;
+      padding: 11px 14px;
+      background: var(--info-bg);
+    }
+    .callout-card.callout-warning, .callout-card.callout-warn {
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      border-left-color: var(--warn);
+    }
+    .callout-card.callout-error, .callout-card.callout-danger, .callout-card.callout-fail {
+      background: var(--fail-bg);
+      border-color: var(--fail-border);
+      border-left-color: var(--fail);
+    }
+    .callout-card.callout-success, .callout-card.callout-ok {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      border-left-color: var(--ok);
+    }
+    .callout-title {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: var(--text);
+    }
+
+    /* Semantic list */
+    .semantic-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      background: #fff;
+    }
+    .semantic-list li {
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--line-soft);
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+    }
+    .semantic-list li:last-child { border-bottom: 0; }
+    .semantic-list li:nth-child(even) { background: #fbfcfe; }
+    .list-idx {
+      flex: 0 0 auto;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--accent);
+      background: var(--accent-soft);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+
+    /* Phase timeline */
+    .phases-section {
+      margin: 24px 0 18px;
+      scroll-margin-top: 110px;
+    }
+    .section-heading-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .section-heading-row h2 {
+      margin: 0;
+      font-size: 16.5px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .section-heading-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .phase-block {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin-bottom: 12px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+    .phase-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: #fafbfd;
+      border-bottom: 1px solid var(--line-soft);
+      flex-wrap: wrap;
+    }
+    .phase-num {
+      font-weight: 700;
+      font-size: 12.5px;
+      color: var(--accent-deep);
+      background: var(--accent-soft);
+      border-radius: 6px;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+    .phase-title { font-weight: 700; flex: 1; min-width: 120px; }
+    .phase-duration { font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .phase-agents { padding: 8px 16px 12px; }
+    .agent-row {
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line-soft);
+      font-size: 13px;
+    }
+    .agent-row:last-child { border-bottom: 0; }
+    .agent-head {
+      display: flex;
+      align-items: center;
+      gap: 6px 8px;
+      flex-wrap: wrap;
+    }
+    .agent-status {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 5px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .agent-ok .agent-status { background: var(--ok-bg); color: var(--ok); }
+    .agent-cached .agent-status { background: #e6fffb; color: #006d75; }
+    .agent-fail .agent-status { background: var(--fail-bg); color: var(--fail); }
+    .agent-cancel .agent-status { background: var(--surface); color: var(--muted); }
+    .agent-pending .agent-status { background: var(--surface); color: var(--quiet); }
+    .agent-label { font-weight: 700; color: var(--text); }
+    .agent-chip {
+      font-size: 11.5px;
+      padding: 1px 7px;
+      border-radius: 5px;
+      background: var(--surface);
+      border: 1px solid var(--line-soft);
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .agent-chip.tool {
+      background: var(--accent-soft);
+      border-color: #d6e4ff;
+      color: var(--accent-deep);
+      font-weight: 600;
+    }
+    .agent-chip.id {
+      font-family: var(--mono);
+      font-weight: 700;
+      color: var(--text);
+    }
+    .agent-task {
+      margin-top: 5px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .agent-activity {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .agent-error {
+      margin-top: 5px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: var(--fail-bg);
+      border: 1px solid var(--fail-border);
+      font-size: 12.5px;
+      color: var(--fail);
+    }
+
+    /* Agent output drawer */
+    details.agent-output-drawer {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: #fcfdff;
+      overflow: hidden;
+    }
+    details.agent-output-drawer > summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      cursor: pointer;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--accent-deep);
+      background: #f5f8ff;
+      user-select: none;
+      list-style: none;
+    }
+    details.agent-output-drawer > summary::-webkit-details-marker { display: none; }
+    details.agent-output-drawer > summary::before {
+      content: "▸";
+      font-size: 11px;
+      transition: transform 0.15s ease;
+    }
+    details.agent-output-drawer[open] > summary::before { transform: rotate(90deg); }
+    details.agent-output-drawer[open] > summary { border-bottom: 1px solid var(--line); }
+    .agent-drawer-meta {
+      margin-left: auto;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--muted);
+    }
+    .agent-drawer-body {
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    details.agent-raw-drawer {
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: #fff;
+      overflow: hidden;
+    }
+    details.agent-raw-drawer > summary {
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--surface);
+      user-select: none;
+    }
+
+    /* Debug appendix & raw monospace boxes */
+    .appendix-group {
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px dashed var(--line);
+      scroll-margin-top: 110px;
+    }
+    .appendix-section > summary {
+      background: #fafbfd;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+    .raw-pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12.5px/1.55 var(--mono);
+      background: var(--code-bg);
+      color: #1f2329;
+      max-height: 460px;
+    }
+
+    .badge-sev-major, .badge-sev-critical, .badge-sev-high {
+      background: var(--fail-bg);
+      color: var(--fail);
+      border: 1px solid var(--fail-border);
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .badge-sev-minor, .badge-sev-medium {
+      background: var(--warn-bg);
+      color: var(--warn);
+      border: 1px solid var(--warn-border);
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    @media (max-width: 720px) {
+      .page-header .wrap, .toolbar, main { padding-left: 14px; padding-right: 14px; }
+      .section-body-rich { padding: 14px; }
+      .exec-banner { padding: 14px; }
+      .kv-grid { grid-template-columns: 1fr; }
+    }
+    @media print {
+      .toolbar-wrap, .section-actions { display: none !important; }
+      details.report-section.primary-section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div class="wrap">
+      <div class="hero-top">
+        <div>
+          <div class="eyebrow">Workflow Execution Report · GhostAP</div>
+          <h1>CLIProxyAPI 接入方式盘点 — Workflow 报告</h1>
+          <div class="meta-row">
+            <span class="meta-pill status-ok">completed</span>
+            <span class="meta-pill verdict-pill-warn">需关注：综合器已按源码修订（第2轮评审未复签）</span>
+            <span>生成时间: 2026-11-25 03:52:53 UTC</span>
+            <span>ID: 4486548ffb98</span>
+            <span>评审模式: Auto（无独立 Reviewer）</span>
+            <span>主编排: [A1] agy/gemini-pro-orchestrator-neon</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value" style="color:#93c5fd">15 分钟 7 秒</div><div class="stat-label">总耗时</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#6ee7b7">4/4</div><div class="stat-label">阶段完成</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#c4b5fd">6/6</div><div class="stat-label">代理完成</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#6ee7b7">100%</div><div class="stat-label">成功率</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#cbd5e1">0</div><div class="stat-label">Token 消耗</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#cbd5e1">0</div><div class="stat-label">失败</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#67e8f9">0</div><div class="stat-label">缓存命中</div></div>
+      </div>
+
+      <section class="exec-banner" aria-label="核心结论摘要">
+        <div class="exec-banner-head">
+          <div class="exec-banner-title">
+            <span>执行结论与团队概览</span>
+          </div>
+          <span class="section-badge badge-warn">remediated_by_synthesizer_from_codebase</span>
+        </div>
+        <div class="exec-req"><strong>原始需求：</strong>帮我看下本地的这个都支持哪些接入方式</div>
+        <div class="md-prose">
+          <p>当前本地仓库（分支 <code class="md-inline-code">feat/kiro-provider</code>，提交 <code class="md-inline-code">40c3289e</code>）同时提供丰富的下游协议接入、多通道上游供应商接入、反向 WebSocket 中继以及可插拔的 C ABI 动态插件体系：</p>
+          <ol>
+            <li><strong>下游协议入口</strong>：覆盖 OpenAI（Chat / Completions / Responses HTTP &amp; WS / Images / Audio / <code class="md-inline-code">/openai/v1/videos*</code>）、xAI 原生多媒体（<code class="md-inline-code">/v1/videos*</code>、<code class="md-inline-code">/v1/tts</code>）、Codex 直连与搜索（<code class="md-inline-code">/v1/alpha/search</code>、<code class="md-inline-code">/backend-api/codex/*</code>）、Codex Live WebRTC &amp; 可用 Realtime 子集（不含 501 桩接口）、Anthropic Messages（<code class="md-inline-code">/v1/messages</code>）、Gemini（<code class="md-inline-code">/v1beta/models*</code>、<code class="md-inline-code">/v1beta/interactions</code>）与 Grok Shell UA 适配；外加管理 API <code class="md-inline-code">/v8/management/*</code>、mDNS 发现、TUI、Home 控制面、Go SDK 与同端口 Redis RESP 遥测队列。</li>
+            <li><strong>上游接入方式</strong>：支持 7 家供应商共 9 个 CLI 交互式 OAuth 登录参数及 <code class="md-inline-code">--siwc-bind</code>、无交互账号导入（<code class="md-inline-code">--vertex-import</code> 与新增 <code class="md-inline-code">--kiro-import</code>）、管理 API 远程引导、8 组 <code class="md-inline-code">api-keys</code> 配置分组、AI Studio 反向 WebSocket 中继（<code class="md-inline-code">/v1/ws</code>）与 13 类内置上游执行器（不含辅助包装 <code class="md-inline-code">oauth_scope</code>）。</li>
+            <li><strong>动态插件扩展</strong>：启用 <code class="md-inline-code">plugins.enabled</code> 后可通过 C ABI 动态库插件及插件商店扩展上下游能力。</li>
+          </ol>
+        </div>
+        <div class="pool-strip">
+          <span class="pool-strip-label">Agent Pool:</span>
+          <span class="pool-chip orch"><span class="aid">[A1]</span> agy / gemini-pro-orchestrator-neon · profile=xhigh · effort=xhigh · role=scout · 主编排</span>
+          <span class="pool-chip"><span class="aid">[A2]</span> claude / default · role=worker</span>
+        </div>
+      </section>
+    </div>
+  </header>
+
+  <div class="toolbar-wrap">
+    <div class="toolbar">
+      <div class="toolbar-controls">
+        <input id="filter" type="search" placeholder="搜索报告章节、交付表、阶段或 Agent…" oninput="filterSections(this.value)">
+        <span class="filter-count" id="filter-count"></span>
+        <button class="primary" type="button" onclick="setAllSections(true)">全部展开</button>
+        <button type="button" onclick="setAllSections(false)">全部折叠</button>
+      </div>
+      <nav class="toc-row" aria-label="报告导航">
+        <div class="toc-group">
+          <span class="toc-group-label">主要阅读</span>
+          <a href="#section-0">核心结论与摘要</a>
+          <a href="#section-1">交付成果与详细内容</a>
+          <a href="#section-2">分析推导与注意事项</a>
+          <a href="#section-3">评审与质量验证</a>
+          <a href="#section-4">后续建议</a>
+          <a href="#section-phases">执行过程</a>
+        </div>
+        <div class="toc-group toc-appendix">
+          <span class="toc-group-label">附录 / 原始数据</span>
+          <a href="#section-5">评审阶段初稿（参考）</a>
+          <a href="#section-raw-result">原始结果 JSON</a>
+          <a href="#section-raw-state">原始 Workflow 状态 JSON</a>
+          <a href="#section-raw-markdown">完整 Markdown 源文本</a>
+        </div>
+      </nav>
+    </div>
+  </div>
+
+  <main>
+    <div class="search-empty" id="search-empty">未找到匹配的报告内容，请尝试清空或缩短搜索关键词。</div>
+
+    <details class="report-section primary-section" id="section-0" data-search="核心结论与摘要 observation conclusion feat/kiro-provider 40c3289e" open>
+      <summary>
+        <span class="section-title">核心结论与摘要</span>
+        <span class="section-badge badge-info">已结构化</span>
+        <div class="section-actions">
+          <button type="button" onclick="toggleSection('section-0'); event.preventDefault();">折叠/展开</button>
+          <button type="button" onclick="copyText('section-body-0', this); event.preventDefault();">复制</button>
+        </div>
+      </summary>
+      <div class="section-body-rich" id="section-body-0">
+        <div class="semantic-block">
+          <div class="callout-card callout-info">
+            <div class="callout-title">综合观察（Observation）</div>
+            <div class="md-prose">
+              <p>本地仓库位于 <code class="md-inline-code">feat/kiro-provider</code> 分支（提交 <code class="md-inline-code">40c3289e</code>），是一个 Go 1.26+ 多协议 AI 代理网关（CLIProxyAPI v8）。执行阶段经历 2 轮评审（最终 <code class="md-inline-code">accepted=false</code>）：本综合器已直接复核仓库源码并全部修正 6 项 major 与 4 项 minor 缺陷后形成最终移交结果。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="report-section primary-section" id="section-1" data-search="交付成果与详细内容 下游接入方式 上游接入方式 动态插件扩展 kiro openai responses codex realtime" open>
+      <summary>
+        <span class="section-title">交付成果与详细内容</span>
+        <span class="section-badge badge-ok">4 组 · 22 项</span>
+        <div class="section-actions">
+          <button type="button" onclick="toggleSection('section-1'); event.preventDefault();">折叠/展开</button>
+          <button type="button" onclick="copyText('section-body-1', this); event.preventDefault();">复制</button>
+        </div>
+      </summary>
+      <div class="section-body-rich" id="section-body-1">
+        <div class="semantic-block">
+          <h4 class="block-title">一、下游接入方式（客户端 → 本地代理）</h4>
+          <div class="md-table-wrap">
+            <table class="md-table">
+              <thead>
+                <tr>
+                  <th>分类</th>
+                  <th>入口与说明</th>
+                  <th>源码依据</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>OpenAI Chat / Completions / Images / Audio</strong></td>
+                  <td><code class="md-inline-code">POST /v1/chat/completions</code>、<code class="md-inline-code">POST /v1/completions</code>、<code class="md-inline-code">POST /v1/images/generations</code>、<code class="md-inline-code">POST /v1/images/edits</code>、<code class="md-inline-code">POST /v1/audio/speech</code>（OpenAI TTS 适配至 xAI）</td>
+                  <td><code class="md-inline-code">internal/api/server_routes.go:74-77, 83</code></td>
+                </tr>
+                <tr>
+                  <td><strong>OpenAI Responses API（HTTP / WebSocket / Compact）</strong></td>
+                  <td><code class="md-inline-code">POST /v1/responses</code>、<code class="md-inline-code">GET /v1/responses</code>（WebSocket）、<code class="md-inline-code">POST /v1/responses/compact</code></td>
+                  <td><code class="md-inline-code">internal/api/server_routes.go:87-89</code></td>
+                </tr>
+                <tr>
+                  <td><strong>Codex Live WebRTC 与 Realtime</strong></td>
+                  <td>可用：<code class="md-inline-code">POST /v1/live</code>、<code class="md-inline-code">GET /v1/live/:call_id</code>、<code class="md-inline-code">/v1/realtime*</code>；未实现（HTTP 501）：<code class="md-inline-code">transcription_sessions</code>、<code class="md-inline-code">translations*</code>、SIP <code class="md-inline-code">{accept,reject,refer}</code></td>
+                  <td><code class="md-inline-code">internal/client/codex/live/capabilities.go:19-39</code></td>
+                </tr>
+                <tr>
+                  <td><strong>Anthropic / Claude Code Messages API</strong></td>
+                  <td><code class="md-inline-code">POST /v1/messages</code>、<code class="md-inline-code">POST /v1/messages/count_tokens</code></td>
+                  <td><code class="md-inline-code">internal/api/server_routes.go:85-86</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="semantic-block">
+          <h4 class="block-title">二、上游接入方式（本地代理 → 供应商）</h4>
+          <div class="md-table-wrap">
+            <table class="md-table">
+              <thead>
+                <tr>
+                  <th>分类</th>
+                  <th>入口与说明</th>
+                  <th>源码依据</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>CLI 交互式 OAuth 登录与 SIWC 绑定</strong></td>
+                  <td>7 家供应商共 9 个登录参数：<code class="md-inline-code">--codex-login</code> / <code class="md-inline-code">--codex-device-login</code>、<code class="md-inline-code">--claude-login</code>、<code class="md-inline-code">--antigravity-login</code>、<code class="md-inline-code">--kimi-login</code> / <code class="md-inline-code">--kimi-ai-login</code>、<code class="md-inline-code">--xai-login</code>、<code class="md-inline-code">--devin-login</code>、<code class="md-inline-code">--meta-login</code>；交互式 <code class="md-inline-code">--siwc-bind &lt;file&gt;</code></td>
+                  <td><code class="md-inline-code">cmd/server/main.go:139-149</code></td>
+                </tr>
+                <tr>
+                  <td><strong>AI Studio 反向 WebSocket 中继（wsrelay）</strong></td>
+                  <td>外部桥接端主动连入 <code class="md-inline-code">GET /v1/ws</code> 动态注册 <code class="md-inline-code">aistudio</code> 上游凭据（Home 模式禁用）</td>
+                  <td><code class="md-inline-code">sdk/cliproxy/service_auth.go:336-385</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="report-section primary-section" id="section-2" data-search="分析推导与注意事项 logic_chain caveats 501 /v1/ws kiro 鉴权" open>
+      <summary>
+        <span class="section-title">分析推导与注意事项</span>
+        <div class="section-actions">
+          <button type="button" onclick="toggleSection('section-2'); event.preventDefault();">折叠/展开</button>
+          <button type="button" onclick="copyText('section-body-2', this); event.preventDefault();">复制</button>
+        </div>
+      </summary>
+      <div class="section-body-rich" id="section-body-2">
+        <div class="semantic-block">
+          <h4 class="block-title">推导链路</h4>
+          <ul class="semantic-list">
+            <li><span class="list-idx">01</span><span>确认本地仓库版本基线：检出分支为 <code class="md-inline-code">feat/kiro-provider</code>（<code class="md-inline-code">40c3289e</code>），包含上游 README 尚未收录的 Kiro 无交互导入与执行器实现。</span></li>
+            <li><span class="list-idx">02</span><span>逐项核对下游接入面：区分真实可用的多协议 API 与返回 501 的 Realtime/SIP 桩接口、客户端鉴权与安全模式边界。</span></li>
+            <li><span class="list-idx">03</span><span>逐项核对上游接入面并排除仅提供 <code class="md-inline-code">ForAPIKey()</code> 的 <code class="md-inline-code">oauth_scope_executor.go</code>。</span></li>
+          </ul>
+        </div>
+        <div class="semantic-block">
+          <h4 class="block-title">注意事项与风险边界</h4>
+          <div class="callout-card callout-warning">
+            <div class="callout-title">关键边界提示（7 项）</div>
+            <div class="md-prose">
+              <ul>
+                <li><strong>评审流程状态</strong>：第 2 轮自动评审结果为 <code class="md-inline-code">accepted=false</code>（6 major + 4 minor），本响应中的修正版清单已由综合器直接对照本地源码逐项复核修正，但未再额外触发第 3 轮评审器复签。</li>
+                <li><strong>Realtime / SIP 部分路由为 501 桩接口</strong>：<code class="md-inline-code">translation</code>、<code class="md-inline-code">transcription_sessions</code> 与 SIP <code class="md-inline-code">accept/reject/refer</code> 固定返回 HTTP 501。</li>
+                <li><strong>鉴权与安全模式边界</strong>：若保留模板示例 key（如 <code class="md-inline-code">your-api-key-1</code>），会触发安全模式导致代理路由返回 403；设置 <code class="md-inline-code">MANAGEMENT_PASSWORD</code> 会隐式允许远程管理访问。</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="report-section primary-section" id="section-3" data-search="评审与质量验证 verification resolved_issues major minor" open>
+      <summary>
+        <span class="section-title">评审与质量验证</span>
+        <span class="section-badge badge-warn">2 轮 · 已按源码修订</span>
+        <div class="section-actions">
+          <button type="button" onclick="toggleSection('section-3'); event.preventDefault();">折叠/展开</button>
+          <button type="button" onclick="copyText('section-body-3', this); event.preventDefault();">复制</button>
+        </div>
+      </summary>
+      <div class="section-body-rich" id="section-body-3">
+        <div class="kv-grid">
+          <div class="kv-item"><div class="kv-key">验证状态</div><div class="kv-val"><code class="md-inline-code">remediated_by_synthesizer_from_codebase</code></div></div>
+          <div class="kv-item"><div class="kv-key">评审轮次</div><div class="kv-val">2 轮</div></div>
+          <div class="kv-item"><div class="kv-key">自动评审签收</div><div class="kv-val">false（综合器已逐条修订）</div></div>
+        </div>
+        <div class="semantic-block">
+          <h4 class="block-title">已解决的评审问题（10 项）</h4>
+          <div class="md-table-wrap">
+            <table class="md-table">
+              <thead>
+                <tr>
+                  <th>级别</th>
+                  <th>问题描述</th>
+                  <th>修订说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><span class="badge-sev-major">major</span></td>
+                  <td>误将 <code class="md-inline-code">oauth_scope</code> 列为上游执行器</td>
+                  <td>已从执行器清单移除，并补齐 <code class="md-inline-code">sdk/cliproxy/service_executors.go:199-384</code> 注册路径。</td>
+                </tr>
+                <tr>
+                  <td><span class="badge-sev-major">major</span></td>
+                  <td>将 <code class="md-inline-code">/v1/ws</code> 误归类为下游网关</td>
+                  <td>已重归类为上游反向 WebSocket 中继（wsrelay），补充 Home 模式禁用与 <code class="md-inline-code">ws-auth</code> 说明。</td>
+                </tr>
+                <tr>
+                  <td><span class="badge-sev-minor">minor</span></td>
+                  <td>默认凭据目录误写为 <code class="md-inline-code">auths/</code></td>
+                  <td>已更正为 <code class="md-inline-code">~/.cli-proxy-api</code>。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="report-section primary-section" id="section-4" data-search="后续建议 next_steps" open>
+      <summary>
+        <span class="section-title">后续建议</span>
+        <div class="section-actions">
+          <button type="button" onclick="toggleSection('section-4'); event.preventDefault();">折叠/展开</button>
+          <button type="button" onclick="copyText('section-body-4', this); event.preventDefault();">复制</button>
+        </div>
+      </summary>
+      <div class="section-body-rich" id="section-body-4">
+        <ul class="semantic-list">
+          <li><span class="list-idx">1</span><span>在 <code class="md-inline-code">config.yaml</code> 中替换模板示例 <code class="md-inline-code">access.api-keys</code>（避免触发 403 安全模式），按需配置至少一种上游。</span></li>
+          <li><span class="list-idx">2</span><span>将 Claude Code 指向 <code class="md-inline-code">/v1/messages</code>、Codex CLI 指向 <code class="md-inline-code">/v1/responses</code>、通用客户端指向 <code class="md-inline-code">/v1/chat/completions</code>。</span></li>
+        </ul>
+      </div>
+    </details>
+
+    <section class="phases-section" id="section-phases">
+      <div class="section-heading-row">
+        <h2>执行过程</h2>
+        <span class="section-heading-sub">4 个阶段 · 6 次 Agent 调用 · 点击「查看输出详情」展开结构化结果</span>
+      </div>
+
+      <div class="phase-block" data-search="阶段 1 scout teamwork-scout A1 agy gemini-pro-orchestrator-neon xhigh">
+        <div class="phase-header">
+          <span class="phase-num">阶段 1</span>
+          <span class="phase-title">Scout</span>
+          <span class="badge badge-ok">已完成 1/1</span>
+          <span class="phase-duration">2 分钟 57 秒</span>
+        </div>
+        <div class="phase-agents">
+          <div class="agent-row agent-ok" data-search="teamwork-scout A1 agy gemini-pro-orchestrator-neon scout xhigh">
+            <div class="agent-head">
+              <span class="agent-status">done</span>
+              <span class="agent-label">teamwork-scout</span>
+              <span class="agent-chip id">[A1]</span>
+              <span class="agent-chip tool">agy</span>
+              <span class="agent-chip">gemini-pro-orchestrator-neon</span>
+              <span class="agent-chip">profile=xhigh</span>
+              <span class="agent-chip">effort=xhigh</span>
+              <span class="agent-chip">role=scout</span>
+              <span class="agent-chip">effective=gemini-pro-orchestrator-neon/xhigh/xhigh</span>
+              <span class="agent-chip">2 分钟 57 秒</span>
+            </div>
+            <div class="agent-task">Explore the relevant files, symbols, tests, and constraints for this task.</div>
+            <details class="agent-output-drawer">
+              <summary>
+                <span>查看输出详情</span>
+                <span class="agent-drawer-meta">已解析为 Markdown 报告（14,051 字符）</span>
+              </summary>
+              <div class="agent-drawer-body">
+                <div class="md-prose">
+                  <p>已完成本地仓库 <code class="md-inline-code">feat/kiro-provider</code> 分支只读盘点，整理为 observation / logic_chain / caveats / conclusion / verification 五段式移交。</p>
+                </div>
+                <details class="agent-raw-drawer">
+                  <summary>查看原始 Agent 输出文本</summary>
+                  <pre class="raw-pre">### 1. observation
+- 入口与 CLI 接入参数：cmd/server/main.go ...</pre>
+                </details>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <div class="phase-block" data-search="阶段 2 execute teamwork-worker-1 A2 claude worker 超时">
+        <div class="phase-header">
+          <span class="phase-num">阶段 2</span>
+          <span class="phase-title">Execute</span>
+          <span class="badge badge-ok">已完成 1/1</span>
+          <span class="phase-duration">2 分钟 0 秒</span>
+        </div>
+        <div class="phase-agents">
+          <div class="agent-row agent-ok" data-search="teamwork-worker-1 A2 claude worker 空闲超时">
+            <div class="agent-head">
+              <span class="agent-status">done</span>
+              <span class="agent-label">teamwork-worker-1</span>
+              <span class="agent-chip id">[A2]</span>
+              <span class="agent-chip tool">claude</span>
+              <span class="agent-chip">default</span>
+              <span class="agent-chip">role=worker</span>
+              <span class="agent-chip">2 分钟 0 秒</span>
+            </div>
+            <div class="agent-task">Fulfill the user's request thoroughly and verify your work before returning.</div>
+            <div class="agent-activity">输出：❌ Claude 空闲超时</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="appendix-group" id="appendix">
+      <div class="section-heading-row">
+        <h2>原始数据与调试附录</h2>
+        <span class="section-heading-sub">默认折叠，完整保留未经截断的 JSON 与 Markdown 源文本用于排障溯源</span>
+      </div>
+
+      <details class="report-section secondary-section" id="section-5" data-search="补充参考 评审阶段初稿 verified_output">
+        <summary>
+          <span class="section-title">补充参考：评审阶段初稿（部分待修订）</span>
+          <span class="section-badge badge-warn">已折叠 · 非最终结论</span>
+          <div class="section-actions">
+            <button type="button" onclick="toggleSection('section-5'); event.preventDefault();">折叠/展开</button>
+            <button type="button" onclick="copyText('section-body-5', this); event.preventDefault();">复制</button>
+          </div>
+        </summary>
+        <div class="section-body-rich" id="section-body-5">
+          <div class="callout-card callout-warning">
+            <div class="callout-title">提示：此段为修订前的评审阶段文本</div>
+            <div class="md-prose"><p>第 2 轮评审指出其中包含 <code class="md-inline-code">oauth_scope</code> 误列、<code class="md-inline-code">/v1/ws</code> 归类偏差等问题；综合器已在「交付成果与详细内容」中完成源码核查修正。</p></div>
+          </div>
+        </div>
+      </details>
+
+      <details class="report-section appendix-section" id="section-raw-result" data-search="原始结果 json card_summary handoff">
+        <summary>
+          <span class="section-title">原始结果 JSON</span>
+          <span class="section-badge badge-neutral">调试附录</span>
+          <div class="section-actions">
+            <button type="button" onclick="toggleSection('section-raw-result'); event.preventDefault();">折叠/展开</button>
+            <button type="button" onclick="copyText('section-body-raw-result', this); event.preventDefault();">复制</button>
+          </div>
+        </summary>
+        <pre class="raw-pre" id="section-body-raw-result">{
+  "card_summary": {
+    "verdict": "needs_attention",
+    "conclusion": "..."
+  }
+}</pre>
+      </details>
+
+      <details class="report-section appendix-section" id="section-raw-state" data-search="原始 workflow 状态 json phases run_spec">
+        <summary>
+          <span class="section-title">原始 Workflow 状态 JSON</span>
+          <span class="section-badge badge-neutral">调试附录</span>
+          <div class="section-actions">
+            <button type="button" onclick="toggleSection('section-raw-state'); event.preventDefault();">折叠/展开</button>
+            <button type="button" onclick="copyText('section-body-raw-state', this); event.preventDefault();">复制</button>
+          </div>
+        </summary>
+        <pre class="raw-pre" id="section-body-raw-state">{
+  "workflow_id": "4486548ffb98",
+  "status": "completed"
+}</pre>
+      </details>
+
+      <details class="report-section appendix-section markdown-source" id="section-raw-markdown" data-search="完整 markdown 源文本">
+        <summary>
+          <span class="section-title">完整 Markdown 源文本</span>
+          <span class="section-badge badge-neutral">调试附录</span>
+          <div class="section-actions">
+            <button type="button" onclick="toggleSection('section-raw-markdown'); event.preventDefault();">折叠/展开</button>
+            <button type="button" onclick="copyText('markdown-source', this); event.preventDefault();">复制</button>
+          </div>
+        </summary>
+        <pre class="raw-pre" id="markdown-source"># CLIProxyAPI 接入方式盘点 完整报告
+...</pre>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    function toggleSection(id) {
+      const el = document.getElementById(id);
+      if (el) el.open = !el.open;
+    }
+
+    function setAllSections(open) {
+      document.querySelectorAll('details.report-section').forEach(s => {
+        if (!s.hidden) s.open = open;
+      });
+    }
+
+    function filterSections(query) {
+      const q = (query || '').trim().toLowerCase();
+      let matches = 0;
+
+      document.querySelectorAll('details.report-section').forEach(s => {
+        const hay = s.getAttribute('data-search') || s.textContent.toLowerCase();
+        const visible = !q || hay.includes(q);
+        s.hidden = !visible;
+        if (visible && q) matches += 1;
+      });
+
+      const phasesSection = document.getElementById('section-phases');
+      if (phasesSection) {
+        let visiblePhases = 0;
+        phasesSection.querySelectorAll('.phase-block').forEach(phase => {
+          const phaseHay = phase.getAttribute('data-search') || phase.textContent.toLowerCase();
+          const phaseHeaderMatch = !q || phaseHay.includes(q);
+          let visibleAgents = 0;
+          phase.querySelectorAll('.agent-row').forEach(agent => {
+            const agentHay = agent.getAttribute('data-search') || agent.textContent.toLowerCase();
+            const showAgent = !q || agentHay.includes(q) || phaseHeaderMatch;
+            agent.hidden = !showAgent;
+            if (showAgent) visibleAgents += 1;
+          });
+          const showPhase = !q || phaseHeaderMatch || visibleAgents > 0;
+          phase.hidden = !showPhase;
+          if (showPhase) {
+            visiblePhases += 1;
+            if (q) matches += 1;
+          }
+        });
+        phasesSection.hidden = q.length > 0 && visiblePhases === 0;
+      }
+
+      const appendixGroup = document.getElementById('appendix');
+      if (appendixGroup) {
+        const anyAppendixVisible = Array.from(
+          appendixGroup.querySelectorAll('details.report-section')
+        ).some(el => !el.hidden);
+        appendixGroup.hidden = q.length > 0 && !anyAppendixVisible;
+      }
+
+      const countNode = document.getElementById('filter-count');
+      if (countNode) {
+        countNode.textContent = q ? ('匹配 ' + matches + ' 处') : '';
+      }
+      const emptyNode = document.getElementById('search-empty');
+      if (emptyNode) {
+        const anySection = Array.from(document.querySelectorAll('details.report-section')).some(el => !el.hidden);
+        const phasesVisible = phasesSection && !phasesSection.hidden;
+        emptyNode.style.display = (q && !anySection && !phasesVisible) ? 'block' : 'none';
+      }
+    }
+
+    async function copyText(id, btn) {
+      const node = document.getElementById(id);
+      if (!node) return;
+      const text = node.innerText || node.textContent || '';
+      let copied = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        }
+      } catch (_err) {}
+      if (!copied) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          copied = document.execCommand('copy');
+          document.body.removeChild(ta);
+        } catch (_err) {}
+      }
+      if (btn && copied) {
+        const orig = btn.textContent;
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = orig; }, 1400);
+      }
+    }
+  </script>
+</body>
+</html>
