@@ -80,6 +80,11 @@ def _escape_md(value: Any, *, limit: int = 180) -> str:
     return text
 
 
+def _code_span(value: Any, *, limit: int = 120) -> str:
+    """Format untrusted text for backtick code spans without backslash-escaping."""
+    return _safe_one_line(value, limit=limit).replace("`", "'")
+
+
 def _fit_summary(text: str, *, default: str) -> str:
     """Clamp card notification summary text into Feishu's 8..60-char envelope."""
     safe_default = _strip_surrogates(default)
@@ -371,7 +376,7 @@ def _extract_agy_runtime_values(settings_snapshot: Any) -> tuple[bool, str, str]
     raw_show = _get_field(settings_snapshot, "show_thinking")
     if raw_show is None and isinstance(runtime_map, Mapping):
         raw_show = runtime_map.get("show_thinking")
-    show_thinking = bool(raw_show) if raw_show is not None else False
+    show_thinking = bool(raw_show) if raw_show is not None else True
 
     raw_verbosity = _get_field(settings_snapshot, "verbosity")
     if raw_verbosity is None and isinstance(runtime_map, Mapping):
@@ -560,7 +565,7 @@ def _render_session_element(usage_snapshot: Any) -> dict[str, Any]:
     if session_state_str:
         state_badge = _escape_md(session_state_str, limit=40)
     elif session_active:
-        short_sid = f"{session_id[:12]}…" if len(session_id) > 12 else session_id
+        short_sid = _code_span(f"{session_id[:12]}…" if len(session_id) > 12 else session_id, limit=24)
         state_badge = f"🟢 活跃 (`{short_sid}`)" if short_sid else "🟢 活跃"
     else:
         state_badge = "⚪ 空闲（未启动）"
@@ -568,7 +573,7 @@ def _render_session_element(usage_snapshot: Any) -> dict[str, Any]:
     model_name = str(
         _get_field(usage_snapshot, "model_name", "current_model", "model", default="") or ""
     ).strip()
-    model_display = _escape_md(model_name or "default（后端默认）", limit=64)
+    model_display = _code_span(model_name or "default（后端默认）", limit=64)
 
     turns = _coerce_int(_get_field(usage_snapshot, "turns", "message_count", "num_turns"))
     turns_display = f"{turns} 轮" if turns is not None else "0 轮"
@@ -786,6 +791,8 @@ def _render_agy_runtime_elements(
                     payload_fn(
                         action_ids.SETTINGS_TOGGLE_SHOW_THINKING,
                         show_thinking=not show_thinking,
+                        next_show_thinking=not show_thinking,
+                        current_show_thinking=show_thinking,
                     ),
                     button_type="primary" if show_thinking else "default",
                 )
@@ -953,7 +960,7 @@ class ToolCockpitBuilder:
         elements.append(
             {
                 "tag": "markdown",
-                "content": f"**当前配置** · {emoji} `{tool}` · 模型 `{_escape_md(active_model, limit=64)}`",
+                "content": f"**当前配置** · {emoji} `{_code_span(tool, limit=24)}` · 模型 `{_code_span(active_model, limit=64)}`",
             }
         )
         elements.append({"tag": "hr"})
@@ -987,7 +994,7 @@ class ToolCockpitBuilder:
 
         readonly_pairs = _extract_readonly_backend_summary(settings_snapshot)
         if readonly_pairs:
-            cfg_bits = " · ".join(f"`{k}`={v}" for k, v in readonly_pairs)
+            cfg_bits = " · ".join(f"`{_code_span(k, limit=32)}`={v}" for k, v in readonly_pairs)
             elements.append(
                 {
                     "tag": "markdown",

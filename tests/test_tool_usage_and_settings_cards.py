@@ -342,7 +342,60 @@ def test_tool_settings_card_agy_controls_cascade_and_readonly_config() -> None:
         action_ids.REFRESH_TOOL_SETTINGS,
     ]
     assert callbacks[0]["show_thinking"] is False
+    assert callbacks[0]["next_show_thinking"] is False
+    assert callbacks[0]["current_show_thinking"] is True
     assert callbacks[3]["command"] == "/compact"
+
+
+def test_tool_settings_card_agy_defaults_show_thinking_true_and_code_spans_preserve_underscores() -> None:
+    default_card, default_raw = _parse_card(
+        ToolCockpitBuilder.build_tool_settings_card(
+            "agy",
+            models=[ACPModelOption(name="c_o_new_thinking")],
+            current_model="c_o_new_thinking",
+            available_tools=["agy", "claude_w"],
+            settings_snapshot=None,
+        )
+    )
+    assert "💭 显示思考过程：已开启" in default_raw
+    assert "`c_o_new_thinking`" in default_raw
+    assert "c\\_o\\_new\\_thinking" not in default_raw
+    toggle_btn = next(
+        _callback_value(btn)
+        for btn in _nodes(default_card, "button")
+        if _callback_value(btn)["action"] == action_ids.SETTINGS_TOGGLE_SHOW_THINKING
+    )
+    assert toggle_btn["show_thinking"] is False
+    assert toggle_btn["next_show_thinking"] is False
+    assert toggle_btn["current_show_thinking"] is True
+
+    off_card, off_raw = _parse_card(
+        ToolCockpitBuilder.build_tool_settings_card(
+            "agy",
+            models=[ACPModelOption(name="c_o_new_thinking")],
+            current_model="c_o_new_thinking",
+            available_tools=["agy"],
+            settings_snapshot=SimpleNamespace(show_thinking=False),
+        )
+    )
+    assert "💭 显示思考过程：已关闭" in off_raw
+    off_toggle = next(
+        _callback_value(btn)
+        for btn in _nodes(off_card, "button")
+        if _callback_value(btn)["action"] == action_ids.SETTINGS_TOGGLE_SHOW_THINKING
+    )
+    assert off_toggle["show_thinking"] is True
+    assert off_toggle["next_show_thinking"] is True
+    assert off_toggle["current_show_thinking"] is False
+
+    _, usage_raw = _parse_card(
+        ToolCockpitBuilder.build_tool_usage_card(
+            "claude_w",
+            SimpleNamespace(model_name="gpt_4o_mini", session_active=True, session_id="sess_abc_1"),
+        )
+    )
+    assert "`gpt_4o_mini`" in usage_raw
+    assert "gpt\\_4o\\_mini" not in usage_raw
 
 
 def test_tool_settings_card_non_agy_empty_models_and_large_catalog_budget() -> None:
