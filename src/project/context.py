@@ -2,6 +2,7 @@ import copy
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Optional
@@ -36,6 +37,40 @@ _MAX_WORKFLOW_PENDING_REQUIREMENTS = 32
 _MAX_WORKFLOW_PENDING_REQ_CHARS = 8192
 
 
+def _sanitize_runtime_setting_value(value: Any, *, depth: int = 0) -> Any:
+    """Recursively sanitize runtime setting values into UTF-8-safe JSON primitives."""
+    if depth > 4:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            key = str(k or "").strip()
+            if not key:
+                continue
+            out[key] = _sanitize_runtime_setting_value(v, depth=depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_runtime_setting_value(item, depth=depth + 1) for item in value[:64]]
+    return str(value).encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _sanitize_runtime_settings_dict(raw: Any) -> dict[str, Any]:
+    """Normalize a mapping of per-tool runtime settings."""
+    if not isinstance(raw, Mapping):
+        return {}
+    cleaned: dict[str, Any] = {}
+    for raw_key, raw_val in raw.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        cleaned[key] = _sanitize_runtime_setting_value(raw_val)
+    return cleaned
+
+
 @dataclass
 class ChatProjectState:
     """Per-chat isolated ACP tool/model configuration, mode flags, and snapshots."""
@@ -47,6 +82,21 @@ class ChatProjectState:
     session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict)
     workflow_team_config: Optional[dict[str, Any]] = None
     workflow_pending_requirements: OrderedDict[str, str] = field(default_factory=OrderedDict)
+    tool_runtime_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @staticmethod
+    def _normalize_tool_runtime_settings_map(raw: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, Mapping):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_tool, raw_cfg in raw.items():
+            tool_key = str(raw_tool or "").strip().lower().replace("-", "_")
+            if not tool_key or not isinstance(raw_cfg, Mapping):
+                continue
+            cleaned = _sanitize_runtime_settings_dict(raw_cfg)
+            if cleaned:
+                normalized[tool_key] = cleaned
+        return normalized
 
     def clone(self) -> "ChatProjectState":
         return ChatProjectState(
@@ -69,6 +119,84 @@ class ChatProjectState:
             },
             workflow_team_config=copy.deepcopy(self.workflow_team_config),
             workflow_pending_requirements=OrderedDict(self.workflow_pending_requirements),
+            tool_runtime_settings={
+                tool_key: copy.deepcopy(cfg)
+                for tool_key, cfg in self.tool_runtime_settings.items()
+                if isinstance(cfg, dict)
+            },
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize per-chat project state to a snapshot dictionary."""
+        payload: dict[str, Any] = {
+            "acp_tool_name": self.acp_tool_name,
+            "acp_model_name": self.acp_model_name,
+            "has_acp_config": self.has_acp_config,
+            "active_modes": sorted(self.active_modes),
+            "session_snapshots": {
+                mode_key: {
+                    "session_id": snap.session_id,
+                    "query_count": snap.query_count,
+                    "last_query": snap.last_query,
+                    "is_resumable": snap.is_resumable,
+                }
+                for mode_key, snap in self.session_snapshots.items()
+                if snap is not None
+            },
+        }
+        if self.workflow_team_config is not None:
+            payload["workflow_team_config"] = copy.deepcopy(self.workflow_team_config)
+        if self.workflow_pending_requirements:
+            payload["workflow_pending_requirements"] = dict(self.workflow_pending_requirements)
+        if self.tool_runtime_settings:
+            payload["tool_runtime_settings"] = copy.deepcopy(self.tool_runtime_settings)
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ChatProjectState":
+        """Deserialize a ``ChatProjectState`` from a snapshot mapping safely."""
+        if not isinstance(data, Mapping):
+            return cls()
+        raw_tool = data.get("acp_tool_name")
+        acp_tool = str(raw_tool).strip() if isinstance(raw_tool, str) and raw_tool.strip() else None
+        raw_model = data.get("acp_model_name")
+        acp_model = str(raw_model) if isinstance(raw_model, str) and acp_tool else None
+        has_acp_cfg = bool(data.get("has_acp_config", acp_tool is not None))
+        active_modes = {
+            str(m)
+            for m in (data.get("active_modes") or ())
+            if isinstance(m, str) and m.strip()
+        }
+        snapshots: dict[str, Optional[SessionSnapshot]] = {}
+        raw_snaps = data.get("session_snapshots")
+        if isinstance(raw_snaps, Mapping):
+            for mode_key, sdata in raw_snaps.items():
+                if isinstance(mode_key, str) and isinstance(sdata, Mapping) and "session_id" in sdata:
+                    snapshots[mode_key] = SessionSnapshot(
+                        session_id=str(sdata["session_id"]),
+                        query_count=int(sdata.get("query_count", 0) or 0),
+                        last_query=str(sdata.get("last_query", "") or ""),
+                        is_resumable=bool(sdata.get("is_resumable", True)),
+                    )
+        raw_wf_cfg = data.get("workflow_team_config")
+        wf_cfg = copy.deepcopy(dict(raw_wf_cfg)) if isinstance(raw_wf_cfg, Mapping) else None
+        wf_pending: OrderedDict[str, str] = OrderedDict()
+        raw_pending = data.get("workflow_pending_requirements")
+        if isinstance(raw_pending, Mapping):
+            for sid, req in raw_pending.items():
+                if isinstance(sid, str) and isinstance(req, str) and sid.strip() and req.strip():
+                    wf_pending[sid.strip()] = req.strip()[:_MAX_WORKFLOW_PENDING_REQ_CHARS]
+        return cls(
+            acp_tool_name=acp_tool,
+            acp_model_name=acp_model,
+            has_acp_config=has_acp_cfg,
+            active_modes=active_modes,
+            session_snapshots=snapshots,
+            workflow_team_config=wf_cfg,
+            workflow_pending_requirements=wf_pending,
+            tool_runtime_settings=cls._normalize_tool_runtime_settings_map(
+                data.get("tool_runtime_settings")
+            ),
         )
 
 
@@ -87,6 +215,7 @@ class ProjectContext:
     _active_modes: set[str] = field(default_factory=set, repr=False)
     session_snapshots: dict[str, Optional[SessionSnapshot]] = field(default_factory=dict, repr=False)
     chat_states: dict[str, ChatProjectState] = field(default_factory=dict, repr=False)
+    _default_tool_runtime_settings: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
 
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
@@ -244,6 +373,59 @@ class ProjectContext:
             if state is not None and state.has_acp_config:
                 return state.acp_tool_name, state.acp_model_name
             return self.acp_tool_name, self.acp_model_name
+
+    @staticmethod
+    def _normalized_tool_runtime_key(tool_name: str) -> str:
+        return str(tool_name or "").strip().lower().replace("-", "_")
+
+    def get_tool_runtime_settings(
+        self,
+        chat_id: Optional[str],
+        tool_name: str,
+    ) -> dict[str, Any]:
+        """Return a deep copy of per-chat runtime settings for *tool_name*."""
+        tool_key = self._normalized_tool_runtime_key(tool_name)
+        if not tool_key:
+            return {}
+        cid = self._normalized_chat_id(chat_id)
+        with self._chat_lock:
+            if cid:
+                state = self.chat_states.get(cid)
+                if state is None:
+                    return {}
+                cfg = state.tool_runtime_settings.get(tool_key)
+                return copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+            cfg = self._default_tool_runtime_settings.get(tool_key)
+            return copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+
+    def set_tool_runtime_settings(
+        self,
+        chat_id: Optional[str],
+        tool_name: str,
+        settings: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Set per-chat runtime settings for *tool_name* under ``_chat_lock``."""
+        tool_key = self._normalized_tool_runtime_key(tool_name)
+        if not tool_key:
+            return {}
+        cid = self._normalized_chat_id(chat_id)
+        cleaned = _sanitize_runtime_settings_dict(settings) if settings is not None else {}
+        with self._chat_lock:
+            if cid:
+                if cleaned:
+                    state = self._ensure_chat_state_unlocked(cid)
+                    state.tool_runtime_settings[tool_key] = copy.deepcopy(cleaned)
+                else:
+                    existing_state = self.chat_states.get(cid)
+                    if existing_state is not None:
+                        existing_state.tool_runtime_settings.pop(tool_key, None)
+            else:
+                if cleaned:
+                    self._default_tool_runtime_settings[tool_key] = copy.deepcopy(cleaned)
+                else:
+                    self._default_tool_runtime_settings.pop(tool_key, None)
+            self.touch()
+        return copy.deepcopy(cleaned)
 
     def get_workflow_team_config(
         self,
@@ -841,33 +1023,11 @@ class ProjectContext:
             for mode_type, (mode_flag, snap_attr) in self._MODE_ATTRS.items():
                 d[mode_flag] = getattr(self, mode_flag)
                 d[snap_attr] = self._snap_to_dict(getattr(self, snap_attr))
+            if self._default_tool_runtime_settings:
+                d["tool_runtime_settings"] = copy.deepcopy(self._default_tool_runtime_settings)
             if self.chat_states:
                 d["chat_states"] = {
-                    cid: {
-                        "acp_tool_name": st.acp_tool_name,
-                        "acp_model_name": st.acp_model_name,
-                        "has_acp_config": st.has_acp_config,
-                        "active_modes": sorted(st.active_modes),
-                        "session_snapshots": {
-                            mode_key: self._snap_to_dict(snap)
-                            for mode_key, snap in st.session_snapshots.items()
-                            if snap is not None
-                        },
-                        **(
-                            {"workflow_team_config": copy.deepcopy(st.workflow_team_config)}
-                            if st.workflow_team_config is not None
-                            else {}
-                        ),
-                        **(
-                            {
-                                "workflow_pending_requirements": dict(
-                                    st.workflow_pending_requirements
-                                )
-                            }
-                            if st.workflow_pending_requirements
-                            else {}
-                        ),
-                    }
+                    cid: st.to_dict()
                     for cid, st in self.chat_states.items()
                 }
         return d
@@ -1116,6 +1276,9 @@ class ProjectContext:
                 wf_pending_reqs = cls.normalize_workflow_pending_requirements(
                     raw_state.get("workflow_pending_requirements")
                 )
+                tool_runtime = ChatProjectState._normalize_tool_runtime_settings_map(
+                    raw_state.get("tool_runtime_settings")
+                )
                 ctx.chat_states[cid] = ChatProjectState(
                     acp_tool_name=chat_tool,
                     acp_model_name=chat_model,
@@ -1124,7 +1287,11 @@ class ProjectContext:
                     session_snapshots=snapshots,
                     workflow_team_config=wf_team_cfg,
                     workflow_pending_requirements=wf_pending_reqs,
+                    tool_runtime_settings=tool_runtime,
                 )
+        ctx._default_tool_runtime_settings = ChatProjectState._normalize_tool_runtime_settings_map(
+            data.get("tool_runtime_settings")
+        )
         return ctx
 
 

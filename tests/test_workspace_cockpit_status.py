@@ -111,6 +111,8 @@ def test_workspace_cockpit_status_and_git_branch_and_buttons(tmp_path) -> None:
     assert "build-api" in dump
     assert action_ids.OPEN_ACP_MODEL_PICKER in dump
     assert action_ids.SHOW_TOOL_COMMANDS in dump
+    assert action_ids.OPEN_TOOL_USAGE in dump
+    assert action_ids.OPEN_TOOL_SETTINGS in dump
     assert action_ids.PROGRAMMING_STOP in dump
     assert action_ids.SHOW_BOARD in dump
 
@@ -125,7 +127,7 @@ def test_workspace_cockpit_status_and_git_branch_and_buttons(tmp_path) -> None:
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
-    assert len(buttons) == 4
+    assert len(buttons) == 6
     for btn in buttons:
         assert btn["behaviors"] == [{"type": "callback", "value": btn["value"]}]
 

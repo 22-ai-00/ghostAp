@@ -6,6 +6,7 @@ import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Sequence
 
+from src.acp import native_commands as _native_commands_mod
 from src.acp.agy_selection import is_agy_orchestrator_model
 from src.acp.native_commands import (
     get_featured_native_commands,
@@ -1049,9 +1050,21 @@ class SystemBuilder:
             "tool_name": tool,
             "project_id": project_id,
         }
+        usage_value = {
+            "action": action_ids.OPEN_TOOL_USAGE,
+            "tool_name": tool,
+            "project_id": project_id,
+        }
+        settings_value = {
+            "action": action_ids.OPEN_TOOL_SETTINGS,
+            "tool_name": tool,
+            "project_id": project_id,
+        }
         if thread_root_id:
             switch_value["thread_root_id"] = thread_root_id
             cmds_value["thread_root_id"] = thread_root_id
+            usage_value["thread_root_id"] = thread_root_id
+            settings_value["thread_root_id"] = thread_root_id
 
         body_lines = [UI_TEXT["system_acp_programming_ready_body"].format(model=model)]
         featured = get_featured_native_commands(tool, live_commands=live_commands, limit=4)
@@ -1076,8 +1089,17 @@ class SystemBuilder:
                         action=cmds_value,
                         button_type="primary",
                     ),
+                    build_callback_button(
+                        text=UI_TEXT["system_tool_usage_btn"],
+                        action=usage_value,
+                    ),
+                    build_callback_button(
+                        text=UI_TEXT["system_tool_settings_btn"],
+                        action=settings_value,
+                    ),
                 ],
-                layout="mobile",
+                layout="responsive",
+                mobile_force_vertical=False,
             ),
         ]
         card = CoreBuilder._wrap_card(
@@ -1085,10 +1107,50 @@ class SystemBuilder:
             "green",
             elements,
         )
+        card["config"]["update_multi"] = True
         card["config"]["summary"] = {
             "content": "编程模式已就绪，打开卡片查看当前模型"
         }
         return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def _truncate_native_cmd_desc(desc: object, limit: int = 72) -> str:
+        """Truncate a native command/skill description to at most *limit* characters."""
+        compact = " ".join(str(desc or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(1, limit - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _partition_native_commands_and_skills(
+        tool_name: str,
+        commands: Sequence,
+    ) -> tuple[tuple, tuple]:
+        """Split *commands* into ``(core_commands, skill_commands)`` safely."""
+        partition_fn = getattr(_native_commands_mod, "partition_commands_and_skills", None)
+        if callable(partition_fn):
+            try:
+                core, skills = partition_fn(tool_name, commands)
+                return tuple(core), tuple(skills)
+            except TypeError:
+                pass
+        core_list: list = []
+        skill_list: list = []
+        skill_desc_re = re.compile(r"(?i)(?:\bskill\b|\[skill\]|\(skill\)|技能)")
+        for cmd in commands:
+            name_lower = str(getattr(cmd, "name", "") or "").strip().casefold()
+            desc = str(getattr(cmd, "description", "") or "").strip()
+            is_skill = bool(getattr(cmd, "is_skill", False))
+            if not is_skill and name_lower != "skills":
+                if name_lower.startswith(("skill:", "skills:", "$")) or ":" in name_lower:
+                    is_skill = True
+                elif skill_desc_re.search(desc):
+                    is_skill = True
+            if is_skill:
+                skill_list.append(cmd)
+            else:
+                core_list.append(cmd)
+        return tuple(core_list), tuple(skill_list)
 
     @staticmethod
     def build_tool_native_commands_card(
@@ -1102,6 +1164,10 @@ class SystemBuilder:
         """Build a card showcasing native slash commands & skills for a coding tool."""
         tool = str(tool_name or "").strip().lower() or "tool"
         normalized = normalize_acp_available_commands(commands)
+        core_cmds, skill_cmds = SystemBuilder._partition_native_commands_and_skills(
+            tool,
+            normalized,
+        )
         source_key = "system_tool_cmds_source_live" if source == "live" else "system_tool_cmds_source_static"
         elements: list[dict] = [
             {
@@ -1109,6 +1175,24 @@ class SystemBuilder:
                 "content": UI_TEXT[source_key].format(count=len(normalized)),
             }
         ]
+
+        def _nav_payload(action: str) -> dict:
+            data = {"action": action, "tool_name": tool, "project_id": project_id}
+            if thread_root_id:
+                data["thread_root_id"] = thread_root_id
+            return data
+
+        nav_buttons = [
+            build_callback_button(
+                text=UI_TEXT["system_tool_usage_cmd_btn"],
+                action=_nav_payload(action_ids.OPEN_TOOL_USAGE),
+            ),
+            build_callback_button(
+                text=UI_TEXT["system_tool_settings_cmd_btn"],
+                action=_nav_payload(action_ids.OPEN_TOOL_SETTINGS),
+            ),
+        ]
+
         if not normalized:
             elements.append(
                 {
@@ -1116,8 +1200,13 @@ class SystemBuilder:
                     "content": UI_TEXT["system_tool_cmds_empty"].format(tool=tool),
                 }
             )
+            elements.append({"tag": "hr"})
+            elements.extend(
+                build_responsive_layout(nav_buttons, layout="responsive", mobile_force_vertical=False)
+            )
         else:
-            quick_cmds = get_zero_arg_quick_commands(normalized, limit=6)
+            quick_source = core_cmds or normalized
+            quick_cmds = get_zero_arg_quick_commands(quick_source, limit=6)
             if quick_cmds:
                 elements.append({"tag": "markdown", "content": UI_TEXT["system_tool_cmds_quick_header"]})
                 quick_buttons = []
@@ -1137,18 +1226,51 @@ class SystemBuilder:
                             button_type="primary" if idx == 0 else "default",
                         )
                     )
-                elements.extend(build_responsive_layout(quick_buttons, layout="mobile"))
+                elements.extend(
+                    build_responsive_layout(quick_buttons, layout="responsive", mobile_force_vertical=False)
+                )
 
             elements.append({"tag": "hr"})
+            display_core = core_cmds if core_cmds else normalized
             list_lines = [UI_TEXT["system_tool_cmds_list_header"]]
             display_limit = 14
-            for cmd in normalized[:display_limit]:
+            for cmd in display_core[:display_limit]:
                 usage = f"/{cmd.name} {cmd.input_hint}".strip() if cmd.input_hint else f"/{cmd.name}"
-                desc = f" — {cmd.description}" if cmd.description else ""
+                short_desc = SystemBuilder._truncate_native_cmd_desc(cmd.description, limit=72)
+                desc = f" — {short_desc}" if short_desc else ""
                 list_lines.append(f"• `{usage}`{desc}")
-            if len(normalized) > display_limit:
-                list_lines.append(f"• …及另外 {len(normalized) - display_limit} 条原生命令")
+            if len(display_core) > display_limit:
+                list_lines.append(f"• …及另外 {len(display_core) - display_limit} 条核心命令")
             elements.append({"tag": "markdown", "content": "\n".join(list_lines)})
+
+            # Separate Skills summary so long skill lists never bloat the command list.
+            if skill_cmds:
+                skill_lines = [UI_TEXT["system_tool_cmds_skills_header"].format(count=len(skill_cmds))]
+                skill_detail_limit = 6
+                for skill in skill_cmds[:skill_detail_limit]:
+                    short_desc = SystemBuilder._truncate_native_cmd_desc(skill.description, limit=72)
+                    desc = f" — {short_desc}" if short_desc else ""
+                    skill_lines.append(f"• `/{skill.name}`{desc}")
+                if len(skill_cmds) > skill_detail_limit:
+                    remainder = skill_cmds[skill_detail_limit : skill_detail_limit + 12]
+                    chips = "、".join(f"`{s.name}`" for s in remainder)
+                    more_count = len(skill_cmds) - skill_detail_limit
+                    suffix = f" 等共 {more_count} 个" if len(skill_cmds) > skill_detail_limit + 12 else ""
+                    skill_lines.append(f"• 其余已加载：{chips}{suffix}")
+                elements.append({"tag": "markdown", "content": "\n".join(skill_lines)})
+            else:
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "text_size": "notation",
+                        "content": UI_TEXT["system_tool_cmds_skills_empty"],
+                    }
+                )
+
+            elements.append({"tag": "hr"})
+            elements.extend(
+                build_responsive_layout(nav_buttons, layout="responsive", mobile_force_vertical=False)
+            )
             elements.append(
                 {
                     "tag": "markdown",
@@ -1161,6 +1283,7 @@ class SystemBuilder:
             "blue",
             elements,
         )
+        card["config"]["update_multi"] = True
         card["config"]["summary"] = {
             "content": f"{SystemBuilder._display_mode_label(tool)} 原生命令与 Skills"
         }

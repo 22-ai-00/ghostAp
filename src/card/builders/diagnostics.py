@@ -263,6 +263,16 @@ class DiagnosticsBuilder:
                 picker_payload["current_model"] = d_info["model_name"]
             buttons.append(build_callback_button(UI_TEXT["system_acp_switch_model_btn"], picker_payload))
             buttons.append(build_callback_button(UI_TEXT["system_acp_native_cmds_btn"], cmds_payload))
+        usage_payload: dict[str, object] = {"action": action_ids.OPEN_TOOL_USAGE}
+        settings_payload: dict[str, object] = {"action": action_ids.OPEN_TOOL_SETTINGS}
+        if tool_name:
+            usage_payload["tool_name"] = tool_name
+            settings_payload["tool_name"] = tool_name
+        if proj_id:
+            usage_payload["project_id"] = proj_id
+            settings_payload["project_id"] = proj_id
+        buttons.append(build_callback_button(UI_TEXT["system_tool_usage_btn"], usage_payload))
+        buttons.append(build_callback_button(UI_TEXT["system_tool_settings_btn"], settings_payload))
         if is_running:
             stop_payload = {"action": action_ids.PROGRAMMING_STOP}
             if tool_name:
@@ -278,12 +288,13 @@ class DiagnosticsBuilder:
             )
         )
         elements.append({"tag": "hr"})
-        elements.extend(build_responsive_layout(buttons, layout="mobile"))
+        elements.extend(build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False))
 
         title_base = UI_TEXT.get("diag_cockpit_title", "🧭 工作区总览")
         header_title = f"{title_base} · {proj_name}" if proj_name else title_base
         header_color = meta.template_color if (meta is not None and mode_key) else "blue"
         card = CoreBuilder._wrap_card(header_title, header_color, elements)
+        card["config"]["update_multi"] = True
         card["config"]["summary"] = {"content": header_title}
         return "interactive", json.dumps(card, ensure_ascii=False)
 

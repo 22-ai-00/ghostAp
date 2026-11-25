@@ -7,7 +7,7 @@
   <style>
     :root { color-scheme: dark; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #111318; color: #f3f4f6; }
-    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 440px)); gap: 24px; padding: 32px; justify-content: center; align-items: start; }
+    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 460px)); gap: 24px; padding: 32px; justify-content: center; align-items: start; }
     .card { border: 1px solid #343946; border-radius: 14px; overflow: hidden; background: #1b1f27; box-shadow: 0 18px 45px rgba(0,0,0,.28); }
     .header { padding: 15px 18px; font-size: 16px; font-weight: 700; border-bottom: 1px solid #343946; }
     .ready .header { background: #174a38; }
@@ -19,7 +19,7 @@
     code { padding: 1px 6px; border-radius: 5px; background: #262c38; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: #93c5fd; }
     .hint { margin-top: 10px; font-size: 12px; color: #9da6b5; }
     .hr { height: 1px; background: #303745; margin: 14px 0; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
     button { padding: 8px 12px; border: 1px solid #4b5565; border-radius: 8px; color: #f3f4f6; background: #2a303b; font-size: 13px; font-weight: 600; cursor: pointer; }
     button.primary { border-color: #3b82f6; background: #2563eb; }
   </style>
@@ -27,7 +27,7 @@
 <body>
   <main>
     <section class="card ready">
-      <div class="header">Agy 编程模式已就绪</div>
+      <div class="header">🪐 AGY 编程模式已就绪</div>
       <div class="body">
         <p style="margin:0 0 8px;">ACP 会话已使用 <code>default</code> 启动，现在可以直接发送需求。</p>
         <p style="margin:0;color:#9da6b5;font-size:13px;">
@@ -38,41 +38,58 @@
         <div class="actions">
           <button>切换模型</button>
           <button class="primary">原生命令 /cmds</button>
+          <button>📊 用量</button>
+          <button>⚙️ 设置</button>
         </div>
       </div>
     </section>
 
     <section class="card cmds">
-      <div class="header">🛠️ Agy 原生命令与 Skills</div>
+      <div class="header">🛠️ 🪐 AGY 原生命令与 Skills</div>
       <div class="body">
         <div style="color:#9da6b5;font-size:12px;">
-          来源：当前 ACP 会话实时上报（共 13 条） · 切换其它工具：<code>/cmds codex</code>
+          来源：当前 ACP 会话实时上报（共 21 条） · 查看其它工具：<code>/cmds &lt;工具&gt;</code>
         </div>
 
-        <div class="section-title">⚡ 一键直达命令</div>
+        <div class="section-title">⚡ 一键直达命令（点击即执行，无需离开当前卡片）</div>
         <div class="actions">
           <button class="primary">▶ /compact</button>
-          <button>▶ /swarm</button>
-          <button>▶ /boost</button>
-          <button>▶ /plan</button>
-          <button>▶ /teamwork</button>
-          <button>▶ /grill-me</button>
+          <button>▶ /skills</button>
+          <button>▶ /usage</button>
+          <button>▶ /settings</button>
+          <button>▶ /learn</button>
+          <button>▶ /mcp</button>
         </div>
 
         <div class="hr"></div>
-        <div class="section-title">📋 原生命令速览</div>
+        <div class="section-title">📋 核心原生命令</div>
         <ul class="cmd-list">
           <li><code>/swarm &lt;任务&gt;</code> — 启动多 Agent 协同 Swarm</li>
           <li><code>/boost &lt;需求&gt;</code> — 复杂编程/研究深度推进</li>
           <li><code>/plan &lt;目标&gt;</code> — 分步架构规划与落地检查</li>
           <li><code>/compact</code> — 压缩当前会话上下文</li>
+          <li><code>/usage</code> — 查看模型配额窗口与会话耗时</li>
+          <li><code>/settings</code> — 调整模型、思考强度与运行设置</li>
           <li><code>/goal &lt;目标&gt;</code> — 长时自主推进直到目标完成</li>
-          <li><code>/grill-me &lt;方案&gt;</code> — 交互式深度追问敲定设计</li>
-          <li><code>/teamwork</code> / <code>/learn</code> / <code>/browser</code> / <code>/schedule</code> / <code>/skills</code></li>
+          <li><code>/grill-me &lt;方案&gt;</code> — 交互式深度追问敲定方案</li>
         </ul>
+
+        <div class="section-title">🧩 已加载 Skills（共 8 个）</div>
+        <ul class="cmd-list">
+          <li><code>/skill:frontend-design</code> — 构建高辨识度前端界面与组件…</li>
+          <li><code>/skill:pdf</code> — 解析、合并与生成 PDF 文档</li>
+          <li><code>/skill:webapp-testing</code> — Playwright 本地 Web 应用端到端测试</li>
+          <li>其余已加载：<code>docx</code>、<code>xlsx</code>、<code>mcp-builder</code>、<code>systematic-debugging</code>、<code>tdd</code></li>
+        </ul>
+
+        <div class="hr"></div>
+        <div class="actions">
+          <button>📊 用量 /usage</button>
+          <button>⚙️ 设置 /settings</button>
+        </div>
+
         <p class="hint">
-          提示：在 Agy 编程模式下直接发送 <code>/命令</code> 即透传给 Agy；
-          在 SMART 模式下发送如 <code>/swarm ...</code> 若唯一匹配且当前无其它冲突则自动进入对应工具，或用 <code>/agy /swarm ...</code> 精确直达。
+          提示：在 <code>agy</code> 编程模式下直接发送 <code>/命令</code> 即透传给工具；也可发送 <code>/agy /命令</code> 或在 SMART 模式下直接发送专属命令（如 <code>/swarm</code>、<code>/review-branch</code>）。
         </p>
       </div>
     </section>

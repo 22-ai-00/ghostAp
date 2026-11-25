@@ -106,6 +106,39 @@ SHOW_TOOL_COMMANDS = "show_tool_commands"
 RUN_NATIVE_TOOL_COMMAND = "run_native_tool_command"
 
 # ---------------------------------------------------------------------------
+# Tool cockpit (/usage & /settings) actions
+# ---------------------------------------------------------------------------
+OPEN_TOOL_USAGE = "open_tool_usage"
+REFRESH_TOOL_USAGE = "refresh_tool_usage"
+OPEN_TOOL_SETTINGS = "open_tool_settings"
+REFRESH_TOOL_SETTINGS = "refresh_tool_settings"
+SETTINGS_SELECT_TOOL = "settings_select_tool"
+SETTINGS_SELECT_MODEL_GROUP = "settings_select_model_group"
+SETTINGS_SELECT_MODEL_PROFILE = "settings_select_model_profile"
+SETTINGS_SELECT_MODEL_EFFORT = "settings_select_model_effort"
+SETTINGS_TOGGLE_SHOW_THINKING = "settings_toggle_show_thinking"
+SETTINGS_SELECT_VERBOSITY = "settings_select_verbosity"
+SETTINGS_SELECT_AGENT_MODE = "settings_select_agent_mode"
+SETTINGS_CLEAR_SESSION = "settings_clear_session"
+
+TOOL_COCKPIT_ACTIONS = frozenset(
+    {
+        OPEN_TOOL_USAGE,
+        REFRESH_TOOL_USAGE,
+        OPEN_TOOL_SETTINGS,
+        REFRESH_TOOL_SETTINGS,
+        SETTINGS_SELECT_TOOL,
+        SETTINGS_SELECT_MODEL_GROUP,
+        SETTINGS_SELECT_MODEL_PROFILE,
+        SETTINGS_SELECT_MODEL_EFFORT,
+        SETTINGS_TOGGLE_SHOW_THINKING,
+        SETTINGS_SELECT_VERBOSITY,
+        SETTINGS_SELECT_AGENT_MODE,
+        SETTINGS_CLEAR_SESSION,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # Global / status actions
 # ---------------------------------------------------------------------------
 EXIT_PROGRAMMING_MODE = "exit"  # Exit whichever programming backend is active

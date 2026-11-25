@@ -299,6 +299,16 @@ def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> No
             "tool_name": "codex",
             "project_id": "project-3",
         },
+        {
+            "action": action_ids.OPEN_TOOL_USAGE,
+            "tool_name": "codex",
+            "project_id": "project-3",
+        },
+        {
+            "action": action_ids.OPEN_TOOL_SETTINGS,
+            "tool_name": "codex",
+            "project_id": "project-3",
+        },
     ]
 
     failed_card = _card(

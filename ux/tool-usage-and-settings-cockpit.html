@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GhostAP 工具用量与设置驾驶舱预览 (/usage &amp; /settings)</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1218;
+      --card: #191e27;
+      --surface: #222834;
+      --border: #313949;
+      --text: #f3f4f6;
+      --muted: #9aa4b5;
+      --blue: #1d4ed8;
+      --orange: #c2590a;
+      --red: #b91c1c;
+      --code-bg: #262e3d;
+      --code-fg: #93c5fd;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.55 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    }
+    header.page-bar {
+      padding: 18px 28px 6px;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    header.page-bar h1 { margin: 0 0 4px; font-size: 18px; }
+    header.page-bar p { margin: 0; color: var(--muted); font-size: 13px; }
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 20px 28px 40px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 22px;
+      align-items: start;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      background: var(--card);
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.3);
+    }
+    .card-header {
+      padding: 14px 18px;
+      font-weight: 700;
+      font-size: 15.5px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .card-header.blue { background: var(--blue); }
+    .card-header.orange { background: var(--orange); }
+    .card-header.red { background: var(--red); }
+    .card-sub {
+      font-size: 12px;
+      font-weight: 400;
+      opacity: 0.88;
+      margin-top: 2px;
+    }
+    .card-body { padding: 16px 18px; color: #dbe1ec; }
+    .banner {
+      padding: 9px 12px;
+      border-radius: 8px;
+      background: rgba(22, 163, 74, 0.16);
+      border: 1px solid rgba(34, 197, 94, 0.45);
+      color: #86efac;
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+    .section-title { font-weight: 700; color: #f8fafc; margin: 0 0 6px; font-size: 13.5px; }
+    .group-title { font-weight: 700; color: #e2e8f0; margin: 10px 0 4px; font-size: 13px; }
+    .quota-line { margin: 4px 0; font-size: 13px; }
+    .bar {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--code-bg);
+      color: #60a5fa;
+      padding: 1px 6px;
+      border-radius: 5px;
+      letter-spacing: 0.5px;
+    }
+    .bar.warn { color: #fbbf24; }
+    .bar.crit { color: #f87171; }
+    code {
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px;
+    }
+    .hr { height: 1px; background: var(--border); margin: 13px 0; }
+    .kv-box { background: var(--surface); border-radius: 10px; padding: 11px 13px; }
+    .kv-row { margin: 3px 0; font-size: 13px; }
+    .note { margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .field-label { font-size: 12.5px; font-weight: 700; color: #e2e8f0; margin: 10px 0 5px; }
+    select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #475569;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .actions-single { margin-top: 8px; }
+    button {
+      padding: 8px 11px;
+      border-radius: 8px;
+      border: 1px solid #475569;
+      background: #28303e;
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary { border-color: #3b82f6; background: #2563eb; }
+    button.danger { border-color: #ef4444; background: #991b1b; }
+  </style>
+</head>
+<body>
+  <header class="page-bar">
+    <h1>GhostAP 工具用量 &amp; 设置驾驶舱预览</h1>
+    <p>对齐生产 Card JSON 2.0 结构：<code>ToolCockpitBuilder.build_tool_usage_card</code>、<code>build_tool_settings_card</code> 与 <code>/status</code> 工作区总览入口。</p>
+  </header>
+  <main>
+    <!-- 1. /usage card (healthy blue) -->
+    <section class="card">
+      <div class="card-header blue">
+        <div>🪐 AGY 用量与会话状态</div>
+        <div class="card-sub">项目：ghostAp</div>
+      </div>
+      <div class="card-body">
+        <div class="section-title">🔋 模型配额窗口</div>
+        <div class="group-title">Gemini Models</div>
+        <div class="quota-line">• 每周限额：<span class="bar">████████░░</span> <strong>84%</strong> · 5天10小时后 (2026-11-30 19:58 UTC)</div>
+        <div class="quota-line">• 5h 窗口：<span class="bar">██████████</span> <strong>96%</strong> · 3小时41分后 (2026-11-25 12:54 UTC)</div>
+
+        <div class="group-title">Claude and GPT models</div>
+        <div class="quota-line">• 每周限额：<span class="bar">██████████</span> <strong>99%</strong> · 4天6小时后 (2026-11-29 15:31 UTC)</div>
+        <div class="quota-line">• 5h 窗口：<span class="bar">██████████</span> <strong>100%</strong> · 未消耗（满额）</div>
+
+        <div style="margin-top:10px;">💎 <strong>G1 Credits 余额</strong>：<code>0</code> · 未开启 G1 抵扣</div>
+
+        <div class="hr"></div>
+        <div class="kv-box">
+          <div class="section-title">📊 会话与上下文状态</div>
+          <div class="kv-row">• 会话状态：🟢 活跃 (<code>sess-91ac…</code>)</div>
+          <div class="kv-row">• 当前模型：<code>gemini-pro-orchestrator/high/medium</code></div>
+          <div class="kv-row">• 交互轮次：<code>6 轮</code> · 耗时：<code>2m 15s</code></div>
+          <div class="kv-row">• 上下文窗口：<code>12,400 / 200,000</code> (6%)</div>
+          <div class="kv-row">• 累计费用：<code>0.125 USD</code></div>
+        </div>
+        <div class="note">ℹ️ 配额说明：同组模型共享 5 小时与每周额度，低耗时模型消耗更少配额。</div>
+
+        <div class="hr"></div>
+        <div class="actions">
+          <button>🔄 刷新用量</button>
+          <button class="primary">⚙️ 工具设置</button>
+          <button>🗜️ 压缩上下文</button>
+          <button>🛠️ 原生命令</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. /usage low-quota adaptive header (red/orange) -->
+    <section class="card">
+      <div class="card-header red">
+        <div>🪐 AGY 用量与会话状态（低配额告警态）</div>
+        <div class="card-sub">项目：ghostAp · 任一窗口 &lt;5% 自动变红，&lt;20% 变橙</div>
+      </div>
+      <div class="card-body">
+        <div class="section-title">🔋 模型配额窗口</div>
+        <div class="group-title">Gemini Models</div>
+        <div class="quota-line">• 每周限额：<span class="bar warn">██░░░░░░░░</span> <strong>16%</strong> · 1天4小时后 (2026-11-26 13:00 UTC)</div>
+        <div class="quota-line">• 5h 窗口：<span class="bar crit">░░░░░░░░░░</span> <strong>3.5%</strong> · 42分钟后 (2026-11-25 09:55 UTC)</div>
+
+        <div style="margin-top:10px;">💎 <strong>G1 Credits 余额</strong>：<code>250</code> · 已开启 G1 超额抵扣</div>
+
+        <div class="hr"></div>
+        <div class="kv-box">
+          <div class="section-title">📊 会话与上下文状态</div>
+          <div class="kv-row">• 会话状态：⚪ 空闲（未启动）</div>
+          <div class="kv-row">• 当前模型：<code>default（后端默认）</code></div>
+          <div class="kv-row">• 交互轮次：<code>0 轮</code> · 耗时：<code>—</code></div>
+          <div class="kv-row">• 上下文窗口：暂未上报</div>
+        </div>
+        <div class="hr"></div>
+        <div class="actions">
+          <button>🔄 刷新用量</button>
+          <button class="primary">⚙️ 工具设置</button>
+          <button>🗜️ 压缩上下文</button>
+          <button>🛠️ 原生命令</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. /settings card -->
+    <section class="card">
+      <div class="card-header blue">
+        <div>⚙️ AGY 工具设置</div>
+        <div class="card-sub">项目：ghostAp</div>
+      </div>
+      <div class="card-body">
+        <div class="banner">✅ 已保存并应用运行时设置（verbosity=medium, agent_mode=auto）</div>
+        <div><strong>当前配置</strong> · 🪐 <code>agy</code> · 模型 <code>gemini-pro-orchestrator/high/medium</code></div>
+        <div class="hr"></div>
+
+        <div class="field-label">🔧 工具切换</div>
+        <select>
+          <option selected>🪐 AGY (agy)</option>
+          <option>💻 Codex (codex)</option>
+          <option>🚀 Traex (traex)</option>
+          <option>🔮 Claude (claude)</option>
+        </select>
+
+        <div class="field-label">模型族</div>
+        <select>
+          <option selected>gemini-pro-orchestrator</option>
+          <option>gemini-4-hydrogen</option>
+          <option>default（后端托管）</option>
+        </select>
+
+        <div class="field-label">Planner Effort</div>
+        <select>
+          <option>medium</option>
+          <option selected>high</option>
+          <option>xhigh</option>
+        </select>
+
+        <div class="field-label">Executor Effort</div>
+        <select>
+          <option>low</option>
+          <option selected>medium</option>
+          <option>high</option>
+        </select>
+
+        <div class="hr"></div>
+        <div class="section-title">🪐 AGY 运行时设置</div>
+        <div class="actions-single">
+          <button class="primary" style="width:100%;">💭 显示思考过程：已开启</button>
+        </div>
+
+        <div class="field-label">📝 输出详细度</div>
+        <select>
+          <option>low · 精简输出</option>
+          <option selected>medium · 标准输出</option>
+          <option>high · 详细输出</option>
+        </select>
+
+        <div class="field-label">🛡️ 执行模式</div>
+        <select>
+          <option selected>auto · 全自动执行</option>
+          <option>accept-edits · 自动接受编辑</option>
+          <option>plan · 先规划后执行</option>
+        </select>
+
+        <div class="note">后端只读配置：<code>toolPermission</code>=request-review · <code>enableTerminalSandbox</code>=关闭 · <code>useG1Credits</code>=关闭</div>
+
+        <div class="hr"></div>
+        <div class="actions">
+          <button>📊 查看用量</button>
+          <button>🛠️ 原生命令</button>
+          <button>🗜️ /compact</button>
+          <button>🧹 清空会话</button>
+          <button>🔄 刷新</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. /status Workspace Cockpit integration -->
+    <section class="card">
+      <div class="card-header blue">
+        <div>🧭 工作区总览 · ghostAp</div>
+      </div>
+      <div class="card-body">
+        <div class="kv-box" style="margin-bottom:10px;">
+          <div class="section-title">📂 工作区与分支</div>
+          <div class="kv-row">• 路径：<code>/data00/home/jiataorui/work/github/ghostAp</code></div>
+          <div class="kv-row">• 分支：<code>feat/cockpit-ui</code></div>
+        </div>
+        <div class="kv-box" style="margin-bottom:10px;">
+          <div class="section-title">💻 Direct 编程通道</div>
+          <div class="kv-row">• 当前模式：🪐 <strong>AGY</strong>（空闲）</div>
+          <div class="kv-row">• 工具 / 模型：<code>agy</code> / <code>gemini-pro-orchestrator/high/medium</code></div>
+          <div class="kv-row">• 会话 <code>sess-91ac…</code> · 6 条消息 · 上下文 <code>12,400/200,000 (6%)</code></div>
+        </div>
+        <div class="hr"></div>
+        <div class="actions">
+          <button>切换模型</button>
+          <button>原生命令 /cmds</button>
+          <button>📊 用量</button>
+          <button>⚙️ 设置</button>
+          <button class="primary">📋 项目看板</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
