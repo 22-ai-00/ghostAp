@@ -24,6 +24,8 @@ CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/cod
 # Operators may explicitly opt in when they prefer eager adapter installation.
 PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-0}"
 SYNC_PYTHON_DEPENDENCIES="${GHOSTAP_SYNC_PYTHON_DEPENDENCIES:-1}"
+AUTO_INSTALL_UV="${GHOSTAP_AUTO_INSTALL_UV:-1}"
+UV_INSTALLER_URL="${GHOSTAP_UV_INSTALLER_URL:-https://astral.sh/uv/install.sh}"
 
 cd "$PROJECT_DIR"
 
@@ -106,13 +108,14 @@ build_restart_python_command() {
     if [ -x "$PYTHON_BIN" ]; then
         RESTART_PYTHON_COMMAND=("$PYTHON_BIN")
     else
+        ensure_uv_available || return 1
         RESTART_PYTHON_COMMAND=(uv run --project "$PROJECT_DIR" python)
     fi
 }
 
 verify_service_readiness() {
     local service_pid="$1"
-    build_restart_python_command
+    build_restart_python_command || return 1
     "${RESTART_PYTHON_COMMAND[@]}" -m src.utils.restart_gate ready \
         --project-dir "$PROJECT_DIR" \
         --service-pid "$service_pid"
@@ -125,7 +128,7 @@ publish_restart_generation() {
 }
 
 snapshot_restart_generation() {
-    build_restart_python_command
+    build_restart_python_command || return 1
     "${RESTART_PYTHON_COMMAND[@]}" -m src.utils.restart_gate snapshot \
         --project-dir "$PROJECT_DIR"
 }
@@ -174,6 +177,7 @@ start_service_process() {
                 'cd "$1" && exec "$2" -m src.main >>"$3" 2>&1' \
                 bash "$PROJECT_DIR" "$PYTHON_BIN" "$LOG_FILE" || return 1
         else
+            ensure_uv_available || return 1
             launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc \
                 'cd "$1" && exec uv run python -m src.main >>"$2" 2>&1' \
                 bash "$PROJECT_DIR" "$LOG_FILE" || return 1
@@ -191,6 +195,7 @@ start_service_process() {
             nohup "${detach_cmd[@]}" "$PYTHON_BIN" -m src.main > "$LOG_FILE" 2>&1 &
         fi
     else
+        ensure_uv_available || return 1
         if [ "$mode" = "append" ]; then
             nohup "${detach_cmd[@]}" uv run python -m src.main >> "$LOG_FILE" 2>&1 &
         else
@@ -270,6 +275,91 @@ venv_has_stale_entrypoint_shebang() {
     return 1
 }
 
+refresh_uv_path() {
+    if command -v uv >/dev/null 2>&1; then
+        return 0
+    fi
+    local candidate_dirs=()
+    if [ -n "${HOME:-}" ]; then
+        candidate_dirs+=(
+            "$HOME/.local/bin"
+            "$HOME/.cargo/bin"
+        )
+        local py_user_bin=""
+        for py_user_bin in "$HOME"/Library/Python/*/bin; do
+            if [ -d "$py_user_bin" ]; then
+                candidate_dirs+=("$py_user_bin")
+            fi
+        done
+    fi
+    candidate_dirs+=(
+        "/opt/homebrew/bin"
+        "/usr/local/bin"
+    )
+    local dir=""
+    for dir in "${candidate_dirs[@]}"; do
+        if [ -x "$dir/uv" ]; then
+            case ":$PATH:" in
+                *":$dir:"*) ;;
+                *) export PATH="$dir:$PATH" ;;
+            esac
+            if command -v uv >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+ensure_uv_available() {
+    refresh_uv_path || true
+    if command -v uv >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ "$AUTO_INSTALL_UV" = "0" ]; then
+        echo "❌ 未找到 uv，且已禁用自动安装（GHOSTAP_AUTO_INSTALL_UV=0）"
+        log_restart "python dependency sync failed missing uv"
+        return 1
+    fi
+
+    echo "📦 未检测到 uv，正在自动安装 uv..."
+    log_restart "uv missing attempting auto-install"
+
+    local installed=0
+    if command -v curl >/dev/null 2>&1; then
+        if (set -o pipefail; curl -LsSf "$UV_INSTALLER_URL" | env UV_NO_MODIFY_PATH=1 sh); then
+            installed=1
+        fi
+    fi
+    if [ "$installed" = "0" ] && command -v wget >/dev/null 2>&1; then
+        if (set -o pipefail; wget -qO- "$UV_INSTALLER_URL" | env UV_NO_MODIFY_PATH=1 sh); then
+            installed=1
+        fi
+    fi
+    if [ "$installed" = "0" ] && command -v brew >/dev/null 2>&1; then
+        if brew install uv; then
+            installed=1
+        fi
+    fi
+    if [ "$installed" = "0" ] && command -v python3 >/dev/null 2>&1 && python3 -m pip --version >/dev/null 2>&1; then
+        if python3 -m pip install --user uv; then
+            installed=1
+        fi
+    fi
+
+    refresh_uv_path || true
+    if command -v uv >/dev/null 2>&1; then
+        echo "✅ uv 自动安装完成"
+        log_restart "uv auto-install succeeded"
+        return 0
+    fi
+
+    echo "❌ uv 自动安装失败，请手动安装 uv: https://docs.astral.sh/uv/getting-started/installation/"
+    log_restart "uv auto-install failed"
+    return 1
+}
+
 prepare_python_dependencies() {
     local phase_started_at=$SECONDS
     if [ "$SYNC_PYTHON_DEPENDENCIES" = "0" ]; then
@@ -278,11 +368,7 @@ prepare_python_dependencies() {
         log_restart "python dependency sync skipped"
         return
     fi
-    if ! command -v uv >/dev/null 2>&1; then
-        echo "❌ 未找到 uv，无法同步 Python 依赖"
-        log_restart "python dependency sync failed missing uv"
-        return 1
-    fi
+    ensure_uv_available || return 1
 
     echo "正在检查 GhostAP Python 依赖..."
     if venv_has_stale_entrypoint_shebang; then
@@ -530,7 +616,7 @@ show_status() {
 remote_restart() {
     echo "🔄 触发远程重启..."
 
-    build_restart_python_command
+    build_restart_python_command || return 1
     local expected_generation=""
     if ! expected_generation="$(snapshot_restart_generation)"; then
         echo "❌ 安全重启预检失败，未启动重启 worker"
@@ -649,6 +735,31 @@ restart_service() {
     return "$stop_status"
 }
 
+bootstrap_environment() {
+    ensure_uv_available || return 1
+    prepare_python_dependencies || return 1
+
+    if [ ! -f "$PROJECT_DIR/.env" ]; then
+        if [ -f "$PROJECT_DIR/.env.example" ]; then
+            cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env" || return 1
+            chmod 600 "$PROJECT_DIR/.env" || return 1
+            echo "✅ 已生成配置文件: $PROJECT_DIR/.env（权限 0600）"
+        elif [ -x "$PROJECT_DIR/.venv/bin/ghostap" ]; then
+            "$PROJECT_DIR/.venv/bin/ghostap" init --dir "$PROJECT_DIR" || return 1
+        fi
+    else
+        echo "ℹ️  保留已有配置文件: $PROJECT_DIR/.env"
+    fi
+
+    echo ""
+    echo "✅ GhostAP 运行环境准备完成"
+    echo "下一步:"
+    echo "  1. 编辑 $PROJECT_DIR/.env，填入 APP_ID 和 APP_SECRET"
+    echo "  2. 运行 ./restart.sh start 启动服务（或运行 uv run ghostap --validate 校验配置）"
+    echo "  3. 在飞书私聊 Bot 发送 /setadmin 绑定首位管理员"
+    return 0
+}
+
 if [ "${GHOSTAP_RESTART_LIBRARY_ONLY:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -669,13 +780,17 @@ case "${1:-restart}" in
     status)
         show_status
         ;;
+    install|bootstrap)
+        bootstrap_environment
+        ;;
     *)
-        echo "用法: $0 {start|stop|restart|remote-restart|status}"
+        echo "用法: $0 {start|stop|restart|remote-restart|status|install}"
         echo "  start          - 启动服务"
         echo "  stop           - 停止服务"
         echo "  restart        - 本地重启（停止后立即启动）"
         echo "  remote-restart - 远程重启（适用于通过机器人执行）"
         echo "  status         - 查看服务状态"
+        echo "  install        - 初始化环境（安装 uv、同步依赖并初始化 .env，别名 bootstrap）"
         exit 1
         ;;
 esac

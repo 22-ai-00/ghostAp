@@ -1215,3 +1215,282 @@ def test_restart_script_has_no_generated_shared_worker_or_heredoc():
 
     assert ".restart_worker.sh" not in text
     assert "WORKER_EOF" not in text
+
+
+def _build_isolated_bin(tmp_path: Path) -> Path:
+    import os
+
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "awk",
+        "basename",
+        "bash",
+        "cat",
+        "chmod",
+        "cksum",
+        "cp",
+        "date",
+        "dirname",
+        "env",
+        "find",
+        "head",
+        "mkdir",
+        "pwd",
+        "rm",
+        "sed",
+        "sh",
+        "sleep",
+        "tr",
+        "uname",
+    ):
+        resolved = shutil.which(name)
+        if resolved:
+            link = sys_bin / name
+            if not link.exists():
+                link.symlink_to(resolved)
+    assert os.access(sys_bin / "sh", os.X_OK)
+    return sys_bin
+
+
+def test_refresh_uv_path_finds_user_local_bin(tmp_path):
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    uv_bin = home_dir / ".local" / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True)
+    uv_bin.write_text("#!/bin/sh\necho uv\n", encoding="utf-8")
+    uv_bin.chmod(0o755)
+
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+source "$1"
+refresh_uv_path
+command -v uv
+'''
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT)],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(uv_bin)
+
+
+def test_ensure_uv_available_auto_installs_via_curl(tmp_path):
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    capture = tmp_path / "events"
+
+    (sys_bin / "curl").write_text(
+        f"""#!/bin/sh
+echo "curl:$*" >> "{capture}"
+cat <<'EOS'
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\\necho uv\\n' > "$HOME/.local/bin/uv"
+chmod +x "$HOME/.local/bin/uv"
+EOS
+""",
+        encoding="utf-8",
+    )
+    (sys_bin / "curl").chmod(0o755)
+
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { printf 'log:%s\n' "$*" >> "$CAPTURE"; }
+ensure_uv_available
+command -v uv >> "$CAPTURE"
+'''
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "正在自动安装 uv" in result.stdout
+    assert "uv 自动安装完成" in result.stdout
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert "log:uv missing attempting auto-install" in lines
+    assert any(line.startswith("curl:-LsSf https://astral.sh/uv/install.sh") for line in lines)
+    assert "log:uv auto-install succeeded" in lines
+    assert str(home_dir / ".local" / "bin" / "uv") in lines
+
+
+def test_ensure_uv_available_falls_back_to_wget_when_curl_fails(tmp_path):
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    capture = tmp_path / "events"
+
+    (sys_bin / "curl").write_text(
+        f'#!/bin/sh\necho "curl-fail" >> "{capture}"\nexit 22\n',
+        encoding="utf-8",
+    )
+    (sys_bin / "curl").chmod(0o755)
+    (sys_bin / "wget").write_text(
+        f"""#!/bin/sh
+echo "wget:$*" >> "{capture}"
+cat <<'EOS'
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\\necho uv\\n' > "$HOME/.local/bin/uv"
+chmod +x "$HOME/.local/bin/uv"
+EOS
+""",
+        encoding="utf-8",
+    )
+    (sys_bin / "wget").chmod(0o755)
+
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { printf 'log:%s\n' "$*" >> "$CAPTURE"; }
+ensure_uv_available
+'''
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert "curl-fail" in lines
+    assert any(line.startswith("wget:-qO-") for line in lines)
+    assert "log:uv auto-install succeeded" in lines
+
+
+def test_ensure_uv_available_falls_back_to_pip_when_downloaders_missing(tmp_path):
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    capture = tmp_path / "events"
+
+    (sys_bin / "python3").write_text(
+        f"""#!/bin/sh
+echo "python3:$*" >> "{capture}"
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "--version" ]; then
+    echo "pip 24.0"
+    exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "install" ]; then
+    mkdir -p "$HOME/.local/bin"
+    printf '#!/bin/sh\\necho uv\\n' > "$HOME/.local/bin/uv"
+    chmod +x "$HOME/.local/bin/uv"
+    exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    (sys_bin / "python3").chmod(0o755)
+
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { printf 'log:%s\n' "$*" >> "$CAPTURE"; }
+ensure_uv_available
+'''
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert "python3:-m pip --version" in lines
+    assert "python3:-m pip install --user uv" in lines
+    assert "log:uv auto-install succeeded" in lines
+
+
+def test_ensure_uv_available_respects_auto_install_disabled(tmp_path):
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    capture = tmp_path / "events"
+
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export GHOSTAP_AUTO_INSTALL_UV=0
+export CAPTURE="$2"
+source "$1"
+log_restart() { printf 'log:%s\n' "$*" >> "$CAPTURE"; }
+ensure_uv_available
+'''
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "GHOSTAP_AUTO_INSTALL_UV=0" in result.stdout
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "log:python dependency sync failed missing uv"
+    ]
+
+
+@pytest.mark.parametrize("subcommand", ["install", "bootstrap"])
+def test_restart_install_and_bootstrap_subcommands(tmp_path, subcommand):
+    import os
+    import stat
+
+    sys_bin = _build_isolated_bin(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    shutil.copy2(ROOT / ".env.example", checkout / ".env.example")
+    capture = tmp_path / "uv-calls"
+
+    (sys_bin / "uv").write_text(
+        f'#!/bin/sh\necho "$*" >> "{capture}"\nexit 0\n',
+        encoding="utf-8",
+    )
+    (sys_bin / "uv").chmod(0o755)
+
+    res1 = subprocess.run(
+        ["bash", str(script), subcommand],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res1.returncode == 0, res1.stderr
+    env_file = checkout / ".env"
+    assert env_file.is_file()
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert "sync --check --group dev" in capture.read_text(encoding="utf-8").splitlines()
+    assert "./restart.sh start" in res1.stdout
+
+    # Existing .env must not be overwritten on repeat run
+    env_file.write_text("APP_ID=custom_keep\n", encoding="utf-8")
+    os.chmod(env_file, 0o600)
+    res2 = subprocess.run(
+        ["bash", str(script), subcommand],
+        env={"PATH": str(sys_bin), "HOME": str(home_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res2.returncode == 0, res2.stderr
+    assert env_file.read_text(encoding="utf-8") == "APP_ID=custom_keep\n"
+    assert "保留已有配置文件" in res2.stdout
