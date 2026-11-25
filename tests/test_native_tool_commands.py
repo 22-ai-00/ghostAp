@@ -279,6 +279,17 @@ def test_system_handler_and_dispatcher_native_routing_and_fast_lane() -> None:
     assert SystemHandler.is_fast_lane_system_command("/goal run tests", in_programming_mode=True) is False
     assert SystemHandler.is_fast_lane_system_command("/goal run tests", in_programming_mode=False) is True
 
+    # /usage, /settings and their aliases resolve via catalog and stay GhostAP control commands in both modes
+    for control_cmd in ("/usage", "/quota", "/credits", "/cost", "/settings", "/config"):
+        assert resolve_command(control_cmd) is not None
+        assert SystemHandler.is_fast_lane_system_command(control_cmd, in_programming_mode=True) is True
+        assert SystemHandler.is_fast_lane_system_command(control_cmd, in_programming_mode=False) is True
+        assert SystemHandler.is_fast_lane_system_command(f"{control_cmd} agy", in_programming_mode=True) is True
+        parsed_ctrl = SlashCommandParser.parse(control_cmd)
+        assert parsed_ctrl is not None
+        assert SystemHandler.is_ghostap_control_command(parsed_ctrl, in_programming_mode=True) is True
+        assert SystemHandler.is_ghostap_control_command(parsed_ctrl, in_programming_mode=False) is True
+
     # Active programming mode passes /goal & /swarm through instead of intercepting
     goal_match = SlashCommandParser.parse("/goal finish work")
     assert goal_match is not None
@@ -348,6 +359,22 @@ def test_action_registry_and_empty_output_native_slash_completion() -> None:
     reg = init_action_registry(mock_client)
     assert action_ids.SHOW_TOOL_COMMANDS in reg
     assert action_ids.RUN_NATIVE_TOOL_COMMAND in reg
+    for cockpit_action in (
+        "open_tool_usage",
+        "refresh_tool_usage",
+        "open_tool_settings",
+        "refresh_tool_settings",
+        "settings_select_tool",
+        "settings_select_model_group",
+        "settings_select_model_profile",
+        "settings_select_model_effort",
+        "settings_toggle_show_thinking",
+        "settings_select_verbosity",
+        "settings_select_agent_mode",
+        "settings_clear_session",
+    ):
+        assert cockpit_action in reg
+        assert reg[cockpit_action] == handlers_map["system"].handle_tool_cockpit_action
 
     # Synthesize completion summary on empty-text /compact turn
     handler = object.__new__(ProgrammingModeHandler)
@@ -485,3 +512,74 @@ def test_system_handler_direct_tool_with_args_and_smart_auto_routing(monkeypatch
     assert handler.try_dispatch_smart_native_command("m4", "c1", "/logout", project) is True
     handler.reply_error.assert_called_once()
     assert handler.try_dispatch_smart_native_command("m5", "c1", "/unknown_xyz_cmd", project) is False
+
+
+def test_tui_only_command_guard_across_dispatcher_and_system(monkeypatch) -> None:
+    import src.acp.native_commands as native_cmds
+
+    def _fake_tui_hint(text: str | None, *, tool_name: str | None = None) -> str | None:
+        raw = (text or "").strip().split(maxsplit=1)[0].lstrip("/").lower()
+        if raw == "vim":
+            return "⚠️ `/vim` 仅支持终端交互模式（TUI）。"
+        if raw == "context" and tool_name == "agy":
+            return "💡 AGY 上下文与配额请直接使用 `/usage` 或 `/status`。"
+        return None
+
+    monkeypatch.setattr(native_cmds, "get_tui_only_command_hint", _fake_tui_hint, raising=False)
+
+    # 1. Dispatcher in active AGY mode intercepts TUI-only commands without invoking agy_handler
+    dispatcher = object.__new__(MessageDispatcher)
+    dispatcher.base = MagicMock()
+    dispatcher.project = MagicMock()
+    dispatcher.handlers = {"coco": dispatcher.base, "system": MagicMock(), "project": dispatcher.project}
+    dispatcher.system = dispatcher.handlers["system"]
+    dispatcher.system.is_ghostap_control_command = SystemHandler.is_ghostap_control_command
+    dispatcher.system.is_interceptable_command_match = SystemHandler.is_interceptable_command_match
+    dispatcher._router = MagicMock()
+    dispatcher._router.is_exit_command.return_value = False
+    dispatcher._router.is_deep_command.return_value = False
+    dispatcher._router.is_spec_command.return_value = False
+    dispatcher._router.is_workflow_command.return_value = False
+    agy_handler = MagicMock()
+    dispatcher.client = SimpleNamespace(
+        _mode_manager=SimpleNamespace(
+            get_mode=lambda *_a, **_kw: InteractionMode.AGY,
+            is_programming_mode=lambda *_a, **_kw: True,
+        ),
+        _get_effective_mode=lambda *_a, **_kw: (InteractionMode.AGY, True),
+        _project_manager=SimpleNamespace(get_active_project=lambda _c: SimpleNamespace(project_id="p1", root_path=".")),
+        _control_plane=SimpleNamespace(should_defer_exit=lambda **_kw: False),
+        _thread_manager=SimpleNamespace(get=lambda _t: None),
+        _get_mode_handler=lambda mode: agy_handler if mode == InteractionMode.AGY else None,
+        _pending_image_lock=SimpleNamespace(__enter__=lambda *_: None, __exit__=lambda *_: None),
+        _pending_image_only=set(),
+    )
+    project = SimpleNamespace(project_id="p1", root_path=".", acp_tool_name="agy")
+
+    dispatcher.process_with_intent("m-tui-1", "c1", "/vim", project=project)
+    dispatcher.process_with_intent("m-tui-2", "c1", "/context", project=project)
+    agy_handler.handle_message.assert_not_called()
+    assert dispatcher.base.reply_text.call_count == 2
+    assert "/vim" in dispatcher.base.reply_text.call_args_list[0][0][1]
+    assert "/usage" in dispatcher.base.reply_text.call_args_list[1][0][1]
+
+    # 2. Direct mode enter with args (`/agy /vim`) and SMART native routing (`/vim`)
+    system = object.__new__(SystemHandler)
+    system.reply_text = MagicMock()
+    system.reply_error = MagicMock()
+    system.add_reaction = MagicMock()
+    system.handle_enter_acp_saved_selection = MagicMock()
+    system._resolve_active_programming_mode_key = MagicMock(return_value=None)
+    system._configuration_project = MagicMock(return_value=project)
+    system._resolve_live_commands_for_tool = MagicMock(return_value=None)
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.is_programming_tool_available",
+        lambda tool, **_kw: tool == "agy",
+    )
+
+    system._handle_direct_mode_enter_with_args("m-tui-3", "c1", "agy", "/vim", project)
+    system._handle_direct_mode_enter_with_args("m-tui-4", "c1", "agy", "/context", project)
+    assert system.try_dispatch_smart_native_command("m-tui-5", "c1", "/vim", project) is True
+    assert system.try_dispatch_smart_native_command("m-tui-6", "c1", "/context", project) is True
+    system.handle_enter_acp_saved_selection.assert_not_called()
+    assert system.reply_text.call_count == 4

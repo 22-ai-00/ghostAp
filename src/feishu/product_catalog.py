@@ -158,6 +158,22 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     *_programming_entry_actions(),
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
     _action("/cmds", "查看当前工具原生命令与 Skills", "/cmds [工具]", aliases=("/commands", "/tool_cmds"), protects_from_auto_activation=True),
+    _action(
+        "/usage",
+        "查看当前工具配额、用量与 Credits 详情",
+        "/usage [工具]",
+        aliases=("/quota", "/credits", "/cost"),
+        protects_from_auto_activation=True,
+        slash_discoverable=False,
+    ),
+    _action(
+        "/settings",
+        "打开当前工具与模型设置驾驶舱",
+        "/settings [工具]",
+        aliases=("/config",),
+        protects_from_auto_activation=True,
+        slash_discoverable=False,
+    ),
     _action("/info", "查看当前会话或工作区详情", protects_from_auto_activation=True, slash_discoverable=False),
     _action("/model", "自适应查看或设置当前编程工具模型", "/model [模型名|default]"),
     _action("/effort", "查看或设置当前模型的思考 Effort", "/effort [档位|planner executor|default]"),
@@ -215,6 +231,7 @@ _RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
 HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
     # tool introspection / low-level ACP
     "/tools", "/tools_status", "/acp", "/effort", "/btw", "/sh", "/ask", "/info",
+    "/usage", "/settings",
     "/coco_status",
     *(spec.info_command for spec in ALL_BACKEND_METAS if spec.supports_info_command),
     # project administration (board stays reachable via cards)

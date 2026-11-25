@@ -184,6 +184,25 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     actions[action_ids.REFRESH_ACP_MODELS] = system.handle_refresh_acp_models
     actions[action_ids.SHOW_TOOL_COMMANDS] = system.handle_show_tool_commands
     actions[action_ids.RUN_NATIVE_TOOL_COMMAND] = system.handle_run_native_tool_command
+    for action in getattr(
+        action_ids,
+        "TOOL_COCKPIT_ACTIONS",
+        (
+            "open_tool_usage",
+            "refresh_tool_usage",
+            "open_tool_settings",
+            "refresh_tool_settings",
+            "settings_select_tool",
+            "settings_select_model_group",
+            "settings_select_model_profile",
+            "settings_select_model_effort",
+            "settings_toggle_show_thinking",
+            "settings_select_verbosity",
+            "settings_select_agent_mode",
+            "settings_clear_session",
+        ),
+    ):
+        actions[action] = system.handle_tool_cockpit_action
 
     def _handle_continue_dev(mid, cid, pid, val):
         project = _resolve_project(client, pid, cid)

@@ -24,6 +24,7 @@ from .access_admin import AccessAdminMixin
 from .acp_activation import ACPActivationMixin
 from .base import BaseHandler
 from .lock_commands import LockCommandsMixin
+from .tool_cockpit import ToolCockpitMixin
 
 if TYPE_CHECKING:
     from ...project import ProjectContext
@@ -84,7 +85,7 @@ class _ACPActivationEffect:
     changed: bool
 
 
-class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, BaseHandler):
+class SystemHandler(ToolCockpitMixin, ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, BaseHandler):
     """Help, exit, shell, directory, and intercepted-command handling."""
 
     # `/status` remains the established Deep/Spec diagnostics command.  Keep
@@ -130,6 +131,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/status",
             "/acp",
             "/cmds",
+            "/usage",
+            "/settings",
             "/info",
             "/model",
             "/effort",
@@ -160,6 +163,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
     _FAST_PREFIX_CONTROL_COMMANDS: frozenset[str] = frozenset(
         {
             "/cmds",
+            "/usage",
+            "/settings",
             "/acp",
             "/model",
             "/effort",
@@ -231,6 +236,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, t, p),
             "/cmds": lambda m, c, t, p: self.show_tool_commands(m, c, t, p),
+            "/usage": lambda m, c, t, p: self.show_tool_usage(m, c, t, p),
+            "/settings": lambda m, c, t, p: self.show_tool_settings(m, c, t, p),
             "/info": lambda m, c, t, p: self.handle_info_command(m, c, p),
             "/stop": lambda m, c, t, p: self.stop_current_task(m, c, p),
             "/clear": lambda m, c, t, p: self.handle_clear_command(m, c, p),
@@ -256,6 +263,8 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             ("/trace", lambda m, c, t, p: self.get_handler("diagnostics").show_message_trace(m, c, t, p)),
             ("/acp", self.handle_acp_command),
             ("/cmds", lambda m, c, t, p: self.show_tool_commands(m, c, t, p)),
+            ("/usage", lambda m, c, t, p: self.show_tool_usage(m, c, t, p)),
+            ("/settings", lambda m, c, t, p: self.show_tool_settings(m, c, t, p)),
             ("/model", self.handle_model_command),
             ("/effort", self.handle_effort_command),
         ]
@@ -287,6 +296,7 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         if not task_text:
             self._handle_direct_mode_enter(message_id, chat_id, mode_key, project)
             return
+        from ...acp import native_commands as _native_cmds
         from ...acp.native_commands import is_blocked_native_command, parse_slash_command
 
         if is_blocked_native_command(task_text):
@@ -297,6 +307,13 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
                 UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
             )
             return
+
+        tui_hint_fn = getattr(_native_cmds, "get_tui_only_command_hint", None)
+        if callable(tui_hint_fn):
+            tui_hint = tui_hint_fn(task_text, tool_name=mode_key)
+            if tui_hint:
+                self.reply_text(message_id, tui_hint)
+                return
 
         active_mode_key = self._resolve_active_programming_mode_key(chat_id, project)
         if active_mode_key == mode_key:
@@ -477,13 +494,16 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
         project: Optional["ProjectContext"] = None,
     ) -> bool:
         """In SMART mode, auto-route unambiguous/preferred native slash commands to their tool."""
+        from ...acp import native_commands as _native_cmds
         from ...acp.native_commands import (
             DEFAULT_TOOL_PRIORITY,
+            is_blocked_native_command,
             parse_slash_command,
             resolve_smart_mode_native_command,
         )
 
-        if parse_slash_command(text) is None:
+        parsed_cmd = parse_slash_command(text)
+        if parsed_cmd is None:
             return False
 
         is_tool_available = getattr(sys.modules[__name__], "is_programming_tool_available")
@@ -493,6 +513,20 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
             if cfg_project
             else None
         )
+
+        if is_blocked_native_command(text):
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_native_cmd_blocked"].format(command=parsed_cmd[0]),
+            )
+            return True
+
+        tui_hint_fn = getattr(_native_cmds, "get_tui_only_command_hint", None)
+        if callable(tui_hint_fn):
+            tui_hint = tui_hint_fn(text, tool_name=preferred_tool)
+            if tui_hint:
+                self.reply_text(message_id, tui_hint)
+                return True
 
         available_tools = [
             tool
@@ -549,6 +583,12 @@ class SystemHandler(ACPActivationMixin, AccessAdminMixin, LockCommandsMixin, Bas
                 ),
             )
             return True
+
+        if callable(tui_hint_fn):
+            tui_hint = tui_hint_fn(text, tool_name=result.tool_name)
+            if tui_hint:
+                self.reply_text(message_id, tui_hint)
+                return True
 
         self.add_reaction(message_id, EmojiReaction.on_processing())
         self.handle_enter_acp_saved_selection(

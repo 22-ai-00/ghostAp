@@ -142,6 +142,7 @@ class MessageDispatcher:
                     return
                 self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
                 return
+            from ..acp import native_commands as _native_cmds
             from ..acp.native_commands import is_blocked_native_command, parse_slash_command
 
             if is_blocked_native_command(text):
@@ -154,6 +155,15 @@ class MessageDispatcher:
                     UI_TEXT["system_native_cmd_blocked"].format(command=blocked_name),
                 )
                 return
+
+            tui_hint_fn = getattr(_native_cmds, "get_tui_only_command_hint", None)
+            if callable(tui_hint_fn):
+                tui_hint = tui_hint_fn(text, tool_name=getattr(current_mode, "value", None))
+                if tui_hint:
+                    if not current_dispatch_allowed():
+                        return
+                    self.base.reply_text(message_id, tui_hint)
+                    return
         else:
             if self.system.is_interceptable_command_match(command_match):
                 if not current_dispatch_allowed():

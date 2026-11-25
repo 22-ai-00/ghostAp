@@ -432,9 +432,73 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 "并发新会话已接管；旧任务停止收尾，避免干扰新任务"
             )
         replacement = outcome.session
+        self._apply_saved_runtime_settings(replacement, project, chat_id)
         if thread_id and project:
             self._register_thread_context(thread_id, chat_id, project, replacement)
         return replacement
+
+    def _apply_saved_runtime_settings(
+        self,
+        session: object,
+        project: Optional["ProjectContext"],
+        chat_id: str,
+    ) -> None:
+        """Apply saved per-tool runtime settings onto a new or reused session."""
+        if session is None or project is None:
+            return
+        getter = getattr(project, "get_tool_runtime_settings", None)
+        setter = getattr(session, "set_runtime_settings", None)
+        if not callable(getter) or not callable(setter):
+            return
+        tool_key = str(
+            getattr(self, "mode_key", None)
+            or getattr(self, "mode_name", "")
+            or ""
+        ).strip().lower()
+        if not tool_key:
+            return
+        try:
+            runtime_settings = getter(chat_id, tool_key)
+        except TypeError:
+            runtime_settings = getter(tool_key)
+        if isinstance(runtime_settings, Mapping) and runtime_settings:
+            setter(dict(runtime_settings))
+
+    def handle_message(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        project: Optional["ProjectContext"] = None,
+        *,
+        expected_session: Optional[SyncSession] = None,
+    ):
+        """Apply saved runtime settings before delegating message execution."""
+        from ...thread import get_current_thread_id
+
+        if project is not None:
+            target_session = expected_session
+            if target_session is None:
+                mgr_getter = getattr(self, "_get_session_manager", None)
+                manager = mgr_getter() if callable(mgr_getter) else None
+                if manager is not None and callable(getattr(manager, "get_session", None)):
+                    try:
+                        target_session = manager.get_session(
+                            chat_id,
+                            project_id=getattr(project, "project_id", None),
+                            thread_id=get_current_thread_id(),
+                        )
+                    except Exception:
+                        target_session = None
+            if target_session is not None:
+                self._apply_saved_runtime_settings(target_session, project, chat_id)
+        return super().handle_message(
+            message_id,
+            chat_id,
+            text,
+            project,
+            expected_session=expected_session,
+        )
 
     def _retire_finalization_session(
         self,
@@ -740,6 +804,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 project_id=project_id,
             )
             if live_session is not None:
+                self._apply_saved_runtime_settings(live_session, project, chat_id)
                 if not silent:
                     info = manager.get_session_info(
                         chat_id,
@@ -814,6 +879,7 @@ class ProgrammingModeHandler(ProgrammingExecutionMixin, BaseHandler):
                 model_name=model_name,
                 thread_id=thread_id,
             )
+            self._apply_saved_runtime_settings(session, project, chat_id)
         except TimeoutError as e:
             # silent 路径也必须记录日志，否则上层 handle_message recovery 看到 session=None
             # 时只能输出泛化的 mode_session_fail_msg，根因（启动超时/失败）完全被吞掉。
