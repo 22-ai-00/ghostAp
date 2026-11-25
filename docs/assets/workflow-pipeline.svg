@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" role="img" aria-labelledby="wf-title wf-desc">
+  <title id="wf-title">GhostAP Teamwork /wf 4-Stage Pipeline</title>
+  <desc id="wf-desc">Four-stage horizontal pipeline for Teamwork /wf: Team Config / Auto-Bind, Freeze Pool and JS Plan, Deterministic JS Primitives, and Live Card 2.0 and Reports.</desc>
+  <defs>
+    <pattern id="dotGrid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#cbd5e1" fill-opacity="0.55"/>
+    </pattern>
+    <marker id="flowArrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#4f46e5"/>
+    </marker>
+    <style>
+      .sans { font-family: 'Inter', 'SF Pro Display', 'Noto Sans CJK SC', 'PingFang SC', 'Segoe UI', system-ui, sans-serif; }
+      .mono { font-family: 'JetBrains Mono', 'SFMono-Regular', 'Noto Sans Mono CJK SC', monospace; }
+    </style>
+  </defs>
+
+  <!-- Self-contained light canvas -->
+  <rect x="0" y="0" width="1200" height="340" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="1" y="1" width="1198" height="338" rx="17" fill="url(#dotGrid)" fill-opacity="0.65"/>
+
+  <!-- Header -->
+  <g transform="translate(34, 18)">
+    <text x="0" y="21" class="sans" font-size="18" font-weight="800" fill="#0f172a">Teamwork /wf Pipeline · 多智能体确定性编排流水线</text>
+    <rect x="786" y="2" width="346" height="26" rx="13" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1"/>
+    <text x="959" y="19" class="mono" font-size="10.5" font-weight="600" fill="#3730a3" text-anchor="middle">Runtime Owns Control Flow · Agents Own Semantics</text>
+  </g>
+
+  <!-- Stage 1 -->
+  <g transform="translate(34, 62)">
+    <rect x="0" y="0" width="258" height="226" rx="14" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <rect x="0" y="0" width="258" height="38" rx="14" fill="#eff6ff"/>
+    <rect x="0" y="20" width="258" height="18" fill="#eff6ff"/>
+    <line x1="0" y1="38" x2="258" y2="38" stroke="#dbeafe" stroke-width="1"/>
+    <rect x="14" y="9" width="66" height="20" rx="10" fill="#2563eb"/>
+    <text x="47" y="23" class="mono" font-size="10.5" font-weight="700" fill="#ffffff" text-anchor="middle">STAGE 01</text>
+    <text x="90" y="23" class="sans" font-size="12" font-weight="700" fill="#1e40af">团队配置与绑定</text>
+
+    <text x="16" y="64" class="sans" font-size="14.5" font-weight="800" fill="#0f172a">Team Config / Auto-Bind</text>
+    <text x="16" y="88" class="sans" font-size="12" fill="#475569">• 1–8 名异构智能体池 (<tspan class="mono" font-size="11.5" fill="#1d4ed8">A1..A8</tspan>)</text>
+    <text x="16" y="110" class="mono" font-size="11.5" fill="#1e293b">  tool + model + profile + effort</text>
+    <text x="16" y="134" class="sans" font-size="12" fill="#475569">• 交互式配置卡 <tspan class="mono" font-size="11.5" fill="#1d4ed8">/wf</tspan> · <tspan class="mono" font-size="11.5" fill="#1d4ed8">/wf_config</tspan></text>
+    <text x="16" y="156" class="sans" font-size="12" fill="#475569">• 一键直发 <tspan class="mono" font-size="11" fill="#1d4ed8">--auto</tspan> / <tspan class="mono" font-size="11" fill="#1d4ed8">--preset</tspan></text>
+
+    <g transform="translate(16, 174)">
+      <rect x="0" y="0" width="110" height="34" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+      <text x="55" y="15" class="mono" font-size="10" font-weight="700" fill="#334155" text-anchor="middle">collaborative</text>
+      <text x="55" y="28" class="sans" font-size="9.5" fill="#64748b" text-anchor="middle">quick · review_team</text>
+
+      <rect x="118" y="0" width="108" height="34" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+      <text x="172" y="15" class="mono" font-size="10" font-weight="700" fill="#334155" text-anchor="middle">deep_collab</text>
+      <text x="172" y="28" class="sans" font-size="9.5" fill="#64748b" text-anchor="middle">auto · custom</text>
+    </g>
+  </g>
+
+  <!-- Connector 1 -> 2 -->
+  <line x1="296" y1="175" x2="320" y2="175" stroke="#4f46e5" stroke-width="2.2" marker-end="url(#flowArrow)"/>
+
+  <!-- Stage 2 -->
+  <g transform="translate(324, 62)">
+    <rect x="0" y="0" width="258" height="226" rx="14" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+    <rect x="0" y="0" width="258" height="38" rx="14" fill="#eef2ff"/>
+    <rect x="0" y="20" width="258" height="18" fill="#eef2ff"/>
+    <line x1="0" y1="38" x2="258" y2="38" stroke="#e0e7ff" stroke-width="1"/>
+    <rect x="14" y="9" width="66" height="20" rx="10" fill="#4f46e5"/>
+    <text x="47" y="23" class="mono" font-size="10.5" font-weight="700" fill="#ffffff" text-anchor="middle">STAGE 02</text>
+    <text x="90" y="23" class="sans" font-size="12" font-weight="700" fill="#3730a3">冻结池与编排计划</text>
+
+    <text x="16" y="64" class="sans" font-size="14.5" font-weight="800" fill="#0f172a">Freeze Pool &amp; JS Plan</text>
+    <text x="16" y="88" class="sans" font-size="12" fill="#475569">• 立即冻结 Agent Pool 与主编排器</text>
+    <text x="16" y="112" class="sans" font-size="12" fill="#475569">• 生成任务专用 JavaScript 脚本</text>
+    <text x="16" y="136" class="sans" font-size="12" fill="#475569">• 模块结构与池引用静态校验</text>
+    <text x="16" y="160" class="sans" font-size="12" fill="#475569">• 锁定确定性调用预算与超时上限</text>
+
+    <rect x="16" y="176" width="226" height="32" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+    <text x="129" y="196" class="mono" font-size="10.5" font-weight="600" fill="#3730a3" text-anchor="middle">Immutable Bindings · No Drift</text>
+  </g>
+
+  <!-- Connector 2 -> 3 -->
+  <line x1="586" y1="175" x2="610" y2="175" stroke="#4f46e5" stroke-width="2.2" marker-end="url(#flowArrow)"/>
+
+  <!-- Stage 3 -->
+  <g transform="translate(614, 62)">
+    <rect x="0" y="0" width="258" height="226" rx="14" fill="#ffffff" stroke="#ddd6fe" stroke-width="1.5"/>
+    <rect x="0" y="0" width="258" height="38" rx="14" fill="#f5f3ff"/>
+    <rect x="0" y="20" width="258" height="18" fill="#f5f3ff"/>
+    <line x1="0" y1="38" x2="258" y2="38" stroke="#ede9fe" stroke-width="1"/>
+    <rect x="14" y="9" width="66" height="20" rx="10" fill="#7c3aed"/>
+    <text x="47" y="23" class="mono" font-size="10.5" font-weight="700" fill="#ffffff" text-anchor="middle">STAGE 03</text>
+    <text x="90" y="23" class="sans" font-size="12" font-weight="700" fill="#5b21b6">确定性运行时原语</text>
+
+    <text x="16" y="64" class="sans" font-size="14" font-weight="800" fill="#0f172a">Deterministic JS Primitives</text>
+
+    <!-- 2x4 Primitive Grid -->
+    <g transform="translate(16, 78)">
+      <rect x="0" y="0" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="54" y="17" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">agent()</text>
+      <rect x="118" y="0" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="172" y="17" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">sequence()</text>
+
+      <rect x="0" y="34" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="54" y="51" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">fanout()</text>
+      <rect x="118" y="34" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="172" y="51" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">verify()</text>
+
+      <rect x="0" y="68" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="54" y="85" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">generate()</text>
+      <rect x="118" y="68" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="172" y="85" class="mono" font-size="11" font-weight="700" fill="#5b21b6" text-anchor="middle">tournament()</text>
+
+      <rect x="0" y="102" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="54" y="119" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">loop()</text>
+      <rect x="118" y="102" width="108" height="26" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+      <text x="172" y="119" class="mono" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">race()</text>
+    </g>
+  </g>
+
+  <!-- Connector 3 -> 4 -->
+  <line x1="876" y1="175" x2="900" y2="175" stroke="#4f46e5" stroke-width="2.2" marker-end="url(#flowArrow)"/>
+
+  <!-- Stage 4 -->
+  <g transform="translate(904, 62)">
+    <rect x="0" y="0" width="262" height="226" rx="14" fill="#ffffff" stroke="#a7f3d0" stroke-width="1.5"/>
+    <rect x="0" y="0" width="262" height="38" rx="14" fill="#ecfdf5"/>
+    <rect x="0" y="20" width="262" height="18" fill="#ecfdf5"/>
+    <line x1="0" y1="38" x2="262" y2="38" stroke="#d1fae5" stroke-width="1"/>
+    <rect x="14" y="9" width="66" height="20" rx="10" fill="#059669"/>
+    <text x="47" y="23" class="mono" font-size="10.5" font-weight="700" fill="#ffffff" text-anchor="middle">STAGE 04</text>
+    <text x="90" y="23" class="sans" font-size="12" font-weight="700" fill="#065f46">实时卡片与报告交付</text>
+
+    <text x="16" y="64" class="sans" font-size="14" font-weight="800" fill="#0f172a">Live Card 2.0 &amp; Reports</text>
+    <text x="16" y="88" class="sans" font-size="12" fill="#475569">• 单张主卡原位更新进度与分组状态</text>
+    <text x="16" y="112" class="sans" font-size="12" fill="#475569">• 单行展示 <tspan class="mono" font-size="11" fill="#047857">model + effort + role</tspan></text>
+    <text x="16" y="136" class="sans" font-size="12" fill="#475569">• 合并原生 COT 过程流（按容量续接）</text>
+    <text x="16" y="160" class="sans" font-size="12" fill="#475569">• 终态交付 GFM 结论卡 + HTML 报告</text>
+
+    <rect x="16" y="176" width="230" height="32" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+    <text x="131" y="196" class="mono" font-size="10.5" font-weight="600" fill="#065f46" text-anchor="middle">Full Evidence · Explicit Terminal State</text>
+  </g>
+
+  <!-- Bottom Lifecycle Invariant Strip -->
+  <g transform="translate(34, 300)">
+    <rect x="0" y="0" width="1132" height="24" rx="8" fill="#f1f5f9" stroke="#e2e8f0" stroke-width="1"/>
+    <circle cx="16" cy="12" r="4" fill="#10b981"/>
+    <text x="28" y="16" class="sans" font-size="11.5" font-weight="600" fill="#334155">全自动推进至成功或明确失败终态，无确认门或恢复门 · Node.js 20+ Host Runtime · 支持 /wf_status 实时巡检与 /stop_wf 中断</text>
+  </g>
+</svg>
