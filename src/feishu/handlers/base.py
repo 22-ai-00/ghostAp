@@ -913,9 +913,9 @@ class BaseHandler:
         if not project:
             return text
         stripped = str(text or "").strip()
-        from ...acp.native_commands import is_pure_zero_arg_native_slash
+        from ...acp.native_commands import is_non_task_native_slash
 
-        if is_pure_zero_arg_native_slash(stripped):
+        if is_non_task_native_slash(stripped):
             return text
         try:
             ctx = self.ctx.context_manager.store.get(

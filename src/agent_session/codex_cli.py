@@ -157,7 +157,7 @@ class SyncCodexCLISession(_BaseCLISession):
         self.is_resumed = bool(self.session_id)
 
     def _build_args(self, text: str, resumed: bool) -> list[str]:
-        from ..acp.native_commands import is_pure_zero_arg_native_slash, parse_slash_command
+        from ..acp.native_commands import is_non_task_native_slash, parse_slash_command
 
         # Global ``-c`` overrides MUST precede the ``exec`` subcommand;
         # codex ignores/mis-resolves them afterwards (model metadata 400).
@@ -178,7 +178,7 @@ class SyncCodexCLISession(_BaseCLISession):
         if resumed and self.session_id:
             args += ["resume", self.session_id]
         stripped = str(text or "").strip()
-        if is_pure_zero_arg_native_slash(stripped):
+        if is_non_task_native_slash(stripped):
             args.append(stripped)
         elif parse_slash_command(stripped) is not None:
             args.append(f"{stripped}\n\n{AUTONOMOUS_EXECUTION_PROMPT}")

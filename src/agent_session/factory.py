@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Mapping
+from typing import Any, Callable, Optional, cast
 
 from ..acp.agy_selection import requires_agy_cli_orchestrator_session
 from ..acp.providers import normalize_acp_model_name
@@ -63,6 +64,18 @@ def _resolve_inputs(
     return agent, normalized_cwd, _normalize_model(agent, model)
 
 
+def _apply_runtime_settings(
+    session: object,
+    runtime_settings: Mapping[str, object] | None,
+) -> None:
+    """Apply runtime settings to a session when the backend exposes ``set_runtime_settings``."""
+    if runtime_settings is None:
+        return
+    setter = getattr(session, "set_runtime_settings", None)
+    if callable(setter):
+        setter(dict(runtime_settings))
+
+
 def _start_base_session(
     agent_type: str,
     cwd: str,
@@ -72,6 +85,7 @@ def _start_base_session(
     startup_timeout: float | None = None,
     startup_retries: int | None = None,
     startup_log_failures: bool | None = None,
+    runtime_settings: Mapping[str, object] | None = None,
 ) -> SyncSession:
     """Start exactly one CLI or ACP transport with shared startup arguments."""
     if agent_type == "agy" and requires_agy_cli_orchestrator_session(model_name):
@@ -79,6 +93,7 @@ def _start_base_session(
             cwd=cwd,
             model_name=model_name,
         )
+        _apply_runtime_settings(session, runtime_settings)
         session.start()
         return session
 
@@ -90,28 +105,31 @@ def _start_base_session(
                 model_name=model_name,
                 config=CodexCLIConfig(command=command),
             )
-        else:
-            cli_kwargs: dict[str, object] = {}
-            if command != "claude":
-                cli_kwargs["config"] = ClaudeCLIConfig(command=command)
+        elif command != "claude":
             session = SyncClaudeCLISession(
                 cwd=cwd,
                 model_name=model_name,
-                **cli_kwargs,
+                config=ClaudeCLIConfig(command=command),
             )
+        else:
+            session = SyncClaudeCLISession(
+                cwd=cwd,
+                model_name=model_name,
+            )
+        _apply_runtime_settings(session, runtime_settings)
         session.start()
         return session
 
     from ..acp.sync_adapter import start_session_with_retry
 
-    kwargs: dict[str, object] = {}
+    acp_kwargs: dict[str, Any] = {}
     if startup_retries is not None:
-        kwargs["retries"] = startup_retries
+        acp_kwargs["retries"] = startup_retries
     if startup_log_failures is not None:
-        kwargs["log_failures"] = startup_log_failures
+        acp_kwargs["log_failures"] = startup_log_failures
     if capture_full_tool_content:
-        kwargs["capture_full_tool_content"] = True
-    return start_session_with_retry(
+        acp_kwargs["capture_full_tool_content"] = True
+    acp_session = start_session_with_retry(
         agent_type=agent_type,
         cwd=cwd,
         startup_timeout=(
@@ -120,8 +138,10 @@ def _start_base_session(
             else startup_timeout
         ),
         model_name=model_name,
-        **kwargs,
+        **acp_kwargs,
     )
+    _apply_runtime_settings(acp_session, runtime_settings)
+    return cast(SyncSession, acp_session)
 
 
 def close_session_safely(session: SyncSession | None) -> None:
@@ -131,6 +151,71 @@ def close_session_safely(session: SyncSession | None) -> None:
         session.close()
     except Exception as exc:
         logger.debug("关闭旧 session 失败: %s", get_error_detail(exc))
+
+
+def _call_start_base_session(
+    agent: str,
+    normalized_cwd: str,
+    model: str | None,
+    *,
+    capture_full_tool_content: bool = False,
+    startup_timeout: float | None = None,
+    startup_retries: int | None = None,
+    startup_log_failures: bool | None = None,
+    runtime_settings: Mapping[str, object] | None = None,
+) -> SyncSession:
+    """Invoke ``_start_base_session``, forwarding ``runtime_settings`` only when non-None."""
+    if runtime_settings is not None:
+        return _start_base_session(
+            agent,
+            normalized_cwd,
+            model,
+            capture_full_tool_content=capture_full_tool_content,
+            startup_timeout=startup_timeout,
+            startup_retries=startup_retries,
+            startup_log_failures=startup_log_failures,
+            runtime_settings=runtime_settings,
+        )
+    return _start_base_session(
+        agent,
+        normalized_cwd,
+        model,
+        capture_full_tool_content=capture_full_tool_content,
+        startup_timeout=startup_timeout,
+        startup_retries=startup_retries,
+        startup_log_failures=startup_log_failures,
+    )
+
+
+def create_programming_session(
+    agent_type: str,
+    cwd: str,
+    model_name: Optional[str] = None,
+    *,
+    capture_full_tool_content: bool = False,
+    startup_timeout: Optional[float] = None,
+    startup_retries: Optional[int] = None,
+    startup_log_failures: Optional[bool] = None,
+    runtime_settings: dict[str, object] | None = None,
+) -> SyncSession:
+    """Create a direct programming session and apply optional runtime settings."""
+    agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
+    logger.info(
+        "[SessionFactory] programming agent=%s cwd=%s model=%s",
+        agent,
+        normalized_cwd,
+        model,
+    )
+    return _call_start_base_session(
+        agent,
+        normalized_cwd,
+        model,
+        capture_full_tool_content=capture_full_tool_content,
+        startup_timeout=startup_timeout,
+        startup_retries=startup_retries,
+        startup_log_failures=startup_log_failures,
+        runtime_settings=runtime_settings,
+    )
 
 
 def create_engine_session(
@@ -145,6 +230,7 @@ def create_engine_session(
     startup_timeout: Optional[float] = None,
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
+    runtime_settings: dict[str, object] | None = None,
 ) -> SyncSession:
     """Create the long-lived Deep/Spec/Workflow session chain."""
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
@@ -155,7 +241,7 @@ def create_engine_session(
         model,
         thread_id or "",
     )
-    session = _start_base_session(
+    session = _call_start_base_session(
         agent,
         normalized_cwd,
         model,
@@ -163,6 +249,7 @@ def create_engine_session(
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,
         startup_log_failures=startup_log_failures,
+        runtime_settings=runtime_settings,
     )
     settings = get_settings()
     if settings.rate_limit_retry_enabled:
@@ -188,6 +275,7 @@ def create_auxiliary_session(
     startup_timeout: Optional[float] = None,
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
+    runtime_settings: dict[str, object] | None = None,
 ) -> SyncSession:
     """Create an unprivileged-by-convention coordination session."""
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
@@ -198,13 +286,14 @@ def create_auxiliary_session(
         model,
         thread_id or "",
     )
-    session = _start_base_session(
+    session = _call_start_base_session(
         agent,
         normalized_cwd,
         model,
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,
         startup_log_failures=startup_log_failures,
+        runtime_settings=runtime_settings,
     )
     if get_settings().rate_limit_retry_enabled:
         session = RateLimitAwareSession(session, cancel_event=cancel_event)

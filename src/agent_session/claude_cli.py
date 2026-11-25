@@ -96,6 +96,11 @@ class SyncClaudeCLISession(_BaseCLISession):
             self.start()
 
     def _build_args(self, text: str, resumed: bool) -> list[str]:
+        from ..acp.native_commands import is_non_task_native_slash
+
+        stripped = str(text or "").strip()
+        non_task_slash = is_non_task_native_slash(stripped)
+
         # Print mode otherwise falls back to dontAsk and denies tools that
         # would need a permission prompt. Apply the backend's own unattended
         # authorization mode on every invocation, including resumed turns.
@@ -104,9 +109,12 @@ class SyncClaudeCLISession(_BaseCLISession):
             "-p",
             "--permission-mode",
             "bypassPermissions",
-            "--append-system-prompt",
-            AUTONOMOUS_EXECUTION_PROMPT,
         ]
+        if not non_task_slash:
+            args += [
+                "--append-system-prompt",
+                AUTONOMOUS_EXECUTION_PROMPT,
+            ]
         if self._cfg.add_dir:
             args += ["--add-dir", self._cwd]
         base_model, effort = split_claude_model_selection(self._model_name)
@@ -121,7 +129,7 @@ class SyncClaudeCLISession(_BaseCLISession):
             args += ["--session-id", self.session_id]
 
         args.append("--")
-        args.append(text)
+        args.append(stripped if non_task_slash else text)
         return args
 
     def _prepare_env(self, env: dict[str, str]) -> None:
