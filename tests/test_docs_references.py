@@ -192,3 +192,48 @@ def test_product_contract_documents_workflow_auto_bound_agent_pool() -> None:
     assert "auto-binds an available recommended Agent Pool" in contract
     assert "1-8 `tool+model` Agents" in contract
     assert "owner-confirmed Agent Pool" not in contract
+
+
+def test_agents_md_stays_concise_and_links_project_skills() -> None:
+    agents_path = ROOT / "AGENTS.md"
+    agents_text = agents_path.read_text(encoding="utf-8")
+    assert len(agents_text.splitlines()) <= 110
+
+    skills_root = ROOT / ".agents" / "skills"
+    skill_files = sorted(skills_root.glob("*/SKILL.md"))
+    assert skill_files, "Expected at least one project skill under .agents/skills/"
+
+    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    frontmatter_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+    for skill_file in skill_files:
+        rel = skill_file.relative_to(ROOT).as_posix()
+        assert rel in agents_text, f"AGENTS.md must index skill {rel}"
+
+        content = skill_file.read_text(encoding="utf-8")
+        fm = frontmatter_re.match(content)
+        assert fm is not None, f"Missing YAML frontmatter in {rel}"
+        header = fm.group(1)
+        assert re.search(rf"^name:\s*{re.escape(skill_file.parent.name)}\s*$", header, re.MULTILINE), rel
+        assert re.search(r"^description:\s*\S+", header, re.MULTILINE), rel
+
+        for match in link_pattern.finditer(content):
+            raw_target = match.group(1).strip()
+            target, _fragment = urldefrag(raw_target)
+            if not target or "://" in target or target.startswith("mailto:"):
+                continue
+            assert (skill_file.parent / target).resolve().exists(), f"{rel} -> {raw_target}"
+
+
+def test_memory_abstract_stays_rolling_and_links_resolve() -> None:
+    memory_dir = ROOT / ".Memory"
+    abstract = memory_dir / "Abstract.md"
+    text = abstract.read_text(encoding="utf-8")
+    assert len(text.splitlines()) <= 80
+
+    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    for match in link_pattern.finditer(text):
+        raw_target = match.group(1).strip()
+        target, _fragment = urldefrag(raw_target)
+        if not target or "://" in target or target.startswith("mailto:"):
+            continue
+        assert (memory_dir / target).resolve().exists(), f".Memory/Abstract.md -> {raw_target}"

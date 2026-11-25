@@ -1,9 +1,5 @@
 # CLAUDE.md
 
-Claude Code should use `AGENTS.md` as the canonical project harness guide.
+Claude Code and other CLI backends use [AGENTS.md](AGENTS.md) as the single startup context guide.
 
-Do not duplicate project rules here. Keeping one shared guide avoids contradictory
-startup context between Claude, Codex, Aiden, Coco, Gemini, and Traex workflows.
-
-Start by reading `AGENTS.md`, then use repo search and `.Memory/Abstract.md` for
-task-specific context.
+Do not duplicate project rules here. Start with [AGENTS.md](AGENTS.md), load matching skills under `.agents/skills/` on demand, and check [.Memory/Abstract.md](.Memory/Abstract.md) (or `rg .Memory/`) for recent decisions and history.
