@@ -1,0 +1,226 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="GhostAP Icon">
+  <defs>
+    <!-- Studio squircle backdrop gradient -->
+    <radialGradient id="bg-grad" cx="50%" cy="48%" r="62%">
+      <stop offset="0%" stop-color="#162344"/>
+      <stop offset="45%" stop-color="#101830"/>
+      <stop offset="85%" stop-color="#0B1120"/>
+      <stop offset="100%" stop-color="#0B1120"/>
+    </radialGradient>
+
+    <!-- Squircle glass rim -->
+    <linearGradient id="card-rim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#6366F1" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#A855F7" stop-opacity="0.55"/>
+    </linearGradient>
+
+    <!-- Studio volumetric auras -->
+    <radialGradient id="aura-cyan" cx="38%" cy="36%" r="42%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#38BDF8" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="aura-violet" cx="62%" cy="62%" r="42%">
+      <stop offset="0%" stop-color="#A855F7" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#6366F1" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#A855F7" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="hover-pool" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#6366F1" stop-opacity="0.46"/>
+      <stop offset="50%" stop-color="#A855F7" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#0B1120" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Orbital conductor ring gradient -->
+    <linearGradient id="ring-grad" x1="18%" y1="18%" x2="82%" y2="82%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.65"/>
+      <stop offset="50%" stop-color="#6366F1" stop-opacity="0.48"/>
+      <stop offset="100%" stop-color="#A855F7" stop-opacity="0.65"/>
+    </linearGradient>
+
+    <!-- Spectral ghost main body gradient -->
+    <linearGradient id="ghost-body" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="46%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+
+    <!-- Translucent glass depth & lighting -->
+    <radialGradient id="ghost-depth" cx="50%" cy="48%" r="56%">
+      <stop offset="0%" stop-color="#0F172A" stop-opacity="0.46"/>
+      <stop offset="68%" stop-color="#1C254E" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#0B1120" stop-opacity="0.06"/>
+    </radialGradient>
+    <radialGradient id="ghost-keylight" cx="30%" cy="20%" r="56%">
+      <stop offset="0%" stop-color="#E0F2FE" stop-opacity="0.58"/>
+      <stop offset="38%" stop-color="#38BDF8" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ghost-bouncelight" cx="78%" cy="78%" r="44%">
+      <stop offset="0%" stop-color="#D8B4FE" stop-opacity="0.44"/>
+      <stop offset="50%" stop-color="#A855F7" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#A855F7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="dome-sheen" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.42"/>
+      <stop offset="65%" stop-color="#E0F2FE" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="ghost-rim" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%" stop-color="#E0F2FE" stop-opacity="0.90"/>
+      <stop offset="46%" stop-color="#818CF8" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#E9D5FF" stop-opacity="0.80"/>
+    </linearGradient>
+    <linearGradient id="tail-fade" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0B1120" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#0B1120" stop-opacity="0.34"/>
+    </linearGradient>
+
+    <!-- Visor -->
+    <linearGradient id="visor-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050914"/>
+      <stop offset="50%" stop-color="#091022"/>
+      <stop offset="100%" stop-color="#0E152D"/>
+    </linearGradient>
+    <linearGradient id="visor-rim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="50%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+    <linearGradient id="visor-glare" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.11"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="cursor-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <!-- Node orb gradients -->
+    <radialGradient id="orb-cyan" cx="35%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#E0F2FE"/>
+      <stop offset="55%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#1E1B4B"/>
+    </radialGradient>
+    <radialGradient id="orb-indigo" cx="35%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#E0E7FF"/>
+      <stop offset="55%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#1E1B4B"/>
+    </radialGradient>
+    <radialGradient id="orb-violet" cx="35%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#F3E8FF"/>
+      <stop offset="55%" stop-color="#A855F7"/>
+      <stop offset="100%" stop-color="#1E1B4B"/>
+    </radialGradient>
+
+    <!-- Soft SVG glow filters -->
+    <filter id="glow-soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-prompt" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="ghost-clip">
+      <path d="M 256 128 C 314 128 344 166 346 218 C 348 258 370 288 366 328 C 363 356 345 368 326 356 C 312 346 303 340 291 354 C 277 371 268 386 256 386 C 244 386 235 371 221 354 C 209 340 200 346 186 356 C 167 368 149 356 146 328 C 142 288 164 258 166 218 C 168 166 198 128 256 128 Z"/>
+    </clipPath>
+    <clipPath id="visor-clip">
+      <rect x="191" y="186" width="130" height="74" rx="34"/>
+    </clipPath>
+  </defs>
+
+  <!-- Obsidian Squircle Container -->
+  <rect x="4" y="4" width="504" height="504" rx="114" fill="url(#bg-grad)" stroke="url(#card-rim)" stroke-width="2"/>
+
+  <!-- Volumetric Studio Auras -->
+  <rect x="4" y="4" width="504" height="504" rx="114" fill="url(#aura-cyan)"/>
+  <rect x="4" y="4" width="504" height="504" rx="114" fill="url(#aura-violet)"/>
+
+  <!-- Hover projection pool -->
+  <ellipse cx="256" cy="398" rx="82" ry="18" fill="url(#hover-pool)"/>
+
+  <!-- Orbital Conductor Telemetry Ring (3 arcs on r=156) -->
+  <g fill="none" stroke="url(#ring-grad)" stroke-width="2.6" stroke-linecap="round">
+    <path d="M 285.77 102.87 A 156 156 0 0 1 401.64 311.91"/>
+    <path d="M 370.09 362.39 A 156 156 0 0 1 141.91 362.39"/>
+    <path d="M 110.36 311.91 A 156 156 0 0 1 226.23 102.87"/>
+  </g>
+
+  <!-- Subtle inclined orbital ellipse -->
+  <g transform="translate(256 266) rotate(-17)" fill="none" stroke-width="1.5" stroke-linecap="round">
+    <path d="M 137.5 21.3 A 152 50 0 0 1 -137.5 21.3" stroke="#38BDF8" stroke-opacity="0.22"/>
+    <path d="M -137.5 -21.3 A 152 50 0 0 1 137.5 -21.3" stroke="#A855F7" stroke-opacity="0.22"/>
+  </g>
+
+  <!-- Subtle routing tethers -->
+  <g stroke-width="1.5" stroke-dasharray="4 5" stroke-opacity="0.30">
+    <line x1="256.00" y1="100.00" x2="256" y2="266" stroke="#38BDF8"/>
+    <line x1="123.70" y1="338.67" x2="256" y2="266" stroke="#6366F1"/>
+    <line x1="388.30" y1="338.67" x2="256" y2="266" stroke="#A855F7"/>
+  </g>
+
+  <!-- Spectral Cyber-Ghost Body -->
+  <g filter="url(#glow-soft)">
+    <path d="M 256 128 C 314 128 344 166 346 218 C 348 258 370 288 366 328 C 363 356 345 368 326 356 C 312 346 303 340 291 354 C 277 371 268 386 256 386 C 244 386 235 371 221 354 C 209 340 200 346 186 356 C 167 368 149 356 146 328 C 142 288 164 258 166 218 C 168 166 198 128 256 128 Z" fill="url(#ghost-body)"/>
+  </g>
+
+  <!-- 3D Glassmorphic Internal Shading -->
+  <g clip-path="url(#ghost-clip)">
+    <rect x="130" y="120" width="252" height="275" fill="url(#ghost-depth)"/>
+    <rect x="130" y="120" width="252" height="275" fill="url(#ghost-keylight)"/>
+    <rect x="130" y="120" width="252" height="275" fill="url(#ghost-bouncelight)"/>
+    <ellipse cx="234" cy="152" rx="52" ry="14" transform="rotate(-9 234 152)" fill="url(#dome-sheen)"/>
+    <rect x="130" y="318" width="252" height="75" fill="url(#tail-fade)"/>
+    <path d="M 256 128 C 314 128 344 166 346 218 C 348 258 370 288 366 328 C 363 356 345 368 326 356 C 312 346 303 340 291 354 C 277 371 268 386 256 386 C 244 386 235 371 221 354 C 209 340 200 346 186 356 C 167 368 149 356 146 328 C 142 288 164 258 166 218 C 168 166 198 128 256 128 Z" fill="none" stroke="url(#ghost-rim)" stroke-width="4.2"/>
+  </g>
+
+  <!-- Outer Crisp Rim -->
+  <path d="M 256 128 C 314 128 344 166 346 218 C 348 258 370 288 366 328 C 363 356 345 368 326 356 C 312 346 303 340 291 354 C 277 371 268 386 256 386 C 244 386 235 371 221 354 C 209 340 200 346 186 356 C 167 368 149 356 146 328 C 142 288 164 258 166 218 C 168 166 198 128 256 128 Z" fill="none" stroke="url(#ghost-rim)" stroke-width="1.8"/>
+
+  <!-- Recessed Dark Obsidian Cyber-Visor -->
+  <rect x="188" y="183" width="136" height="80" rx="37" fill="#060A16" fill-opacity="0.48"/>
+  <rect x="191" y="186" width="130" height="74" rx="34" fill="url(#visor-bg)"/>
+  <g clip-path="url(#visor-clip)">
+    <ellipse cx="234" cy="192" rx="48" ry="14" transform="rotate(-4 234 192)" fill="url(#visor-glare)"/>
+  </g>
+  <rect x="191" y="186" width="130" height="74" rx="34" fill="none" stroke="url(#visor-rim)" stroke-width="2.0"/>
+
+  <!-- Luminous >_ Terminal / Conductor Expression -->
+  <g filter="url(#glow-prompt)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M 219 207 L 245 223 L 219 239" stroke="#38BDF8" stroke-width="11.5"/>
+    <path d="M 219 207 L 245 223 L 219 239" stroke="#E0F2FE" stroke-width="4.6"/>
+    <line x1="259" y1="237" x2="292" y2="237" stroke="url(#cursor-grad)" stroke-width="11"/>
+    <line x1="260" y1="237" x2="291" y2="237" stroke="#F5F3FF" stroke-width="4.2"/>
+  </g>
+
+  <!-- Subtle Holographic Routing Core & Flowing Cloak Traces -->
+  <g stroke-linecap="round" fill="none">
+    <path d="M 256 300 Q 256 326 256 356" stroke="#7DD3FC" stroke-opacity="0.34" stroke-width="2.0"/>
+    <path d="M 249 296 Q 220 314 198 340" stroke="#38BDF8" stroke-opacity="0.28" stroke-width="2.0"/>
+    <path d="M 263 296 Q 292 314 314 340" stroke="#C084FC" stroke-opacity="0.28" stroke-width="2.0"/>
+    <circle cx="256" cy="292" r="8.2" stroke="#818CF8" stroke-opacity="0.68" stroke-width="1.4"/>
+    <circle cx="256" cy="292" r="4.6" fill="#E0F2FE" fill-opacity="0.80"/>
+  </g>
+
+  <!-- 3 Orbital Conductor Nodes -->
+  <g>
+    <circle cx="256.00" cy="100.00" r="14" fill="#38BDF8" fill-opacity="0.22"/>
+    <circle cx="256.00" cy="100.00" r="9.2" fill="#0B1120"/>
+    <circle cx="256.00" cy="100.00" r="7.4" fill="url(#orb-cyan)" stroke="#E0F2FE" stroke-width="1.1"/>
+    <circle cx="123.70" cy="338.67" r="14" fill="#6366F1" fill-opacity="0.22"/>
+    <circle cx="123.70" cy="338.67" r="9.2" fill="#0B1120"/>
+    <circle cx="123.70" cy="338.67" r="7.4" fill="url(#orb-indigo)" stroke="#E0E7FF" stroke-width="1.1"/>
+    <circle cx="388.30" cy="338.67" r="14" fill="#A855F7" fill-opacity="0.22"/>
+    <circle cx="388.30" cy="338.67" r="9.2" fill="#0B1120"/>
+    <circle cx="388.30" cy="338.67" r="7.4" fill="url(#orb-violet)" stroke="#F3E8FF" stroke-width="1.1"/>
+  </g>
+</svg>
