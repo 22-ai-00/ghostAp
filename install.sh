@@ -146,7 +146,7 @@ parse_args() {
     case "$INSTALL_MODE" in
         source|tool|wheel) ;;
         *)
-            echo "❌ 无效的 --mode: $INSTALL_MODE（可选: source, tool, wheel）" >&2
+            echo "❌ 无效的 --mode: ${INSTALL_MODE}（可选: source, tool, wheel）" >&2
             return 2
             ;;
     esac

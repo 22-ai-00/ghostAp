@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -692,3 +693,15 @@ exit 1
             "python3:-m pip --version",
             "python3:-m pip install --user uv",
         ]
+
+
+def test_shell_scripts_brace_variables_before_non_ascii():
+    pattern = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]")
+    offenders: list[str] = []
+    for script_name in ("install.sh", "restart.sh"):
+        text = (ROOT / script_name).read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            match = pattern.search(line)
+            if match:
+                offenders.append(f"{script_name}:{lineno}: {match.group(0)}")
+    assert offenders == []

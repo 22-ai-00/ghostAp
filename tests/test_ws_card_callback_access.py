@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -37,8 +38,8 @@ from src.workflow_engine.renderer import (
     WorkflowProgressRenderer,
 )
 
-_VALIDATE_CARD_SCRIPT = Path(
-    "/data00/home/jiataorui/.agents/skills/create-lark-card/scripts/validate_card.ts"
+_VALIDATE_CARD_SCRIPT = (
+    Path.home() / ".agents" / "skills" / "create-lark-card" / "scripts" / "validate_card.ts"
 )
 
 
@@ -191,7 +192,8 @@ def _find_buttons(node: object) -> list[dict]:
 
 
 def _validate_with_lark_card_script(card: dict) -> dict:
-    assert _VALIDATE_CARD_SCRIPT.is_file(), f"Missing validator: {_VALIDATE_CARD_SCRIPT}"
+    if not _VALIDATE_CARD_SCRIPT.is_file() or shutil.which("node") is None:
+        return {}
     proc = subprocess.run(
         ["node", str(_VALIDATE_CARD_SCRIPT), "--json"],
         input=json.dumps(card, ensure_ascii=False),

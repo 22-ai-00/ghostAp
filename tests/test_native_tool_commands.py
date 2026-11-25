@@ -201,6 +201,7 @@ def test_codex_cli_build_args_preserves_native_slash(monkeypatch) -> None:
         return _FakeProc()
 
     monkeypatch.setattr("src.agent_session.codex_cli.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("src.agent_session.codex_cli.shutil.which", lambda _cmd: "/usr/bin/codex")
     sess = SyncCodexCLISession(cwd=".")
 
     sess.send_prompt("/compact")

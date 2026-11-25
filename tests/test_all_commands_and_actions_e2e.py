@@ -185,6 +185,8 @@ def test_all_commands_and_card_actions_deliver_end_to_end(tmp_path: Path, monkey
 
     try:
         with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.feishu.ws_client.get_settings", return_value=settings),
             patch("src.feishu.handlers.acp_activation.fetch_acp_models", return_value=[]),
             patch("src.acp.helper.is_programming_tool_available", return_value=True),
             patch("src.feishu.handlers.system.is_programming_tool_available", return_value=True),

@@ -20,7 +20,9 @@ class TestRepoLockHeartbeatBasic:
         stop = threading.Event()
         hb = RepoLockHeartbeat(stop, touch, interval=0.02, max_beats=None)
         hb.start()
-        time.sleep(0.12)  # should get ~5 beats
+        deadline = time.monotonic() + 1.5
+        while counter["n"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         stop.set()
         hb.join(timeout=1)
         assert counter["n"] >= 2
