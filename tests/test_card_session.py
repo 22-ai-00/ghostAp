@@ -701,7 +701,7 @@ class TestDeliverAndTrackRejected:
 
     def _make_session(self, delivery, **kwargs):
         metadata = CardMetadata(mode_name="Test", engine_type="deep")
-        config = SessionConfig(metadata=metadata, retry_delay=0.01)
+        config = SessionConfig(metadata=metadata, retry_delay=0.01, sync_delivery=True)
         callbacks_kwargs = {}
         for key in ("notify_callback", "cancel_callback", "reply_text_fn"):
             if key in kwargs:
@@ -730,6 +730,7 @@ class TestDeliverAndTrackRejected:
         assert delivery.close_calls == 0
         # notify should have been called for rejected
         assert notify.call_count >= 1
+        session.close()
 
 
 # ---------------------------------------------------------------------------

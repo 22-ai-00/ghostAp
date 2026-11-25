@@ -79,13 +79,50 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
-          prerelease: ${{ inputs.prerelease || (startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-')) || (inputs.tag != '' && contains(inputs.tag, '-')) }}
-          generate_release_notes: true
-          files: |
-            dist/*.whl
-            dist/*.tar.gz
-            dist/install.sh
-            dist/SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+          IS_PRERELEASE: ${{ inputs.prerelease || (startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-')) || (inputs.tag != '' && contains(inputs.tag, '-')) }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.whl dist/*.tar.gz dist/install.sh dist/SHA256SUMS.txt)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found in dist/" >&2
+            exit 1
+          fi
+
+          prerelease_flag=()
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          backoffs=(3 5 8 12 18 25 35 0)
+          attempt=1
+          max_attempts="${#backoffs[@]}"
+          for delay in "${backoffs[@]}"; do
+            echo "Attempt ${attempt}/${max_attempts}: publishing GitHub Release ${RELEASE_TAG}..."
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              if gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber; then
+                echo "Uploaded assets to existing release ${RELEASE_TAG}."
+                exit 0
+              fi
+            else
+              if gh release create "${RELEASE_TAG}" \
+                --title "${RELEASE_TAG}" \
+                --generate-notes \
+                "${prerelease_flag[@]}" \
+                "${assets[@]}"; then
+                echo "Created release ${RELEASE_TAG} with assets."
+                exit 0
+              fi
+            fi
+
+            if [ "${attempt}" -eq "${max_attempts}" ]; then
+              echo "Failed to publish GitHub Release ${RELEASE_TAG} after ${max_attempts} attempts." >&2
+              exit 1
+            fi
+            echo "Transient error publishing release; retrying in ${delay}s..." >&2
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+          done
