@@ -10,10 +10,31 @@ from src.workflow_engine.constants import NODE_MIN_VERSION
 ROOT = Path(__file__).resolve().parents[1]
 DOC_PATHS = [
     ROOT / "README.md",
+    ROOT / "README_EN.md",
     ROOT / "CHANGELOG.md",
     ROOT / "AGENTS.md",
     ROOT / "CLAUDE.md",
+    ROOT / "CONTRIBUTING.md",
+    ROOT / "SECURITY.md",
     *sorted((ROOT / "docs").glob("*.md")),
+]
+
+REQUIRED_OSS_AND_ASSET_PATHS = [
+    ROOT / "LICENSE",
+    ROOT / "CONTRIBUTING.md",
+    ROOT / "SECURITY.md",
+    ROOT / "README_EN.md",
+    ROOT / "install.sh",
+    ROOT / ".github" / "workflows" / "ci.yml",
+    ROOT / "docs" / "assets" / "hero-banner.svg",
+    ROOT / "docs" / "assets" / "architecture-overview.svg",
+    ROOT / "docs" / "assets" / "workflow-pipeline.svg",
+    ROOT / "docs" / "assets" / "showcase-workflow.png",
+    ROOT / "docs" / "assets" / "showcase-cockpit.png",
+    ROOT / "docs" / "assets" / "showcase-programming.png",
+    ROOT / "docs" / "assets" / "showcase-report.png",
+    ROOT / "docs" / "assets" / "ghostap-avatar.png",
+    ROOT / "docs" / "assets" / "ghostap-icon.svg",
 ]
 
 ARCHIVED_DOC_PATHS = [
@@ -42,11 +63,56 @@ REMOVED_ARTIFACT_REFERENCES = {
     "check_shim_" + "deadline",
 }
 
+_FENCED_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+_HTML_IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)
+_HTML_ANCHOR_HREF_RE = re.compile(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+def _iter_local_doc_targets(text: str) -> list[str]:
+    """Extract local path targets from Markdown links, images, and HTML tags."""
+    stripped = _FENCED_CODE_RE.sub("", text)
+    raw_targets: list[str] = []
+
+    raw_targets.extend(match.group(1) for match in _MD_IMAGE_RE.finditer(stripped))
+    without_images = _MD_IMAGE_RE.sub("IMAGE_PLACEHOLDER", stripped)
+    raw_targets.extend(match.group(1) for match in _MD_LINK_RE.finditer(without_images))
+    raw_targets.extend(match.group(1) for match in _HTML_IMG_SRC_RE.finditer(stripped))
+    raw_targets.extend(match.group(1) for match in _HTML_ANCHOR_HREF_RE.finditer(stripped))
+
+    targets: list[str] = []
+    for raw in raw_targets:
+        cleaned = raw.strip().strip("<>")
+        if not cleaned:
+            continue
+        first_token = cleaned.split()[0]
+        target, _fragment = urldefrag(first_token)
+        if not target or "://" in target or target.startswith(("mailto:", "data:")):
+            continue
+        targets.append(first_token)
+    return targets
+
 
 def test_archived_doc_noise_paths_are_removed() -> None:
     violations = [path.relative_to(ROOT).as_posix() for path in ARCHIVED_DOC_PATHS if path.exists()]
 
     assert violations == []
+
+
+def test_required_oss_installer_and_visual_assets_exist() -> None:
+    missing = [path.relative_to(ROOT).as_posix() for path in REQUIRED_OSS_AND_ASSET_PATHS if not path.is_file()]
+
+    assert missing == []
+
+    license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+    assert "MIT" in license_text
+    assert "Permission is hereby granted" in license_text
+
+    install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert install_sh.startswith("#!/")
+    for retired in ("Agent Department", "src/autonomous", "/hire"):
+        assert retired not in install_sh
 
 
 def test_retained_docs_do_not_reference_removed_cleanup_artifacts() -> None:
@@ -62,19 +128,37 @@ def test_retained_docs_do_not_reference_removed_cleanup_artifacts() -> None:
 
 def test_local_markdown_links_in_retained_docs_resolve() -> None:
     violations: list[str] = []
-    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
     for path in DOC_PATHS:
         text = path.read_text(encoding="utf-8")
-        for match in link_pattern.finditer(text):
-            raw_target = match.group(1).strip()
+        for raw_target in _iter_local_doc_targets(text):
             target, _fragment = urldefrag(raw_target)
-            if not target or "://" in target or target.startswith("mailto:"):
-                continue
-
             candidate = (path.parent / target).resolve()
             if not candidate.exists():
                 violations.append(f"{path.relative_to(ROOT)} -> {raw_target}")
+
+    assert violations == []
+
+
+def test_local_image_references_in_docs_resolve() -> None:
+    violations: list[str] = []
+
+    for path in DOC_PATHS:
+        text = _FENCED_CODE_RE.sub("", path.read_text(encoding="utf-8"))
+        image_targets = [
+            *(match.group(1) for match in _MD_IMAGE_RE.finditer(text)),
+            *(match.group(1) for match in _HTML_IMG_SRC_RE.finditer(text)),
+        ]
+        for raw in image_targets:
+            cleaned = raw.strip().strip("<>")
+            if not cleaned:
+                continue
+            target, _fragment = urldefrag(cleaned.split()[0])
+            if not target or "://" in target or target.startswith("data:"):
+                continue
+            candidate = (path.parent / target).resolve()
+            if not candidate.exists():
+                violations.append(f"{path.relative_to(ROOT)} -> {raw}")
 
     assert violations == []
 
@@ -99,6 +183,7 @@ def test_readme_card_tree_documents_current_pipeline_directories() -> None:
 
 def test_public_positioning_matches_product_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_en = (ROOT / "README_EN.md").read_text(encoding="utf-8")
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     contract = (ROOT / "docs" / "product-contract.md").read_text(
         encoding="utf-8"
@@ -106,6 +191,8 @@ def test_public_positioning_matches_product_contract() -> None:
 
     assert "主 Bot" in readme
     assert "provider/transport" in readme
+    assert "Main Bot" in readme_en
+    assert "provider/transport" in readme_en
     assert (
         'description = "飞书原生多工具 AI 研发控制面与执行网关"'
         in pyproject
@@ -122,6 +209,9 @@ def test_public_positioning_matches_product_contract() -> None:
 def test_public_docs_do_not_reference_retired_employee_department() -> None:
     for path in (
         ROOT / "README.md",
+        ROOT / "README_EN.md",
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "SECURITY.md",
         ROOT / "AGENTS.md",
         ROOT / "docs" / "product-contract.md",
         ROOT / "pyproject.toml",
@@ -169,10 +259,12 @@ def test_workflow_node_minimum_is_consistent_across_runtime_and_readme() -> None
     )
     minimum = ".".join(str(part) for part in NODE_MIN_VERSION)
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_en = (ROOT / "README_EN.md").read_text(encoding="utf-8")
 
     assert runtime_package["engines"]["node"] == f">={minimum}"
     assert NODE_MIN_VERSION[1:] == (0, 0), "README's major+ notation would be too broad"
     assert f"Node.js {NODE_MIN_VERSION[0]}+" in readme
+    assert f"Node.js {NODE_MIN_VERSION[0]}+" in readme_en
 
 
 def test_readme_documents_workflow_auto_bound_agent_pool() -> None:
