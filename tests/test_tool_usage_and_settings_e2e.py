@@ -830,3 +830,87 @@ def test_select_static_option_extraction_accepts_all_callback_shapes() -> None:
     assert system._extract_selected_option({"option": "plan"}) == "plan"
     assert system._extract_selected_option({}) is None
     assert SlashCommandParser.parse("/quota agy").command == "/usage"
+
+
+def test_show_thinking_toggle_honors_card_payload_without_live_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, project, deliveries, _patch_should_fail = _build_real_ws_graph(tmp_path, monkeypatch)
+    _attach_runtime_settings_methods_if_missing(project)
+    _telemetry_calls, builder_calls = _install_fake_slice_ab_modules(monkeypatch)
+    client._handler_ctx.agy_manager.get_session = MagicMock(return_value=None)
+    client._handler_ctx.codex_manager.get_session = MagicMock(return_value=None)
+
+    try:
+        with (
+            patch("src.feishu.handlers.acp_activation.fetch_acp_models", return_value=_sample_agy_models()),
+            patch("src.feishu.handlers.system.is_programming_tool_available", return_value=True),
+        ):
+            registry = init_action_registry(client)
+
+            # Case 1: card button sends legacy payload `show_thinking=True` without saved state or live session
+            registry[SETTINGS_TOGGLE_SHOW_THINKING](
+                "om_card_rt1",
+                "oc_cockpit",
+                project.project_id,
+                {
+                    "action": SETTINGS_TOGGLE_SHOW_THINKING,
+                    "tool_name": "agy",
+                    "project_id": project.project_id,
+                    "show_thinking": True,
+                },
+            )
+            assert project.get_tool_runtime_settings("oc_cockpit", "agy")["show_thinking"] is True
+            assert builder_calls[-1]["status_banner"] == "✅ 已开启思考过程显示"
+            assert deliveries[-1][0] == "patch"
+
+            # Case 2: fresh untouched tool (`codex`) with payload `show_thinking=False` persists False cleanly
+            registry[SETTINGS_TOGGLE_SHOW_THINKING](
+                "om_card_rt2",
+                "oc_cockpit",
+                project.project_id,
+                {
+                    "action": SETTINGS_TOGGLE_SHOW_THINKING,
+                    "tool_name": "codex",
+                    "project_id": project.project_id,
+                    "show_thinking": False,
+                },
+            )
+            assert project.get_tool_runtime_settings("oc_cockpit", "codex")["show_thinking"] is False
+            assert builder_calls[-1]["status_banner"] == "✅ 已关闭思考过程显示"
+
+            # Case 3: explicit next_show_thinking/current_show_thinking card payload toggles accurately
+            registry[SETTINGS_TOGGLE_SHOW_THINKING](
+                "om_card_rt3",
+                "oc_cockpit",
+                project.project_id,
+                {
+                    "action": SETTINGS_TOGGLE_SHOW_THINKING,
+                    "tool_name": "agy",
+                    "project_id": project.project_id,
+                    "show_thinking": True,
+                    "next_show_thinking": True,
+                    "current_show_thinking": False,
+                },
+            )
+            assert project.get_tool_runtime_settings("oc_cockpit", "agy")["show_thinking"] is True
+            assert builder_calls[-1]["status_banner"] == "✅ 已开启思考过程显示"
+
+            registry[SETTINGS_TOGGLE_SHOW_THINKING](
+                "om_card_rt3",
+                "oc_cockpit",
+                project.project_id,
+                {
+                    "action": SETTINGS_TOGGLE_SHOW_THINKING,
+                    "tool_name": "agy",
+                    "project_id": project.project_id,
+                    "show_thinking": False,
+                    "next_show_thinking": False,
+                    "current_show_thinking": True,
+                },
+            )
+            assert project.get_tool_runtime_settings("oc_cockpit", "agy")["show_thinking"] is False
+            assert builder_calls[-1]["status_banner"] == "✅ 已关闭思考过程显示"
+    finally:
+        client.close()

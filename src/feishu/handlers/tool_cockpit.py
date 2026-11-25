@@ -1098,9 +1098,12 @@ class ToolCockpitMixin:
                         cur_val = live_rt.get("show_thinking")
                 if cur_val is None and isinstance(payload.get("current_show_thinking"), bool):
                     cur_val = payload["current_show_thinking"]
-                if cur_val is None:
-                    cur_val = True
-                new_val = not bool(cur_val)
+                if cur_val is not None:
+                    new_val = not bool(cur_val)
+                elif isinstance(payload.get("show_thinking"), bool):
+                    new_val = payload["show_thinking"]
+                else:
+                    new_val = False
             updated["show_thinking"] = new_val
             banner = f"✅ 已{'开启' if new_val else '关闭'}思考过程显示"
         elif action == SETTINGS_SELECT_VERBOSITY:
