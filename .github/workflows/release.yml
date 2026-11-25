@@ -98,31 +98,64 @@ jobs:
           fi
 
           backoffs=(3 5 8 12 18 25 35 0)
-          attempt=1
           max_attempts="${#backoffs[@]}"
-          for delay in "${backoffs[@]}"; do
-            echo "Attempt ${attempt}/${max_attempts}: publishing GitHub Release ${RELEASE_TAG}..."
-            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-              if gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber; then
-                echo "Uploaded assets to existing release ${RELEASE_TAG}."
-                exit 0
+
+          ensure_release_exists() {
+            local attempt=1
+            local delay
+            for delay in "${backoffs[@]}"; do
+              echo "Release metadata attempt ${attempt}/${max_attempts}: ensuring ${RELEASE_TAG} exists..."
+              if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+                return 0
               fi
-            else
               if gh release create "${RELEASE_TAG}" \
                 --title "${RELEASE_TAG}" \
                 --generate-notes \
-                "${prerelease_flag[@]}" \
-                "${assets[@]}"; then
-                echo "Created release ${RELEASE_TAG} with assets."
-                exit 0
+                "${prerelease_flag[@]}"; then
+                return 0
               fi
-            fi
+              if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+                return 0
+              fi
+              if [ "${attempt}" -eq "${max_attempts}" ]; then
+                echo "Failed to create or locate release ${RELEASE_TAG} after ${max_attempts} attempts." >&2
+                return 1
+              fi
+              echo "Transient error ensuring release; retrying in ${delay}s..." >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+            done
+          }
 
-            if [ "${attempt}" -eq "${max_attempts}" ]; then
-              echo "Failed to publish GitHub Release ${RELEASE_TAG} after ${max_attempts} attempts." >&2
-              exit 1
-            fi
-            echo "Transient error publishing release; retrying in ${delay}s..." >&2
-            sleep "${delay}"
-            attempt=$((attempt + 1))
+          upload_and_verify_asset() {
+            local asset_path="$1"
+            local asset_name
+            asset_name="$(basename "${asset_path}")"
+            local attempt=1
+            local delay
+            for delay in "${backoffs[@]}"; do
+              echo "Asset ${asset_name} upload attempt ${attempt}/${max_attempts}..."
+              if gh release upload "${RELEASE_TAG}" "${asset_path}" --clobber; then
+                local verified=""
+                verified="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+                  --jq ".assets[] | select(.name == \"${asset_name}\" and .state == \"uploaded\") | .name" 2>/dev/null || true)"
+                if [ "${verified}" = "${asset_name}" ]; then
+                  echo "Verified uploaded asset: ${asset_name}"
+                  return 0
+                fi
+                echo "Asset ${asset_name} not yet in state=uploaded after upload; retrying..." >&2
+              fi
+              if [ "${attempt}" -eq "${max_attempts}" ]; then
+                echo "Failed to upload and verify ${asset_name} after ${max_attempts} attempts." >&2
+                return 1
+              fi
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          ensure_release_exists
+          for asset in "${assets[@]}"; do
+            upload_and_verify_asset "${asset}"
           done
+          gh release view "${RELEASE_TAG}" --json url,tagName,assets
