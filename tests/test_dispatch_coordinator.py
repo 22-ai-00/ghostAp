@@ -126,6 +126,22 @@ class TestNotifyRejected:
         assert args[0] == "msg-123"
         assert "/deep" in args[1]
 
+    def test_notify_rejected_fires_when_monotonic_clock_under_60s(self, monkeypatch):
+        """Freshly booted hosts have time.monotonic() < 60s; initial rejection must still notify."""
+        ticks = iter([12.5, 30.0])
+        monkeypatch.setattr("src.card.dispatch_coordinator.time.monotonic", lambda: next(ticks))
+        notify = MagicMock()
+        coord, _, _, _, _ = _make_coordinator(notify_callback=notify)
+
+        first = coord.notify_rejected(engine_cmd="/deep")
+        assert first is None
+        notify.assert_called_once()
+
+        second = coord.notify_rejected(engine_cmd="/deep")
+        assert second is not None
+        assert "toast" in second
+        assert notify.call_count == 1
+
 
 class TestFinalizeTerminal:
     def test_finalize_closes_delivery_and_fires_hooks(self):

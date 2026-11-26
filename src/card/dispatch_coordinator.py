@@ -73,7 +73,7 @@ class DispatchDeliveryCoordinator:
         self._cancel_callback = cancel_callback
         self._reply_text_fn = reply_text_fn
         self._reply_to = reply_to
-        self._last_rejected_notify: float = 0.0
+        self._last_rejected_notify: float | None = None
 
     # ------------------------------------------------------------------
     # Main entry: deliver + track outcomes
@@ -173,7 +173,7 @@ class DispatchDeliveryCoordinator:
             reason: Optional reason string; "shutting down" triggers maintenance text.
         """
         now = time.monotonic()
-        if now - self._last_rejected_notify < 60.0:
+        if self._last_rejected_notify is not None and now - self._last_rejected_notify < 60.0:
             return {"toast": {"type": "info", "content": UI_TEXT.get("card_session_rejected_throttled", "请稍后重试")}}
         self._last_rejected_notify = now
         if "shutting down" in reason:

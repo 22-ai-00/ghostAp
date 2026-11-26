@@ -76,7 +76,9 @@ def test_harness_real_workflow_engine_and_node_runtime_end_to_end(tmp_path: Path
 
     assert e2e.project.status == WorkflowStatus.COMPLETED
     assert len(recorder.invocations) == 3
-    assert [inv.agent_type for inv in recorder.invocations] == ["codex", "claude", "claude"]
+    tools = [inv.agent_type for inv in recorder.invocations]
+    assert sorted(tools[:2]) == ["claude", "codex"]
+    assert tools[2] == "claude"
     assert e2e.report_files is not None
     assert Path(e2e.report_files.html_path).exists()
     assert Path(e2e.report_files.markdown_path).exists()

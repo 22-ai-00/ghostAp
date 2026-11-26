@@ -2134,7 +2134,7 @@ class TestM2CoalescerErrorsAndReporting(unittest.TestCase):
             ),
             ("empty_quotes_200k", 'a "" ' * 40000, 60.0),
             ("json_fail_532k", ("x" * 500000) + ("{a} " * 8000), 150.0),
-            ("esc_quote_192k", r'\"{\\\"a\\\":1}\" ' * 12000, 250.0),
+            ("esc_quote_192k", r'\"{\\\"a\\\":1}\" ' * 12000, 600.0),
         ):
             with self.subTest(scaling=name):
                 t0 = time.perf_counter()

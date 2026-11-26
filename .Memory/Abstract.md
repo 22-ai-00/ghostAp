@@ -1,7 +1,7 @@
 # GhostAP 项目记忆索引
 
 ## 2026-11-26
-- **GitHub元数据、社交海报与CI绿标** - 更新About/10 Topics、`1280×640` Social Preview与main CI验证 → [2026-11-26.md](2026-11-26.md)
+- **修复卡片首拒节流与完善仓库门面** - 修`<60s`开机`monotonic`误节流、About/Topics、`1280×640`海报与CI → [2026-11-26.md](2026-11-26.md)
 
 ## 2026-11-25
 - **GitHub门面与一键打包安装** - 双语README、Bot头像/卡片画廊、`ghostap` CLI/Wheel与自动安装`uv` → [2026-11-25.md](2026-11-25.md)
