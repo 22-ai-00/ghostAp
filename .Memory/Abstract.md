@@ -1,5 +1,8 @@
 # GhostAP 项目记忆索引
 
+## 2026-11-26
+- **GitHub元数据、社交海报与CI绿标** - 更新About/10 Topics、`1280×640` Social Preview与main CI验证 → [2026-11-26.md](2026-11-26.md)
+
 ## 2026-11-25
 - **GitHub门面与一键打包安装** - 双语README、Bot头像/卡片画廊、`ghostap` CLI/Wheel与自动安装`uv` → [2026-11-25.md](2026-11-25.md)
 - **AGENTS精简与按需Skills拆分** - 精简AGENTS至一屏、拆分4个按需Skill与滚动Memory索引 → [2026-11-25.md](2026-11-25.md)
