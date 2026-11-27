@@ -205,6 +205,8 @@ def resolve_effective_model_name(
                 parsed.model_id,
                 planner,
                 executor,
+                planner_model=parsed.planner_model,
+                executor_model=parsed.executor_model,
             )
 
         agy_raw_model = (

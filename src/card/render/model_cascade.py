@@ -5,6 +5,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from src.acp.agy_selection import (
+    AGY_DEFAULT_MODEL_ID,
+    AGY_ORCHESTRATOR_DEFAULT_PROFILE,
+    compose_agy_orchestrator_selection,
+    get_agy_orchestrator_spec,
+    is_agy_orchestrator_model,
+    is_valid_agy_catalog_selection,
+    parse_agy_model_selection,
+)
 from src.acp.options import ACPModelOption, ACPModelSelectionVariant
 
 
@@ -26,6 +35,20 @@ class ModelCascadeState:
     selected_effort: str | None
     selection: str
     selections: tuple[ModelSelection, ...] = ()
+
+
+@dataclass(frozen=True)
+class AGYOrchestratorCascadeState:
+    has_role_models: bool
+    orchestrator_model: str
+    role_model_names: tuple[str, ...]
+    selected_planner_model: str
+    planner_efforts: tuple[str, ...]
+    selected_planner_effort: str | None
+    selected_executor_model: str
+    executor_efforts: tuple[str, ...]
+    selected_executor_effort: str | None
+    selection: str
 
 
 def _ordered_unique(values: Sequence[str | None]) -> tuple[str, ...]:
@@ -88,14 +111,22 @@ def parse_model_selection(
         (candidate for candidate in _variants(models) if candidate.name == value),
         None,
     )
-    if variant is None:
-        return None
-    return ModelSelection(
-        model=variant.model,
-        profile=variant.profile,
-        effort=variant.effort,
-        value=variant.name,
-    )
+    if variant is not None:
+        return ModelSelection(
+            model=variant.model,
+            profile=variant.profile,
+            effort=variant.effort,
+            value=variant.name,
+        )
+    if value and is_valid_agy_catalog_selection(models, value):
+        parsed = parse_agy_model_selection(value)
+        return ModelSelection(
+            model=parsed.model_id,
+            profile=parsed.planner_effort,
+            effort=parsed.executor_effort if parsed.planner_model or parsed.executor_model else parsed.thought_level,
+            value=value,
+        )
+    return None
 
 
 def available_model_selections(
@@ -258,4 +289,131 @@ def resolve_model_cascade(
         selected_effort=effort,
         selection=selection,
         selections=available_model_selections(models),
+    )
+
+
+def _resolve_agy_role(
+    by_name: dict[str, ACPModelOption],
+    models: Sequence[ACPModelOption],
+    *,
+    pending_model: str | None,
+    pending_effort: str | None,
+    cur_model: str | None,
+    cur_effort: str | None,
+    default_role_model_id: str,
+) -> tuple[str, tuple[str, ...], str | None]:
+    pend_m = str(pending_model or "").strip()
+    if pend_m in by_name:
+        role_model = pend_m
+    elif cur_model and cur_model in by_name:
+        role_model = cur_model
+    else:
+        role_model = default_role_model_id
+
+    opt = by_name[role_model]
+    efforts = tuple(dict.fromkeys(eff for eff in (opt.reasoning_efforts or ()) if eff))
+    if not efforts:
+        efforts = available_model_efforts(models, role_model, None)
+    if not efforts:
+        return role_model, (), None
+
+    pend_e = str(pending_effort or "").strip().lower() or None
+    if pend_e == AGY_ORCHESTRATOR_DEFAULT_PROFILE:
+        pend_e = None
+    if pend_e in efforts:
+        role_effort: str | None = pend_e
+    elif (cur_model is None or cur_model == role_model) and cur_effort in efforts:
+        role_effort = cur_effort
+    elif "high" in efforts:
+        role_effort = "high"
+    elif opt.default_reasoning_effort in efforts:
+        role_effort = opt.default_reasoning_effort
+    else:
+        role_effort = efforts[0]
+    return role_model, efforts, role_effort
+
+
+def resolve_agy_orchestrator_cascade(
+    models: Sequence[ACPModelOption],
+    *,
+    orchestrator_model: str | None = None,
+    current_model: str | None = None,
+    pending_planner_model: str | None = None,
+    pending_planner_effort: str | None = None,
+    pending_executor_model: str | None = None,
+    pending_executor_effort: str | None = None,
+) -> AGYOrchestratorCascadeState:
+    """Resolve 4-axis Planner/Executor model + effort state for AGY Orchestrators."""
+    orch_id = str(orchestrator_model or AGY_DEFAULT_MODEL_ID).strip()
+    spec = get_agy_orchestrator_spec(orch_id)
+    role_options = [
+        opt for opt in (models or ())
+        if getattr(opt, "name", None) and not is_agy_orchestrator_model(opt.name)
+    ]
+    role_model_names = tuple(dict.fromkeys(opt.name for opt in role_options))
+    by_name = {opt.name: opt for opt in role_options}
+    has_role_models = bool(
+        spec is not None
+        and spec.planner_model_id in by_name
+        and spec.executor_model_id in by_name
+    )
+    if not has_role_models or spec is None:
+        return AGYOrchestratorCascadeState(
+            has_role_models=False,
+            orchestrator_model=orch_id,
+            role_model_names=role_model_names,
+            selected_planner_model="",
+            planner_efforts=(),
+            selected_planner_effort=None,
+            selected_executor_model="",
+            executor_efforts=(),
+            selected_executor_effort=None,
+            selection=orch_id,
+        )
+
+    parsed_cur = None
+    if current_model:
+        try:
+            cand = parse_agy_model_selection(current_model)
+            if cand.model_id == orch_id:
+                parsed_cur = cand
+        except ValueError:
+            parsed_cur = None
+
+    p_model, p_efforts, p_eff = _resolve_agy_role(
+        by_name,
+        models,
+        pending_model=pending_planner_model,
+        pending_effort=pending_planner_effort,
+        cur_model=parsed_cur.planner_model if parsed_cur else None,
+        cur_effort=parsed_cur.planner_effort if parsed_cur else None,
+        default_role_model_id=spec.planner_model_id,
+    )
+    e_model, e_efforts, e_eff = _resolve_agy_role(
+        by_name,
+        models,
+        pending_model=pending_executor_model,
+        pending_effort=pending_executor_effort,
+        cur_model=parsed_cur.executor_model if parsed_cur else None,
+        cur_effort=parsed_cur.executor_effort if parsed_cur else None,
+        default_role_model_id=spec.executor_model_id,
+    )
+    selection = compose_agy_orchestrator_selection(
+        orch_id,
+        p_eff,
+        e_eff,
+        planner_model=p_model,
+        executor_model=e_model,
+    )
+    return AGYOrchestratorCascadeState(
+        has_role_models=True,
+        orchestrator_model=orch_id,
+        role_model_names=role_model_names,
+        selected_planner_model=p_model,
+        planner_efforts=p_efforts,
+        selected_planner_effort=p_eff,
+        selected_executor_model=e_model,
+        executor_efforts=e_efforts,
+        selected_executor_effort=e_eff,
+        selection=selection,
     )

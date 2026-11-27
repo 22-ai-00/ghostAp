@@ -878,9 +878,16 @@ async def discover_agy_model_options(
         compose_fn=compose_agy_model_selection,
     )
     _register_agy_available_model_labels(response, discovered)
-    if _is_agy_enterprise_tier(response):
-        return discovered
-    return _enrich_agy_orchestrator_options(discovered)
+    if not _is_agy_enterprise_tier(response):
+        discovered = _enrich_agy_orchestrator_options(discovered)
+    from .agy_selection import AGY_DEFAULT_MODEL_ID
+
+    if any(opt.name == AGY_DEFAULT_MODEL_ID for opt in discovered):
+        discovered = [
+            dataclasses.replace(opt, is_default=(opt.name == AGY_DEFAULT_MODEL_ID))
+            for opt in discovered
+        ]
+    return discovered
 
 
 async def _probe_acp_models(

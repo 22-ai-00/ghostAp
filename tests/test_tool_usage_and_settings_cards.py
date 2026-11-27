@@ -102,6 +102,8 @@ def test_tool_cockpit_action_constants_and_frozenset() -> None:
         "SETTINGS_SELECT_MODEL_GROUP": "settings_select_model_group",
         "SETTINGS_SELECT_MODEL_PROFILE": "settings_select_model_profile",
         "SETTINGS_SELECT_MODEL_EFFORT": "settings_select_model_effort",
+        "SETTINGS_SELECT_ORCH_PLANNER_MODEL": "settings_select_orch_planner_model",
+        "SETTINGS_SELECT_ORCH_EXECUTOR_MODEL": "settings_select_orch_executor_model",
         "SETTINGS_TOGGLE_SHOW_THINKING": "settings_toggle_show_thinking",
         "SETTINGS_SELECT_VERBOSITY": "settings_select_verbosity",
         "SETTINGS_SELECT_AGENT_MODE": "settings_select_agent_mode",

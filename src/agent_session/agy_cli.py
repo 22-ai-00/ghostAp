@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..acp.agy_selection import (
-    format_agy_model_effort_label,
+    compose_agy_orchestrator_selection,
     get_agy_orchestrator_spec,
     parse_agy_model_selection,
     requires_agy_cli_orchestrator_session,
@@ -1032,7 +1032,13 @@ class SyncAGYCLISession(_BaseCLISession):
             return False
         parsed = parse_agy_model_selection(candidate)
         resolve_agy_orchestrator_settings(candidate)
-        canonical = f"{parsed.model_id}/{parsed.planner_effort}/{parsed.executor_effort}"
+        canonical = compose_agy_orchestrator_selection(
+            parsed.model_id,
+            parsed.planner_effort,
+            parsed.executor_effort,
+            planner_model=parsed.planner_model,
+            executor_model=parsed.executor_model,
+        )
         self._model_name = canonical
         return True
 
@@ -1060,17 +1066,11 @@ class SyncAGYCLISession(_BaseCLISession):
         try:
             parsed = parse_agy_model_selection(self._model_name)
             spec = get_agy_orchestrator_spec(parsed.model_id)
-            if spec and parsed.planner_effort and parsed.executor_effort:
-                planner_label = format_agy_model_effort_label(
-                    spec.planner_model_id,
-                    parsed.planner_effort,
-                    display_base=spec.planner_display_base,
-                )
-                executor_label = format_agy_model_effort_label(
-                    spec.executor_model_id,
-                    parsed.executor_effort,
-                    display_base=spec.executor_display_base,
-                )
+            if spec and requires_agy_cli_orchestrator_session(self._model_name):
+                _orch_id, settings_payload = resolve_agy_orchestrator_settings(self._model_name)
+                orch = settings_payload.get("orchestrator", {})
+                planner_label = orch.get("planner", "")
+                executor_label = orch.get("executor", "")
                 return (
                     f"{base}\n"
                     f"- 模型: {parsed.model_id}\n"

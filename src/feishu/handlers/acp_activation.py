@@ -743,6 +743,8 @@ class ACPActivationMixin:
         pending_group: Optional[str] = None,
         pending_profile: Optional[str] = None,
         pending_effort: Optional[str] = None,
+        pending_planner_model: Optional[str] = None,
+        pending_executor_model: Optional[str] = None,
         show_loading: bool = True,
     ) -> None:
         """Show the explicit model configuration surface for one backend.
@@ -817,6 +819,8 @@ class ACPActivationMixin:
             pending_group=pending_group,
             pending_profile=pending_profile,
             pending_effort=pending_effort,
+            pending_planner_model=pending_planner_model,
+            pending_executor_model=pending_executor_model,
         )
         if card_message_id and self.update_card(card_message_id, card_content):
             return
@@ -840,31 +844,47 @@ class ACPActivationMixin:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_model_prompt"])
             return
 
+        from ...acp.agy_selection import is_agy_orchestrator_model
         from ...card.actions import dispatch as action_ids
 
+        tool = str(value.get("tool_name") or "").strip().lower()
         group = str(value.get("model_group") or "").strip() or None
         profile = str(value.get("model_profile") or "").strip() or None
         effort = str(value.get("model_effort") or "").strip() or None
+        planner_model = str(value.get("planner_model") or "").strip() or None
+        executor_model = str(value.get("executor_model") or "").strip() or None
         if action == action_ids.SELECT_ACP_MODEL_GROUP:
-            group, profile, effort = selected, None, None
+            group, profile, effort, planner_model, executor_model = selected, None, None, None, None
+        elif action == action_ids.SELECT_ACP_ORCH_PLANNER_MODEL:
+            planner_model, profile = selected, None
         elif action == action_ids.SELECT_ACP_MODEL_PROFILE:
-            profile, effort = selected, None
+            profile = selected
+            if not (tool in {"agy", "agy_b"} and is_agy_orchestrator_model(group)):
+                effort = None
+        elif action == action_ids.SELECT_ACP_ORCH_EXECUTOR_MODEL:
+            executor_model, effort = selected, None
         elif action == action_ids.SELECT_ACP_MODEL_EFFORT:
             effort = selected
         else:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_model_prompt"])
             return
 
+        extra_kwargs: dict[str, Any] = {}
+        if planner_model is not None or executor_model is not None:
+            extra_kwargs["pending_planner_model"] = planner_model
+            extra_kwargs["pending_executor_model"] = executor_model
+
         self.show_explicit_acp_model_selection(
             message_id,
             chat_id,
-            str(value.get("tool_name") or ""),
+            tool,
             project,
             origin_message_id=message_id,
             pending_group=group,
             pending_profile=profile,
             pending_effort=effort,
             show_loading=False,
+            **extra_kwargs,
         )
 
     def handle_open_acp_model_picker(
@@ -880,6 +900,12 @@ class ACPActivationMixin:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_config_save_failed"])
             return
         tool = str(value.get("tool_name") or "").strip().lower()
+        extra_kwargs: dict[str, Any] = {}
+        planner_model = str(value.get("planner_model") or "").strip() or None
+        executor_model = str(value.get("executor_model") or "").strip() or None
+        if planner_model is not None or executor_model is not None:
+            extra_kwargs["pending_planner_model"] = planner_model
+            extra_kwargs["pending_executor_model"] = executor_model
         self.show_explicit_acp_model_selection(
             message_id,
             chat_id,
@@ -890,6 +916,7 @@ class ACPActivationMixin:
             pending_profile=str(value.get("model_profile") or "").strip() or None,
             pending_effort=str(value.get("model_effort") or "").strip() or None,
             show_loading=False,
+            **extra_kwargs,
         )
 
     def handle_refresh_acp_models(
@@ -906,6 +933,12 @@ class ACPActivationMixin:
             return
         tool = str(value.get("tool_name") or "").strip().lower()
         _system_module().invalidate_acp_model_cache(tool, project.root_path)
+        extra_kwargs: dict[str, Any] = {}
+        planner_model = str(value.get("planner_model") or "").strip() or None
+        executor_model = str(value.get("executor_model") or "").strip() or None
+        if planner_model is not None or executor_model is not None:
+            extra_kwargs["pending_planner_model"] = planner_model
+            extra_kwargs["pending_executor_model"] = executor_model
         self.show_explicit_acp_model_selection(
             message_id,
             chat_id,
@@ -915,6 +948,7 @@ class ACPActivationMixin:
             pending_group=str(value.get("model_group") or "").strip() or None,
             pending_profile=str(value.get("model_profile") or "").strip() or None,
             pending_effort=str(value.get("model_effort") or "").strip() or None,
+            **extra_kwargs,
         )
 
     def handle_select_acp_model(
@@ -943,38 +977,107 @@ class ACPActivationMixin:
             cwd=project.root_path,
             current_model=get_project_acp_model_name(project, chat_id, tool_name=tool),
         )
+        planner_model: Optional[str] = None
+        executor_model: Optional[str] = None
         if value.get("use_default_model") is True:
             model_name = None
             model_group = None
             model_profile = None
             model_effort = None
         else:
-            from ...card.render.model_cascade import compose_model_selection, parse_model_selection
+            from ...acp.agy_selection import is_agy_orchestrator_model, is_valid_agy_catalog_selection
+            from ...card.render.model_cascade import (
+                compose_model_selection,
+                parse_model_selection,
+                resolve_agy_orchestrator_cascade,
+            )
 
             group = str(value.get("model_group") or "").strip()
-            model_name = compose_model_selection(
-                models,
-                model=group,
-                profile=str(value.get("model_profile") or "").strip() or None,
-                effort=str(value.get("model_effort") or "").strip() or None,
-            )
-            if model_name is None:
-                self.reply_error(
-                    message_id,
-                    _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
-                )
-                return
-            canonical = parse_model_selection(models, model_name)
-            if canonical is None:
-                self.reply_error(
-                    message_id,
-                    _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
-                )
-                return
-            model_group = canonical.model
-            model_profile = canonical.profile
-            model_effort = canonical.effort
+            raw_profile = str(value.get("model_profile") or "").strip() or None
+            raw_effort = str(value.get("model_effort") or "").strip() or None
+            raw_planner_model = str(value.get("planner_model") or "").strip() or None
+            raw_executor_model = str(value.get("executor_model") or "").strip() or None
 
+            orch_probe = (
+                resolve_agy_orchestrator_cascade(models, orchestrator_model=group)
+                if tool in {"agy", "agy_b"} and is_agy_orchestrator_model(group)
+                else None
+            )
+            if orch_probe is not None and orch_probe.has_role_models:
+                if raw_planner_model and raw_planner_model not in orch_probe.role_model_names:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=raw_planner_model),
+                    )
+                    return
+                if raw_executor_model and raw_executor_model not in orch_probe.role_model_names:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=raw_executor_model),
+                    )
+                    return
+                orch_state = resolve_agy_orchestrator_cascade(
+                    models,
+                    orchestrator_model=group,
+                    pending_planner_model=raw_planner_model,
+                    pending_planner_effort=raw_profile,
+                    pending_executor_model=raw_executor_model,
+                    pending_executor_effort=raw_effort,
+                )
+                if (
+                    raw_profile
+                    and orch_state.planner_efforts
+                    and raw_profile.lower() not in orch_state.planner_efforts
+                ) or (
+                    raw_effort
+                    and orch_state.executor_efforts
+                    and raw_effort.lower() not in orch_state.executor_efforts
+                ):
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
+                    )
+                    return
+                model_name = orch_state.selection
+                if not is_valid_agy_catalog_selection(models, model_name):
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
+                    )
+                    return
+                model_group = group
+                model_profile = orch_state.selected_planner_effort
+                model_effort = orch_state.selected_executor_effort
+                planner_model = orch_state.selected_planner_model
+                executor_model = orch_state.selected_executor_model
+            else:
+                model_name = compose_model_selection(
+                    models,
+                    model=group,
+                    profile=raw_profile,
+                    effort=raw_effort,
+                )
+                if model_name is None:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
+                    )
+                    return
+                canonical = parse_model_selection(models, model_name)
+                if canonical is None:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=group),
+                    )
+                    return
+                model_group = canonical.model
+                model_profile = canonical.profile
+                model_effort = canonical.effort
+
+        activate_extra: dict[str, Any] = {}
+        if planner_model is not None or executor_model is not None:
+            activate_extra["planner_model"] = planner_model
+            activate_extra["executor_model"] = executor_model
         self._activate_acp_selection(
             message_id,
             chat_id,
@@ -985,6 +1088,7 @@ class ACPActivationMixin:
             model_group=model_group,
             model_profile=model_profile,
             model_effort=model_effort,
+            **activate_extra,
         )
 
     def handle_enter_acp_saved_selection(
@@ -1036,6 +1140,8 @@ class ACPActivationMixin:
         model_group: Optional[str] = None,
         model_profile: Optional[str] = None,
         model_effort: Optional[str] = None,
+        planner_model: Optional[str] = None,
+        executor_model: Optional[str] = None,
     ) -> None:
         """Validate, fence, connect/replace session, and commit ACP mode selection."""
         tool = (tool_name or "").strip().lower()
@@ -1174,6 +1280,8 @@ class ACPActivationMixin:
                         model_group=model_group,
                         model_profile=model_profile,
                         model_effort=model_effort,
+                        planner_model=planner_model,
+                        executor_model=executor_model,
                     )
                 )
                 _replace_status_card(failed_content)
@@ -1389,10 +1497,14 @@ class ACPActivationMixin:
                     if not _owns_activation():
                         return False
                     if target_project:
-                        if (
-                            self.project_manager.get_active_project(chat_id)
-                            is not target_project
+                        active_for_chat = self.project_manager.get_active_project(chat_id)
+                        if active_for_chat is None and callable(
+                            getattr(self.project_manager, "find_by_bound_chat_id", None)
                         ):
+                            bound_for_chat = self.project_manager.find_by_bound_chat_id(chat_id)
+                            if bound_for_chat is target_project:
+                                active_for_chat = bound_for_chat
+                        if active_for_chat is not target_project:
                             _retire_changed_effect()
                             _rollback_handler_model()
                             _publish_failure(
@@ -1626,13 +1738,12 @@ class ACPActivationMixin:
             if project
             else None
         )
-        model_names = self._model_names(
-            self._fetch_acp_models(
-                tool_name,
-                cwd=cwd,
-                current_model=current_model,
-            )
+        models = self._fetch_acp_models(
+            tool_name,
+            cwd=cwd,
+            current_model=current_model,
         )
+        model_names = self._model_names(models)
         if requested.lower() in {"list", "ls"}:
             self.reply_text(
                 message_id,
@@ -1644,11 +1755,16 @@ class ACPActivationMixin:
             )
             return
         model_name = None if requested.lower() == "default" else requested
+        valid_custom_agy = False
         if tool_name in {"agy", "agy_b"} and model_name:
-            from ...acp.agy_selection import normalize_agy_model_input
+            from ...acp.agy_selection import (
+                is_valid_agy_catalog_selection,
+                normalize_agy_model_input,
+            )
 
             model_name = normalize_agy_model_input(model_name, model_names)
-        if model_name and model_names and model_name not in model_names:
+            valid_custom_agy = is_valid_agy_catalog_selection(models, model_name)
+        if model_name and model_names and model_name not in model_names and not valid_custom_agy:
             self.reply_error(
                 message_id,
                 _system_module().UI_TEXT["system_acp_unknown_model"].format(model=model_name),
@@ -1704,9 +1820,13 @@ class ACPActivationMixin:
         """Show or update the active model's thinking/reasoning effort."""
         from ...acp.agy_selection import (
             AGY_ORCHESTRATOR_DEFAULT_PROFILE,
+            compose_agy_orchestrator_selection,
             is_agy_orchestrator_model,
         )
-        from ...card.render.model_cascade import resolve_model_cascade
+        from ...card.render.model_cascade import (
+            resolve_agy_orchestrator_cascade,
+            resolve_model_cascade,
+        )
 
         parts = (text or "").strip().split(maxsplit=1)
         requested = parts[1].strip() if len(parts) > 1 else ""
@@ -1748,97 +1868,184 @@ class ACPActivationMixin:
         )
 
         if is_agy_orch:
-            planner_choices = tuple(
-                dict.fromkeys(
-                    v.profile
-                    for v in model_variants
-                    if v.profile and v.profile != AGY_ORCHESTRATOR_DEFAULT_PROFILE
-                )
+            orch_state = resolve_agy_orchestrator_cascade(
+                models,
+                orchestrator_model=active_model,
+                current_model=current_model,
             )
-            executor_choices = tuple(
-                dict.fromkeys(v.effort for v in model_variants if v.effort)
-            )
-            planner_disp = " · ".join(f"`{e}`" for e in (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices))
-            executor_disp = " · ".join(f"`{e}`" for e in executor_choices)
-            if not requested:
-                cur_planner = state.selected_profile or AGY_ORCHESTRATOR_DEFAULT_PROFILE
-                cur_executor = (
-                    AGY_ORCHESTRATOR_DEFAULT_PROFILE
-                    if cur_planner == AGY_ORCHESTRATOR_DEFAULT_PROFILE
-                    else (state.selected_effort or AGY_ORCHESTRATOR_DEFAULT_PROFILE)
-                )
-                self.reply_text(
-                    message_id,
-                    _system_module().UI_TEXT["system_effort_orch_config_summary"].format(
-                        tool=tool_name,
-                        model=active_model,
-                        planner=cur_planner,
-                        executor=cur_executor,
-                        planner_available=planner_disp,
-                        executor_available=executor_disp,
-                    ),
-                )
-                return
+            if orch_state.has_role_models:
+                planner_choices = orch_state.planner_efforts
+                executor_choices = orch_state.executor_efforts
+                planner_disp = " · ".join(f"`{e}`" for e in (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices))
+                executor_disp = " · ".join(f"`{e}`" for e in executor_choices) or "`default`"
+                if not requested:
+                    self.reply_text(
+                        message_id,
+                        _system_module().UI_TEXT["system_effort_orch_config_summary"].format(
+                            tool=tool_name,
+                            model=active_model,
+                            planner=f"{orch_state.selected_planner_model}:{orch_state.selected_planner_effort or 'default'}",
+                            executor=f"{orch_state.selected_executor_model}:{orch_state.selected_executor_effort or 'default'}",
+                            planner_available=planner_disp,
+                            executor_available=executor_disp,
+                        ),
+                    )
+                    return
 
-            raw_tokens = (
-                [tok.strip().lower() for tok in requested.split("/", 1)]
-                if "/" in requested and " " not in requested
-                else [tok.strip().lower() for tok in requested.split()]
-            )
-            target_variant = None
-            if len(raw_tokens) == 1 and raw_tokens[0] == "default":
-                target_variant = next(
-                    (
-                        v
-                        for v in model_variants
-                        if v.profile == AGY_ORCHESTRATOR_DEFAULT_PROFILE
-                    ),
-                    None,
+                raw_tokens = (
+                    [tok.strip().lower() for tok in requested.split("/", 1)]
+                    if "/" in requested and " " not in requested
+                    else [tok.strip().lower() for tok in requested.split()]
                 )
-            elif len(raw_tokens) == 1:
-                eff = raw_tokens[0]
-                target_variant = next(
-                    (v for v in model_variants if v.profile == eff and v.effort == eff),
-                    None,
-                )
-                if target_variant is None:
-                    default_exec = getattr(active_opt, "default_reasoning_effort", None)
-                    if default_exec:
-                        target_variant = next(
-                            (
-                                v
-                                for v in model_variants
-                                if v.profile == eff and v.effort == default_exec
+                if len(raw_tokens) == 1 and raw_tokens[0] == "default":
+                    next_model_name = active_model
+                elif len(raw_tokens) == 1:
+                    eff = raw_tokens[0]
+                    if (planner_choices and eff not in planner_choices) or (
+                        executor_choices and eff not in executor_choices
+                    ):
+                        self.reply_error(
+                            message_id,
+                            _system_module().UI_TEXT["system_effort_unsupported"].format(
+                                model=active_model,
+                                effort=requested,
+                                available=f"Planner: {planner_disp} / Executor: {executor_disp}",
                             ),
-                            None,
                         )
-                if target_variant is None:
+                        return
+                    next_model_name = compose_agy_orchestrator_selection(
+                        active_model,
+                        eff if planner_choices else None,
+                        eff if executor_choices else None,
+                        planner_model=orch_state.selected_planner_model,
+                        executor_model=orch_state.selected_executor_model,
+                    )
+                elif len(raw_tokens) == 2:
+                    p_eff, e_eff = raw_tokens
+                    if (
+                        (planner_choices and p_eff not in planner_choices)
+                        or (not planner_choices and p_eff != "default")
+                        or (executor_choices and e_eff not in executor_choices)
+                        or (not executor_choices and e_eff != "default")
+                    ):
+                        self.reply_error(
+                            message_id,
+                            _system_module().UI_TEXT["system_effort_unsupported"].format(
+                                model=active_model,
+                                effort=requested,
+                                available=f"Planner: {planner_disp} / Executor: {executor_disp}",
+                            ),
+                        )
+                        return
+                    next_model_name = compose_agy_orchestrator_selection(
+                        active_model,
+                        None if p_eff == "default" else p_eff,
+                        None if e_eff == "default" else e_eff,
+                        planner_model=orch_state.selected_planner_model,
+                        executor_model=orch_state.selected_executor_model,
+                    )
+                else:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_effort_unsupported"].format(
+                            model=active_model,
+                            effort=requested,
+                            available=f"Planner: {planner_disp} / Executor: {executor_disp}",
+                        ),
+                    )
+                    return
+            else:
+                planner_choices = tuple(
+                    dict.fromkeys(
+                        v.profile
+                        for v in model_variants
+                        if v.profile and v.profile != AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                    )
+                )
+                executor_choices = tuple(
+                    dict.fromkeys(v.effort for v in model_variants if v.effort)
+                )
+                planner_disp = " · ".join(f"`{e}`" for e in (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices))
+                executor_disp = " · ".join(f"`{e}`" for e in executor_choices)
+                if not requested:
+                    cur_planner = state.selected_profile or AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                    cur_executor = (
+                        AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                        if cur_planner == AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                        else (state.selected_effort or AGY_ORCHESTRATOR_DEFAULT_PROFILE)
+                    )
+                    self.reply_text(
+                        message_id,
+                        _system_module().UI_TEXT["system_effort_orch_config_summary"].format(
+                            tool=tool_name,
+                            model=active_model,
+                            planner=cur_planner,
+                            executor=cur_executor,
+                            planner_available=planner_disp,
+                            executor_available=executor_disp,
+                        ),
+                    )
+                    return
+
+                raw_tokens = (
+                    [tok.strip().lower() for tok in requested.split("/", 1)]
+                    if "/" in requested and " " not in requested
+                    else [tok.strip().lower() for tok in requested.split()]
+                )
+                target_variant = None
+                if len(raw_tokens) == 1 and raw_tokens[0] == "default":
                     target_variant = next(
-                        (v for v in model_variants if v.profile == eff and v.effort),
+                        (
+                            v
+                            for v in model_variants
+                            if v.profile == AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                        ),
                         None,
                     )
-            elif len(raw_tokens) == 2:
-                p_eff, e_eff = raw_tokens
-                target_variant = next(
-                    (
-                        v
-                        for v in model_variants
-                        if v.profile == p_eff and v.effort == e_eff
-                    ),
-                    None,
-                )
+                elif len(raw_tokens) == 1:
+                    eff = raw_tokens[0]
+                    target_variant = next(
+                        (v for v in model_variants if v.profile == eff and v.effort == eff),
+                        None,
+                    )
+                    if target_variant is None:
+                        default_exec = getattr(active_opt, "default_reasoning_effort", None)
+                        if default_exec:
+                            target_variant = next(
+                                (
+                                    v
+                                    for v in model_variants
+                                    if v.profile == eff and v.effort == default_exec
+                                ),
+                                None,
+                            )
+                    if target_variant is None:
+                        target_variant = next(
+                            (v for v in model_variants if v.profile == eff and v.effort),
+                            None,
+                        )
+                elif len(raw_tokens) == 2:
+                    p_eff, e_eff = raw_tokens
+                    target_variant = next(
+                        (
+                            v
+                            for v in model_variants
+                            if v.profile == p_eff and v.effort == e_eff
+                        ),
+                        None,
+                    )
 
-            if target_variant is None:
-                self.reply_error(
-                    message_id,
-                    _system_module().UI_TEXT["system_effort_unsupported"].format(
-                        model=active_model,
-                        effort=requested,
-                        available=f"Planner: {planner_disp} / Executor: {executor_disp}",
-                    ),
-                )
-                return
-            next_model_name: Optional[str] = target_variant.value
+                if target_variant is None:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_effort_unsupported"].format(
+                            model=active_model,
+                            effort=requested,
+                            available=f"Planner: {planner_disp} / Executor: {executor_disp}",
+                        ),
+                    )
+                    return
+                next_model_name = target_variant.value
         else:
             active_profile = state.selected_profile
             efforts = tuple(

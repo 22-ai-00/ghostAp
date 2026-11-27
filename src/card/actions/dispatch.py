@@ -102,6 +102,8 @@ REFRESH_ACP_MODELS = "refresh_acp_models"
 SELECT_ACP_MODEL_GROUP = "select_acp_model_group"
 SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"
 SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"
+SELECT_ACP_ORCH_PLANNER_MODEL = "select_acp_orch_planner_model"
+SELECT_ACP_ORCH_EXECUTOR_MODEL = "select_acp_orch_executor_model"
 SHOW_TOOL_COMMANDS = "show_tool_commands"
 RUN_NATIVE_TOOL_COMMAND = "run_native_tool_command"
 
@@ -116,6 +118,8 @@ SETTINGS_SELECT_TOOL = "settings_select_tool"
 SETTINGS_SELECT_MODEL_GROUP = "settings_select_model_group"
 SETTINGS_SELECT_MODEL_PROFILE = "settings_select_model_profile"
 SETTINGS_SELECT_MODEL_EFFORT = "settings_select_model_effort"
+SETTINGS_SELECT_ORCH_PLANNER_MODEL = "settings_select_orch_planner_model"
+SETTINGS_SELECT_ORCH_EXECUTOR_MODEL = "settings_select_orch_executor_model"
 SETTINGS_TOGGLE_SHOW_THINKING = "settings_toggle_show_thinking"
 SETTINGS_SELECT_VERBOSITY = "settings_select_verbosity"
 SETTINGS_SELECT_AGENT_MODE = "settings_select_agent_mode"
@@ -131,6 +135,8 @@ TOOL_COCKPIT_ACTIONS = frozenset(
         SETTINGS_SELECT_MODEL_GROUP,
         SETTINGS_SELECT_MODEL_PROFILE,
         SETTINGS_SELECT_MODEL_EFFORT,
+        SETTINGS_SELECT_ORCH_PLANNER_MODEL,
+        SETTINGS_SELECT_ORCH_EXECUTOR_MODEL,
         SETTINGS_TOGGLE_SHOW_THINKING,
         SETTINGS_SELECT_VERBOSITY,
         SETTINGS_SELECT_AGENT_MODE,

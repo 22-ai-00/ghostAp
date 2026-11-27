@@ -560,6 +560,8 @@ def validate_agent_binding_spec(
     base_model: Optional[str] = raw_model
     emb_profile: Optional[str] = None
     emb_effort: Optional[str] = None
+    agy_planner_model: Optional[str] = None
+    agy_executor_model: Optional[str] = None
     traex_meta = None
 
     if tool in {"claude", "claude_w"}:
@@ -586,6 +588,8 @@ def validate_agent_binding_spec(
                 base_model = parsed.model_id
                 emb_profile = parsed.planner_effort
                 emb_effort = parsed.executor_effort
+                agy_planner_model = parsed.planner_model
+                agy_executor_model = parsed.executor_model
             else:
                 try:
                     base_model, emb_effort = split_agy_model_selection(raw_model)
@@ -638,7 +642,16 @@ def validate_agent_binding_spec(
                         f"（可用: {', '.join(allowed_profiles)}）",
                     )
         elif tool in {"agy", "agy_b"} and base_model and is_agy_orchestrator_model(base_model):
-            allowed_planner = set(AGY_REASONING_EFFORTS) | {AGY_ORCHESTRATOR_DEFAULT_PROFILE}
+            plan_target = agy_planner_model or base_model
+            plan_efforts = (
+                cap.efforts_by_model.get(plan_target)
+                or cap.efforts_by_model.get(base_model)
+            )
+            allowed_planner = (
+                set(plan_efforts) | {AGY_ORCHESTRATOR_DEFAULT_PROFILE}
+                if plan_efforts
+                else set(AGY_REASONING_EFFORTS) | {AGY_ORCHESTRATOR_DEFAULT_PROFILE}
+            )
             if effective_profile not in allowed_planner:
                 return (
                     False,
@@ -715,7 +728,11 @@ def validate_agent_binding_spec(
                 )
         elif tool in {"agy", "agy_b"}:
             if base_model and is_agy_orchestrator_model(base_model):
-                model_efforts = cap.efforts_by_model.get(base_model)
+                exec_target = agy_executor_model or base_model
+                model_efforts = (
+                    cap.efforts_by_model.get(exec_target)
+                    or cap.efforts_by_model.get(base_model)
+                )
                 allowed = (
                     set(model_efforts) | {AGY_ORCHESTRATOR_DEFAULT_PROFILE}
                     if model_efforts

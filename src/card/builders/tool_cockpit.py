@@ -16,7 +16,11 @@ from src.acp.agy_selection import is_agy_orchestrator_model
 from src.acp.options import ACPModelOption, ACPModelSelectionVariant
 from src.card.actions import dispatch as action_ids
 from src.card.backend_meta import get_backend_meta
-from src.card.render.model_cascade import resolve_model_cascade
+from src.card.render.model_cascade import (
+    AGYOrchestratorCascadeState,
+    resolve_agy_orchestrator_cascade,
+    resolve_model_cascade,
+)
 from src.card.schema import require_card_json_2
 from src.card.shared import build_callback_button, build_responsive_layout
 from src.card.shared.text_safety import neutralize_feishu_rich_text_controls
@@ -664,6 +668,8 @@ def _render_model_cascade_elements(
     tool: str,
     state: Any,
     payload_fn: Any,
+    *,
+    orch_state: AGYOrchestratorCascadeState | None = None,
 ) -> list[dict[str, Any]]:
     """Build ``model_group``, ``model_profile``, and ``model_effort`` elements."""
     elements: list[dict[str, Any]] = []
@@ -708,6 +714,67 @@ def _render_model_cascade_elements(
     )
 
     is_agy_orch = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
+    if orch_state is not None and orch_state.has_role_models:
+        capped_role_models = _cap_options_preserving(
+            orch_state.role_model_names,
+            keep=(orch_state.selected_planner_model, orch_state.selected_executor_model),
+            limit=_MAX_SELECT_OPTIONS,
+        )
+        role_options = [(m, m) for m in capped_role_models]
+        elements.append({"tag": "markdown", "content": UI_TEXT["system_acp_agy_orchestrator_planner_model_label"]})
+        elements.append(
+            _build_select_static(
+                name="planner_model",
+                placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_model_placeholder"],
+                options=role_options,
+                selected=orch_state.selected_planner_model,
+                callback=payload_fn(action_ids.SETTINGS_SELECT_ORCH_PLANNER_MODEL),
+            )
+        )
+        if orch_state.planner_efforts:
+            capped_p_efforts = _cap_options_preserving(
+                orch_state.planner_efforts,
+                keep=(orch_state.selected_planner_effort,),
+                limit=_MAX_SELECT_OPTIONS,
+            )
+            elements.append({"tag": "markdown", "content": UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"]})
+            elements.append(
+                _build_select_static(
+                    name="model_profile",
+                    placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"],
+                    options=[(p, p) for p in capped_p_efforts],
+                    selected=orch_state.selected_planner_effort,
+                    callback=payload_fn(action_ids.SETTINGS_SELECT_MODEL_PROFILE),
+                )
+            )
+        elements.append({"tag": "markdown", "content": UI_TEXT["system_acp_agy_orchestrator_executor_model_label"]})
+        elements.append(
+            _build_select_static(
+                name="executor_model",
+                placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_model_placeholder"],
+                options=role_options,
+                selected=orch_state.selected_executor_model,
+                callback=payload_fn(action_ids.SETTINGS_SELECT_ORCH_EXECUTOR_MODEL),
+            )
+        )
+        if orch_state.executor_efforts:
+            capped_e_efforts = _cap_options_preserving(
+                orch_state.executor_efforts,
+                keep=(orch_state.selected_executor_effort,),
+                limit=_MAX_SELECT_OPTIONS,
+            )
+            elements.append({"tag": "markdown", "content": UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"]})
+            elements.append(
+                _build_select_static(
+                    name="model_effort",
+                    placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"],
+                    options=[(e, e) for e in capped_e_efforts],
+                    selected=orch_state.selected_executor_effort,
+                    callback=payload_fn(action_ids.SETTINGS_SELECT_MODEL_EFFORT),
+                )
+            )
+        return elements
+
     if state.profiles:
         capped_profiles = _cap_options_preserving(
             state.profiles,
@@ -927,6 +994,21 @@ class ToolCockpitBuilder:
             selected_profile=pending_profile or _get_field(settings_snapshot, "pending_profile"),
             selected_effort=pending_effort or _get_field(settings_snapshot, "pending_effort"),
         )
+        is_agy_orch = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
+        orch_state = (
+            resolve_agy_orchestrator_cascade(
+                coerced_models,
+                orchestrator_model=state.selected_model,
+                current_model=current_model,
+                pending_planner_model=_get_field(settings_snapshot, "pending_planner_model"),
+                pending_planner_effort=pending_profile or _get_field(settings_snapshot, "pending_profile"),
+                pending_executor_model=_get_field(settings_snapshot, "pending_executor_model"),
+                pending_executor_effort=pending_effort or _get_field(settings_snapshot, "pending_effort"),
+            )
+            if is_agy_orch
+            else None
+        )
+        use_orch_roles = bool(orch_state is not None and orch_state.has_role_models)
         show_thinking, verbosity, agent_mode = _extract_agy_runtime_values(settings_snapshot)
 
         def _settings_payload(action: str, **updates: Any) -> dict[str, Any]:
@@ -936,9 +1018,20 @@ class ToolCockpitBuilder:
                 "project_id": project_id,
                 "current_model": current_model,
                 "model_group": state.selected_model or None,
-                "model_profile": state.selected_profile,
-                "model_effort": state.selected_effort,
+                "model_profile": (
+                    orch_state.selected_planner_effort
+                    if (use_orch_roles and orch_state is not None)
+                    else state.selected_profile
+                ),
+                "model_effort": (
+                    orch_state.selected_executor_effort
+                    if (use_orch_roles and orch_state is not None)
+                    else state.selected_effort
+                ),
             }
+            if use_orch_roles and orch_state is not None:
+                data["planner_model"] = orch_state.selected_planner_model
+                data["executor_model"] = orch_state.selected_executor_model
             if thread_root_id:
                 data["thread_root_id"] = thread_root_id
             if tool in {"agy", "agy_b"}:
@@ -956,7 +1049,11 @@ class ToolCockpitBuilder:
                 CoreBuilder._build_banner_element(_safe_one_line(status_banner, limit=140), type=b_type)
             )
 
-        active_model = current_model or state.selection or UI_TEXT["system_tool_settings_default_model"]
+        active_model = (
+            current_model
+            or (orch_state.selection if (use_orch_roles and orch_state is not None) else state.selection)
+            or UI_TEXT["system_tool_settings_default_model"]
+        )
         elements.append(
             {
                 "tag": "markdown",
@@ -980,7 +1077,7 @@ class ToolCockpitBuilder:
                 callback=_settings_payload(action_ids.SETTINGS_SELECT_TOOL),
             )
         )
-        elements.extend(_render_model_cascade_elements(tool, state, _settings_payload))
+        elements.extend(_render_model_cascade_elements(tool, state, _settings_payload, orch_state=orch_state))
 
         if tool in {"agy", "agy_b"}:
             elements.extend(

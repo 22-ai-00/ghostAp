@@ -28,6 +28,8 @@ SETTINGS_SELECT_TOOL = getattr(action_ids, "SETTINGS_SELECT_TOOL", "settings_sel
 SETTINGS_SELECT_MODEL_GROUP = getattr(action_ids, "SETTINGS_SELECT_MODEL_GROUP", "settings_select_model_group")
 SETTINGS_SELECT_MODEL_PROFILE = getattr(action_ids, "SETTINGS_SELECT_MODEL_PROFILE", "settings_select_model_profile")
 SETTINGS_SELECT_MODEL_EFFORT = getattr(action_ids, "SETTINGS_SELECT_MODEL_EFFORT", "settings_select_model_effort")
+SETTINGS_SELECT_ORCH_PLANNER_MODEL = getattr(action_ids, "SETTINGS_SELECT_ORCH_PLANNER_MODEL", "settings_select_orch_planner_model")
+SETTINGS_SELECT_ORCH_EXECUTOR_MODEL = getattr(action_ids, "SETTINGS_SELECT_ORCH_EXECUTOR_MODEL", "settings_select_orch_executor_model")
 SETTINGS_TOGGLE_SHOW_THINKING = getattr(action_ids, "SETTINGS_TOGGLE_SHOW_THINKING", "settings_toggle_show_thinking")
 SETTINGS_SELECT_VERBOSITY = getattr(action_ids, "SETTINGS_SELECT_VERBOSITY", "settings_select_verbosity")
 SETTINGS_SELECT_AGENT_MODE = getattr(action_ids, "SETTINGS_SELECT_AGENT_MODE", "settings_select_agent_mode")
@@ -764,6 +766,8 @@ class ToolCockpitMixin:
             SETTINGS_SELECT_MODEL_GROUP,
             SETTINGS_SELECT_MODEL_PROFILE,
             SETTINGS_SELECT_MODEL_EFFORT,
+            SETTINGS_SELECT_ORCH_PLANNER_MODEL,
+            SETTINGS_SELECT_ORCH_EXECUTOR_MODEL,
         }:
             self._handle_cockpit_select_model_dimension(
                 message_id,
@@ -915,9 +919,11 @@ class ToolCockpitMixin:
         thread_root_id: Optional[str],
     ) -> None:
         """Handle model group, profile, or effort selection and persist/hot-sync."""
+        from ...acp.agy_selection import is_agy_orchestrator_model
         from ...card.render.model_cascade import (
             available_model_names,
             compose_model_selection,
+            resolve_agy_orchestrator_cascade,
             resolve_model_cascade,
         )
 
@@ -937,6 +943,34 @@ class ToolCockpitMixin:
 
         group = str(payload.get("model_group") or "").strip() or None
         profile = str(payload.get("model_profile") or "").strip() or None
+        planner_model = str(payload.get("planner_model") or "").strip() or None
+        executor_model = str(payload.get("executor_model") or "").strip() or None
+
+        def _maybe_orch_cascade(
+            orch_model: Optional[str],
+            *,
+            p_model: Optional[str] = None,
+            p_eff: Optional[str] = None,
+            e_model: Optional[str] = None,
+            e_eff: Optional[str] = None,
+        ):
+            if not (
+                models
+                and tool_name in {"agy", "agy_b"}
+                and orch_model
+                and is_agy_orchestrator_model(orch_model)
+            ):
+                return None
+            probe = resolve_agy_orchestrator_cascade(
+                models,
+                orchestrator_model=orch_model,
+                current_model=current_model,
+                pending_planner_model=p_model,
+                pending_planner_effort=p_eff,
+                pending_executor_model=e_model,
+                pending_executor_effort=e_eff,
+            )
+            return probe if probe.has_role_models else None
 
         next_model_name: Optional[str]
         if action == SETTINGS_SELECT_MODEL_GROUP:
@@ -951,22 +985,26 @@ class ToolCockpitMixin:
                 )
                 return
             else:
-                state = resolve_model_cascade(
-                    models,
-                    current_model=current_model,
-                    selected_model=selected,
-                    selected_profile=None,
-                    selected_effort=None,
-                )
-                next_model_name = (
-                    compose_model_selection(
+                orch_state = _maybe_orch_cascade(selected)
+                if orch_state is not None:
+                    next_model_name = orch_state.selection
+                else:
+                    state = resolve_model_cascade(
                         models,
-                        model=state.selected_model,
-                        profile=state.selected_profile,
-                        effort=state.selected_effort,
+                        current_model=current_model,
+                        selected_model=selected,
+                        selected_profile=None,
+                        selected_effort=None,
                     )
-                    or state.selection
-                )
+                    next_model_name = (
+                        compose_model_selection(
+                            models,
+                            model=state.selected_model,
+                            profile=state.selected_profile,
+                            effort=state.selected_effort,
+                        )
+                        or state.selection
+                    )
         else:
             if not models:
                 self.reply_error(
@@ -974,7 +1012,82 @@ class ToolCockpitMixin:
                     _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
                 )
                 return
-            if action == SETTINGS_SELECT_MODEL_PROFILE:
+            orch_base = group or (
+                current_model.split("/", 1)[0].strip()
+                if current_model and is_agy_orchestrator_model(current_model)
+                else None
+            )
+            if action in {
+                SETTINGS_SELECT_ORCH_PLANNER_MODEL,
+                SETTINGS_SELECT_ORCH_EXECUTOR_MODEL,
+            }:
+                orch_probe = _maybe_orch_cascade(orch_base)
+                if orch_probe is None or selected not in orch_probe.role_model_names:
+                    self.reply_error(
+                        message_id,
+                        _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
+                    )
+                    return
+                if action == SETTINGS_SELECT_ORCH_PLANNER_MODEL:
+                    orch_state = _maybe_orch_cascade(
+                        orch_base,
+                        p_model=selected,
+                        p_eff=None,
+                        e_model=executor_model,
+                        e_eff=str(payload.get("model_effort") or "").strip() or None,
+                    )
+                else:
+                    orch_state = _maybe_orch_cascade(
+                        orch_base,
+                        p_model=planner_model,
+                        p_eff=profile,
+                        e_model=selected,
+                        e_eff=None,
+                    )
+                assert orch_state is not None
+                next_model_name = orch_state.selection
+            elif (
+                tool_name in {"agy", "agy_b"}
+                and orch_base
+                and is_agy_orchestrator_model(orch_base)
+                and (orch_probe := _maybe_orch_cascade(
+                    orch_base,
+                    p_model=planner_model,
+                    e_model=executor_model,
+                )) is not None
+            ):
+                effort_val = str(payload.get("model_effort") or "").strip() or None
+                if action == SETTINGS_SELECT_MODEL_PROFILE:
+                    if orch_probe.planner_efforts and selected.lower() not in orch_probe.planner_efforts:
+                        self.reply_error(
+                            message_id,
+                            _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
+                        )
+                        return
+                    orch_state = _maybe_orch_cascade(
+                        orch_base,
+                        p_model=planner_model,
+                        p_eff=selected,
+                        e_model=executor_model,
+                        e_eff=effort_val,
+                    )
+                else:
+                    if orch_probe.executor_efforts and selected.lower() not in orch_probe.executor_efforts:
+                        self.reply_error(
+                            message_id,
+                            _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
+                        )
+                        return
+                    orch_state = _maybe_orch_cascade(
+                        orch_base,
+                        p_model=planner_model,
+                        p_eff=profile,
+                        e_model=executor_model,
+                        e_eff=selected,
+                    )
+                assert orch_state is not None
+                next_model_name = orch_state.selection
+            elif action == SETTINGS_SELECT_MODEL_PROFILE:
                 state = resolve_model_cascade(
                     models,
                     current_model=current_model,
@@ -988,6 +1101,15 @@ class ToolCockpitMixin:
                         _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
                     )
                     return
+                next_model_name = (
+                    compose_model_selection(
+                        models,
+                        model=state.selected_model,
+                        profile=state.selected_profile,
+                        effort=state.selected_effort,
+                    )
+                    or state.selection
+                )
             else:
                 state = resolve_model_cascade(
                     models,
@@ -1002,15 +1124,15 @@ class ToolCockpitMixin:
                         _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
                     )
                     return
-            next_model_name = (
-                compose_model_selection(
-                    models,
-                    model=state.selected_model,
-                    profile=state.selected_profile,
-                    effort=state.selected_effort,
+                next_model_name = (
+                    compose_model_selection(
+                        models,
+                        model=state.selected_model,
+                        profile=state.selected_profile,
+                        effort=state.selected_effort,
+                    )
+                    or state.selection
                 )
-                or state.selection
-            )
 
         tool_spec = BACKEND_META_BY_KEY.get(tool_name)
         if tool_spec is not None and tool_spec.uses_claude_cli and next_model_name:

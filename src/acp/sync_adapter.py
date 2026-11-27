@@ -949,6 +949,11 @@ class SyncACPSession(PromptGenerationTracker):
                 raise RuntimeError(
                     f"AGY ACP rejected selected model: {self._model_name}"
                 )
+        elif self._uses_agy_acp():
+            from .agy_selection import AGY_DEFAULT_MODEL_ID
+
+            with contextlib.suppress(Exception):
+                await self._apply_agy_selection(AGY_DEFAULT_MODEL_ID)
         return session_id
 
     def load_session(self, session_id: str, timeout: float) -> None:

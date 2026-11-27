@@ -513,9 +513,14 @@ class ProjectManager:
         with self._lock:
             project_id = self._active_project.get(chat_id)
             ctx = self._projects.get(project_id) if project_id else None
-            if ctx and not self._is_visible(ctx, chat_id):
-                return None
-            return ctx
+            if ctx is not None:
+                return ctx if self._is_visible(ctx, chat_id) else None
+            if chat_id:
+                bound_id = self._bound_chat_index.get(chat_id)
+                bound_ctx = self._projects.get(bound_id) if bound_id else None
+                if bound_ctx is not None and self._is_visible(bound_ctx, chat_id):
+                    return bound_ctx
+            return None
 
     def set_active_project(self, chat_id: str, project_id: str) -> tuple[bool, str]:
         eviction_info: tuple[str, str, str] | None = None  # (evicted_chat_id, project_name, project_id)
@@ -775,6 +780,8 @@ class ProjectManager:
                     else:
                         return False, None
                 snapshot = self._binding_snapshot(project)
+            had_prev_active = chat_id in self._active_project
+            prev_active = self._active_project.get(chat_id)
             project.bound_chat_id = chat_id
             project.bound_chat_name = chat_name
             project.bound_chat_created_at = created_at
@@ -784,6 +791,7 @@ class ProjectManager:
             project.add_chat_id(chat_id)
             if additional_chat_id and additional_chat_id != chat_id:
                 project.add_chat_id(additional_chat_id)
+            self._active_project[chat_id] = project_id
             expected = self._binding_snapshot(project)
             if operation_id:
                 self._managed_chat_binding_sagas[operation_id] = (
@@ -820,6 +828,10 @@ class ProjectManager:
             project.owner_chat_id = snapshot.owner_chat_id
             project.project_name = snapshot.project_name
             project.managed_binding_generation = snapshot.binding_generation
+            if had_prev_active and prev_active is not None:
+                self._active_project[chat_id] = prev_active
+            else:
+                self._active_project.pop(chat_id, None)
             if was_quarantined:
                 self._quarantined_bound_chat_ids.add(chat_id)
             if operation_id and existing_saga is None:
@@ -848,6 +860,20 @@ class ProjectManager:
                 project_name=project.project_name,
                 binding_generation=project.managed_binding_generation,
             )
+            prev_active_cur = (
+                self._active_project.get(current.bound_chat_id)
+                if current.bound_chat_id
+                else None
+            )
+            had_prev_active_snap = (
+                bool(snapshot.bound_chat_id)
+                and snapshot.bound_chat_id in self._active_project
+            )
+            prev_active_snap = (
+                self._active_project.get(snapshot.bound_chat_id)
+                if snapshot.bound_chat_id
+                else None
+            )
             project.bound_chat_id = snapshot.bound_chat_id
             project.bound_chat_name = snapshot.bound_chat_name
             project.bound_chat_created_at = snapshot.bound_chat_created_at
@@ -855,6 +881,14 @@ class ProjectManager:
             project.owner_chat_id = snapshot.owner_chat_id
             project.project_name = snapshot.project_name
             project.managed_binding_generation = snapshot.binding_generation
+            if (
+                current.bound_chat_id
+                and current.bound_chat_id != snapshot.bound_chat_id
+                and prev_active_cur == project_id
+            ):
+                self._active_project.pop(current.bound_chat_id, None)
+            if snapshot.bound_chat_id:
+                self._active_project[snapshot.bound_chat_id] = project_id
             old_saga = self._managed_chat_binding_sagas.pop(operation_id, None)
             if self._save_projects():
                 return True
@@ -865,6 +899,13 @@ class ProjectManager:
             project.owner_chat_id = current.owner_chat_id
             project.project_name = current.project_name
             project.managed_binding_generation = current.binding_generation
+            if current.bound_chat_id and prev_active_cur is not None:
+                self._active_project[current.bound_chat_id] = prev_active_cur
+            if snapshot.bound_chat_id and snapshot.bound_chat_id != current.bound_chat_id:
+                if had_prev_active_snap and prev_active_snap is not None:
+                    self._active_project[snapshot.bound_chat_id] = prev_active_snap
+                else:
+                    self._active_project.pop(snapshot.bound_chat_id, None)
             if old_saga is not None:
                 self._managed_chat_binding_sagas[operation_id] = old_saga
             self._rebuild_bound_chat_index()
@@ -1086,12 +1127,19 @@ class ProjectManager:
                 project.bound_chat_created_at,
                 OrderedDict(project.allowed_chat_ids),
             )
+            prev_active = (
+                self._active_project.pop(chat_id)
+                if self._active_project.get(chat_id) == project.project_id
+                else None
+            )
             project.bound_chat_id = ""
             project.bound_chat_name = ""
             project.bound_chat_created_at = 0.0
             project.allowed_chat_ids.pop(chat_id, None)
             if self._save_projects():
                 return True
+            if prev_active is not None:
+                self._active_project[chat_id] = prev_active
             (
                 project.bound_chat_id,
                 project.bound_chat_name,

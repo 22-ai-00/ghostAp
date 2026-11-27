@@ -178,6 +178,8 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         action_ids.SELECT_ACP_MODEL_GROUP,
         action_ids.SELECT_ACP_MODEL_PROFILE,
         action_ids.SELECT_ACP_MODEL_EFFORT,
+        action_ids.SELECT_ACP_ORCH_PLANNER_MODEL,
+        action_ids.SELECT_ACP_ORCH_EXECUTOR_MODEL,
     ):
         actions[action] = system.handle_acp_model_cascade_select
     actions[action_ids.OPEN_ACP_MODEL_PICKER] = system.handle_open_acp_model_picker

@@ -770,16 +770,23 @@ class SystemBuilder:
         pending_group: Optional[str] = None,
         pending_profile: Optional[str] = None,
         pending_effort: Optional[str] = None,
+        pending_planner_model: Optional[str] = None,
+        pending_executor_model: Optional[str] = None,
         context_markdown: Optional[str] = None,
         group_action: str = action_ids.SELECT_ACP_MODEL_GROUP,
         profile_action: str = action_ids.SELECT_ACP_MODEL_PROFILE,
         effort_action: str = action_ids.SELECT_ACP_MODEL_EFFORT,
+        planner_model_action: str = action_ids.SELECT_ACP_ORCH_PLANNER_MODEL,
+        executor_model_action: str = action_ids.SELECT_ACP_ORCH_EXECUTOR_MODEL,
         select_action: str = action_ids.SELECT_ACP_MODEL,
         refresh_action: str = action_ids.REFRESH_ACP_MODELS,
         value_extra: Optional[dict] = None,
     ) -> tuple[str, str]:
         """Build the explicit model picker without activating a programming mode."""
-        from src.card.render.model_cascade import resolve_model_cascade
+        from src.card.render.model_cascade import (
+            resolve_agy_orchestrator_cascade,
+            resolve_model_cascade,
+        )
 
         tool = str(tool_name or "").strip().lower()
         state = resolve_model_cascade(
@@ -789,6 +796,24 @@ class SystemBuilder:
             selected_profile=pending_profile,
             selected_effort=pending_effort,
         )
+        is_agy_orchestrator = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
+        orch_state = (
+            resolve_agy_orchestrator_cascade(
+                models,
+                orchestrator_model=state.selected_model,
+                current_model=current_model,
+                pending_planner_model=pending_planner_model,
+                pending_planner_effort=pending_profile,
+                pending_executor_model=pending_executor_model,
+                pending_executor_effort=pending_effort,
+            )
+            if is_agy_orchestrator
+            else None
+        )
+        use_orch_roles = bool(orch_state is not None and orch_state.has_role_models)
+        active_profile = orch_state.selected_planner_effort if (use_orch_roles and orch_state) else state.selected_profile
+        active_effort = orch_state.selected_executor_effort if (use_orch_roles and orch_state) else state.selected_effort
+        active_selection = orch_state.selection if (use_orch_roles and orch_state) else state.selection
 
         def payload(action: str, **updates: object) -> dict:
             value = dict(value_extra or {})
@@ -799,10 +824,13 @@ class SystemBuilder:
                     "project_id": project_id,
                     "current_model": current_model,
                     "model_group": state.selected_model,
-                    "model_profile": state.selected_profile,
-                    "model_effort": state.selected_effort,
+                    "model_profile": active_profile,
+                    "model_effort": active_effort,
                 }
             )
+            if use_orch_roles and orch_state is not None:
+                value["planner_model"] = orch_state.selected_planner_model
+                value["executor_model"] = orch_state.selected_executor_model
             if thread_root_id:
                 value["thread_root_id"] = thread_root_id
             value.update(updates)
@@ -862,59 +890,122 @@ class SystemBuilder:
                     ),
                 ]
             )
-            is_agy_orchestrator = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
-            if state.profiles:
-                profile_label = (
-                    UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"]
-                    if is_agy_orchestrator
-                    else UI_TEXT["system_acp_model_profile_label"]
-                )
-                profile_placeholder = (
-                    UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"]
-                    if is_agy_orchestrator
-                    else UI_TEXT["system_acp_model_profile_placeholder"]
-                )
+            if use_orch_roles and orch_state is not None:
                 elements.extend(
                     [
                         {
                             "tag": "markdown",
-                            "content": profile_label,
+                            "content": UI_TEXT["system_acp_agy_orchestrator_planner_model_label"],
                         },
                         select_static(
-                            name="model_profile",
-                            placeholder=profile_placeholder,
-                            values=state.profiles,
-                            selected=state.selected_profile,
-                            action=profile_action,
+                            name="planner_model",
+                            placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_model_placeholder"],
+                            values=orch_state.role_model_names,
+                            selected=orch_state.selected_planner_model,
+                            action=planner_model_action,
                         ),
                     ]
                 )
-            if state.efforts:
-                effort_label = (
-                    UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"]
-                    if is_agy_orchestrator
-                    else UI_TEXT["system_acp_model_effort_label"]
-                )
-                effort_placeholder = (
-                    UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"]
-                    if is_agy_orchestrator
-                    else UI_TEXT["system_acp_model_effort_placeholder"]
-                )
+                if orch_state.planner_efforts:
+                    elements.extend(
+                        [
+                            {
+                                "tag": "markdown",
+                                "content": UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"],
+                            },
+                            select_static(
+                                name="model_profile",
+                                placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"],
+                                values=orch_state.planner_efforts,
+                                selected=orch_state.selected_planner_effort,
+                                action=profile_action,
+                            ),
+                        ]
+                    )
                 elements.extend(
                     [
                         {
                             "tag": "markdown",
-                            "content": effort_label,
+                            "content": UI_TEXT["system_acp_agy_orchestrator_executor_model_label"],
                         },
                         select_static(
-                            name="model_effort",
-                            placeholder=effort_placeholder,
-                            values=state.efforts,
-                            selected=state.selected_effort,
-                            action=effort_action,
+                            name="executor_model",
+                            placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_model_placeholder"],
+                            values=orch_state.role_model_names,
+                            selected=orch_state.selected_executor_model,
+                            action=executor_model_action,
                         ),
                     ]
                 )
+                if orch_state.executor_efforts:
+                    elements.extend(
+                        [
+                            {
+                                "tag": "markdown",
+                                "content": UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"],
+                            },
+                            select_static(
+                                name="model_effort",
+                                placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"],
+                                values=orch_state.executor_efforts,
+                                selected=orch_state.selected_executor_effort,
+                                action=effort_action,
+                            ),
+                        ]
+                    )
+            else:
+                if state.profiles:
+                    profile_label = (
+                        UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"]
+                        if is_agy_orchestrator
+                        else UI_TEXT["system_acp_model_profile_label"]
+                    )
+                    profile_placeholder = (
+                        UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"]
+                        if is_agy_orchestrator
+                        else UI_TEXT["system_acp_model_profile_placeholder"]
+                    )
+                    elements.extend(
+                        [
+                            {
+                                "tag": "markdown",
+                                "content": profile_label,
+                            },
+                            select_static(
+                                name="model_profile",
+                                placeholder=profile_placeholder,
+                                values=state.profiles,
+                                selected=state.selected_profile,
+                                action=profile_action,
+                            ),
+                        ]
+                    )
+                if state.efforts:
+                    effort_label = (
+                        UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"]
+                        if is_agy_orchestrator
+                        else UI_TEXT["system_acp_model_effort_label"]
+                    )
+                    effort_placeholder = (
+                        UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"]
+                        if is_agy_orchestrator
+                        else UI_TEXT["system_acp_model_effort_placeholder"]
+                    )
+                    elements.extend(
+                        [
+                            {
+                                "tag": "markdown",
+                                "content": effort_label,
+                            },
+                            select_static(
+                                name="model_effort",
+                                placeholder=effort_placeholder,
+                                values=state.efforts,
+                                selected=state.selected_effort,
+                                action=effort_action,
+                            ),
+                        ]
+                    )
 
             default_button = build_callback_button(
                 text=UI_TEXT["system_acp_default_model_option"],
@@ -926,11 +1017,11 @@ class SystemBuilder:
             )
             confirm_button = build_callback_button(
                 text=UI_TEXT["system_acp_confirm_model"].format(
-                    model=state.selection,
+                    model=active_selection,
                 ),
                 action=payload(
                     select_action,
-                    model_name=state.selection,
+                    model_name=active_selection,
                     use_default_model=False,
                 ),
                 button_type="primary",
@@ -1336,6 +1427,8 @@ class SystemBuilder:
         model_group: Optional[str] = None,
         model_profile: Optional[str] = None,
         model_effort: Optional[str] = None,
+        planner_model: Optional[str] = None,
+        executor_model: Optional[str] = None,
     ) -> tuple[str, str]:
         """Build the retryable terminal frame after ACP startup fails."""
         tool = str(tool_name or "").strip().lower()
@@ -1352,6 +1445,10 @@ class SystemBuilder:
             "model_name": model_name,
             "use_default_model": model_name is None,
         }
+        if planner_model:
+            retry_value["planner_model"] = planner_model
+        if executor_model:
+            retry_value["executor_model"] = executor_model
         back_value = {
             **base,
             "action": action_ids.REFRESH_ACP_MODELS,

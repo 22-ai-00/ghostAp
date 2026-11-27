@@ -96,9 +96,10 @@
     }
     .hint { color: var(--muted); margin: 10px 0 0; }
     @media (max-width: 560px) {
-      main { margin: 12px auto; }
+      main { margin: 12px auto; max-width: 100%; }
+      .card { overflow-wrap: anywhere; word-break: break-word; }
       .button-row { flex-direction: column; }
-      button { width: 100%; }
+      button { width: 100%; overflow-wrap: anywhere; }
     }
   </style>
 </head>
@@ -229,6 +230,78 @@
           <hr>
           <div class="button-row"><button>刷新模型</button></div>
           <p class="hint">模型始终使用下拉框；仅在后端提供时显示 Profile / Effort。选择后确认生效。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Case 4: AGY / AGY-B — default Carbon Orchestrator + Planner/Executor Model & Effort -->
+    <div class="card">
+      <div class="header">AGY 模型选择</div>
+      <div class="body">
+        <div class="prompt">请选择本次编程会话使用的模型配置。显式选择完成后才会初始化会话。</div>
+        <div class="section">
+          <label for="agy-group">模型族</label>
+          <select id="agy-group" class="remembered">
+            <option>gemini-4-neon</option>
+            <option>gemini-4-carbon</option>
+            <option>gemini-4-hydrogen</option>
+            <option>gemini-pro-orchestrator-neon</option>
+            <option selected>gemini-pro-orchestrator</option>
+            <option>gemini-pro-orchestrator-argon</option>
+            <option>claude-opus-5-5</option>
+            <option>gpt-oss-120b-medium</option>
+          </select>
+
+          <label for="agy-planner-model">Planner 模型</label>
+          <select id="agy-planner-model" class="remembered">
+            <option>gemini-4-neon</option>
+            <option selected>gemini-4-carbon</option>
+            <option>gemini-4-hydrogen</option>
+            <option>claude-opus-5-5</option>
+            <option>claude-sonnet-5-5</option>
+            <option>gpt-oss-120b-medium</option>
+          </select>
+
+          <label for="agy-planner-effort">Planner Effort</label>
+          <select id="agy-planner-effort" class="remembered">
+            <option>low</option>
+            <option>medium</option>
+            <option selected>high</option>
+          </select>
+
+          <label for="agy-executor-model">Executor 模型</label>
+          <select id="agy-executor-model" class="remembered">
+            <option>gemini-4-neon</option>
+            <option>gemini-4-carbon</option>
+            <option selected>gemini-4-hydrogen</option>
+            <option>claude-opus-5-5</option>
+            <option>claude-sonnet-5-5</option>
+            <option>gpt-oss-120b-medium</option>
+          </select>
+
+          <label for="agy-executor-effort">Executor Effort</label>
+          <select id="agy-executor-effort" class="remembered">
+            <option>low</option>
+            <option>medium</option>
+            <option selected>high</option>
+            <option>xhigh</option>
+          </select>
+
+          <div class="selected">
+            默认模型族：<code>gemini-pro-orchestrator</code>（Carbon Orchestrator）
+            <span class="badge">Planner + Executor 独立可选模型与 Effort</span>
+          </div>
+
+          <div class="button-row">
+            <button>默认模型（推荐）</button>
+            <button class="primary">确认此模型: gemini-pro-orchestrator/claude-opus-5-5:high/gemini-4-hydrogen:xhigh</button>
+          </div>
+          <hr>
+          <div class="button-row"><button>刷新模型</button></div>
+          <p class="hint">
+            未指定或选默认模型时采用 <code>gemini-pro-orchestrator</code>（Orchestrator Carbon）。
+            自定义 Planner/Executor 模型与 Effort 通过 <code>--settings orchestrator</code> 生效。
+          </p>
         </div>
       </div>
     </div>
