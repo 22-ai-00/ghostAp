@@ -280,6 +280,7 @@ def _run_agy_slash_probe(
     *,
     cwd: str,
     timeout_s: float,
+    command: str = "agy",
 ) -> tuple[dict[str, Any] | None, str, str]:
     """Run one bounded headless AGY CLI slash command and extract structured command data."""
     try:
@@ -289,9 +290,10 @@ def _run_agy_slash_probe(
     if bounded_timeout <= 0:
         return None, "", "probe timeout budget exhausted"
 
-    agy_bin = shutil.which("agy")
+    cli_cmd = str(command or "agy").strip() or "agy"
+    agy_bin = shutil.which(cli_cmd)
     if not agy_bin:
-        return None, "", "未检测到 agy CLI 可执行文件"
+        return None, "", f"未检测到 {cli_cmd} CLI 可执行文件"
 
     safe_cwd = cwd if cwd and os.path.isdir(cwd) else None
     args = [
@@ -314,7 +316,7 @@ def _run_agy_slash_probe(
             timeout=bounded_timeout,
         )
     except subprocess.TimeoutExpired:
-        return None, "", f"agy {prompt_cmd} 探测超时 ({bounded_timeout:.1f}s)"
+        return None, "", f"{cli_cmd} {prompt_cmd} 探测超时 ({bounded_timeout:.1f}s)"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return None, "", str(exc) or type(exc).__name__
 
@@ -366,7 +368,7 @@ def _run_agy_slash_probe(
 
     if not error_text and proc.returncode not in (0, None):
         stderr = (proc.stderr or "").strip()
-        error_text = stderr or f"agy {prompt_cmd} 退出码 {proc.returncode}"
+        error_text = stderr or f"{cli_cmd} {prompt_cmd} 退出码 {proc.returncode}"
 
     return command_data, response_text, error_text
 
@@ -538,7 +540,7 @@ def _normalize_runtime_settings(
 ) -> dict[str, Any]:
     """Merge and validate persisted and live runtime settings for the target tool."""
     merged: dict[str, Any] = {}
-    if tool_key == "agy":
+    if tool_key in {"agy", "agy_b"}:
         merged["show_thinking"] = True
         merged["verbosity"] = "medium"
         merged["agent_mode"] = "auto"
@@ -657,7 +659,7 @@ def collect_tool_usage_snapshot(
             "cost_currency": None,
         }
 
-    if tool_key != "agy":
+    if tool_key not in {"agy", "agy_b"}:
         note = (
             f"{tool_key} 后端当前未暴露远程配额查询接口；已显示当前会话的上下文窗口与费用遥测。"
             if metrics["session_active"]
@@ -680,7 +682,8 @@ def collect_tool_usage_snapshot(
             capability_note=note,
         )
 
-    if not shutil.which("agy"):
+    cli_cmd = "agy-b" if tool_key == "agy_b" else "agy"
+    if not shutil.which(cli_cmd):
         return ToolUsageSnapshot(
             tool_name=tool_key,
             cwd=str(cwd or ""),
@@ -695,8 +698,8 @@ def collect_tool_usage_snapshot(
             cost_amount=metrics["cost_amount"],
             cost_currency=metrics["cost_currency"],
             quota_supported=False,
-            capability_note="宿主机未检测到 `agy` CLI，无法查询实时配额与 Credits。",
-            error="未检测到 agy CLI 可执行文件",
+            capability_note=f"宿主机未检测到 `{cli_cmd}` CLI，无法查询实时配额与 Credits。",
+            error=f"未检测到 {cli_cmd} CLI 可执行文件",
         )
 
     usage_data: dict[str, Any] | None = None
@@ -708,8 +711,8 @@ def collect_tool_usage_snapshot(
 
     try:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="agy-usage") as pool:
-            usage_future = pool.submit(_run_agy_slash_probe, "/usage", cwd=cwd, timeout_s=timeout_s)
-            credits_future = pool.submit(_run_agy_slash_probe, "/credits", cwd=cwd, timeout_s=timeout_s)
+            usage_future = pool.submit(_run_agy_slash_probe, "/usage", cwd=cwd, timeout_s=timeout_s, command=cli_cmd)
+            credits_future = pool.submit(_run_agy_slash_probe, "/credits", cwd=cwd, timeout_s=timeout_s, command=cli_cmd)
             usage_data, usage_resp, usage_err = usage_future.result()
             credits_data, credits_resp, credits_err = credits_future.result()
     except Exception as exc:
@@ -788,12 +791,14 @@ def collect_tool_settings_snapshot(
     probe_error = ""
     capability_note = ""
 
-    if tool_key == "agy":
-        if shutil.which("agy"):
+    if tool_key in {"agy", "agy_b"}:
+        cli_cmd = "agy-b" if tool_key == "agy_b" else "agy"
+        if shutil.which(cli_cmd):
             cfg_data, cfg_resp, cfg_err = _run_agy_slash_probe(
                 "/config",
                 cwd=cwd,
                 timeout_s=timeout_s,
+                command=cli_cmd,
             )
             if isinstance(cfg_data, Mapping) and isinstance(cfg_data.get("config"), Mapping):
                 backend_config_summary = _extract_safe_agy_config_summary(cfg_data.get("config"))
@@ -804,7 +809,7 @@ def collect_tool_settings_snapshot(
             if cfg_err:
                 probe_error = cfg_err
         else:
-            capability_note = "宿主机未检测到 `agy` CLI，仅展示 GhostAP 已保存运行参数。"
+            capability_note = f"宿主机未检测到 `{cli_cmd}` CLI，仅展示 GhostAP 已保存运行参数。"
     else:
         capability_note = (
             f"{tool_key} 运行设置由 GhostAP 模型与会话控制面托管。"

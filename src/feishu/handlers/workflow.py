@@ -651,6 +651,13 @@ class WorkflowHandler(
                         resolved_preset = str(saved_cfg.get("preset_id") or "").strip() or None
 
         if not agent_pool:
+            from ...mode.backends import ALL_BACKEND_SPECS
+
+            hidden_tools = frozenset(
+                spec.mode_key
+                for spec in ALL_BACKEND_SPECS
+                if not spec.visible_in_tools_list
+            )
             preferred_order = (
                 "traex",
                 "claude",
@@ -664,7 +671,9 @@ class WorkflowHandler(
             )
             selected_names = [t for t in preferred_order if t in available_tools][:3]
             if not selected_names:
-                selected_names = list(available_tools)[:3]
+                selected_names = [
+                    t for t in available_tools if t not in hidden_tools
+                ][:3]
             if not selected_names:
                 if admission_owner is not None:
                     admission_owner.done_event.set()

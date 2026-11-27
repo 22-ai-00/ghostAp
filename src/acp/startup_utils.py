@@ -80,7 +80,7 @@ def select_startup_backend(
     normalized = (agent_type or "").lower().strip()
     if is_cli_backend(normalized):
         return StartupBackend.CLI
-    if normalized == "agy" and requires_agy_cli_orchestrator_session(model_name):
+    if normalized in {"agy", "agy_b"} and requires_agy_cli_orchestrator_session(model_name):
         return StartupBackend.CLI
     return StartupBackend.ACP
 
@@ -133,9 +133,17 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
-            if (agent_type or "").lower().strip() == "agy":
-                from ..agent_session.agy_cli import SyncAGYCLISession
+            normalized_agent = (agent_type or "").lower().strip()
+            if normalized_agent in {"agy", "agy_b"}:
+                from ..agent_session.agy_cli import AGYCLIConfig, SyncAGYCLISession
 
+                if normalized_agent == "agy_b":
+                    return SyncAGYCLISession(
+                        cwd=cwd or ".",
+                        config=AGYCLIConfig(command="agy-b"),
+                        model_name=model_name,
+                        agent_type="agy_b",
+                    )
                 return SyncAGYCLISession(
                     cwd=cwd or ".",
                     model_name=model_name,

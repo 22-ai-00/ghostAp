@@ -948,7 +948,26 @@ class SystemHandler(ToolCockpitMixin, ACPActivationMixin, AccessAdminMixin, Lock
     def handle_menu_command(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         from ...card.builders.system import SystemBuilder
 
-        msg_type, card_content = SystemBuilder.build_command_menu_card(project)
+        target_project = project or self._safe_active_project(chat_id)
+        active_mode_key = self._safe_active_mode_key(chat_id, target_project)
+        saved_tool = get_project_acp_tool_name(target_project, chat_id) if target_project else None
+        if not isinstance(saved_tool, str):
+            saved_tool = None
+        current_tool = active_mode_key or saved_tool
+        current_model = (
+            get_project_acp_model_name(target_project, chat_id, tool_name=current_tool)
+            if (target_project and current_tool)
+            else None
+        )
+        if not isinstance(current_model, str):
+            current_model = None
+
+        msg_type, card_content = SystemBuilder.build_command_menu_card(
+            target_project,
+            current_tool=current_tool,
+            current_model=current_model,
+            active_mode_key=active_mode_key,
+        )
         self.reply_card(message_id, card_content)
 
     def handle_help_category(
@@ -1557,7 +1576,14 @@ class SystemHandler(ToolCockpitMixin, ACPActivationMixin, AccessAdminMixin, Lock
                 }
             )
 
-        msg_type, card = SystemBuilder.build_tools_list_card(tools, project)
+        current_tool = self._safe_active_mode_key(chat_id, project) or (
+            get_project_acp_tool_name(project, chat_id) if project else None
+        )
+        if not isinstance(current_tool, str):
+            current_tool = None
+        msg_type, card = SystemBuilder.build_tools_list_card(
+            tools, project, current_tool=current_tool
+        )
         self.reply_interactive_card(message_id, card, msg_type=msg_type)
 
     def _lookup_session_manager(self, mode_key: str):
@@ -1679,5 +1705,12 @@ class SystemHandler(ToolCockpitMixin, ACPActivationMixin, AccessAdminMixin, Lock
                         "message_count": int(latest.get("message_count", 0) or 0),
                     }
 
-        msg_type, card = SystemBuilder.build_tools_status_card(tools, active_sessions, project)
+        current_tool = self._safe_active_mode_key(chat_id, project) or (
+            get_project_acp_tool_name(project, chat_id) if project else None
+        )
+        if not isinstance(current_tool, str):
+            current_tool = None
+        msg_type, card = SystemBuilder.build_tools_status_card(
+            tools, active_sessions, project, current_tool=current_tool
+        )
         self.reply_interactive_card(message_id, card, msg_type=msg_type)

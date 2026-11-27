@@ -561,14 +561,15 @@ class ACPSessionManager:
                 )
                 _safe_end_session(lambda _: True)
                 existing = None
-        if existing and effective_agent_for_model == "agy":
+        if existing and effective_agent_for_model in {"agy", "agy_b"}:
             from .agy_selection import requires_agy_cli_orchestrator_session
 
             existing_is_agy_cli = bool(getattr(existing, "_is_agy_cli_session", False))
             target_is_agy_cli = requires_agy_cli_orchestrator_session(model_name)
             if existing_is_agy_cli != target_is_agy_cli:
                 logger.info(
-                    "[ACP:AGY] Transport changed (%s -> %s), restarting: key=%s",
+                    "[ACP:%s] Transport changed (%s -> %s), restarting: key=%s",
+                    effective_agent_for_model.upper(),
                     "cli" if existing_is_agy_cli else "acp",
                     "cli" if target_is_agy_cli else "acp",
                     key[-16:],

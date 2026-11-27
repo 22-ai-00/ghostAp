@@ -28,6 +28,7 @@ class InteractionMode(Enum):
     GROK = "grok"
     DSH = "dsh"
     AGY = "agy"
+    AGY_B = "agy_b"
     SHELL = "shell"
 
 
@@ -282,6 +283,23 @@ ALL_BACKEND_SPECS: tuple[BackendSpec, ...] = (
         legacy_exit_mode="none",
         nl_enter_keywords=("进入agy模式", "agy模式", "进入agy", "使用agy"),
         supports_info_command=True,
+    ),
+    BackendSpec(
+        mode_key="agy_b",
+        interaction_mode=InteractionMode.AGY_B,
+        cli_name="agy-b",
+        display_name="AGY-B",
+        emoji="🪐",
+        mode_emoji="🪐",
+        template_color="wathet",
+        visible_in_tools_list=False,
+        transport="acp",
+        uses_claude_cli=False,
+        session_timeout_attr="coco_session_timeout",
+        is_coco=False,
+        legacy_exit_mode="shared_exit_alias",
+        nl_enter_keywords=(),
+        supports_info_command=False,
     ),
 )
 

@@ -9,7 +9,7 @@ from typing import Any, Iterable, Sequence
 
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _EFFORT_CAPABLE_TOOLS = frozenset(
-    {"codex", "codex_w", "claude", "claude_w", "agy", "traex", "dsh"}
+    {"codex", "codex_w", "claude", "claude_w", "agy", "agy_b", "traex", "dsh"}
 )
 
 
@@ -177,7 +177,7 @@ def resolve_effective_model_name(
             return None
         return compose_traex_model_selection(base, resolved_profile, resolved_effort)
 
-    if tool == "agy":
+    if tool in {"agy", "agy_b"}:
         from src.acp.agy_selection import (
             AGY_ORCHESTRATOR_DEFAULT_PROFILE,
             AGY_REASONING_EFFORTS,
@@ -224,7 +224,7 @@ def resolve_effective_model_name(
         if base is None and resolved_effort:
             base = (
                 _cached_default_model(
-                    "agy",
+                    tool,
                     skip_orchestrator=True,
                     require_effort=True,
                 )

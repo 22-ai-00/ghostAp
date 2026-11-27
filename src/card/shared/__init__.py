@@ -56,7 +56,8 @@ def _create_mode_button(
         "text": {"tag": "plain_text", "content": config["text"]},
         "type": config["type"],
         "size": button_size or "medium",
-        "behaviors": [{"type": "callback", "value": value}],
+        "value": dict(value),
+        "behaviors": [{"type": "callback", "value": dict(value)}],
     }
 
 

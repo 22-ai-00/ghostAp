@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..acp.models import ACPEvent, PromptResult
@@ -665,7 +666,7 @@ class ModelFailureAwareSession(_SessionWrapper):
             getattr(base, "_build_args", None)
         )
         is_agy_cli = bool(getattr(base, "_is_agy_cli_session", False))
-        is_agy = agent_lower == "agy" or is_agy_cli
+        is_agy = agent_lower in {"agy", "agy_b"} or is_agy_cli
 
         if is_agy:
             agy_cwd = str(getattr(base, "_cwd", "") or "")
@@ -685,11 +686,25 @@ class ModelFailureAwareSession(_SessionWrapper):
                     cli_cfg = existing_cfg
                 else:
                     base_cmd = str(getattr(base, "_agent_cmd", "") or "").strip()
+                    if not base_cmd and agent_lower == "agy_b":
+                        base_cmd = "agy-b"
                     cli_cfg = (
                         AGYCLIConfig(command=base_cmd) if base_cmd else AGYCLIConfig()
                     )
+                effective_cli_agent = agent_type or (
+                    "agy_b"
+                    if Path(str(getattr(cli_cfg, "command", "") or "")).name.strip().lower() == "agy-b"
+                    else "agy"
+                )
 
                 def create_agy_cli_candidate() -> SyncSession:
+                    if effective_cli_agent.lower() == "agy_b":
+                        return agy_cli_cls(
+                            cwd=agy_cwd,
+                            config=cli_cfg,
+                            model_name=to_model,
+                            agent_type="agy_b",
+                        )
                     return agy_cli_cls(
                         cwd=agy_cwd,
                         config=cli_cfg,
@@ -707,9 +722,18 @@ class ModelFailureAwareSession(_SessionWrapper):
                 )
 
             if is_cli_session or is_agy_cli:
+                effective_agent_type = agent_type or (
+                    "agy_b"
+                    if Path(str(getattr(getattr(base, "_cfg", None), "command", "") or "")).name.strip().lower()
+                    == "agy-b"
+                    else "agy"
+                )
                 try:
                     resolver = getattr(sys.modules[__name__], "resolve_agent_spec")
-                    resolved_cmd, resolved_args = resolver("agy", model_name=to_model)
+                    resolved_cmd, resolved_args = resolver(
+                        effective_agent_type,
+                        model_name=to_model,
+                    )
                     agy_acp_cmd = str(resolved_cmd or "").strip()
                     agy_acp_args = list(resolved_args or [])
                 except Exception:
@@ -720,7 +744,6 @@ class ModelFailureAwareSession(_SessionWrapper):
                     return False
                 if not agy_acp_cmd and not agy_acp_args:
                     return False
-                effective_agent_type = agent_type or "agy"
 
                 def create_agy_acp_candidate() -> SyncSession:
                     return self._build_sync_acp_candidate(
@@ -858,6 +881,7 @@ class ModelFailureAwareSession(_SessionWrapper):
             "traex",
             "dsh",
             "agy",
+            "agy_b",
         } or bool(str(getattr(base, "_model_name", "") or "").strip())
         if not replaced and not is_config_option_backend:
             return False

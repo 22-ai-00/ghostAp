@@ -452,86 +452,122 @@ class SystemBuilder:
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
-    def build_command_menu_card(project: Optional[ProjectContext] = None) -> tuple[str, str]:
-        """Build a mobile-friendly command menu card."""
-        # Local import preserves the card -> Feishu initialization boundary.
-        from src.feishu.product_catalog import format_owner_execution_lane_summary
+    def _compact_chat_id(chat_id: object) -> str:
+        raw = str(chat_id or "").strip()
+        if len(raw) > 16:
+            return f"{raw[:7]}…{raw[-4:]}"
+        return raw or "N/A"
 
-        project_id = project.project_id if project else None
+    @staticmethod
+    def build_command_menu_card(
+        project: Optional[ProjectContext] = None,
+        *,
+        current_tool: Optional[str] = None,
+        current_model: Optional[str] = None,
+        active_mode_key: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build a mobile-friendly quick command menu card."""
+        raw_pid = getattr(project, "project_id", None) if project else None
+        project_id = raw_pid if isinstance(raw_pid, str) else None
+        raw_pname = getattr(project, "project_name", None) if project else None
+        project_name = raw_pname if isinstance(raw_pname, str) and raw_pname.strip() else None
 
-        buttons = [
-            {
-                "text": UI_TEXT["system_menu_btn_new_project"],
-                "type": "primary",
-                "action": "new_project_prompt",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_switch_project"],
-                "type": "default",
-                "action": "switch_project",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_deep_task"],
-                "type": "primary",
-                "action": "enter_deep_prompt",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_workflow"],
-                "type": "primary",
-                "action": "show_workflow_menu",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_status"],
-                "type": "default",
-                "action": "show_status",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_help"],
-                "type": "default",
-                "action": "show_help_menu",
-            },
-        ]
+        if project and project_name:
+            compact_path = CoreBuilder._compact_path(getattr(project, "root_path", None), limit=42)
+            project_line = f"📁 **{project_name}** · `{compact_path}`"
+        else:
+            project_line = "📁 当前未绑定项目 · 发送 `/projects` 切换或 `/new` 创建"
 
-        # Convert to actual card buttons
-        card_buttons = []
-        for btn in buttons:
-            btn_value = {"action": btn["action"], "project_id": project_id}
-            card_buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn["text"]},
-                    "type": btn["type"],
-                    "value": btn_value,
-                    "behaviors": [{"type": "callback", "value": btn_value}],
-                }
+        effective_key = active_mode_key or current_tool
+        meta = get_backend_meta(effective_key) if isinstance(effective_key, str) and effective_key else None
+        if meta is not None:
+            status_tag = "（运行中）" if active_mode_key else "（已选默认）"
+            model_tag = (
+                f" · `{current_model.strip()}`"
+                if isinstance(current_model, str) and current_model.strip()
+                else ""
             )
+            channel_line = f"⚡ 当前通道：{meta.emoji} **{meta.display_name}**{model_tag}{status_tag}"
+        else:
+            channel_line = "💭 当前通道：智能模式"
+
+        tool_extra = (
+            {"tool_name": current_tool}
+            if isinstance(current_tool, str) and current_tool.strip()
+            else {}
+        )
+
+        card_buttons = [
+            build_callback_button(
+                UI_TEXT["system_menu_btn_switch_project"],
+                {"action": action_ids.SWITCH_PROJECT, "project_id": project_id},
+                button_type="primary",
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_settings"],
+                {"action": action_ids.OPEN_TOOL_SETTINGS, "project_id": project_id, **tool_extra},
+                button_type="primary",
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_usage"],
+                {"action": action_ids.OPEN_TOOL_USAGE, "project_id": project_id, **tool_extra},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_cmds"],
+                {"action": action_ids.SHOW_TOOL_COMMANDS, "project_id": project_id, **tool_extra},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_workflow_config"],
+                {"action": action_ids.WF_OPEN_CONFIG, "project_id": project_id},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_deep_task"],
+                {"action": action_ids.ENTER_DEEP_PROMPT, "project_id": project_id},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_new_project"],
+                {"action": action_ids.NEW_PROJECT_PROMPT, "project_id": project_id},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["system_menu_btn_help"],
+                {"action": action_ids.SHOW_HELP_MENU, "project_id": project_id},
+                compact=True,
+            ),
+        ]
 
         elements = [
-            CoreBuilder._build_directory_element(project),
+            {"tag": "markdown", "content": f"{project_line}\n{channel_line}"},
             {"tag": "hr"},
             {"tag": "markdown", "content": UI_TEXT["system_menu_header"]},
+            *build_responsive_layout(
+                card_buttons,
+                layout="responsive",
+                mobile_force_vertical=False,
+            ),
+            {"tag": "hr"},
             {
-                "tag": "collapsible_panel",
-                "expanded": False,
-                "header": {
-                    "title": {
-                        "tag": "markdown",
-                        "content": "**执行通道与完成度**",
-                    },
-                    "vertical_align": "center",
-                },
-                "border": {"color": "grey", "corner_radius": PANEL_STYLES["corner_radius"]},
-                "vertical_spacing": PANEL_STYLES["vertical_spacing"],
-                "padding": PANEL_STYLES["padding_standard"],
-                "elements": [{
-                    "tag": "markdown",
-                    "content": format_owner_execution_lane_summary(),
-                }],
+                "tag": "markdown",
+                "text_size": "notation",
+                "content": UI_TEXT["system_menu_footer_hint"],
             },
         ]
-        elements.extend(build_responsive_layout(card_buttons))
 
-        card = CoreBuilder._wrap_card(UI_TEXT["system_menu_title"], "blue", elements)
+        subtitle = f"项目：{project_name}" if project_name else ""
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_menu_title"],
+            "blue",
+            elements,
+            subtitle=subtitle,
+            update_multi=True,
+            summary="GhostAP 快捷菜单 · 常用指令与驾驶舱",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -826,7 +862,7 @@ class SystemBuilder:
                     ),
                 ]
             )
-            is_agy_orchestrator = tool == "agy" and is_agy_orchestrator_model(state.selected_model)
+            is_agy_orchestrator = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
             if state.profiles:
                 profile_label = (
                     UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"]
@@ -1395,35 +1431,59 @@ class SystemBuilder:
     def build_tools_list_card(
         tools: list[dict],
         project: Optional[ProjectContext] = None,
+        *,
+        current_tool: Optional[str] = None,
     ) -> tuple[str, str]:
         """Build a card showing all available ACP tools."""
         elements = []
+        raw_pid = getattr(project, "project_id", None) if project else None
+        project_id = raw_pid if isinstance(raw_pid, str) else None
+        normalized_current = current_tool.strip() if isinstance(current_tool, str) and current_tool.strip() else None
+        visible_tool_names = {t["name"] for t in tools if isinstance(t, dict) and t.get("name")}
+        visible_current = normalized_current if (normalized_current and normalized_current in visible_tool_names) else None
+        cur_meta = get_backend_meta(visible_current) if visible_current else None
 
         if project:
-            elements.append(CoreBuilder._build_directory_element(project))
+            compact_path = CoreBuilder._compact_path(getattr(project, "root_path", None), limit=42)
+            top_line = f"📁 `{compact_path}`"
+            if cur_meta is not None:
+                top_line += f" · 当前默认：{cur_meta.emoji} **{cur_meta.display_name}**"
+            elements.append({"tag": "markdown", "content": top_line})
+            elements.append({"tag": "hr"})
+        elif cur_meta is not None:
+            elements.append({"tag": "markdown", "content": f"当前默认：{cur_meta.emoji} **{cur_meta.display_name}**"})
             elements.append({"tag": "hr"})
 
-        elements.append({"tag": "markdown", "content": UI_TEXT["system_tools_list_header"]})
-
-        # Add tool buttons
+        directory_lines = [UI_TEXT["system_tools_list_header"]]
         buttons = []
         for tool in tools:
             tool_name = tool["name"]
             emoji = tool.get("emoji", "🤖")
             description = tool.get("description", "")
-            is_available = tool.get("available", False)
+            is_available = bool(tool.get("available", False))
+            is_current = bool(visible_current and tool_name == visible_current)
+            label = SystemBuilder._display_mode_label(tool_name)
 
-            btn_text = f"{emoji} {SystemBuilder._display_mode_label(tool_name)}"
+            line = f"• {emoji} **{label}**"
             if description:
-                btn_text += f" ({description})"
-            if not is_available:
+                line += f" — {description}"
+            if is_current:
+                line += " · ✓ 当前"
+            elif not is_available:
+                line += " · ⚠️ 未就绪"
+            directory_lines.append(line)
+
+            btn_text = f"{emoji} {label}"
+            if is_current:
+                btn_text += " ✓"
+            elif not is_available:
                 btn_text += " ⚠️"
 
-            _btn_val = {"action": f"enter_{tool_name}", "project_id": project.project_id if project else None}
+            _btn_val = {"action": f"enter_{tool_name}", "project_id": project_id}
             _btn = {
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": btn_text},
-                "type": "primary" if is_available else "default",
+                "type": "primary" if (is_available and is_current) else "default",
                 "disabled": not is_available,
                 "value": _btn_val,
             }
@@ -1431,23 +1491,54 @@ class SystemBuilder:
                 _btn["behaviors"] = [{"type": "callback", "value": dict(_btn_val)}]
             buttons.append(_btn)
 
-        elements.extend(build_responsive_layout(buttons))
+        elements.append({"tag": "markdown", "content": "\n".join(directory_lines)})
+        elements.extend(
+            build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False)
+        )
 
-        # Add status indicator
-        available_count = sum(1 for t in tools if t.get("available", False))
+        # Cockpit shortcuts
+        tool_extra = {"tool_name": visible_current} if visible_current else {}
         elements.append({"tag": "hr"})
+        elements.extend(
+            build_responsive_layout(
+                [
+                    build_callback_button(
+                        UI_TEXT["system_tool_usage_settings_btn"],
+                        {"action": action_ids.OPEN_TOOL_SETTINGS, "project_id": project_id, **tool_extra},
+                        button_type="default" if visible_current else "primary",
+                        compact=True,
+                    ),
+                    build_callback_button(
+                        UI_TEXT["system_tool_usage_btn"],
+                        {"action": action_ids.OPEN_TOOL_USAGE, "project_id": project_id, **tool_extra},
+                        compact=True,
+                    ),
+                ],
+                layout="responsive",
+                mobile_force_vertical=False,
+            )
+        )
+
+        # Status indicator
+        available_count = sum(1 for t in tools if t.get("available", False))
         elements.append(
             {
                 "tag": "markdown",
                 "text_size": "notation",
                 "content": UI_TEXT["system_tools_list_footer"].format(
                     available=available_count,
-                    total=len(tools)
+                    total=len(tools),
                 ),
             }
         )
 
-        card = CoreBuilder._wrap_card(UI_TEXT["system_tools_list_title"], "blue", elements)
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_tools_list_title"],
+            "blue",
+            elements,
+            update_multi=True,
+            summary=f"编程工具选择 · {available_count}/{len(tools)} 可用",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -1455,63 +1546,115 @@ class SystemBuilder:
         tools: list[dict],
         active_sessions: dict[str, dict] = None,
         project: Optional[ProjectContext] = None,
+        *,
+        current_tool: Optional[str] = None,
     ) -> tuple[str, str]:
         """Build a card showing detailed status of all tools."""
         active_sessions = active_sessions or {}
         elements = []
+        raw_pid = getattr(project, "project_id", None) if project else None
+        project_id = raw_pid if isinstance(raw_pid, str) else None
+        normalized_current = current_tool.strip() if isinstance(current_tool, str) and current_tool.strip() else None
+        visible_tool_names = {t["name"] for t in tools if isinstance(t, dict) and t.get("name")}
+        visible_current = normalized_current if (normalized_current and normalized_current in visible_tool_names) else None
 
+        available_count = sum(1 for t in tools if t.get("available", False))
+        summary_lines = [
+            f"共 **{len(tools)}** 个工具 · ✅ **{available_count}** 个可用 · 🔴 **{len(active_sessions)}** 个活跃会话"
+        ]
         if project:
-            elements.append(CoreBuilder._build_directory_element(project))
-            elements.append({"tag": "hr"})
+            compact_path = CoreBuilder._compact_path(getattr(project, "root_path", None), limit=42)
+            summary_lines.append(f"📁 `{compact_path}`")
+        elements.append({"tag": "markdown", "content": "\n".join(summary_lines)})
+        elements.append({"tag": "hr"})
 
-        elements.append({"tag": "markdown", "content": UI_TEXT["system_tools_status_header"]})
+        avail_lines: list[str] = []
+        unavail_lines: list[str] = []
+        action_buttons: list[dict] = []
 
         for tool in tools:
             tool_name = tool["name"]
             emoji = tool.get("emoji", "🤖")
-            is_available = tool.get("available", False)
+            is_available = bool(tool.get("available", False))
             last_used = tool.get("last_used", UI_TEXT["system_never_used"])
+            label = SystemBuilder._display_mode_label(tool_name)
+            is_current = bool(visible_current and tool_name == visible_current)
 
-            status_text = UI_TEXT["system_status_available"] if is_available else UI_TEXT["system_status_unavailable"]
-            active_info = ""
-            if tool_name in active_sessions:
-                session_info = active_sessions[tool_name]
-                active_info = UI_TEXT["system_tools_status_active_session"].format(
-                    chat_id=session_info.get('chat_id', 'N/A')
+            if is_available:
+                cur_tag = " · ✓ 当前" if is_current else ""
+                active_tag = ""
+                if tool_name in active_sessions:
+                    session_info = active_sessions[tool_name]
+                    msg_count = int(session_info.get("message_count", 0) or 0)
+                    compact_cid = SystemBuilder._compact_chat_id(session_info.get("chat_id", "N/A"))
+                    active_tag = UI_TEXT["system_tools_status_active_compact"].format(
+                        count=msg_count,
+                        chat_id=compact_cid,
+                    )
+                avail_lines.append(f"• {emoji} **{label}**{cur_tag} · {last_used}{active_tag}")
+
+                _status_btn_val = {"action": f"enter_{tool_name}", "project_id": project_id}
+                action_buttons.append(
+                    build_callback_button(
+                        UI_TEXT["system_tools_status_btn_enter"].format(name=label),
+                        _status_btn_val,
+                        button_type="primary" if is_current else "default",
+                        compact=True,
+                    )
                 )
+            else:
+                unavail_lines.append(f"• {emoji} {label}（未检测到 CLI）")
 
+        if avail_lines:
             elements.append(
                 {
                     "tag": "markdown",
-                    "content": UI_TEXT["system_tools_status_item"].format(
-                        emoji=emoji,
-                        name=SystemBuilder._display_mode_label(tool_name),
-                        status=status_text,
-                        last_used=last_used,
-                        active_info=active_info
-                    ),
+                    "content": "**✅ 可用工具**\n" + "\n".join(avail_lines),
+                }
+            )
+        if unavail_lines:
+            elements.append({"tag": "hr"})
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "**❌ 未就绪工具**\n" + "\n".join(unavail_lines),
                 }
             )
 
-        elements.append({"tag": "hr"})
-
-        # Quick actions
-        action_buttons = []
-        for tool in tools:
-            if tool.get("available", False):
-                _status_btn_val = {"action": f"enter_{tool['name']}", "project_id": project.project_id if project else None}
-                action_buttons.append(
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_tools_status_btn_enter"].format(name=SystemBuilder._display_mode_label(tool['name']))},
-                        "type": "default",
-                        "value": _status_btn_val,
-                        "behaviors": [{"type": "callback", "value": dict(_status_btn_val)}],
-                    }
-                )
-
         if action_buttons:
-            elements.extend(build_responsive_layout(action_buttons))
+            elements.append({"tag": "hr"})
+            elements.extend(
+                build_responsive_layout(
+                    action_buttons, layout="responsive", mobile_force_vertical=False
+                )
+            )
 
-        card = CoreBuilder._wrap_card(UI_TEXT["system_tools_status_title"], "blue", elements)
+        tool_extra = {"tool_name": visible_current} if visible_current else {}
+        elements.append({"tag": "hr"})
+        elements.extend(
+            build_responsive_layout(
+                [
+                    build_callback_button(
+                        UI_TEXT["system_tool_usage_settings_btn"],
+                        {"action": action_ids.OPEN_TOOL_SETTINGS, "project_id": project_id, **tool_extra},
+                        compact=True,
+                    ),
+                    build_callback_button(
+                        UI_TEXT["system_tool_usage_btn"],
+                        {"action": action_ids.OPEN_TOOL_USAGE, "project_id": project_id, **tool_extra},
+                        compact=True,
+                    ),
+                ],
+                layout="responsive",
+                mobile_force_vertical=False,
+            )
+        )
+
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_tools_status_title"],
+            "blue",
+            elements,
+            update_multi=True,
+            summary=f"工具状态 · {available_count}/{len(tools)} 可用",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)

@@ -5,6 +5,7 @@ from .deep import DeepHandler
 from .diagnostics import DiagnosticsHandler
 from .programming import (
     PROGRAMMING_HANDLER_TYPES,
+    AGYBModeHandler,
     AGYModeHandler,
     AidenModeHandler,
     ClaudeModeHandler,
@@ -35,6 +36,7 @@ __all__ = [
     "CodexWModeHandler",
     "DSHModeHandler",
     "AGYModeHandler",
+    "AGYBModeHandler",
     "GeminiModeHandler",
     "GrokModeHandler",
     "TraexModeHandler",

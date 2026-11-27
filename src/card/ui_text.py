@@ -237,12 +237,17 @@ UI_TEXT = {
     "system_shell_stderr_label": "⚠️ **错误输出**:",
     "system_menu_title": "📱 快捷菜单",
     "system_menu_header": "**📱 常用指令菜单**",
-    "system_menu_btn_new_project": "新项目",
-    "system_menu_btn_switch_project": "切项目",
-    "system_menu_btn_deep_task": "Deep",
+    "system_menu_btn_new_project": "➕ 新建项目",
+    "system_menu_btn_switch_project": "📋 切换项目",
+    "system_menu_btn_deep_task": "💭 Deep 任务",
     "system_menu_btn_workflow": "Workflow",
+    "system_menu_btn_workflow_config": "⚡ Workflow 配置",
+    "system_menu_btn_settings": "⚙️ 工具设置",
+    "system_menu_btn_usage": "📊 工具用量",
+    "system_menu_btn_cmds": "🛠️ 原生命令",
     "system_menu_btn_status": "状态",
     "system_menu_btn_help": "📖 帮助",
+    "system_menu_footer_hint": "💡 更多指令：`/tools` 工具列表 · `/status` 工作区总览 · `/spec` 结构化开发",
     "system_help_title": "📖 GhostAP 使用帮助",
     "system_help_status_header": "**当前状态** · {mode} · 项目: {project}\n<font color='grey'>{cwd}</font>",
     "system_help_section_modes": "🔄 编程模式切换与工具命令",
@@ -250,6 +255,8 @@ UI_TEXT = {
         "`/coco` · `/claude` · `/aiden` · `/codex` · `/gemini` · `/traex` · `/grok` · `/dsh` · `/agy` · 进入对应编程模式\n"
         "`/<工具> <需求>` · 单句直达对应工具执行任务（如 `/agy /swarm 修复测试`）\n"
         "`/cmds [工具]` · 查看工具原生 `/` 命令与 Skills（如 `/swarm`、`/review`、`/compact`）\n"
+        "`/usage [工具]` · `/settings [工具]` · 查看配额用量与工具/模型设置驾驶舱\n"
+        "`/tools` · `/tools_status` · 查看可用编程工具与实时会话状态\n"
         "`/model [模型|list|default]` · `/effort [档位]` · `/acp [工具]` · 查看或热切换工具与模型/Effort\n"
         "`/stop` · 立即停止当前任务（保持模式）  ·  `/clear` · 清空上下文（保留工具与模型）\n"
         "`/sh <命令>` · 直接执行 Shell  ·  `/ask <工具> <问题>` · 零副作用旁路咨询\n"
@@ -299,11 +306,12 @@ UI_TEXT = {
     ),
     "system_tools_list_title": "🛠️ 工具选择",
     "system_tools_list_header": "**🔧 可用工具列表**",
-    "system_tools_list_footer": "可用工具: {available}/{total} • 点击按钮进入对应模式 • 灰色按钮表示工具不可用",
+    "system_tools_list_footer": "可用工具: {available}/{total} • 点击工具选择模型进入 • 灰色表示未就绪",
     "system_tools_status_title": "📋 工具状态",
     "system_tools_status_header": "**📊 工具状态详情**",
     "system_tools_status_item": "{emoji} **{name}**\n   状态: {status}\n   最后使用: {last_used}{active_info}",
     "system_tools_status_active_session": "\n   🔴 活跃会话: {chat_id}",
+    "system_tools_status_active_compact": " · 🔴 活跃 ({count}条 · {chat_id})",
     "system_tools_status_btn_enter": "进入 {name}",
     # Project Commands
     "project_create_success": "✅ 项目 **{name}** 创建成功\n\n📁 路径: `{path}`",
@@ -333,7 +341,7 @@ UI_TEXT = {
     "project_similar_header": "\n\n**相似项目：**",
     "project_restore_info": "\n\n📋 已恢复上下文: {count} 条记录",
     "project_restore_last_mode": ", 上次模式: {mode}",
-    "project_switched_content": "已切换到项目 **{name}**\n\n📂 项目目录: `{root}`{context_info}",
+    "project_switched_content": "已切换到项目 **{name}**{context_info}",
     "project_board_title": "📋 项目看板",
     "project_board_empty": "当前没有活动项目\n\n发送 `/new 项目名 [路径]` 创建新项目",
     "project_info_card_title": "当前项目",
@@ -430,8 +438,16 @@ UI_TEXT = {
     "project_board_btn_next": "下一页 ➡️",
     "project_board_btn_refresh": "🔄 刷新",
     "project_created_title": "🎉 新项目已创建",
+    "project_btn_settings": "⚙️ 工具设置",
+    "project_btn_usage": "📊 用量",
+    "project_btn_usage_full": "📊 工具用量",
+    "project_btn_cmds": "🛠️ 原生命令",
+    "project_btn_back_board": "📋 返回看板",
+    "project_btn_choose_tool": "⚙️ 选择工具与模型",
     "project_btn_start_coco": "🤖 开始 Coco",
     "project_btn_start_claude": "🔮 开始 Claude",
+    "project_btn_start_agy": "🪐 开始 AGY",
+    "project_btn_start_codex": "💻 开始 Codex",
     # ── Programming Mode Prompts (centralized) ──
     "mode_enter_msg": "{emoji} 已进入{name}编程模式\n\n现在可以用自然语言描述你的需求\n\n说「退出模式」或发送 `/exit` 退出",
     "mode_enter_no_project_msg": "{emoji} 已进入 {name} 编程模式\n\n现在可以用自然语言描述你的需求\n\n说「退出模式」或发送 `/exit` 退出",

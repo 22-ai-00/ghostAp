@@ -840,6 +840,7 @@ class BaseHandler:
             InteractionMode.GROK: ContextSourceMode.GROK,
             InteractionMode.DSH: ContextSourceMode.DSH,
             InteractionMode.AGY: ContextSourceMode.AGY,
+            InteractionMode.AGY_B: ContextSourceMode.AGY_B,
         }
         return mapping.get(mode, ContextSourceMode.SMART)
 

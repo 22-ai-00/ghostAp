@@ -160,7 +160,7 @@ def _extract_current_base_model(
         return None
     if not (
         cap.supports_effort
-        and tool in {"traex", "codex", "codex_w", "claude", "claude_w", "agy"}
+        and tool in {"traex", "codex", "codex_w", "claude", "claude_w", "agy", "agy_b"}
     ):
         return raw_current
 
@@ -190,7 +190,7 @@ def _extract_current_base_model(
                 and (
                     (rem_parts[0] in allowed_profiles and rem_parts[1] in allowed_efforts)
                     or (
-                        tool == "agy"
+                        tool in {"agy", "agy_b"}
                         and rem_parts[0] in allowed_efforts
                         and rem_parts[1] in allowed_efforts
                     )
@@ -217,7 +217,7 @@ def _extract_current_base_model(
 
         base, _effort = split_claude_model_selection(raw_current)
         return base or None
-    if tool == "agy":
+    if tool in {"agy", "agy_b"}:
         from src.acp.agy_selection import (
             AGY_REASONING_EFFORTS,
             is_agy_orchestrator_model,

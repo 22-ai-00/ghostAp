@@ -30,6 +30,7 @@ class IntentType(Enum):
     EXIT_GROK = "exit_grok"
     ENTER_DSH = "enter_dsh"
     ENTER_AGY = "enter_agy"
+    ENTER_AGY_B = "enter_agy_b"
     EXIT_MODE = "exit_mode"
     CHANGE_DIR = "change_dir"
     SHELL_COMMAND = "shell"
@@ -44,6 +45,7 @@ class IntentType(Enum):
     GROK_MESSAGE = "grok_message"
     DSH_MESSAGE = "dsh_message"
     AGY_MESSAGE = "agy_message"
+    AGY_B_MESSAGE = "agy_b_message"
     CREATE_PROJECT = "create_project"
     SWITCH_PROJECT = "switch_project"
     LIST_PROJECTS = "list_projects"
@@ -482,13 +484,27 @@ class IntentRecognizer:
 
     def _match_exact_command(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        if text_lower in self.EXACT_COMMANDS:
-            intent, desc = self.EXACT_COMMANDS[text_lower]
+        matched_cmd = text_lower
+        if (
+            matched_cmd not in self.EXACT_COMMANDS
+            and "@" in matched_cmd
+            and not any(ch.isspace() for ch in matched_cmd)
+        ):
+            base_cmd, _, mention_target = matched_cmd.partition("@")
+            if (
+                base_cmd.startswith("/")
+                and mention_target
+                and "/" not in mention_target
+                and base_cmd in self.EXACT_COMMANDS
+            ):
+                matched_cmd = base_cmd
+        if matched_cmd in self.EXACT_COMMANDS:
+            intent, desc = self.EXACT_COMMANDS[matched_cmd]
             return IntentResult.single(
                 intent=intent,
                 confidence=1.0,
                 original_text=text,
-                reasoning=f"精确匹配命令: {text_lower}",
+                reasoning=f"精确匹配命令: {matched_cmd}",
                 description=desc,
             )
         return None

@@ -71,6 +71,7 @@ class HandlerContext:
     grok_manager: Optional["ACPSessionManager"] = None
     dsh_manager: Optional["ACPSessionManager"] = None
     agy_manager: Optional["ACPSessionManager"] = None
+    agy_b_manager: Optional["ACPSessionManager"] = None
 
     # Shared mutable state
     working_dirs: dict[str, str] = field(default_factory=dict)

@@ -233,4 +233,5 @@ def get_acp_result_header_text() -> dict[str, str]:
         "tool_desc_grok": "xAI Grok Build",
         "tool_desc_dsh": "DeepSeek Harness 原生 ACP 编程",
         "tool_desc_agy": "Google Antigravity 原生 ACP 编程",
+        "tool_desc_agy_b": "Google Antigravity 原生 ACP 编程 (AGY-B)",
     }

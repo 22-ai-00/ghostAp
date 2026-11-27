@@ -183,6 +183,75 @@ class TestGetAvailableTools(unittest.TestCase):
             ["codex"],
         )
 
+    def test_discover_acp_tools_detects_agy_b_via_hyphenated_binary_without_sync_probe(self):
+        """Cold-cache discovery must probe shutil.which('agy-b'), not 'agy_b', without sync probes."""
+        from types import SimpleNamespace
+
+        seen_which: list[str] = []
+        seen_availability: list[dict] = []
+
+        def _which(cmd: str):
+            seen_which.append(cmd)
+            return "/usr/local/bin/agy-b" if cmd == "agy-b" else None
+
+        def _availability(_name, **kwargs):
+            seen_availability.append(dict(kwargs))
+            if kwargs.get("allow_sync_probe"):
+                raise AssertionError("cold-cache discovery must not run synchronous ACP probe")
+            return False
+
+        # Test both _config.binary_name and backend_spec.cli_name fallback (plain object)
+        for provider_obj in (
+            SimpleNamespace(_config=SimpleNamespace(binary_name="agy-b")),
+            object(),
+        ):
+            seen_which.clear()
+            seen_availability.clear()
+            with patch(
+                "src.acp.providers.get_providers",
+                return_value={"agy_b": provider_obj},
+            ), patch(
+                "shutil.which",
+                side_effect=_which,
+            ), patch(
+                "src.acp.providers.tool_registry.get_availability",
+                side_effect=_availability,
+            ):
+                tools = _discover_acp_tools(require_available=True)
+
+            self.assertEqual(
+                tools,
+                {"agy_b": "Google Antigravity 原生 ACP 编程 (AGY-B)"},
+            )
+            self.assertIn("agy-b", seen_which)
+            self.assertTrue(all(not call.get("allow_sync_probe") for call in seen_availability))
+
+    def test_discover_acp_tools_agy_b_uses_fallback_description_when_text_missing(self):
+        """When text.get_acp_result_header_text() lacks tool_desc_agy_b, fallback description is used."""
+        with patch(
+            "src.acp.providers.get_providers",
+            return_value={"agy_b": object()},
+        ), patch(
+            "shutil.which",
+            side_effect=lambda cmd: "/usr/local/bin/agy-b" if cmd == "agy-b" else None,
+        ), patch(
+            "src.acp.providers.tool_registry.get_availability",
+            return_value=False,
+        ), patch(
+            "src.utils.text.get_acp_result_header_text",
+            return_value={},
+        ):
+            tools = _discover_acp_tools(require_available=True)
+
+        self.assertEqual(
+            tools,
+            {"agy_b": _FALLBACK_DESCRIPTIONS["agy_b"]},
+        )
+        self.assertEqual(
+            _FALLBACK_DESCRIPTIONS["agy_b"],
+            "Google Antigravity 原生 ACP 编程 (AGY-B)",
+        )
+
 
 class TestInvalidateCache(unittest.TestCase):
     """Test cache invalidation."""

@@ -1489,3 +1489,8 @@ class DSHModeHandler(ProgrammingModeHandler):
 @_bind_programming_backend(InteractionMode.AGY)
 class AGYModeHandler(ProgrammingModeHandler):
     pass
+
+
+@_bind_programming_backend(InteractionMode.AGY_B)
+class AGYBModeHandler(AGYModeHandler):
+    pass

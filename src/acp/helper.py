@@ -937,7 +937,7 @@ async def _probe_acp_models_once(
             return await discover_codex_model_options(connection, response)
         if tool_name == "dsh":
             return await discover_dsh_model_options(connection, response)
-        if tool_name == "agy":
+        if tool_name in {"agy", "agy_b"}:
             return await discover_agy_model_options(connection, response)
         if tool_name == "traex":
             # Traex applies model changes through ``session/set_config_option``.

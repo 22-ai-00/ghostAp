@@ -707,7 +707,7 @@ def _render_model_cascade_elements(
         )
     )
 
-    is_agy_orch = tool == "agy" and is_agy_orchestrator_model(state.selected_model)
+    is_agy_orch = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
     if state.profiles:
         capped_profiles = _cap_options_preserving(
             state.profiles,
@@ -941,7 +941,7 @@ class ToolCockpitBuilder:
             }
             if thread_root_id:
                 data["thread_root_id"] = thread_root_id
-            if tool == "agy":
+            if tool in {"agy", "agy_b"}:
                 data["show_thinking"] = show_thinking
                 data["verbosity"] = verbosity
                 data["agent_mode"] = agent_mode
@@ -982,7 +982,7 @@ class ToolCockpitBuilder:
         )
         elements.extend(_render_model_cascade_elements(tool, state, _settings_payload))
 
-        if tool == "agy":
+        if tool in {"agy", "agy_b"}:
             elements.extend(
                 _render_agy_runtime_elements(
                     show_thinking=show_thinking,

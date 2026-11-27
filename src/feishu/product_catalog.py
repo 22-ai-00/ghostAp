@@ -371,6 +371,13 @@ def resolve_command(token: str, arguments: str = "") -> ResolvedProductCommand |
 
     invoked_as = (token or "").strip().lower()
     action = _PUBLIC_BY_COMMAND.get(invoked_as) or _COMPATIBILITY_BY_COMMAND.get(invoked_as)
+    if action is None and "@" in invoked_as:
+        base_token, _, mention_target = invoked_as.partition("@")
+        if base_token.startswith("/") and mention_target and "/" not in mention_target:
+            base_action = _PUBLIC_BY_COMMAND.get(base_token) or _COMPATIBILITY_BY_COMMAND.get(base_token)
+            if base_action is not None:
+                action = base_action
+                invoked_as = base_token
     if action is None:
         return None
     rewritten = action.command if (

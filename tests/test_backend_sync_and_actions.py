@@ -43,9 +43,9 @@ def _make_handlers_map() -> dict:
 
 
 def test_backend_meta_ssot_covers_all_11_backends() -> None:
-    assert len(ALL_BACKEND_METAS) == 11
+    assert len(ALL_BACKEND_METAS) == 12
     assert len(VISIBLE_BACKEND_METAS) == 9
-    assert {m.mode_key for m in VISIBLE_BACKEND_METAS} & {"claude_w", "codex_w"} == set()
+    assert {m.mode_key for m in VISIBLE_BACKEND_METAS} & {"claude_w", "codex_w", "agy_b"} == set()
 
     for meta in ALL_BACKEND_METAS:
         assert meta.display_name in MODE_TEMPLATES
@@ -54,7 +54,7 @@ def test_backend_meta_ssot_covers_all_11_backends() -> None:
         assert get_backend_meta(meta.cli_name) == meta
 
     # Header titles and mode resolution cover previously-omitted backends
-    for key in ("codex", "aiden", "claude_w", "codex_w", "agy"):
+    for key in ("codex", "aiden", "claude_w", "codex_w", "agy", "agy_b"):
         proj = ProjectContext(project_id="p1", project_name="demo", root_path="/tmp/demo")
         proj.set_programming_mode(key, True, session_id="s1", query_count=4)
         resolved = resolve_project_programming_mode(proj)
@@ -62,19 +62,23 @@ def test_backend_meta_ssot_covers_all_11_backends() -> None:
         header = CoreBuilder._build_header_title(proj)
         assert get_backend_meta(key).display_name in header
 
-    # Project board renders mode info for AGY and attaches Card 2.0 behaviors on all callback buttons
+    # Project board renders mode info for AGY / AGY-B and attaches Card 2.0 behaviors on all callback buttons
     agy_proj = ProjectContext(project_id="p-agy", project_name="agy-app", root_path="/tmp/agy", last_active=time.time())
     agy_proj.set_programming_mode("agy", True, session_id="s2", query_count=7)
     agy_proj.status = ProjectStatus.IDLE
     idle_proj = ProjectContext(project_id="p-other", project_name="other", root_path="/tmp/o", last_active=time.time() - 10)
     idle_proj.acp_tool_name = "codex"
     idle_proj.acp_model_name = "gpt-5.6-sol"
+    agy_b_proj = ProjectContext(project_id="p-agy-b", project_name="agy-b-app", root_path="/tmp/agyb", last_active=time.time() - 20)
+    agy_b_proj.acp_tool_name = "agy_b"
+    agy_b_proj.acp_model_name = "gemini-4-hydrogen/xhigh"
 
-    _, board_json = ProjectBuilder.build_status_board_card([agy_proj, idle_proj], current_project_id="p-agy")
+    _, board_json = ProjectBuilder.build_status_board_card([agy_proj, idle_proj, agy_b_proj], current_project_id="p-agy")
     board = json.loads(board_json)
     board_str = json.dumps(board, ensure_ascii=False)
     assert "AGY(7)" in board_str
     assert "Codex/gpt-5.6-sol" in board_str
+    assert "AGY-B/gemini-4-hydrogen/xhigh" in board_str
 
     stack = [board]
     callback_buttons = []
@@ -253,6 +257,54 @@ def test_project_preserve_and_switch_respects_all_11_backends_and_acp_tool(monke
     coco_handler.enter_mode.assert_not_called()
     handler.reply_card.assert_called_once()
 
+    # Preserve and switch parity for hidden acp backend agy_b
+    agy_b_proj = ProjectContext(project_id="p4", project_name="p-agy-b", root_path="/tmp/p4")
+    agy_b_proj.set_programming_mode("agy_b", True, session_id="s-old-b", query_count=2)
+    agy_b_session = SimpleNamespace(
+        session_id="s-agy-b",
+        last_query="work on b",
+        message_count=6,
+        to_snapshot=lambda: {"session_id": "s-agy-b"},
+    )
+    agy_b_mgr = SimpleNamespace(get_session=lambda *_a, **_kw: agy_b_session)
+    ctx_mgr_b = MagicMock()
+    handler.ctx = SimpleNamespace(
+        agy_b_manager=agy_b_mgr,
+        mode_manager=SimpleNamespace(get_mode=lambda *_a, **_kw: InteractionMode.AGY_B),
+        context_manager=ctx_mgr_b,
+        project_manager=MagicMock(),
+        handlers={},
+    )
+    handler.preserve_project_context("chat-1", agy_b_proj)
+    assert agy_b_proj.agy_b_session_snapshot.session_id == "s-agy-b"
+    assert agy_b_proj.agy_b_session_snapshot.query_count == 6
+    ctx_mgr_b.update_context.assert_called_once()
+    assert ctx_mgr_b.update_context.call_args.kwargs["session_snapshot"]["source_mode"] == "agy_b"
+
+    target_b_proj = ProjectContext(project_id="p5", project_name="target-b", root_path="/tmp/p5")
+    target_b_proj.acp_tool_name = "agy_b"
+    target_b_proj.acp_model_name = "gemini-4-hydrogen/xhigh"
+    target_agy_b_handler = MagicMock()
+    handler.ctx = SimpleNamespace(
+        project_manager=SimpleNamespace(
+            find_project_by_name_with_hint=lambda *_a, **_kw: (target_b_proj, ""),
+            validate_project_path=lambda *_a: (True, ""),
+            get_active_project=lambda _c: None,
+            set_active_project=lambda _c, _p: (True, "ok"),
+        ),
+        context_manager=MagicMock(),
+        mode_manager=MagicMock(),
+        handlers={"agy_b": target_agy_b_handler},
+    )
+    handler.switch_project("m3", "chat-1", "target-b", auto_enter_coco=True, coco_handler=coco_handler)
+    coco_handler.enter_mode.assert_not_called()
+    target_agy_b_handler.enter_mode.assert_called_once_with(
+        "m3",
+        "chat-1",
+        project=target_b_proj,
+        model_override="gemini-4-hydrogen/xhigh",
+    )
+
 
 def test_action_registry_handles_previously_unregistered_actions_and_signed_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GHOSTAP_SIGNING_KEY", "test-secret-signing-key-32-chars!!")
@@ -328,7 +380,7 @@ def test_ssot_parity_across_mode_handlers_acp_catalog_intent_and_context() -> No
     from src.utils.engine_identity import resolve_engine_identity
 
     expected_keys = [spec.mode_key for spec in backend_ssot.ALL_BACKEND_SPECS]
-    assert len(expected_keys) == 11
+    assert len(expected_keys) == 12
 
     # Card compatibility aliases re-export the exact SSOT objects
     assert ALL_BACKEND_METAS is backend_ssot.ALL_BACKEND_SPECS

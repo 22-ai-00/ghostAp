@@ -43,7 +43,8 @@ class ProjectBuilder:
 
     @staticmethod
     def _build_project_group_jump_button(project: Optional[ProjectContext]) -> Optional[dict]:
-        chat_id = str(getattr(project, "bound_chat_id", "") or "").strip() if project else ""
+        raw_chat_id = getattr(project, "bound_chat_id", None) if project else None
+        chat_id = raw_chat_id.strip() if isinstance(raw_chat_id, str) else ""
         if not chat_id:
             return None
         return apply_compact_style(
@@ -96,6 +97,7 @@ class ProjectBuilder:
         global_working_dir: str,
         *,
         chat_id: Optional[str] = None,
+        is_current: Optional[bool] = None,
     ) -> tuple[str, str]:
         """Build the full card for project status report."""
         del global_working_dir  # status card keeps one directory row for compactness
@@ -107,57 +109,111 @@ class ProjectBuilder:
         last_active = UI_TEXT["project_last_active_label"].format(
             time_ago=CoreBuilder._format_time_ago(project.last_active)
         )
-        group_chat_id = str(getattr(project, "bound_chat_id", "") or "").strip()
-        group_name = str(getattr(project, "bound_chat_name", "") or "").strip()
+        raw_chat_id = getattr(project, "bound_chat_id", None)
+        group_chat_id = raw_chat_id.strip() if isinstance(raw_chat_id, str) else ""
+        raw_chat_name = getattr(project, "bound_chat_name", None)
+        group_name = raw_chat_name.strip() if isinstance(raw_chat_name, str) else ""
         group_line = (
             UI_TEXT["project_status_group_label"].format(name=group_name or group_chat_id)
             if group_chat_id
             else UI_TEXT["project_status_no_group"]
         )
 
+        title_suffix = " · 当前项目" if is_current else ""
         lines = [
-            f"**{UI_TEXT['project_status_card_title']}**",
+            f"**{UI_TEXT['project_status_card_title']}**{title_suffix}",
             status,
             last_active,
             group_line,
         ]
 
+        has_active_mode = False
         for meta in ALL_BACKEND_METAS:
             if get_project_programming_mode(project, meta.mode_key, chat_id):
                 snap = get_project_programming_snapshot(project, meta.mode_key, chat_id)
                 if snap:
+                    has_active_mode = True
                     lines.append(
-                        f"• {meta.display_name}: `{snap.session_id}` · {UI_TEXT['project_session_count_label'].format(count=snap.query_count).lstrip('• ')}"
+                        f"• {meta.emoji} {meta.display_name}: `{snap.session_id}` · {UI_TEXT['project_session_count_label'].format(count=snap.query_count).lstrip('• ')}"
                     )
 
-        buttons = [
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_board_btn_switch"]},
-                    "type": "default",
-                    "behaviors": [
-                        {
-                            "type": "callback",
-                            "value": {"action": "switch_project", "project_id": project.project_id},
-                        }
-                    ],
-                }
+        if not has_active_mode:
+            saved_tool = get_project_acp_tool_name(project, chat_id)
+            meta = get_backend_meta(saved_tool) if isinstance(saved_tool, str) and saved_tool else None
+            if meta is not None:
+                saved_model = get_project_acp_model_name(project, chat_id, tool_name=saved_tool)
+                model_disp = saved_model.strip() if isinstance(saved_model, str) and saved_model.strip() else "default"
+                lines.append(f"• 默认工具: {meta.emoji} {meta.display_name} · 模型: `{model_disp}`")
+            else:
+                lines.append("• 默认工具: 未配置（可点击「工具设置」选择）")
+
+        buttons = []
+        if is_current is True:
+            buttons.append(
+                build_callback_button(
+                    UI_TEXT["project_board_btn_continue"],
+                    {"action": "continue_dev", "project_id": project.project_id},
+                    button_type="primary",
+                    compact=True,
+                )
             )
-        ]
+        else:
+            buttons.append(
+                build_callback_button(
+                    UI_TEXT["project_board_btn_switch"],
+                    {"action": "switch_to", "project_id": project.project_id},
+                    button_type="primary",
+                    compact=True,
+                )
+            )
+
+        buttons.extend(
+            [
+                build_callback_button(
+                    UI_TEXT["project_btn_settings"],
+                    {"action": "open_tool_settings", "project_id": project.project_id},
+                    compact=True,
+                ),
+                build_callback_button(
+                    UI_TEXT["project_btn_usage_full"],
+                    {"action": "open_tool_usage", "project_id": project.project_id},
+                    compact=True,
+                ),
+                build_callback_button(
+                    UI_TEXT["project_btn_cmds"],
+                    {"action": "show_tool_commands", "project_id": project.project_id},
+                    compact=True,
+                ),
+            ]
+        )
         group_button = ProjectBuilder._build_project_group_jump_button(project)
         if group_button:
             buttons.append(group_button)
+        buttons.append(
+            build_callback_button(
+                UI_TEXT["project_btn_back_board"],
+                {"action": "show_board"},
+                compact=True,
+            )
+        )
 
         elements = [
-            CoreBuilder._build_directory_element(project),
+            {"tag": "markdown", "content": f"📁 `{CoreBuilder._compact_path(project.root_path, limit=48)}`"},
             {"tag": "hr"},
             {"tag": "markdown", "content": "\n".join(lines)},
         ]
-        elements.extend(build_responsive_layout(buttons))
+        elements.extend(
+            build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False)
+        )
 
         header_title = CoreBuilder._build_header_title(project)
-        card = CoreBuilder._wrap_card(header_title, theme.header_template, elements)
+        card = CoreBuilder._wrap_card(
+            header_title,
+            theme.header_template,
+            elements,
+            update_multi=True,
+            summary=f"项目详情 · {project.project_name}",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -263,10 +319,6 @@ class ProjectBuilder:
                     "text_size": "notation",
                 }
             )
-        else:
-            footer_note = CoreBuilder._build_footer_note(project, working_dir)
-            if footer_note:
-                elements.append(footer_note)
 
         if show_buttons:
             buttons = CoreBuilder._build_footer_buttons(
@@ -275,14 +327,20 @@ class ProjectBuilder:
             )
             if extra_buttons:
                 buttons.extend([apply_compact_style(b) for b in extra_buttons])
-            elements.extend(build_responsive_layout(buttons))
+            elements.extend(
+                build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False)
+            )
         elif extra_buttons:
             # Render extra buttons without the standard footer buttons
-            elements.extend(build_responsive_layout(
-                [apply_compact_style(b) for b in extra_buttons]
-            ))
+            elements.extend(
+                build_responsive_layout(
+                    [apply_compact_style(b) for b in extra_buttons],
+                    layout="responsive",
+                    mobile_force_vertical=False,
+                )
+            )
 
-        card = CoreBuilder._wrap_card(header_title, theme.header_template, elements)
+        card = CoreBuilder._wrap_card(header_title, theme.header_template, elements, update_multi=True)
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -305,11 +363,24 @@ class ProjectBuilder:
                             {"action": "new_project_prompt"},
                             button_type="primary",
                             compact=True,
-                        )
-                    ]
+                        ),
+                        build_callback_button(
+                            UI_TEXT["project_board_btn_refresh"],
+                            {"action": "refresh_board"},
+                            compact=True,
+                        ),
+                    ],
+                    layout="responsive",
+                    mobile_force_vertical=False,
                 ),
             ]
-            card = CoreBuilder._wrap_card(board_title, "blue", empty_elements)
+            card = CoreBuilder._wrap_card(
+                board_title,
+                "blue",
+                empty_elements,
+                update_multi=True,
+                summary="项目看板 · 暂无项目",
+            )
             return "interactive", json.dumps(card, ensure_ascii=False)
 
         # Sort: Current project first, then by last_active descending
@@ -328,7 +399,14 @@ class ProjectBuilder:
         end_idx = start_idx + page_size
         page_projects = sorted_projects[start_idx:end_idx]
 
-        elements = [{"tag": "markdown", "content": UI_TEXT["project_board_total_projects"].format(total=total_projects)}, {"tag": "hr"}]
+        summary_parts = [UI_TEXT["project_board_total_projects"].format(total=total_projects)]
+        current_proj = next((p for p in sorted_projects if p.project_id == current_project_id), None)
+        if current_proj:
+            summary_parts.append(f"当前：**{current_proj.project_name}**")
+        if total_pages > 1:
+            summary_parts.append(f"第 {page}/{total_pages} 页")
+
+        elements = [{"tag": "markdown", "content": " · ".join(summary_parts)}, {"tag": "hr"}]
 
         for project in page_projects:
             is_current = project.project_id == current_project_id
@@ -344,63 +422,88 @@ class ProjectBuilder:
                     snap = get_project_programming_snapshot(project, meta.mode_key, chat_id)
                     if snap:
                         query_count = getattr(snap, "query_count", 0) or 0
-                if active_mode == InteractionMode.CLAUDE:
-                    mode_info = UI_TEXT["project_board_claude_info"].format(count=query_count)
-                elif active_mode == InteractionMode.COCO:
-                    mode_info = UI_TEXT["project_board_coco_info"].format(count=query_count)
-                elif meta is not None:
                     mode_info = f" · {meta.emoji} {meta.display_name}({query_count})"
+                    saved_model = get_project_acp_model_name(
+                        project,
+                        chat_id,
+                        tool_name=meta.mode_key,
+                    )
+                    if isinstance(saved_model, str) and saved_model.strip():
+                        mode_info += f" · `{saved_model.strip()}`"
             else:
                 saved_tool = get_project_acp_tool_name(project, chat_id)
-                meta = get_backend_meta(saved_tool) if saved_tool else None
+                meta = get_backend_meta(saved_tool) if isinstance(saved_tool, str) and saved_tool else None
                 if meta is not None:
                     saved_model = get_project_acp_model_name(
                         project,
                         chat_id,
                         tool_name=saved_tool,
                     )
-                    model_suffix = f"/{saved_model}" if saved_model else ""
+                    model_suffix = f"/{saved_model}" if isinstance(saved_model, str) and saved_model else ""
                     mode_info = f" · {meta.emoji} {meta.display_name}{model_suffix}"
 
             last_active = CoreBuilder._format_time_ago(project.last_active)
+            compact_path = CoreBuilder._compact_path(project.root_path, limit=44)
 
             project_content = (
                 f"{status_emoji} **{project.project_name}**{current_marker}\n"
-                f"└─ 📁 `{project.root_path}`\n"
+                f"└─ 📁 `{compact_path}`\n"
                 f"└─ ⏱️ {last_active}{mode_info}"
             )
 
             elements.append({"tag": "markdown", "content": project_content})
 
             buttons = []
-            if not is_current:
-                buttons.append(
-                    build_callback_button(
-                        UI_TEXT["project_board_btn_switch"],
-                        {"action": "switch_to", "project_id": project.project_id},
-                        button_type="primary",
-                    )
+            if is_current:
+                buttons.extend(
+                    [
+                        build_callback_button(
+                            UI_TEXT["project_board_btn_continue"],
+                            {"action": "continue_dev", "project_id": project.project_id},
+                            button_type="primary",
+                            compact=True,
+                        ),
+                        build_callback_button(
+                            UI_TEXT["project_btn_settings"],
+                            {"action": "open_tool_settings", "project_id": project.project_id},
+                            compact=True,
+                        ),
+                        build_callback_button(
+                            UI_TEXT["project_btn_usage"],
+                            {"action": "open_tool_usage", "project_id": project.project_id},
+                            compact=True,
+                        ),
+                        build_callback_button(
+                            UI_TEXT["project_board_btn_detail"],
+                            {"action": "show_detail", "project_id": project.project_id},
+                            compact=True,
+                        ),
+                    ]
                 )
             else:
-                buttons.append(
-                    build_callback_button(
-                        UI_TEXT["project_board_btn_continue"],
-                        {"action": "continue_dev", "project_id": project.project_id},
-                        button_type="primary",
-                    )
+                buttons.extend(
+                    [
+                        build_callback_button(
+                            UI_TEXT["project_board_btn_switch"],
+                            {"action": "switch_to", "project_id": project.project_id},
+                            button_type="primary",
+                            compact=True,
+                        ),
+                        build_callback_button(
+                            UI_TEXT["project_board_btn_detail"],
+                            {"action": "show_detail", "project_id": project.project_id},
+                            compact=True,
+                        ),
+                    ]
                 )
 
-            buttons.append(
-                build_callback_button(
-                    UI_TEXT["project_board_btn_detail"],
-                    {"action": "show_detail", "project_id": project.project_id},
-                )
-            )
             group_button = ProjectBuilder._build_project_group_jump_button(project)
             if group_button:
                 buttons.append(group_button)
 
-            elements.extend(build_responsive_layout(buttons))
+            elements.extend(
+                build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False)
+            )
             elements.append({"tag": "hr"})
 
         # Remove last hr
@@ -414,6 +517,7 @@ class ProjectBuilder:
                 build_callback_button(
                     UI_TEXT["project_board_btn_prev"],
                     {"action": "switch_board_page", "page": page - 1},
+                    compact=True,
                 )
             )
 
@@ -422,12 +526,17 @@ class ProjectBuilder:
                 build_callback_button(
                     UI_TEXT["project_board_btn_next"],
                     {"action": "switch_board_page", "page": page + 1},
+                    compact=True,
                 )
             )
 
         if pagination_buttons:
             elements.append({"tag": "hr"})
-            elements.extend(build_responsive_layout(pagination_buttons))
+            elements.extend(
+                build_responsive_layout(
+                    pagination_buttons, layout="responsive", mobile_force_vertical=False
+                )
+            )
             if total_pages > 1:
                 elements.append(
                     {
@@ -445,16 +554,27 @@ class ProjectBuilder:
                     build_callback_button(
                         UI_TEXT["project_board_btn_new"],
                         {"action": "new_project_prompt"},
+                        compact=True,
                     ),
                     build_callback_button(
                         UI_TEXT["project_board_btn_refresh"],
                         {"action": "refresh_board"},
+                        compact=True,
                     ),
-                ]
+                ],
+                layout="responsive",
+                mobile_force_vertical=False,
             )
         )
 
-        card = CoreBuilder._wrap_card(board_title, "blue", elements)
+        page_suffix = f"（第 {page}/{total_pages} 页）" if total_pages > 1 else ""
+        card = CoreBuilder._wrap_card(
+            board_title,
+            "blue",
+            elements,
+            update_multi=True,
+            summary=f"项目看板 · 共 {total_projects} 个项目{page_suffix}",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -497,9 +617,19 @@ class ProjectBuilder:
 
         buttons = [
             build_callback_button(
+                UI_TEXT["project_btn_choose_tool"],
+                {"action": "open_tool_settings", "project_id": project.project_id},
+                button_type="primary",
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["project_board_title"],
+                {"action": "show_board"},
+                compact=True,
+            ),
+            build_callback_button(
                 UI_TEXT["project_btn_start_coco"],
                 {"action": "enter_coco", "project_id": project.project_id},
-                button_type="primary",
                 compact=True,
             ),
             build_callback_button(
@@ -508,8 +638,13 @@ class ProjectBuilder:
                 compact=True,
             ),
             build_callback_button(
-                UI_TEXT["project_board_title"],
-                {"action": "show_board"},
+                UI_TEXT["project_btn_start_agy"],
+                {"action": "enter_agy", "project_id": project.project_id},
+                compact=True,
+            ),
+            build_callback_button(
+                UI_TEXT["project_btn_start_codex"],
+                {"action": "enter_codex", "project_id": project.project_id},
                 compact=True,
             ),
         ]
@@ -517,9 +652,17 @@ class ProjectBuilder:
         elements = [
             CoreBuilder._build_content_element(content),
         ]
-        elements.extend(build_responsive_layout(buttons))
+        elements.extend(
+            build_responsive_layout(buttons, layout="responsive", mobile_force_vertical=False)
+        )
 
-        card = CoreBuilder._wrap_card(UI_TEXT["project_created_title"], theme.header_template, elements)
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["project_created_title"],
+            theme.header_template,
+            elements,
+            update_multi=True,
+            summary=f"新项目已创建 · {project.project_name}",
+        )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod

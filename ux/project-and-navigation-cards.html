@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GhostAP 命令交互卡片优化预览 (/projects · 详情 · /new · /menu · /tools · /tools_status)</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1218;
+      --card: #191e27;
+      --surface: #222834;
+      --border: #313949;
+      --text: #f3f4f6;
+      --muted: #9aa4b5;
+      --blue: #1d4ed8;
+      --green: #174a38;
+      --code-bg: #262e3d;
+      --code-fg: #93c5fd;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    }
+    header.page-bar {
+      padding: 20px 28px 8px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    header.page-bar h1 { margin: 0 0 4px; font-size: 18px; }
+    header.page-bar p { margin: 0; color: var(--muted); font-size: 13px; }
+    section.viewport-block {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 16px 28px 28px;
+    }
+    .section-heading {
+      font-size: 14px;
+      font-weight: 700;
+      color: #cbd5e1;
+      margin: 0 0 14px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+    .desktop-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(440px, 470px));
+      gap: 22px;
+      justify-content: center;
+      align-items: start;
+    }
+    .mobile-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      justify-content: center;
+      align-items: start;
+    }
+    .mobile-frame {
+      width: 375px;
+      flex: 0 0 375px;
+      padding: 10px;
+      border: 1px dashed #475569;
+      border-radius: 18px;
+      background: #0b0e14;
+    }
+    .mobile-tag {
+      font-size: 11px;
+      color: var(--muted);
+      margin: 0 0 8px 4px;
+      font-weight: 600;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      background: var(--card);
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.3);
+    }
+    .card-header {
+      padding: 13px 16px;
+      font-weight: 700;
+      font-size: 15px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .card-header.blue { background: var(--blue); }
+    .card-header.green { background: var(--green); }
+    .card-sub {
+      font-size: 12px;
+      font-weight: 400;
+      opacity: 0.88;
+      margin-top: 2px;
+    }
+    .card-body { padding: 14px 16px; color: #dbe1ec; }
+    .summary-line { font-size: 13.5px; color: #f8fafc; }
+    .kv-box {
+      background: var(--surface);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .kv-row { margin: 3px 0; font-size: 13px; }
+    .proj-block { margin: 2px 0; }
+    .proj-title { font-size: 13.5px; font-weight: 700; color: #f8fafc; }
+    .proj-meta { font-size: 12.5px; color: #cbd5e1; margin-top: 2px; line-height: 1.5; }
+    .section-title { font-weight: 700; color: #f8fafc; margin: 0 0 6px; font-size: 13.5px; }
+    .tool-list { margin: 0; padding: 0; list-style: none; font-size: 12.5px; line-height: 1.6; }
+    .tool-list li { margin: 2px 0; }
+    code {
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .hr { height: 1px; background: var(--border); margin: 11px 0; }
+    .note { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    .note.center { text-align: center; }
+    .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: rgba(59, 130, 246, 0.2);
+      color: #93c5fd;
+      font-size: 11.5px;
+      font-weight: 600;
+      margin-left: 4px;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 9px;
+    }
+    button {
+      min-width: 0;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 1px solid #475569;
+      background: #28303e;
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+    }
+    button.primary { border-color: #3b82f6; background: #2563eb; }
+    button.disabled { opacity: 0.48; cursor: not-allowed; }
+    .mobile-frame .card-body { padding: 12px 13px; }
+    .mobile-frame button { font-size: 12px; padding: 7px 8px; }
+  </style>
+</head>
+<body>
+  <header class="page-bar">
+    <h1>GhostAP 命令交互卡片优化预览（Card JSON 2.0 · 桌面 &amp; 375px 移动端）</h1>
+    <p>覆盖 <code>/projects</code> 看板、项目详情（修复 <code>switch_to</code> 与活跃态）、<code>/new</code> 新建项目、<code>/menu</code> 快捷菜单、<code>/tools</code> 与 <code>/tools_status</code>。</p>
+  </header>
+
+  <!-- ==================== DESKTOP SECTION ==================== -->
+  <section class="viewport-block desktop-section">
+    <h2 class="section-heading">桌面端卡片宽度预览（~460px · 2 列响应式网格）</h2>
+    <div class="desktop-grid">
+
+      <!-- 1. /projects Status Board -->
+      <section class="card">
+        <div class="card-header blue">
+          <div>📋 项目看板</div>
+        </div>
+        <div class="card-body">
+          <div class="summary-line">共 <strong>8</strong> 个项目 · 当前：<strong>ghostAp</strong> · 第 1/2 页</div>
+          <div class="hr"></div>
+
+          <div class="proj-block">
+            <div class="proj-title">🟢 <strong>ghostAp</strong> (当前)</div>
+            <div class="proj-meta">
+              └─ 📁 <code>~/work/github/ghostAp</code><br>
+              └─ ⏱️ 刚刚 · 🪐 AGY(7) · <code>gemini-pro-orch</code>
+            </div>
+            <div class="actions">
+              <button class="primary">继续开发</button>
+              <button>⚙️ 工具设置</button>
+              <button>📊 用量</button>
+              <button>查看详情</button>
+            </div>
+          </div>
+          <div class="hr"></div>
+
+          <div class="proj-block">
+            <div class="proj-title">🟢 <strong>api-service</strong></div>
+            <div class="proj-meta">
+              └─ 📁 <code>~/…/services/api-service</code><br>
+              └─ ⏱️ 12 分钟前 · 💻 Codex/gpt-5.6-sol
+            </div>
+            <div class="actions">
+              <button class="primary">切换到此项目</button>
+              <button>查看详情</button>
+            </div>
+          </div>
+          <div class="hr"></div>
+
+          <div class="actions">
+            <button>⬅️ 上一页</button>
+            <button>下一页 ➡️</button>
+          </div>
+          <div class="note center">第 1/2 页</div>
+          <div class="hr"></div>
+          <div class="actions">
+            <button>➕ 新建项目</button>
+            <button>🔄 刷新</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Project Detail (Non-Active & Active comparison) -->
+      <section class="card">
+        <div class="card-header green">
+          <div>💻 api-service · Codex</div>
+        </div>
+        <div class="card-body">
+          <div class="kv-box">
+            <div class="kv-row">📁 <code>~/work/services/api-service</code></div>
+          </div>
+          <div class="hr"></div>
+          <div class="section-title">项目状态</div>
+          <div class="kv-row">• 状态: 🟢 active</div>
+          <div class="kv-row">• 最后活跃: 12 分钟前</div>
+          <div class="kv-row">• 项目群: api-service 研发群</div>
+          <div class="kv-row">• 默认工具: 💻 Codex · 模型: <code>gpt-5.6-sol</code></div>
+          <div class="actions">
+            <button class="primary">切换到此项目</button>
+            <button>⚙️ 工具设置</button>
+            <button>📊 工具用量</button>
+            <button>🛠️ 原生命令</button>
+            <button>进入项目群</button>
+            <button>📋 返回看板</button>
+          </div>
+          <div class="hr"></div>
+          <div class="kv-box">
+            <div class="kv-row"><strong>当前项目态（ghostAp · AGY）</strong><span class="badge">当前项目</span></div>
+            <div class="actions" style="margin-top:8px;">
+              <button class="primary">继续开发</button>
+              <button>⚙️ 工具设置</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. /new Project Created -->
+      <section class="card">
+        <div class="card-header green">
+          <div>🎉 新项目已创建</div>
+        </div>
+        <div class="card-body">
+          <div class="kv-box">
+            <div class="kv-row">✅ 项目 <strong>demo-app</strong> 创建成功</div>
+            <div class="kv-row" style="margin-top:6px;">📁 路径: <code>~/work/github/demo-app</code></div>
+            <div class="kv-row">• 项目 ID: <code>demo-app</code></div>
+            <div class="kv-row">• 主题色: 🟢 green</div>
+          </div>
+          <div class="actions">
+            <button class="primary">⚙️ 选择工具与模型</button>
+            <button>📋 项目看板</button>
+            <button>🤖 开始 Coco</button>
+            <button>🔮 开始 Claude</button>
+            <button>🪐 开始 AGY</button>
+            <button>💻 开始 Codex</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. /menu Quick Command Menu -->
+      <section class="card">
+        <div class="card-header blue">
+          <div>📱 快捷菜单</div>
+          <div class="card-sub">项目：ghostAp</div>
+        </div>
+        <div class="card-body">
+          <div class="kv-box">
+            <div class="kv-row">📁 <strong>ghostAp</strong> · <code>~/work/github/ghostAp</code></div>
+            <div class="kv-row">⚡ 当前通道：🪐 <strong>AGY</strong> · <code>gemini-pro-orch</code>（运行中）</div>
+          </div>
+          <div class="hr"></div>
+          <div class="section-title">📱 常用指令菜单</div>
+          <div class="actions">
+            <button class="primary">📋 切换项目</button>
+            <button class="primary">⚙️ 工具设置</button>
+            <button>📊 工具用量</button>
+            <button>🛠️ 原生命令</button>
+            <button>⚡ Workflow 配置</button>
+            <button>💭 Deep 任务</button>
+            <button>➕ 新建项目</button>
+            <button>📖 帮助</button>
+          </div>
+          <div class="hr"></div>
+          <div class="note">💡 更多指令：<code>/tools</code> 工具列表 · <code>/status</code> 工作区总览 · <code>/spec</code> 结构化开发</div>
+        </div>
+      </section>
+
+      <!-- 5. /tools Tools List -->
+      <section class="card">
+        <div class="card-header blue">
+          <div>🛠️ 工具选择</div>
+        </div>
+        <div class="card-body">
+          <div class="summary-line">📁 <code>~/work/github/ghostAp</code> · 当前默认：🪐 <strong>AGY</strong></div>
+          <div class="hr"></div>
+          <div class="section-title">🔧 可用工具列表</div>
+          <ul class="tool-list">
+            <li>• 🤖 <strong>Coco</strong> — 字节跳动 AI</li>
+            <li>• 🔮 <strong>Claude</strong> — Anthropic AI</li>
+            <li>• 🎯 <strong>Aiden</strong> — Aiden CLI · ⚠️ 未就绪</li>
+            <li>• 💻 <strong>Codex</strong> — OpenAI Codex</li>
+            <li>• ✨ <strong>Gemini</strong> — Google Gemini CLI</li>
+            <li>• 🚀 <strong>Traex</strong> — TRAE CLI</li>
+            <li>• 🌌 <strong>Grok</strong> — xAI Grok Build</li>
+            <li>• 🧭 <strong>DSH</strong> — DeepSeek Harness</li>
+            <li>• 🪐 <strong>AGY</strong> — Google Antigravity · ✓ 当前</li>
+          </ul>
+          <div class="actions">
+            <button>🤖 Coco</button>
+            <button>🔮 Claude</button>
+            <button class="disabled">🎯 Aiden ⚠️</button>
+            <button>💻 Codex</button>
+            <button>✨ Gemini</button>
+            <button>🚀 Traex</button>
+            <button>🌌 Grok</button>
+            <button>🧭 DSH</button>
+            <button class="primary">🪐 AGY ✓</button>
+          </div>
+          <div class="hr"></div>
+          <div class="actions">
+            <button>⚙️ 工具设置</button>
+            <button>📊 用量</button>
+          </div>
+          <div class="note">可用工具: 8/9 • 点击工具选择模型进入 • 灰色表示未就绪</div>
+        </div>
+      </section>
+
+      <!-- 6. /tools_status Tools Status -->
+      <section class="card">
+        <div class="card-header blue">
+          <div>📋 工具状态</div>
+        </div>
+        <div class="card-body">
+          <div class="summary-line">共 <strong>9</strong> 个工具 · ✅ <strong>8</strong> 个可用 · 🔴 <strong>1</strong> 个活跃会话</div>
+          <div class="kv-row" style="margin-top:3px;">📁 <code>~/work/github/ghostAp</code></div>
+          <div class="hr"></div>
+          <div class="section-title">✅ 可用工具</div>
+          <ul class="tool-list">
+            <li>• 🪐 <strong>AGY</strong> ✓ 当前 · 刚刚 · 🔴 活跃 (4条 · <code>oc_8a12…f91c</code>)</li>
+            <li>• 🤖 <strong>Coco</strong> · 12 分钟前</li>
+            <li>• 🔮 <strong>Claude</strong> · 1 小时前</li>
+            <li>• 💻 <strong>Codex</strong> · 2 小时前</li>
+            <li>• ✨ <strong>Gemini</strong> · 从未使用</li>
+            <li>• 🚀 <strong>Traex</strong> · 从未使用</li>
+            <li>• 🌌 <strong>Grok</strong> · 从未使用</li>
+            <li>• 🧭 <strong>DSH</strong> · 从未使用</li>
+          </ul>
+          <div class="hr"></div>
+          <div class="section-title">❌ 未就绪工具</div>
+          <div class="kv-row" style="font-size:12.5px;color:#cbd5e1;">• 🎯 Aiden（CLI 未检测到）</div>
+          <div class="hr"></div>
+          <div class="actions">
+            <button class="primary">进入 AGY</button>
+            <button>进入 Coco</button>
+            <button>进入 Claude</button>
+            <button>进入 Codex</button>
+          </div>
+          <div class="hr"></div>
+          <div class="actions">
+            <button>⚙️ 工具设置</button>
+            <button>📊 用量</button>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </section>
+
+  <!-- ==================== 375px MOBILE SECTION ==================== -->
+  <section class="viewport-block mobile-section">
+    <h2 class="section-heading">375px 移动端视口预览（2 列紧凑按钮防溢出核验）</h2>
+    <div class="mobile-grid">
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · /projects</div>
+        <section class="card">
+          <div class="card-header blue"><div>📋 项目看板</div></div>
+          <div class="card-body">
+            <div class="summary-line">共 <strong>8</strong> 个项目 · 当前：<strong>ghostAp</strong> · 第 1/2 页</div>
+            <div class="hr"></div>
+            <div class="proj-block">
+              <div class="proj-title">🟢 <strong>ghostAp</strong> (当前)</div>
+              <div class="proj-meta">└─ 📁 <code>~/work/github/ghostAp</code><br>└─ ⏱️ 刚刚 · 🪐 AGY(7) · <code>gemini-pro-orch</code></div>
+              <div class="actions">
+                <button class="primary">继续开发</button>
+                <button>⚙️ 工具设置</button>
+                <button>📊 用量</button>
+                <button>查看详情</button>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="proj-block">
+              <div class="proj-title">🟢 <strong>api-service</strong></div>
+              <div class="proj-meta">└─ 📁 <code>~/…/services/api-service</code><br>└─ ⏱️ 12 分钟前 · 💻 Codex/gpt-5.6-sol</div>
+              <div class="actions">
+                <button class="primary">切换到此项目</button>
+                <button>查看详情</button>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="actions">
+              <button>➕ 新建项目</button>
+              <button>🔄 刷新</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · 项目详情（非活跃态）</div>
+        <section class="card">
+          <div class="card-header green"><div>💻 api-service · Codex</div></div>
+          <div class="card-body">
+            <div class="kv-box"><div class="kv-row">📁 <code>~/work/services/api-service</code></div></div>
+            <div class="hr"></div>
+            <div class="section-title">项目状态</div>
+            <div class="kv-row">• 状态: 🟢 active</div>
+            <div class="kv-row">• 最后活跃: 12 分钟前</div>
+            <div class="kv-row">• 默认工具: 💻 Codex · 模型: <code>gpt-5.6-sol</code></div>
+            <div class="actions">
+              <button class="primary">切换到此项目</button>
+              <button>⚙️ 工具设置</button>
+              <button>📊 工具用量</button>
+              <button>🛠️ 原生命令</button>
+              <button>进入项目群</button>
+              <button>📋 返回看板</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · /new</div>
+        <section class="card">
+          <div class="card-header green"><div>🎉 新项目已创建</div></div>
+          <div class="card-body">
+            <div class="kv-box">
+              <div class="kv-row">✅ 项目 <strong>demo-app</strong> 创建成功</div>
+              <div class="kv-row">📁 路径: <code>~/work/github/demo-app</code></div>
+              <div class="kv-row">• 项目 ID: <code>demo-app</code> · 🟢 green</div>
+            </div>
+            <div class="actions">
+              <button class="primary">⚙️ 选择工具与模型</button>
+              <button>📋 项目看板</button>
+              <button>🤖 开始 Coco</button>
+              <button>🔮 开始 Claude</button>
+              <button>🪐 开始 AGY</button>
+              <button>💻 开始 Codex</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · /menu</div>
+        <section class="card">
+          <div class="card-header blue">
+            <div>📱 快捷菜单</div>
+            <div class="card-sub">项目：ghostAp</div>
+          </div>
+          <div class="card-body">
+            <div class="kv-box">
+              <div class="kv-row">📁 <strong>ghostAp</strong> · <code>~/work/github/ghostAp</code></div>
+              <div class="kv-row">⚡ 当前通道：🪐 <strong>AGY</strong>（运行中）</div>
+            </div>
+            <div class="hr"></div>
+            <div class="actions">
+              <button class="primary">📋 切换项目</button>
+              <button class="primary">⚙️ 工具设置</button>
+              <button>📊 工具用量</button>
+              <button>🛠️ 原生命令</button>
+              <button>⚡ Workflow 配置</button>
+              <button>💭 Deep 任务</button>
+              <button>➕ 新建项目</button>
+              <button>📖 帮助</button>
+            </div>
+            <div class="note">💡 <code>/tools</code> 工具列表 · <code>/status</code> 工作区总览</div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · /tools</div>
+        <section class="card">
+          <div class="card-header blue"><div>🛠️ 工具选择</div></div>
+          <div class="card-body">
+            <div class="summary-line">📁 <code>~/work/github/ghostAp</code> · 当前：🪐 <strong>AGY</strong></div>
+            <div class="hr"></div>
+            <div class="actions">
+              <button>🤖 Coco</button>
+              <button>🔮 Claude</button>
+              <button class="disabled">🎯 Aiden ⚠️</button>
+              <button>💻 Codex</button>
+              <button>✨ Gemini</button>
+              <button>🚀 Traex</button>
+              <button>🌌 Grok</button>
+              <button>🧭 DSH</button>
+              <button class="primary">🪐 AGY ✓</button>
+            </div>
+            <div class="hr"></div>
+            <div class="actions">
+              <button>⚙️ 工具设置</button>
+              <button>📊 用量</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mobile-frame">
+        <div class="mobile-tag">Mobile 375px · /tools_status</div>
+        <section class="card">
+          <div class="card-header blue"><div>📋 工具状态</div></div>
+          <div class="card-body">
+            <div class="summary-line">共 <strong>9</strong> 个工具 · ✅ <strong>8</strong> 个可用 · 🔴 <strong>1</strong> 个活跃会话</div>
+            <div class="hr"></div>
+            <div class="section-title">✅ 可用工具</div>
+            <ul class="tool-list">
+              <li>• 🪐 <strong>AGY</strong> ✓ 当前 · 刚刚 · 🔴 活跃 (4条 · <code>oc_8a12…f91c</code>)</li>
+              <li>• 🤖 <strong>Coco</strong> · 12 分钟前</li>
+              <li>• 🔮 <strong>Claude</strong> · 1 小时前</li>
+            </ul>
+            <div class="hr"></div>
+            <div class="actions">
+              <button class="primary">进入 AGY</button>
+              <button>进入 Coco</button>
+              <button>进入 Claude</button>
+              <button>进入 Codex</button>
+            </div>
+            <div class="hr"></div>
+            <div class="actions">
+              <button>⚙️ 工具设置</button>
+              <button>📊 用量</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+    </div>
+  </section>
+</body>
+</html>

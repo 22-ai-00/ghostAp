@@ -34,6 +34,7 @@ _PREFERRED_TOOL_ORDER: tuple[str, ...] = (
     "coco",
     "claude_w",
     "codex_w",
+    "agy_b",
 )
 
 
@@ -430,6 +431,7 @@ class WorkflowConfigMixin:
                 [
                     *(str(t or "").strip().lower() for t in priority_tools if t),
                     "agy",
+                    "agy_b",
                     "traex",
                     "codex",
                     "coco",
@@ -443,6 +445,7 @@ class WorkflowConfigMixin:
         )
         priority_set = {str(t or "").strip().lower() for t in priority_tools if t} | {
             "agy",
+            "agy_b",
             "traex",
         }
         unsettled: list[str] = []
@@ -650,13 +653,29 @@ class WorkflowConfigMixin:
         preset_id: str = "collaborative",
     ) -> tuple[Any, ...]:
         """Build an initial role-aligned team roster from available capabilities."""
+        from ...mode.backends import ALL_BACKEND_SPECS
         from ...workflow_engine.agent_pool import WorkflowAgentBinding, freeze_agent_pool
 
-        avail_names = [name for name, cap in capabilities.items() if cap.available]
+        hidden_tools = frozenset(
+            spec.mode_key
+            for spec in ALL_BACKEND_SPECS
+            if not spec.visible_in_tools_list
+        )
+        avail_names = [
+            name
+            for name, cap in capabilities.items()
+            if cap.available and name not in hidden_tools
+        ]
         if not avail_names:
-            avail_names = [name for name in _PREFERRED_TOOL_ORDER if name in capabilities][:3]
+            avail_names = [
+                name
+                for name in _PREFERRED_TOOL_ORDER
+                if name in capabilities and name not in hidden_tools
+            ][:3]
         if not avail_names:
-            avail_names = list(capabilities.keys())[:3]
+            avail_names = [
+                name for name in capabilities.keys() if name not in hidden_tools
+            ][:3]
         if not avail_names:
             return ()
 
@@ -794,10 +813,24 @@ class WorkflowConfigMixin:
             members = self._default_members_for_preset(capabilities, preset_id=preset_id)
             orchestrator_id = members[0].agent_id if members else ""
 
+        from ...mode.backends import ALL_BACKEND_SPECS
+
+        hidden_tools = frozenset(
+            spec.mode_key
+            for spec in ALL_BACKEND_SPECS
+            if not spec.visible_in_tools_list
+        )
         first = members[0] if members else None
         avail_first_tool = next(
-            (name for name, cap in capabilities.items() if cap.available),
-            next(iter(capabilities), "codex"),
+            (
+                name
+                for name, cap in capabilities.items()
+                if cap.available and name not in hidden_tools
+            ),
+            next(
+                (name for name in capabilities if name not in hidden_tools),
+                next(iter(capabilities), "codex"),
+            ),
         )
         raw_thread_root_id = get_current_thread_id()
         safe_thread_root_id = (
@@ -1048,7 +1081,7 @@ class WorkflowConfigMixin:
                     and resolved_model is not None
                 )
                 or (
-                    cap.tool_name == "agy"
+                    cap.tool_name in {"agy", "agy_b"}
                     and resolved_model is not None
                     and is_agy_orchestrator_model(resolved_model)
                 )

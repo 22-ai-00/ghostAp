@@ -83,10 +83,16 @@ class ProjectHandler(BaseHandler):
         from ...card.builders.project import ProjectBuilder
 
         global_working_dir = self.get_working_dir(chat_id)
+        active_project = self.project_manager.get_active_project(chat_id)
+        is_current = bool(
+            active_project is not None
+            and getattr(active_project, "project_id", None) == project.project_id
+        )
         msg_type, card_content = ProjectBuilder.build_project_status_report_card(
             project,
             global_working_dir,
             chat_id=chat_id,
+            is_current=is_current,
         )
 
         if origin_message_id:

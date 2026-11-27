@@ -139,6 +139,7 @@ DEFAULT_TOOL_PRIORITY: tuple[str, ...] = (
     "gemini",
     "claude_w",
     "codex_w",
+    "agy_b",
 )
 
 # Featured commands highlighted first on ready cards and /cmds menus.
@@ -329,6 +330,8 @@ STATIC_TOOL_NATIVE_COMMANDS: dict[str, tuple[ACPAvailableCommand, ...]] = {
         ACPAvailableCommand("effort", "查看或设置思考强度", "[档位]"),
     ),
 }
+
+STATIC_TOOL_NATIVE_COMMANDS["agy_b"] = STATIC_TOOL_NATIVE_COMMANDS["agy"]
 
 _STATIC_ZERO_ARG_NAMES: frozenset[str] = frozenset(
     cmd.name.casefold()
@@ -589,7 +592,7 @@ def get_tui_only_command_hint(
         return None
     name, _args = parsed
     tool_key = normalize_native_tool_key(tool_name)
-    if name == "context" and tool_key == "agy":
+    if name == "context" and tool_key in {"agy", "agy_b"}:
         return (
             "ℹ️ `/context` 仅支持在 AGY 交互式终端中查看上下文面板；"
             "请在飞书中使用 `/usage` 查看配额与用量，或使用 `/status` 查看当前会话与上下文占用。"

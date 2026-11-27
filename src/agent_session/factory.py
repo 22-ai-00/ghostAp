@@ -88,11 +88,21 @@ def _start_base_session(
     runtime_settings: Mapping[str, object] | None = None,
 ) -> SyncSession:
     """Start exactly one CLI or ACP transport with shared startup arguments."""
-    if agent_type == "agy" and requires_agy_cli_orchestrator_session(model_name):
-        session: SyncSession = SyncAGYCLISession(
-            cwd=cwd,
-            model_name=model_name,
-        )
+    if agent_type in {"agy", "agy_b"} and requires_agy_cli_orchestrator_session(model_name):
+        if agent_type == "agy_b":
+            from .agy_cli import AGYCLIConfig
+
+            session: SyncSession = SyncAGYCLISession(
+                cwd=cwd,
+                config=AGYCLIConfig(command="agy-b"),
+                model_name=model_name,
+                agent_type="agy_b",
+            )
+        else:
+            session = SyncAGYCLISession(
+                cwd=cwd,
+                model_name=model_name,
+            )
         _apply_runtime_settings(session, runtime_settings)
         session.start()
         return session

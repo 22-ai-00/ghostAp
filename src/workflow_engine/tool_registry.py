@@ -35,7 +35,7 @@ _cached_selectable_at: float = 0.0
 _cached_capabilities: dict[str, tuple[float, int, dict[str, "ToolCapability"]]] = {}
 
 EFFORT_CAPABLE_TOOLS: frozenset[str] = frozenset(
-    {"codex", "codex_w", "claude", "claude_w", "agy", "traex", "dsh"}
+    {"codex", "codex_w", "claude", "claude_w", "agy", "agy_b", "traex", "dsh"}
 )
 MODEL_ONLY_TOOLS: frozenset[str] = frozenset({"coco", "aiden", "gemini", "grok"})
 _CLI_PSEUDO_MODEL_TOOLS: frozenset[str] = frozenset({"claude", "claude_w", "codex_w"})
@@ -139,6 +139,7 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "grok": "xAI 原生 ACP 编程",
     "dsh": "DeepSeek Harness 原生 ACP 编程",
     "agy": "Google Antigravity 原生 ACP 编程",
+    "agy_b": "Google Antigravity 原生 ACP 编程 (AGY-B)",
 }
 
 
@@ -290,7 +291,7 @@ def _extract_option_capabilities(
         for variant in variants:
             v_effort = str(getattr(variant, "effort", "") or "").strip().lower()
             v_profile = str(getattr(variant, "profile", "") or "").strip().lower()
-            if v_profile and (tool_name != "agy" or v_profile != "default"):
+            if v_profile and (tool_name not in {"agy", "agy_b"} or v_profile != "default"):
                 if v_profile not in variant_profiles:
                     variant_profiles.append(v_profile)
             if v_effort:
@@ -575,7 +576,7 @@ def validate_agent_binding_spec(
             emb_effort = parsed_effort
             if len(parts) >= 3 or (len(parts) >= 2 and parts[-1].lower() in {"standard", "max"}):
                 emb_profile = parsed_profile
-    elif tool == "agy":
+    elif tool in {"agy", "agy_b"}:
         if raw_model is not None:
             if is_agy_orchestrator_model(raw_model):
                 try:
@@ -636,7 +637,7 @@ def validate_agent_binding_spec(
                         f"Traex 模型 {base_model} 不支持 profile={effective_profile}"
                         f"（可用: {', '.join(allowed_profiles)}）",
                     )
-        elif tool == "agy" and base_model and is_agy_orchestrator_model(base_model):
+        elif tool in {"agy", "agy_b"} and base_model and is_agy_orchestrator_model(base_model):
             allowed_planner = set(AGY_REASONING_EFFORTS) | {AGY_ORCHESTRATOR_DEFAULT_PROFILE}
             if effective_profile not in allowed_planner:
                 return (
@@ -712,7 +713,7 @@ def validate_agent_binding_spec(
                     False,
                     f"工具 {tool} 不支持的 effort: {effective_effort}（可选: {choices}）",
                 )
-        elif tool == "agy":
+        elif tool in {"agy", "agy_b"}:
             if base_model and is_agy_orchestrator_model(base_model):
                 model_efforts = cap.efforts_by_model.get(base_model)
                 allowed = (
@@ -737,7 +738,7 @@ def validate_agent_binding_spec(
             if effective_effort not in allowed:
                 return (
                     False,
-                    f"工具 agy 不支持的 effort: {effective_effort}"
+                    f"工具 {tool} 不支持的 effort: {effective_effort}"
                     f"（可选: {', '.join(sorted(allowed))}）",
                 )
         elif tool == "traex":
@@ -842,6 +843,8 @@ def _discover_acp_tools(*, require_available: bool = False) -> dict[str, str]:
     try:
         from ..acp.helper import is_programming_tool_available
         from ..acp.providers import get_providers
+        from ..agent_session.backend_resolver import cli_command_for_agent, is_cli_backend
+        from ..mode.backends import get_backend_spec
     except ImportError:
         logger.debug("Cannot import ACP providers module")
         return tools
@@ -864,38 +867,51 @@ def _discover_acp_tools(*, require_available: bool = False) -> dict[str, str]:
     except Exception:
         pass
 
-    for name in providers:
+    for name, provider in providers.items():
         if require_available:
             available = False
 
             # User-facing selection cards need a fast answer. A binary on PATH
             # is enough to offer the tool; the actual ACP startup path still
             # performs its normal capability checks and fallbacks later.
-            if shutil.which(name) is not None:
-                available = True
-                try:
-                    is_programming_tool_available(
-                        name,
-                        allow_sync_probe=False,
-                        trigger_async_probe=True,
-                    )
-                except Exception:
-                    logger.debug("Async ACP availability warmup failed for %s", name, exc_info=True)
+            if is_cli_backend(name):
+                cli_cmd = cli_command_for_agent(name)
+                available = shutil.which(cli_cmd) is not None
             else:
-                get_fallback = getattr(providers.get(name), "get_fallback_command", None)
-                try:
-                    available = bool(callable(get_fallback) and get_fallback())
-                except Exception:
-                    available = False
-                if not available:
+                cfg_bin = getattr(getattr(provider, "_config", None), "binary_name", None)
+                spec = get_backend_spec(name)
+                binary = (
+                    cfg_bin
+                    if isinstance(cfg_bin, str) and cfg_bin.strip()
+                    else None
+                ) or (spec.cli_name if spec is not None else None) or name
+                if shutil.which(binary) is not None or (
+                    binary != name and shutil.which(name) is not None
+                ):
+                    available = True
                     try:
-                        available = is_programming_tool_available(
+                        is_programming_tool_available(
                             name,
                             allow_sync_probe=False,
                             trigger_async_probe=True,
                         )
                     except Exception:
+                        logger.debug("Async ACP availability warmup failed for %s", name, exc_info=True)
+                else:
+                    get_fallback = getattr(provider, "get_fallback_command", None)
+                    try:
+                        available = bool(callable(get_fallback) and get_fallback())
+                    except Exception:
                         available = False
+                    if not available:
+                        try:
+                            available = is_programming_tool_available(
+                                name,
+                                allow_sync_probe=False,
+                                trigger_async_probe=True,
+                            )
+                        except Exception:
+                            available = False
 
             if not available:
                 continue

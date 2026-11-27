@@ -223,6 +223,7 @@ def test_tui_only_commands_and_hints() -> None:
 def test_static_catalog_all_11_tools_live_merge_and_partition() -> None:
     expected_tools = {
         "agy",
+        "agy_b",
         "codex",
         "codex_w",
         "traex",

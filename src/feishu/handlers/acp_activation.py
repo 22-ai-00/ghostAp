@@ -381,7 +381,7 @@ class ACPActivationMixin:
                         changed=False,
                     )
             requires_transport_switch = False
-            if tool_name == "agy" and live_session is not None and model_name is not None:
+            if tool_name in {"agy", "agy_b"} and live_session is not None and model_name is not None:
                 from ...acp.agy_selection import requires_agy_cli_orchestrator_session
 
                 target_is_cli = requires_agy_cli_orchestrator_session(backend_model_name)
@@ -673,7 +673,7 @@ class ACPActivationMixin:
         if live_session is None or not isinstance(getattr(live_session, "session_id", None), str):
             return ""
         transport_mismatch = False
-        if tool_name == "agy":
+        if tool_name in {"agy", "agy_b"}:
             from ...acp.agy_selection import requires_agy_cli_orchestrator_session
 
             transport_mismatch = requires_agy_cli_orchestrator_session(model_name) != bool(
@@ -1644,7 +1644,7 @@ class ACPActivationMixin:
             )
             return
         model_name = None if requested.lower() == "default" else requested
-        if tool_name == "agy" and model_name:
+        if tool_name in {"agy", "agy_b"} and model_name:
             from ...acp.agy_selection import normalize_agy_model_input
 
             model_name = normalize_agy_model_input(model_name, model_names)
@@ -1739,7 +1739,7 @@ class ACPActivationMixin:
         active_opt = next((opt for opt in (models or []) if opt.name == active_model), None)
         model_variants = [v for v in state.selections if v.model == active_model]
         is_agy_orch = (
-            tool_name == "agy"
+            tool_name in {"agy", "agy_b"}
             and is_agy_orchestrator_model(active_model)
             and any(
                 v.profile and v.profile != AGY_ORCHESTRATOR_DEFAULT_PROFILE and v.effort

@@ -10,6 +10,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Optional
 
 from ..acp.agy_selection import (
@@ -438,6 +439,7 @@ class SyncAGYCLISession(_BaseCLISession):
         config: Optional[AGYCLIConfig] = None,
         *,
         model_name: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ) -> None:
         cfg_copy = replace(config) if config is not None else AGYCLIConfig()
         super().__init__(
@@ -445,7 +447,13 @@ class SyncAGYCLISession(_BaseCLISession):
             cfg_copy,
             model_name=model_name,
         )
-        self._agent_type = "agy"
+        normalized_agent = str(agent_type or "").strip().lower()
+        if not normalized_agent:
+            cmd_name = Path(str(cfg_copy.command or "")).name.strip().lower()
+            normalized_agent = "agy_b" if cmd_name == "agy-b" else "agy"
+        self._agent_type = normalized_agent
+        if self._agent_type == "agy_b":
+            self._display_name = "AGY-B"
         self._last_usage: Optional[ACPUsageInfo] = None
         self._turn_segments: list[str] = []
         self._turn_current_segment: list[str] = []
@@ -565,7 +573,7 @@ class SyncAGYCLISession(_BaseCLISession):
         stdout = (proc.stdout or "").strip()
         stderr = self._filter_stderr(proc.stderr or "")
         if int(proc.returncode or 0) != 0:
-            detail = stderr or stdout or f"agy mcp list 退出码 {proc.returncode}"
+            detail = stderr or stdout or f"{self._cfg.command} mcp list 退出码 {proc.returncode}"
             if on_event:
                 on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=detail))
             return PromptResult(
@@ -1035,14 +1043,14 @@ class SyncAGYCLISession(_BaseCLISession):
         """Return static native commands registered for AGY CLI sessions."""
         from ..acp.native_commands import STATIC_TOOL_NATIVE_COMMANDS
 
-        return list(STATIC_TOOL_NATIVE_COMMANDS["agy"])
+        return list(STATIC_TOOL_NATIVE_COMMANDS.get(self._agent_type, STATIC_TOOL_NATIVE_COMMANDS["agy"]))
 
     def describe_agent(self) -> str:
         return f"cmd={self._cfg.command} cwd={self._cwd} model={self._model_name or ''} backend=cli"
 
     def to_snapshot(self) -> dict:
         snapshot = super().to_snapshot()
-        snapshot["agent_type"] = "agy"
+        snapshot["agent_type"] = self._agent_type
         return snapshot
 
     def get_session_info(self) -> str:

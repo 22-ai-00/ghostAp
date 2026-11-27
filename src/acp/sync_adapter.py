@@ -728,7 +728,7 @@ class SyncACPSession(PromptGenerationTracker):
         return (self._agent_type or "").strip().lower() == "dsh"
 
     def _uses_agy_acp(self) -> bool:
-        return (self._agent_type or "").strip().lower() == "agy"
+        return (self._agent_type or "").strip().lower() in {"agy", "agy_b"}
 
     @property
     def supports_background_tool_continuation(self) -> bool:

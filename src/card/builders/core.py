@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from src.mode.manager import InteractionMode
@@ -184,16 +185,82 @@ class CoreBuilder:
         return None
 
     @staticmethod
-    def _wrap_card(header_title: str, header_template: str, elements: list[dict], *, subtitle: str = "") -> dict:
+    def _compact_path(path: Optional[str], *, limit: int = 44) -> str:
+        """Compact a filesystem path cross-platform (Linux + macOS) for card display."""
+        if limit <= 0:
+            return ""
+        raw = str(path).strip() if isinstance(path, (str, Path)) else ""
+        raw = raw or "~"
+        text = raw
+        try:
+            home = Path.home()
+            expanded = Path(raw).expanduser()
+            if expanded == home:
+                text = "~"
+            elif expanded.is_relative_to(home):
+                rel = expanded.relative_to(home).as_posix()
+                text = f"~/{rel}" if rel and rel != "." else "~"
+        except (OSError, ValueError, RuntimeError):
+            text = raw
+
+        if len(text) <= limit:
+            return text
+
+        if text.startswith("~/"):
+            rel_parts = [p for p in text[2:].split("/") if p]
+            if len(rel_parts) >= 2:
+                candidate = f"~/…/{rel_parts[-2]}/{rel_parts[-1]}"
+                if len(candidate) <= limit:
+                    return candidate
+            if rel_parts:
+                candidate = f"~/…/{rel_parts[-1]}"
+                if len(candidate) <= limit:
+                    return candidate
+        else:
+            parts = [p for p in text.split("/") if p]
+            if len(parts) >= 2:
+                candidate = f"…/{parts[-2]}/{parts[-1]}"
+                if len(candidate) <= limit:
+                    return candidate
+            if parts:
+                candidate = f"…/{parts[-1]}"
+                if len(candidate) <= limit:
+                    return candidate
+
+        if limit == 1:
+            return "…"
+        return "…" + text[-(limit - 1):]
+
+    @staticmethod
+    def _wrap_card(
+        header_title: str,
+        header_template: str,
+        elements: list[dict],
+        *,
+        subtitle: str = "",
+        update_multi: bool = False,
+        summary: Optional[str] = None,
+    ) -> dict:
         header: dict = {
             "title": {"tag": "plain_text", "content": header_title},
             "template": header_template,
         }
         if subtitle:
             header["subtitle"] = {"tag": "plain_text", "content": subtitle}
+        config: dict = {"wide_screen_mode": True}
+        if update_multi:
+            config["update_multi"] = True
+        if summary:
+            clean = " ".join(str(summary).split())
+            if clean:
+                if len(clean) < 8:
+                    clean = f"GhostAP · {clean}"
+                if len(clean) > 60:
+                    clean = clean[:59].rstrip() + "…"
+                config["summary"] = {"content": clean}
         return {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": config,
             "header": header,
             "body": {
                 "elements": elements,

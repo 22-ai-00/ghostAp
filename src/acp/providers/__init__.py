@@ -110,6 +110,7 @@ class _ProviderConfig:
     help_blob_loader: Optional[HelpBlobLoader] = None
     is_default: bool = False
     skip_model_selection: bool = False
+    binary_name: Optional[str] = None
 
 
 def _apply_model_args(
@@ -160,7 +161,7 @@ class GenericACPProvider:
         args = _apply_model_args(
             args, self.normalize_model_name(model_name), self._config.model_style, self._config.help_blob_loader
         )
-        return self._config.tool_name, args
+        return (self._config.binary_name or self._config.tool_name), args
 
     def get_fallback_command(self, model_name: Optional[str] = None) -> Optional[tuple[str, list[str]]]:
         return None
@@ -393,6 +394,10 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
             ["agy", "acp", "--help"],
             ["usage:", "agy acp", "stdio"],
         )
+        agy_b = _make_custom_help_checker_with_cache_handle(
+            ["agy-b", "acp", "--help"],
+            ["usage:", "agy acp", "stdio"],
+        )
         _checkers = {
             "aiden": aiden,
             "codex": codex,
@@ -401,6 +406,7 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
             "grok": grok,
             "dsh": dsh,
             "agy": agy,
+            "agy_b": agy_b,
         }
 
         _aiden_checker, _aiden_help_loader, _ = aiden
@@ -410,6 +416,7 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
         _grok_checker, _grok_help_loader, _ = grok
         _dsh_checker, _dsh_help_loader, _ = dsh
         _agy_checker, _agy_help_loader, _ = agy
+        _agy_b_checker, _agy_b_help_loader, _ = agy_b
 
         # --- 2) build configs ---
         configs = [
@@ -493,6 +500,13 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 serve_args=["acp"],
                 availability_checker=_agy_checker,
                 help_blob_loader=_agy_help_loader,
+            ),
+            _ProviderConfig(
+                tool_name="agy_b",
+                binary_name="agy-b",
+                serve_args=["acp"],
+                availability_checker=_agy_b_checker,
+                help_blob_loader=_agy_b_help_loader,
             ),
         ]
 
