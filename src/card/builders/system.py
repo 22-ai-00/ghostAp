@@ -7,7 +7,14 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from src.acp import native_commands as _native_commands_mod
-from src.acp.agy_selection import is_agy_orchestrator_model
+from src.acp.agy_selection import (
+    canonical_agy_model_group,
+    collapse_agy_orchestrator_group_names,
+    format_agy_group_option_label,
+    format_agy_orchestrator_summary,
+    format_agy_role_option_label,
+    is_agy_orchestrator_model,
+)
 from src.acp.native_commands import (
     get_featured_native_commands,
     get_zero_arg_quick_commands,
@@ -789,6 +796,7 @@ class SystemBuilder:
         )
 
         tool = str(tool_name or "").strip().lower()
+        is_agy_tool = tool in {"agy", "agy_b"}
         state = resolve_model_cascade(
             models,
             current_model=current_model,
@@ -796,11 +804,31 @@ class SystemBuilder:
             selected_profile=pending_profile,
             selected_effort=pending_effort,
         )
-        is_agy_orchestrator = tool in {"agy", "agy_b"} and is_agy_orchestrator_model(state.selected_model)
+        group_values = (
+            collapse_agy_orchestrator_group_names(state.model_names)
+            if (is_agy_tool and state.model_names)
+            else state.model_names
+        )
+        if is_agy_tool and group_values:
+            if pending_group:
+                selected_group = canonical_agy_model_group(pending_group, group_values)
+            elif current_model:
+                cur_cand = canonical_agy_model_group(current_model, group_values)
+                selected_group = (
+                    cur_cand
+                    if cur_cand in group_values
+                    else canonical_agy_model_group(state.selected_model, group_values)
+                )
+            else:
+                selected_group = canonical_agy_model_group(state.selected_model, group_values)
+        else:
+            selected_group = state.selected_model
+
+        is_agy_orchestrator = is_agy_tool and is_agy_orchestrator_model(selected_group)
         orch_state = (
             resolve_agy_orchestrator_cascade(
                 models,
-                orchestrator_model=state.selected_model,
+                orchestrator_model=selected_group,
                 current_model=current_model,
                 pending_planner_model=pending_planner_model,
                 pending_planner_effort=pending_profile,
@@ -823,7 +851,7 @@ class SystemBuilder:
                     "tool_name": tool,
                     "project_id": project_id,
                     "current_model": current_model,
-                    "model_group": state.selected_model,
+                    "model_group": selected_group,
                     "model_profile": active_profile,
                     "model_effort": active_effort,
                 }
@@ -843,25 +871,61 @@ class SystemBuilder:
             values: tuple[str, ...],
             selected: Optional[str],
             action: str,
+            option_items: Optional[Sequence[tuple[str, str]]] = None,
         ) -> dict:
             callback = payload(action)
+            items = list(option_items) if option_items is not None else [(value, value) for value in values]
             element = {
                 "tag": "select_static",
                 "name": name,
                 "placeholder": {"tag": "plain_text", "content": placeholder},
                 "options": [
                     {
-                        "text": {"tag": "plain_text", "content": value},
+                        "text": {"tag": "plain_text", "content": label},
                         "value": value,
                     }
-                    for value in values
+                    for value, label in items
                 ],
                 "value": callback,
                 "behaviors": [{"type": "callback", "value": callback}],
             }
-            if selected in values:
+            if selected in {value for value, _label in items}:
                 element["initial_option"] = selected
             return element
+
+        def _orch_pair_row(
+            left_label: str,
+            left_select: dict,
+            right_label: str,
+            right_select: dict,
+        ) -> dict:
+            return {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "horizontal_spacing": "small",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 3,
+                        "vertical_align": "top",
+                        "elements": [
+                            {"tag": "markdown", "text_size": "notation", "content": left_label},
+                            left_select,
+                        ],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 2,
+                        "vertical_align": "top",
+                        "elements": [
+                            {"tag": "markdown", "text_size": "notation", "content": right_label},
+                            right_select,
+                        ],
+                    },
+                ],
+            }
 
         elements: list[dict] = [
             {
@@ -875,6 +939,11 @@ class SystemBuilder:
 
         # The model picker must not depend on optional profile/effort metadata.
         if state.model_names:
+            group_option_items = (
+                [(value, format_agy_group_option_label(value)) for value in group_values]
+                if is_agy_tool
+                else None
+            )
             elements.extend(
                 [
                     {
@@ -884,75 +953,116 @@ class SystemBuilder:
                     select_static(
                         name="model_group",
                         placeholder=UI_TEXT["system_acp_model_group_placeholder"],
-                        values=state.model_names,
-                        selected=state.selected_model,
+                        values=group_values,
+                        selected=selected_group,
                         action=group_action,
+                        option_items=group_option_items,
                     ),
                 ]
             )
             if use_orch_roles and orch_state is not None:
-                elements.extend(
-                    [
-                        {
-                            "tag": "markdown",
-                            "content": UI_TEXT["system_acp_agy_orchestrator_planner_model_label"],
-                        },
-                        select_static(
-                            name="planner_model",
-                            placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_model_placeholder"],
-                            values=orch_state.role_model_names,
-                            selected=orch_state.selected_planner_model,
-                            action=planner_model_action,
-                        ),
-                    ]
+                p_models = orch_state.planner_model_names or orch_state.role_model_names
+                e_models = orch_state.executor_model_names or orch_state.role_model_names
+                planner_select = select_static(
+                    name="planner_model",
+                    placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_model_placeholder"],
+                    values=p_models,
+                    selected=orch_state.selected_planner_model,
+                    action=planner_model_action,
+                    option_items=[(m, format_agy_role_option_label(m)) for m in p_models],
                 )
-                if orch_state.planner_efforts:
+                planner_effort_select = (
+                    select_static(
+                        name="model_profile",
+                        placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"],
+                        values=orch_state.planner_efforts,
+                        selected=orch_state.selected_planner_effort,
+                        action=profile_action,
+                        option_items=[
+                            (p, "default（原生预设）" if p == "default" else p)
+                            for p in orch_state.planner_efforts
+                        ],
+                    )
+                    if orch_state.planner_efforts
+                    else None
+                )
+                executor_select = select_static(
+                    name="executor_model",
+                    placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_model_placeholder"],
+                    values=e_models,
+                    selected=orch_state.selected_executor_model,
+                    action=executor_model_action,
+                    option_items=[(m, format_agy_role_option_label(m)) for m in e_models],
+                )
+                executor_effort_select = (
+                    select_static(
+                        name="model_effort",
+                        placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"],
+                        values=orch_state.executor_efforts,
+                        selected=orch_state.selected_executor_effort,
+                        action=effort_action,
+                        option_items=[
+                            (e, "default（跟随预设）" if e == "default" else e)
+                            for e in orch_state.executor_efforts
+                        ],
+                    )
+                    if orch_state.executor_efforts
+                    else None
+                )
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "text_size": "notation",
+                        "content": UI_TEXT["system_acp_agy_orchestrator_section_hint"],
+                    }
+                )
+                if planner_effort_select is not None:
+                    elements.append(
+                        _orch_pair_row(
+                            UI_TEXT["system_acp_agy_orchestrator_planner_model_label"],
+                            planner_select,
+                            UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"],
+                            planner_effort_select,
+                        )
+                    )
+                else:
                     elements.extend(
                         [
                             {
                                 "tag": "markdown",
-                                "content": UI_TEXT["system_acp_agy_orchestrator_planner_effort_label"],
+                                "content": UI_TEXT["system_acp_agy_orchestrator_planner_model_label"],
                             },
-                            select_static(
-                                name="model_profile",
-                                placeholder=UI_TEXT["system_acp_agy_orchestrator_planner_effort_placeholder"],
-                                values=orch_state.planner_efforts,
-                                selected=orch_state.selected_planner_effort,
-                                action=profile_action,
-                            ),
+                            planner_select,
                         ]
                     )
-                elements.extend(
-                    [
-                        {
-                            "tag": "markdown",
-                            "content": UI_TEXT["system_acp_agy_orchestrator_executor_model_label"],
-                        },
-                        select_static(
-                            name="executor_model",
-                            placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_model_placeholder"],
-                            values=orch_state.role_model_names,
-                            selected=orch_state.selected_executor_model,
-                            action=executor_model_action,
-                        ),
-                    ]
-                )
-                if orch_state.executor_efforts:
+                if executor_effort_select is not None:
+                    elements.append(
+                        _orch_pair_row(
+                            UI_TEXT["system_acp_agy_orchestrator_executor_model_label"],
+                            executor_select,
+                            UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"],
+                            executor_effort_select,
+                        )
+                    )
+                else:
                     elements.extend(
                         [
                             {
                                 "tag": "markdown",
-                                "content": UI_TEXT["system_acp_agy_orchestrator_executor_effort_label"],
+                                "content": UI_TEXT["system_acp_agy_orchestrator_executor_model_label"],
                             },
-                            select_static(
-                                name="model_effort",
-                                placeholder=UI_TEXT["system_acp_agy_orchestrator_executor_effort_placeholder"],
-                                values=orch_state.executor_efforts,
-                                selected=orch_state.selected_executor_effort,
-                                action=effort_action,
-                            ),
+                            executor_select,
                         ]
                     )
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "text_size": "notation",
+                        "content": UI_TEXT["system_acp_agy_orchestrator_summary_line"].format(
+                            summary=format_agy_orchestrator_summary(active_selection)
+                        ),
+                    }
+                )
             else:
                 if state.profiles:
                     profile_label = (

@@ -523,6 +523,8 @@ def validate_agent_binding_spec(
         AGY_ORCHESTRATOR_DEFAULT_PROFILE,
         AGY_REASONING_EFFORTS,
         is_agy_orchestrator_model,
+        is_valid_agy_executor_model,
+        is_valid_agy_planner_model,
         parse_agy_model_selection,
         split_agy_model_selection,
     )
@@ -590,6 +592,10 @@ def validate_agent_binding_spec(
                 emb_effort = parsed.executor_effort
                 agy_planner_model = parsed.planner_model
                 agy_executor_model = parsed.executor_model
+                if agy_planner_model and not is_valid_agy_planner_model(agy_planner_model):
+                    return False, f"AGY Orchestrator 不支持的 Planner 模型: {agy_planner_model}"
+                if agy_executor_model and not is_valid_agy_executor_model(agy_executor_model):
+                    return False, f"AGY Orchestrator 不支持的 Executor 模型: {agy_executor_model}"
             else:
                 try:
                     base_model, emb_effort = split_agy_model_selection(raw_model)
@@ -684,6 +690,32 @@ def validate_agent_binding_spec(
                 False,
                 f"工具 {tool} 不支持模型: {base_model}（可用: {', '.join(cap.models[:8])}）",
             )
+        elif (
+            tool in {"agy", "agy_b"}
+            and is_agy_orchestrator_model(base_model)
+            and cap.authoritative_models
+        ):
+            from ..acp.agy_selection import get_agy_orchestrator_spec
+
+            orch_spec = get_agy_orchestrator_spec(base_model)
+            if (
+                agy_planner_model
+                and (orch_spec is None or agy_planner_model != orch_spec.planner_model_id)
+                and agy_planner_model not in cap.models
+            ):
+                return (
+                    False,
+                    f"工具 {tool} 不支持模型: {agy_planner_model}（可用: {', '.join(cap.models[:8])}）",
+                )
+            if (
+                agy_executor_model
+                and (orch_spec is None or agy_executor_model != orch_spec.executor_model_id)
+                and agy_executor_model not in cap.models
+            ):
+                return (
+                    False,
+                    f"工具 {tool} 不支持模型: {agy_executor_model}（可用: {', '.join(cap.models[:8])}）",
+                )
 
     effective_effort = raw_effort or emb_effort
     if effective_effort == "default" and tool != "dsh":

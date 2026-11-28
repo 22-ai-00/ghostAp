@@ -14,7 +14,24 @@ from .model_selection import (
     split_slash_model_effort,
 )
 
-AGY_DEFAULT_MODEL_ID = "gemini-pro-orchestrator"
+AGY_ORCHESTRATOR_MODE_ID = "gemini-pro-orchestrator"
+AGY_DEFAULT_MODEL_ID = AGY_ORCHESTRATOR_MODE_ID
+AGY_ORCHESTRATOR_PLANNER_MODELS: tuple[str, ...] = (
+    "gemini-4-neon",
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "claude-opus-5-5",
+)
+AGY_ORCHESTRATOR_EXECUTOR_MODELS: tuple[str, ...] = (
+    "gemini-4-hydrogen",
+    "gemini-4-neon",
+    "claude-sonnet-5-5",
+)
+AGY_PLANNER_NATIVE_ORCHESTRATOR_IDS: dict[str, str] = {
+    "gemini-4-neon": "gemini-pro-orchestrator-neon",
+    "gemini-4-carbon": "gemini-pro-orchestrator",
+    "gemini-4-argon": "gemini-pro-orchestrator-argon",
+}
 AGY_MODEL_CONFIG_ID = "model"
 AGY_THOUGHT_LEVEL_CONFIG_ID = "thought_level"
 AGY_EFFORT_CONFIG_IDS: tuple[str, ...] = (
@@ -120,6 +137,170 @@ def get_agy_orchestrator_spec(model_id: str | None) -> AGYOrchestratorSpec | Non
         return None
     base = raw.split("/", 1)[0].strip()
     return AGY_ORCHESTRATOR_SPECS.get(base)
+
+
+def is_valid_agy_planner_model(model_id: str | None) -> bool:
+    """Return True if *model_id* is one of the 4 allowed AGY Orchestrator Planner models."""
+    return str(model_id or "").strip() in AGY_ORCHESTRATOR_PLANNER_MODELS
+
+
+def is_valid_agy_executor_model(model_id: str | None) -> bool:
+    """Return True if *model_id* is one of the 3 allowed AGY Orchestrator Executor models."""
+    return str(model_id or "").strip() in AGY_ORCHESTRATOR_EXECUTOR_MODELS
+
+
+def _filter_agy_role_models(
+    allowlist: tuple[str, ...],
+    available_names: Sequence[str] = (),
+) -> tuple[str, ...]:
+    clean_available = {
+        str(name or "").strip()
+        for name in (available_names or ())
+        if str(name or "").strip()
+    }
+    if not clean_available:
+        return allowlist
+    return tuple(model for model in allowlist if model in clean_available)
+
+
+def filter_agy_planner_models(available_names: Sequence[str] = ()) -> tuple[str, ...]:
+    """Filter *available_names* to allowed Planner models in canonical order."""
+    return _filter_agy_role_models(AGY_ORCHESTRATOR_PLANNER_MODELS, available_names)
+
+
+def filter_agy_executor_models(available_names: Sequence[str] = ()) -> tuple[str, ...]:
+    """Filter *available_names* to allowed Executor models in canonical order."""
+    return _filter_agy_role_models(AGY_ORCHESTRATOR_EXECUTOR_MODELS, available_names)
+
+
+def collapse_agy_orchestrator_group_names(model_names: Sequence[str]) -> tuple[str, ...]:
+    """Collapse all Orchestrator entries into one unified Orchestrator entry at first position."""
+    cleaned = [str(name or "").strip() for name in (model_names or ()) if str(name or "").strip()]
+    orch_ids = [name.split("/", 1)[0].strip() for name in cleaned if is_agy_orchestrator_model(name)]
+    if not orch_ids:
+        return tuple(dict.fromkeys(cleaned))
+    preferred = (
+        AGY_ORCHESTRATOR_MODE_ID
+        if AGY_ORCHESTRATOR_MODE_ID in orch_ids
+        else orch_ids[0]
+    )
+    collapsed: list[str] = []
+    inserted = False
+    for name in cleaned:
+        if is_agy_orchestrator_model(name):
+            if not inserted:
+                collapsed.append(preferred)
+                inserted = True
+            continue
+        if name not in collapsed:
+            collapsed.append(name)
+    return tuple(collapsed)
+
+
+def canonical_agy_model_group(
+    model_id: str | None,
+    group_names: Sequence[str] = (),
+) -> str:
+    """Map any AGY selection (regular or any Orchestrator) to its collapsed group entry."""
+    raw = str(model_id or "").strip()
+    if not raw:
+        return ""
+    groups = tuple(str(name or "").strip() for name in (group_names or ()) if str(name or "").strip())
+    if is_agy_orchestrator_model(raw):
+        orch_groups = [name for name in groups if is_agy_orchestrator_model(name)]
+        if AGY_ORCHESTRATOR_MODE_ID in orch_groups:
+            return AGY_ORCHESTRATOR_MODE_ID
+        if orch_groups:
+            return orch_groups[0]
+        return AGY_ORCHESTRATOR_MODE_ID
+    if raw in groups:
+        return raw
+    base = raw.split("/", 1)[0].strip()
+    if base in groups:
+        return base
+    if not groups:
+        try:
+            return parse_agy_model_selection(raw).model_id
+        except ValueError:
+            return base
+    return raw
+
+
+def resolve_native_orchestrator_preset(
+    planner_model: str | None,
+    available_names: Sequence[str] = (),
+) -> str | None:
+    """Return the native ACP Orchestrator preset ID for *planner_model*, if supported & present."""
+    clean_planner = str(planner_model or "").strip()
+    preset = AGY_PLANNER_NATIVE_ORCHESTRATOR_IDS.get(clean_planner)
+    if not preset:
+        return None
+    clean_available = {
+        str(name or "").strip()
+        for name in (available_names or ())
+        if str(name or "").strip()
+    }
+    if clean_available and preset not in clean_available:
+        return None
+    return preset
+
+
+def format_agy_role_option_label(model_id: str) -> str:
+    """Return the friendly display label for an AGY Planner or Executor model option."""
+    clean = str(model_id or "").strip()
+    if not clean:
+        return ""
+    with _LABEL_LOCK:
+        friendly = _LIVE_BASE_DISPLAY_NAMES.get(clean)
+    return friendly or AGY_KNOWN_MODEL_DISPLAY_NAMES.get(clean) or clean
+
+
+def format_agy_group_option_label(model_id: str) -> str:
+    """Format a top-level AGY model-group dropdown option label (<= 44 chars for regular models)."""
+    clean = str(model_id or "").strip()
+    if not clean:
+        return ""
+    if is_agy_orchestrator_model(clean):
+        return "🪐 Orchestrator（双阶段规划+执行）"
+    if clean.lower() == "default":
+        return "default（后端托管）"
+    friendly = format_agy_role_option_label(clean)
+    label = f"{friendly} · {clean}" if friendly and friendly != clean else clean
+    if len(label) <= 44:
+        return label
+    return f"{label[:43].rstrip()}…"
+
+
+def format_agy_orchestrator_summary(selection: str | None) -> str:
+    """Format a concise summary for the active AGY Orchestrator selection."""
+    raw = str(selection or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = parse_agy_model_selection(raw)
+    except ValueError:
+        return raw
+    spec = AGY_ORCHESTRATOR_SPECS.get(parsed.model_id)
+    if spec is None:
+        return format_agy_role_label(parsed.model_id, parsed.thought_level)
+    if not requires_agy_cli_orchestrator_session(raw):
+        return (
+            f"原生 ACP 预设 · Planner {spec.planner_display_base}"
+            f" + Executor {spec.executor_display_base}（支持 /swarm）"
+        )
+    planner_model = parsed.planner_model or spec.planner_model_id
+    executor_model = parsed.executor_model or spec.executor_model_id
+    planner_label = format_agy_role_label(
+        planner_model,
+        parsed.planner_effort,
+        display_base=(spec.planner_display_base if planner_model == spec.planner_model_id else None),
+    )
+    executor_label = format_agy_role_label(
+        executor_model,
+        parsed.executor_effort,
+        display_base=(spec.executor_display_base if executor_model == spec.executor_model_id else None),
+    )
+    return f"Planner {planner_label} → Executor {executor_label}"
 
 
 def register_agy_model_display_labels(
@@ -265,9 +446,9 @@ def compose_agy_orchestrator_selection(
     raw_em = str(executor_model or "").strip()
     p_model = spec.planner_model_id if raw_pm in {"", AGY_ORCHESTRATOR_DEFAULT_PROFILE} else raw_pm
     e_model = spec.executor_model_id if raw_em in {"", AGY_ORCHESTRATOR_DEFAULT_PROFILE} else raw_em
-    if not _is_valid_agy_role_model_slug(p_model):
+    if not is_valid_agy_planner_model(p_model):
         raise ValueError(f"invalid AGY planner model: {planner_model}")
-    if not _is_valid_agy_role_model_slug(e_model):
+    if not is_valid_agy_executor_model(e_model):
         raise ValueError(f"invalid AGY executor model: {executor_model}")
 
     norm_planner = str(planner_effort or "").strip().lower()
@@ -277,9 +458,18 @@ def compose_agy_orchestrator_selection(
     if norm_executor == AGY_ORCHESTRATOR_DEFAULT_PROFILE:
         norm_executor = ""
 
+    if not norm_planner and not norm_executor:
+        if e_model == "gemini-4-hydrogen" and p_model in AGY_PLANNER_NATIVE_ORCHESTRATOR_IDS:
+            return (
+                spec.model_id
+                if p_model == spec.planner_model_id
+                else AGY_PLANNER_NATIVE_ORCHESTRATOR_IDS[p_model]
+            )
+        raise ValueError(
+            f"AGY orchestrator native default is unavailable for planner={p_model!r}, executor={e_model!r}"
+        )
+
     if p_model == spec.planner_model_id and e_model == spec.executor_model_id:
-        if not norm_planner and not norm_executor:
-            return spec.model_id
         if norm_planner not in AGY_REASONING_EFFORTS:
             raise ValueError(f"invalid AGY planner effort: {planner_effort}")
         if not norm_executor:
@@ -288,13 +478,11 @@ def compose_agy_orchestrator_selection(
             raise ValueError(f"invalid AGY executor effort: {executor_effort}")
         return f"{spec.model_id}/{norm_planner}/{norm_executor}"
 
-    if norm_planner and norm_planner not in AGY_REASONING_EFFORTS:
+    if norm_planner not in AGY_REASONING_EFFORTS:
         raise ValueError(f"invalid AGY planner effort: {planner_effort}")
-    if norm_executor and norm_executor not in AGY_REASONING_EFFORTS:
+    if norm_executor not in AGY_REASONING_EFFORTS:
         raise ValueError(f"invalid AGY executor effort: {executor_effort}")
-    p_tok = f"{p_model}:{norm_planner}" if norm_planner else p_model
-    e_tok = f"{e_model}:{norm_executor}" if norm_executor else e_model
-    return f"{spec.model_id}/{p_tok}/{e_tok}"
+    return f"{spec.model_id}/{p_model}:{norm_planner}/{e_model}:{norm_executor}"
 
 
 def parse_agy_model_selection(
@@ -329,6 +517,13 @@ def parse_agy_model_selection(
         spec = AGY_ORCHESTRATOR_SPECS[base]
         p_model, p_eff = _parse_agy_role_token(parts[1], spec.planner_model_id)
         e_model, e_eff = _parse_agy_role_token(parts[2], spec.executor_model_id)
+        if (
+            not is_valid_agy_planner_model(p_model)
+            or not is_valid_agy_executor_model(e_model)
+            or p_eff not in AGY_REASONING_EFFORTS
+            or e_eff not in AGY_REASONING_EFFORTS
+        ):
+            raise ValueError(f"invalid AGY model selection: {selection}")
         return AGYParsedSelection(
             model_id=base,
             planner_effort=p_eff,
@@ -344,18 +539,16 @@ def parse_agy_model_selection(
         e_eff_raw = parts[4].strip().lower()
         if (
             base not in AGY_ORCHESTRATOR_SPECS
-            or not _is_valid_agy_role_model_slug(p_model)
-            or not _is_valid_agy_role_model_slug(e_model)
-            or p_eff_raw not in (*AGY_REASONING_EFFORTS, AGY_ORCHESTRATOR_DEFAULT_PROFILE, "none")
-            or e_eff_raw not in (*AGY_REASONING_EFFORTS, AGY_ORCHESTRATOR_DEFAULT_PROFILE, "none")
+            or not is_valid_agy_planner_model(p_model)
+            or not is_valid_agy_executor_model(e_model)
+            or p_eff_raw not in AGY_REASONING_EFFORTS
+            or e_eff_raw not in AGY_REASONING_EFFORTS
         ):
             raise ValueError(f"invalid AGY model selection: {selection}")
-        p_eff = None if p_eff_raw in {AGY_ORCHESTRATOR_DEFAULT_PROFILE, "none"} else p_eff_raw
-        e_eff = None if e_eff_raw in {AGY_ORCHESTRATOR_DEFAULT_PROFILE, "none"} else e_eff_raw
         return AGYParsedSelection(
             model_id=base,
-            planner_effort=p_eff,
-            executor_effort=e_eff,
+            planner_effort=p_eff_raw,
+            executor_effort=e_eff_raw,
             planner_model=p_model,
             executor_model=e_model,
         )
@@ -463,6 +656,11 @@ def is_valid_agy_catalog_selection(
     spec = AGY_ORCHESTRATOR_SPECS[parsed.model_id]
     planner_model = parsed.planner_model or spec.planner_model_id
     executor_model = parsed.executor_model or spec.executor_model_id
+    if (
+        not is_valid_agy_planner_model(planner_model)
+        or not is_valid_agy_executor_model(executor_model)
+    ):
+        return False
     planner_opt = by_name.get(planner_model)
     executor_opt = by_name.get(executor_model)
     if planner_opt is None or executor_opt is None:
@@ -476,6 +674,14 @@ def is_valid_agy_catalog_selection(
         if is_agy_orchestrator_model(getattr(role_opt, "name", "")):
             return False
         efforts = tuple(getattr(role_opt, "reasoning_efforts", ()) or ())
+        if not efforts:
+            efforts = tuple(
+                dict.fromkeys(
+                    str(getattr(v, "effort", "") or "").strip().lower()
+                    for v in (getattr(role_opt, "selection_variants", ()) or ())
+                    if str(getattr(v, "effort", "") or "").strip()
+                )
+            )
         if efforts:
             if not role_effort or role_effort not in efforts:
                 return False
@@ -492,6 +698,11 @@ def normalize_agy_model_input(
     text = str(raw or "").strip()
     if not text:
         return ""
+    lowered = text.lower()
+    if lowered == "orchestrator":
+        text = AGY_ORCHESTRATOR_MODE_ID
+    elif lowered.startswith("orchestrator/"):
+        text = f"{AGY_ORCHESTRATOR_MODE_ID}/{text[len('orchestrator/'):]}"
     known_list = [str(name or "").strip() for name in (known_model_names or ()) if str(name or "").strip()]
     known_set = set(known_list)
     if text in known_set:
@@ -510,7 +721,9 @@ def normalize_agy_model_input(
                 for candidate in known_list:
                     if candidate.startswith(prefix):
                         return candidate
-                if not known_list:
+                if not known_list or (
+                    base in known_set and not any(c.startswith(f"{base}/") for c in known_list)
+                ):
                     return same_target
         elif len(parts) in {3, 5} and parts[0].strip() in AGY_ORCHESTRATOR_SPECS:
             try:

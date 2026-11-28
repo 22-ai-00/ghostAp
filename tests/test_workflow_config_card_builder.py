@@ -811,3 +811,31 @@ def test_unified_11_tool_model_and_effort_config_card_matrix() -> None:
         assert sels["effort"].get("initial_option") == "default"
         assert "effort" not in sels["effort"]["value"]
 
+
+def test_workflow_extract_current_base_model_supports_agy_orchestrator_role_models() -> None:
+    from src.card.builders.workflow import _extract_current_base_model
+    from src.workflow_engine.tool_registry import ToolCapability
+
+    cap = ToolCapability(
+        tool_name="agy",
+        display_name="AGY",
+        available=True,
+        supports_model=True,
+        supports_effort=True,
+        models=("gemini-pro-orchestrator", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5"),
+        efforts_by_model={
+            "gemini-4-carbon": ("low", "medium", "high"),
+            "claude-opus-5-5": ("low", "medium", "high"),
+            "claude-sonnet-5-5": ("low", "medium", "high"),
+        },
+        authoritative_models=True,
+    )
+    assert (
+        _extract_current_base_model(
+            cap,
+            "agy",
+            "gemini-pro-orchestrator/claude-opus-5-5:high/claude-sonnet-5-5:high",
+        )
+        == "gemini-pro-orchestrator"
+    )
+

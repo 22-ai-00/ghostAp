@@ -1,5 +1,8 @@
 # GhostAP 项目记忆索引
 
+## 2026-11-28
+- **AGY Orchestrator 统一入口与 4×3 限定交互优化** - 收拢单一 Orchestrator 入口、严格 4 Planner × 3 Executor 白名单与 2×2 卡片布局 → [2026-11-28.md](2026-11-28.md)
+
 ## 2026-11-27
 - **修复绑定群`/agy`并兼容Orchestrator双角色模型** - 修绑定群激活退回、默认Carbon与Planner/Executor四维选择 → [2026-11-27.md](2026-11-27.md)
 - **命令卡片交互优化与`/agy-b`隐藏接入** - 重构`/projects`/`/menu`/`/tools`双列前置并新增面板隔离`agy-b` → [2026-11-27.md](2026-11-27.md)

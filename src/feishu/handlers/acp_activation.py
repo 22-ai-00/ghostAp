@@ -859,12 +859,20 @@ class ACPActivationMixin:
             planner_model, profile = selected, None
         elif action == action_ids.SELECT_ACP_MODEL_PROFILE:
             profile = selected
-            if not (tool in {"agy", "agy_b"} and is_agy_orchestrator_model(group)):
+            if tool in {"agy", "agy_b"} and is_agy_orchestrator_model(group):
+                if selected == "default":
+                    effort = "default"
+            else:
                 effort = None
         elif action == action_ids.SELECT_ACP_ORCH_EXECUTOR_MODEL:
             executor_model, effort = selected, None
         elif action == action_ids.SELECT_ACP_MODEL_EFFORT:
             effort = selected
+            if tool in {"agy", "agy_b"} and is_agy_orchestrator_model(group):
+                if selected == "default":
+                    profile = "default"
+                elif profile == "default":
+                    profile = None
         else:
             self.reply_error(message_id, _system_module().UI_TEXT["system_acp_select_model_prompt"])
             return
@@ -1004,13 +1012,15 @@ class ACPActivationMixin:
                 else None
             )
             if orch_probe is not None and orch_probe.has_role_models:
-                if raw_planner_model and raw_planner_model not in orch_probe.role_model_names:
+                allowed_planners = orch_probe.planner_model_names or orch_probe.role_model_names
+                allowed_executors = orch_probe.executor_model_names or orch_probe.role_model_names
+                if raw_planner_model and raw_planner_model not in allowed_planners:
                     self.reply_error(
                         message_id,
                         _system_module().UI_TEXT["system_acp_unknown_model"].format(model=raw_planner_model),
                     )
                     return
-                if raw_executor_model and raw_executor_model not in orch_probe.role_model_names:
+                if raw_executor_model and raw_executor_model not in allowed_executors:
                     self.reply_error(
                         message_id,
                         _system_module().UI_TEXT["system_acp_unknown_model"].format(model=raw_executor_model),
@@ -1745,12 +1755,35 @@ class ACPActivationMixin:
         )
         model_names = self._model_names(models)
         if requested.lower() in {"list", "ls"}:
+            if tool_name in {"agy", "agy_b"}:
+                from ...acp.agy_selection import (
+                    collapse_agy_orchestrator_group_names,
+                    is_agy_orchestrator_model,
+                )
+
+                concise = [
+                    name
+                    for name in collapse_agy_orchestrator_group_names(
+                        [getattr(opt, "name", "") for opt in (models or [])]
+                    )
+                    if name
+                ]
+                has_orch = any(is_agy_orchestrator_model(n) for n in concise)
+                avail_str = " · ".join(f"`{name}`" for name in concise) or "default"
+                if has_orch:
+                    avail_str += (
+                        "\nOrchestrator：`gemini-pro-orchestrator/<planner>/<executor>`"
+                        "（Planner 限定 `gemini-4-neon`/`gemini-4-carbon`/`gemini-4-argon`/`claude-opus-5-5`"
+                        " × Executor 限定 `gemini-4-hydrogen`/`gemini-4-neon`/`claude-sonnet-5-5`）"
+                    )
+            else:
+                avail_str = " · ".join(f"`{name}`" for name in model_names) or "default"
             self.reply_text(
                 message_id,
                 _system_module().UI_TEXT["system_model_config_summary"].format(
                     tool=tool_name,
                     current=current_model or "default",
-                    available=" · ".join(f"`{name}`" for name in model_names) or "default",
+                    available=avail_str,
                 ),
             )
             return
@@ -1822,6 +1855,7 @@ class ACPActivationMixin:
             AGY_ORCHESTRATOR_DEFAULT_PROFILE,
             compose_agy_orchestrator_selection,
             is_agy_orchestrator_model,
+            resolve_native_orchestrator_preset,
         )
         from ...card.render.model_cascade import (
             resolve_agy_orchestrator_cascade,
@@ -1874,9 +1908,21 @@ class ACPActivationMixin:
                 current_model=current_model,
             )
             if orch_state.has_role_models:
-                planner_choices = orch_state.planner_efforts
-                executor_choices = orch_state.executor_efforts
-                planner_disp = " · ".join(f"`{e}`" for e in (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices))
+                planner_choices = tuple(
+                    e for e in orch_state.planner_efforts if e != AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                )
+                executor_choices = tuple(
+                    e for e in orch_state.executor_efforts if e != AGY_ORCHESTRATOR_DEFAULT_PROFILE
+                )
+                supports_default = AGY_ORCHESTRATOR_DEFAULT_PROFILE in orch_state.planner_efforts
+                planner_disp = " · ".join(
+                    f"`{e}`"
+                    for e in (
+                        (AGY_ORCHESTRATOR_DEFAULT_PROFILE, *planner_choices)
+                        if supports_default
+                        else planner_choices
+                    )
+                )
                 executor_disp = " · ".join(f"`{e}`" for e in executor_choices) or "`default`"
                 if not requested:
                     self.reply_text(
@@ -1897,8 +1943,18 @@ class ACPActivationMixin:
                     if "/" in requested and " " not in requested
                     else [tok.strip().lower() for tok in requested.split()]
                 )
+                native_preset = (
+                    resolve_native_orchestrator_preset(
+                        orch_state.selected_planner_model,
+                        [str(getattr(m, "name", "") or "").strip() for m in (models or ())],
+                    )
+                    if orch_state.selected_executor_model == "gemini-4-hydrogen"
+                    else None
+                )
                 if len(raw_tokens) == 1 and raw_tokens[0] == "default":
-                    next_model_name = active_model
+                    next_model_name = native_preset or active_model
+                elif raw_tokens == ["default", "default"]:
+                    next_model_name = native_preset or active_model
                 elif len(raw_tokens) == 1:
                     eff = raw_tokens[0]
                     if (planner_choices and eff not in planner_choices) or (

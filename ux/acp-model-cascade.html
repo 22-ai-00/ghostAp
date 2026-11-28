@@ -23,14 +23,24 @@
       background: var(--bg);
       color: var(--text);
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-x: hidden;
     }
-    main { max-width: 760px; margin: 32px auto; padding: 0 16px; }
+    main { max-width: 1200px; margin: 24px auto; padding: 0 20px 32px; }
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 20px;
+      align-items: start;
+      margin-top: 14px;
+    }
     .card {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
       overflow: hidden;
-      margin-bottom: 28px;
     }
     .header {
       padding: 14px 18px;
@@ -49,6 +59,8 @@
     }
     select {
       width: 100%;
+      max-width: 100%;
+      min-width: 0;
       min-height: 40px;
       border: 1px solid var(--border);
       border-radius: 6px;
@@ -68,6 +80,7 @@
       margin-top: 16px;
     }
     button {
+      max-width: 100%;
       min-height: 38px;
       border: 1px solid var(--border);
       border-radius: 6px;
@@ -76,6 +89,11 @@
       padding: 8px 12px;
       font: inherit;
       cursor: default;
+      overflow-wrap: anywhere;
+    }
+    code {
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     button.primary { border-color: var(--blue); background: var(--blue); color: white; }
     .selected {
@@ -84,6 +102,7 @@
       border-radius: 6px;
       background: var(--blue-soft);
       color: #143c9e;
+      overflow-wrap: anywhere;
     }
     .badge {
       display: inline-block;
@@ -94,10 +113,40 @@
       color: var(--green);
       margin-left: 6px;
     }
-    .hint { color: var(--muted); margin: 10px 0 0; }
+    .hint { color: var(--muted); margin: 10px 0 0; overflow-wrap: anywhere; }
+    .orch-hint {
+      margin-top: 12px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #f5f7fb;
+      border: 1px solid #e4e8f0;
+      color: #4b5563;
+      font-size: 12.5px;
+    }
+    .orch-pair-row {
+      display: grid;
+      grid-template-columns: 3fr 2fr;
+      gap: 10px 12px;
+      margin-top: 10px;
+    }
+    .orch-cell { min-width: 0; }
+    .orch-cell label {
+      margin: 0 0 5px;
+      font-size: 13px;
+    }
+    .is-hidden { display: none; }
+    @media (max-width: 900px) {
+      .cards-grid { grid-template-columns: minmax(0, 1fr); }
+    }
     @media (max-width: 560px) {
-      main { margin: 12px auto; max-width: 100%; }
-      .card { overflow-wrap: anywhere; word-break: break-word; }
+      html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+      main { margin: 12px auto; width: 100%; max-width: 100%; padding: 0 12px 24px; }
+      .cards-grid { width: 100%; max-width: 100%; }
+      .body, .section { padding: 14px; min-width: 0; max-width: 100%; }
+      .section { padding: 14px 0 0; }
+      .card { width: 100%; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+      select { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .orch-pair-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
       .button-row { flex-direction: column; }
       button { width: 100%; overflow-wrap: anywhere; }
     }
@@ -113,6 +162,86 @@
       Redraw actions: select_acp_model_group / _profile / _effort
       Commit action: select_acp_model (confirm button)
     -->
+    <div class="cards-grid">
+
+    <!-- Case 4: AGY / AGY-B — Unified Orchestrator Mode + Restricted 4 Planner × 3 Executor 2x2 Grid -->
+    <div class="card">
+      <div class="header">🪐 AGY 模型选择</div>
+      <div class="body">
+        <div class="prompt">请选择本次编程会话使用的模型配置。显式选择完成后才会初始化会话。</div>
+        <div class="section">
+          <label for="agy-group">模型族</label>
+          <select id="agy-group" class="remembered">
+            <option value="gemini-pro-orchestrator" selected>🪐 Orchestrator（双阶段规划+执行）</option>
+            <option value="gemini-4-neon">Gemini 4 Neon · gemini-4-neon</option>
+            <option value="gemini-4-carbon">Gemini 4 Carbon · gemini-4-carbon</option>
+            <option value="gemini-4-argon">Gemini 4 Argon · gemini-4-argon</option>
+            <option value="gemini-4-hydrogen">Gemini 4 Hydrogen · gemini-4-hydrogen</option>
+            <option value="claude-opus-5-5">Claude Opus 5.5 · claude-opus-5-5</option>
+            <option value="claude-sonnet-5-5">Claude Sonnet 5.5 · claude-sonnet-5-5</option>
+            <option value="gpt-oss-120b-medium">GPT-OSS 120B (Medium) · gpt-oss-120b-medium</option>
+            <option value="default">default（后端托管）</option>
+          </select>
+
+          <div id="agy-orch-panel">
+            <div class="orch-hint">🧭 <strong>Orchestrator 双阶段模式</strong> · 限定 4 种规划模型 × 3 种执行模型</div>
+
+            <div class="orch-pair-row">
+              <div class="orch-cell">
+                <label for="agy-planner-model">🧠 Planner 模型</label>
+                <select id="agy-planner-model" class="remembered">
+                  <option value="gemini-4-neon">Gemini 4 Neon</option>
+                  <option value="gemini-4-carbon" selected>Gemini 4 Carbon</option>
+                  <option value="gemini-4-argon">Gemini 4 Argon</option>
+                  <option value="claude-opus-5-5">Claude Opus 5.5</option>
+                </select>
+              </div>
+              <div class="orch-cell">
+                <label for="agy-planner-effort">⚡ Planner Effort</label>
+                <select id="agy-planner-effort" class="remembered"></select>
+              </div>
+            </div>
+
+            <div class="orch-pair-row">
+              <div class="orch-cell">
+                <label for="agy-executor-model">⚙️ Executor 模型</label>
+                <select id="agy-executor-model" class="remembered">
+                  <option value="gemini-4-hydrogen" selected>Gemini 4 Hydrogen</option>
+                  <option value="gemini-4-neon">Gemini 4 Neon</option>
+                  <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+                </select>
+              </div>
+              <div class="orch-cell">
+                <label for="agy-executor-effort">⚡ Executor Effort</label>
+                <select id="agy-executor-effort" class="remembered"></select>
+              </div>
+            </div>
+          </div>
+
+          <div id="agy-single-effort-wrap" class="is-hidden">
+            <label for="agy-single-effort">Effort</label>
+            <select id="agy-single-effort" class="remembered"></select>
+          </div>
+
+          <div class="selected">
+            📌 当前组合：<span id="agy-summary-text">原生 ACP 预设 · Planner Gemini 4 Carbon + Executor Gemini 4 Hydrogen（支持 /swarm）</span>
+            <span class="badge" id="agy-mode-badge">原生 ACP 预设 · /swarm</span>
+          </div>
+
+          <div class="button-row">
+            <button id="agy-default-btn" type="button">默认模型（推荐）</button>
+            <button class="primary" id="agy-confirm" type="button">确认此模型: gemini-pro-orchestrator</button>
+          </div>
+          <hr>
+          <div class="button-row"><button type="button">刷新模型</button></div>
+          <p class="hint">
+            所有 <code>gemini-pro-orchestrator*</code> 原生预设已收拢为唯一 <code>🪐 Orchestrator（双阶段规划+执行）</code> 入口；
+            Planner 仅允许 4 种规划模型，Executor 仅允许 3 种执行模型。选择 <code>default</code> 时走原生 ACP 预设（支持 <code>/swarm</code>）；
+            指定自定义组合时通过 CLI <code>--settings orchestrator</code> 生效。
+          </p>
+        </div>
+      </div>
+    </div>
 
     <!-- Case 1: Traex — cascade, default selection remembered from last model -->
     <div class="card">
@@ -233,83 +362,175 @@
         </div>
       </div>
     </div>
-
-    <!-- Case 4: AGY / AGY-B — default Carbon Orchestrator + Planner/Executor Model & Effort -->
-    <div class="card">
-      <div class="header">AGY 模型选择</div>
-      <div class="body">
-        <div class="prompt">请选择本次编程会话使用的模型配置。显式选择完成后才会初始化会话。</div>
-        <div class="section">
-          <label for="agy-group">模型族</label>
-          <select id="agy-group" class="remembered">
-            <option>gemini-4-neon</option>
-            <option>gemini-4-carbon</option>
-            <option>gemini-4-hydrogen</option>
-            <option>gemini-pro-orchestrator-neon</option>
-            <option selected>gemini-pro-orchestrator</option>
-            <option>gemini-pro-orchestrator-argon</option>
-            <option>claude-opus-5-5</option>
-            <option>gpt-oss-120b-medium</option>
-          </select>
-
-          <label for="agy-planner-model">Planner 模型</label>
-          <select id="agy-planner-model" class="remembered">
-            <option>gemini-4-neon</option>
-            <option selected>gemini-4-carbon</option>
-            <option>gemini-4-hydrogen</option>
-            <option>claude-opus-5-5</option>
-            <option>claude-sonnet-5-5</option>
-            <option>gpt-oss-120b-medium</option>
-          </select>
-
-          <label for="agy-planner-effort">Planner Effort</label>
-          <select id="agy-planner-effort" class="remembered">
-            <option>low</option>
-            <option>medium</option>
-            <option selected>high</option>
-          </select>
-
-          <label for="agy-executor-model">Executor 模型</label>
-          <select id="agy-executor-model" class="remembered">
-            <option>gemini-4-neon</option>
-            <option>gemini-4-carbon</option>
-            <option selected>gemini-4-hydrogen</option>
-            <option>claude-opus-5-5</option>
-            <option>claude-sonnet-5-5</option>
-            <option>gpt-oss-120b-medium</option>
-          </select>
-
-          <label for="agy-executor-effort">Executor Effort</label>
-          <select id="agy-executor-effort" class="remembered">
-            <option>low</option>
-            <option>medium</option>
-            <option selected>high</option>
-            <option>xhigh</option>
-          </select>
-
-          <div class="selected">
-            默认模型族：<code>gemini-pro-orchestrator</code>（Carbon Orchestrator）
-            <span class="badge">Planner + Executor 独立可选模型与 Effort</span>
-          </div>
-
-          <div class="button-row">
-            <button>默认模型（推荐）</button>
-            <button class="primary">确认此模型: gemini-pro-orchestrator/claude-opus-5-5:high/gemini-4-hydrogen:xhigh</button>
-          </div>
-          <hr>
-          <div class="button-row"><button>刷新模型</button></div>
-          <p class="hint">
-            未指定或选默认模型时采用 <code>gemini-pro-orchestrator</code>（Orchestrator Carbon）。
-            自定义 Planner/Executor 模型与 Effort 通过 <code>--settings orchestrator</code> 生效。
-          </p>
-        </div>
-      </div>
     </div>
   </main>
   <script>
     document.getElementById('plain-model').addEventListener('change', (event) => {
       document.getElementById('plain-confirm').textContent = '确认此模型: ' + event.target.value;
     });
+
+    (() => {
+      const NATIVE_PRESETS = {
+        'gemini-4-neon': 'gemini-pro-orchestrator-neon',
+        'gemini-4-carbon': 'gemini-pro-orchestrator',
+        'gemini-4-argon': 'gemini-pro-orchestrator-argon',
+      };
+      const DISPLAY_NAMES = {
+        'gemini-4-neon': 'Gemini 4 Neon',
+        'gemini-4-carbon': 'Gemini 4 Carbon',
+        'gemini-4-argon': 'Gemini 4 Argon',
+        'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+        'claude-opus-5-5': 'Claude Opus 5.5',
+        'claude-sonnet-5-5': 'Claude Sonnet 5.5',
+        'gpt-oss-120b-medium': 'GPT-OSS 120B (Medium)',
+        'default': 'default（后端托管）',
+      };
+      const EFFORTS = {
+        'gemini-4-neon': ['low', 'medium', 'high', 'xhigh'],
+        'gemini-4-carbon': ['low', 'medium', 'high'],
+        'gemini-4-argon': ['low', 'medium', 'high'],
+        'gemini-4-hydrogen': ['low', 'medium', 'high', 'xhigh'],
+        'claude-opus-5-5': ['low', 'medium', 'high'],
+        'claude-sonnet-5-5': ['low', 'medium', 'high'],
+        'gpt-oss-120b-medium': [],
+        'default': [],
+      };
+      const EFFORT_LABELS = {
+        low: 'Low',
+        medium: 'Medium',
+        high: 'High',
+        xhigh: 'XHigh',
+      };
+
+      const groupEl = document.getElementById('agy-group');
+      const orchPanelEl = document.getElementById('agy-orch-panel');
+      const singleWrapEl = document.getElementById('agy-single-effort-wrap');
+      const singleEffortEl = document.getElementById('agy-single-effort');
+      const plannerModelEl = document.getElementById('agy-planner-model');
+      const plannerEffortEl = document.getElementById('agy-planner-effort');
+      const executorModelEl = document.getElementById('agy-executor-model');
+      const executorEffortEl = document.getElementById('agy-executor-effort');
+      const summaryEl = document.getElementById('agy-summary-text');
+      const badgeEl = document.getElementById('agy-mode-badge');
+      const confirmEl = document.getElementById('agy-confirm');
+      const defaultBtnEl = document.getElementById('agy-default-btn');
+
+      let state = {
+        group: 'gemini-pro-orchestrator',
+        plannerModel: 'gemini-4-carbon',
+        plannerEffort: 'default',
+        executorModel: 'gemini-4-hydrogen',
+        executorEffort: 'default',
+        singleEffort: 'high',
+      };
+
+      function populateSelect(selectEl, items, selectedValue, labelFn) {
+        selectEl.innerHTML = '';
+        for (const value of items) {
+          const opt = document.createElement('option');
+          opt.value = value;
+          opt.textContent = labelFn ? labelFn(value) : value;
+          if (value === selectedValue) opt.selected = true;
+          selectEl.appendChild(opt);
+        }
+      }
+
+      function render(source) {
+        const isOrch = state.group === 'gemini-pro-orchestrator';
+        orchPanelEl.classList.toggle('is-hidden', !isOrch);
+
+        if (!isOrch) {
+          const modelEfforts = EFFORTS[state.group] || [];
+          singleWrapEl.classList.toggle('is-hidden', modelEfforts.length === 0);
+          if (modelEfforts.length > 0) {
+            if (!modelEfforts.includes(state.singleEffort)) {
+              state.singleEffort = modelEfforts.includes('high') ? 'high' : modelEfforts[0];
+            }
+            populateSelect(singleEffortEl, modelEfforts, state.singleEffort);
+          }
+          const selection = modelEfforts.length > 0 ? `${state.group}/${state.singleEffort}` : state.group;
+          const display = DISPLAY_NAMES[state.group] || state.group;
+          summaryEl.textContent = modelEfforts.length > 0
+            ? `${display} (${EFFORT_LABELS[state.singleEffort] || state.singleEffort})`
+            : display;
+          badgeEl.textContent = '单模型模式';
+          confirmEl.textContent = '确认此模型: ' + selection;
+          return;
+        }
+
+        singleWrapEl.classList.add('is-hidden');
+        const supportsNative = Boolean(NATIVE_PRESETS[state.plannerModel]) && state.executorModel === 'gemini-4-hydrogen';
+        const pBaseEfforts = EFFORTS[state.plannerModel] || ['low', 'medium', 'high'];
+        const eBaseEfforts = EFFORTS[state.executorModel] || ['low', 'medium', 'high'];
+        const pOptions = supportsNative ? ['default', ...pBaseEfforts] : [...pBaseEfforts];
+        const eOptions = supportsNative ? ['default', ...eBaseEfforts] : [...eBaseEfforts];
+
+        if (source === 'plannerEffort' && state.plannerEffort === 'default' && supportsNative) {
+          state.executorEffort = 'default';
+        } else if (source === 'executorEffort' && state.executorEffort !== 'default' && state.plannerEffort === 'default') {
+          state.plannerEffort = pBaseEfforts.includes('high') ? 'high' : pBaseEfforts[0];
+        } else if (source === 'executorEffort' && state.executorEffort === 'default' && supportsNative) {
+          state.plannerEffort = 'default';
+        }
+
+        if (!pOptions.includes(state.plannerEffort)) {
+          state.plannerEffort = pBaseEfforts.includes('high') ? 'high' : pBaseEfforts[0];
+        }
+        if (!eOptions.includes(state.executorEffort)) {
+          state.executorEffort = (supportsNative && state.plannerEffort === 'default')
+            ? 'default'
+            : (eBaseEfforts.includes('high') ? 'high' : eBaseEfforts[0]);
+        }
+        if (state.plannerEffort === 'default' && state.executorEffort !== 'default') {
+          state.plannerEffort = pBaseEfforts.includes('high') ? 'high' : pBaseEfforts[0];
+        }
+        if (state.executorEffort === 'default' && state.plannerEffort !== 'default') {
+          state.executorEffort = eBaseEfforts.includes('high') ? 'high' : eBaseEfforts[0];
+        }
+
+        populateSelect(plannerEffortEl, pOptions, state.plannerEffort, (v) => v === 'default' ? 'default（原生预设）' : v);
+        populateSelect(executorEffortEl, eOptions, state.executorEffort, (v) => v === 'default' ? 'default（跟随预设）' : v);
+
+        if (supportsNative && state.plannerEffort === 'default' && state.executorEffort === 'default') {
+          const presetId = NATIVE_PRESETS[state.plannerModel];
+          summaryEl.textContent = `原生 ACP 预设 · Planner ${DISPLAY_NAMES[state.plannerModel]} + Executor Gemini 4 Hydrogen（支持 /swarm）`;
+          badgeEl.textContent = '原生 ACP 预设 · /swarm';
+          confirmEl.textContent = '确认此模型: ' + presetId;
+        } else {
+          const pLabel = `${DISPLAY_NAMES[state.plannerModel]} (${EFFORT_LABELS[state.plannerEffort] || state.plannerEffort})`;
+          const eLabel = `${DISPLAY_NAMES[state.executorModel]} (${EFFORT_LABELS[state.executorEffort] || state.executorEffort})`;
+          const selection = (state.plannerModel === 'gemini-4-carbon' && state.executorModel === 'gemini-4-hydrogen')
+            ? `gemini-pro-orchestrator/${state.plannerEffort}/${state.executorEffort}`
+            : `gemini-pro-orchestrator/${state.plannerModel}:${state.plannerEffort}/${state.executorModel}:${state.executorEffort}`;
+          summaryEl.textContent = `Planner ${pLabel} → Executor ${eLabel}`;
+          badgeEl.textContent = '自定义双阶段 · --settings';
+          confirmEl.textContent = '确认此模型: ' + selection;
+        }
+      }
+
+      groupEl.addEventListener('change', (e) => { state.group = e.target.value; render('group'); });
+      singleEffortEl.addEventListener('change', (e) => { state.singleEffort = e.target.value; render('singleEffort'); });
+      plannerModelEl.addEventListener('change', (e) => { state.plannerModel = e.target.value; render('plannerModel'); });
+      plannerEffortEl.addEventListener('change', (e) => { state.plannerEffort = e.target.value; render('plannerEffort'); });
+      executorModelEl.addEventListener('change', (e) => { state.executorModel = e.target.value; render('executorModel'); });
+      executorEffortEl.addEventListener('change', (e) => { state.executorEffort = e.target.value; render('executorEffort'); });
+      defaultBtnEl.addEventListener('click', () => {
+        state = {
+          group: 'gemini-pro-orchestrator',
+          plannerModel: 'gemini-4-carbon',
+          plannerEffort: 'default',
+          executorModel: 'gemini-4-hydrogen',
+          executorEffort: 'default',
+          singleEffort: 'high',
+        };
+        groupEl.value = state.group;
+        plannerModelEl.value = state.plannerModel;
+        executorModelEl.value = state.executorModel;
+        render('reset');
+      });
+
+      render('init');
+    })();
   </script>
 </body>
 </html>

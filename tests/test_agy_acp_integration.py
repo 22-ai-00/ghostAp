@@ -1403,8 +1403,8 @@ def test_agy_hybrid_transport_dispatch_card_labels_and_commands(tmp_path: Path) 
         pending_profile="xhigh",
         pending_effort="low",
     )
-    assert "**Planner Effort**" in orch_card_json
-    assert "**Executor Effort**" in orch_card_json
+    assert "Planner Effort" in orch_card_json
+    assert "Executor Effort" in orch_card_json
 
     _t, reg_card_json = SystemBuilder.build_acp_model_cascade_card(
         [orch_option, reg_option],
@@ -1637,6 +1637,16 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
     from src.card.shared.truncation import count_tagged_nodes
     from src.card.thresholds import THRESHOLDS
     from src.feishu.handlers.system import SystemHandler
+    from src.workflow_engine.tool_registry import ToolCapability, validate_agent_binding_spec
+
+    def _walk_nodes(obj: object):
+        if isinstance(obj, dict):
+            yield obj
+            for child in obj.values():
+                yield from _walk_nodes(child)
+        elif isinstance(obj, list):
+            for child in obj:
+                yield from _walk_nodes(child)
 
     catalog = [
         ACPModelOption(
@@ -1664,6 +1674,18 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
             ),
         ),
         ACPModelOption(
+            name="gemini-4-argon",
+            description="Gemini 4 Argon",
+            reasoning_efforts=("low", "medium", "high"),
+            default_reasoning_effort="high",
+            selection_variants=tuple(
+                ACPModelSelectionVariant(
+                    name=f"gemini-4-argon/{e}", model="gemini-4-argon", effort=e, is_default=(e == "high")
+                )
+                for e in ("low", "medium", "high")
+            ),
+        ),
+        ACPModelOption(
             name="gemini-4-hydrogen",
             description="Gemini 4 Hydrogen",
             reasoning_efforts=("low", "medium", "high", "xhigh"),
@@ -1673,6 +1695,20 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
                     name=f"gemini-4-hydrogen/{e}", model="gemini-4-hydrogen", effort=e, is_default=(e == "high")
                 )
                 for e in ("low", "medium", "high", "xhigh")
+            ),
+        ),
+        ACPModelOption(
+            name="gemini-pro-orchestrator-neon",
+            description="Orchestrator (Neon)",
+            reasoning_efforts=("low", "medium", "high", "xhigh"),
+            default_reasoning_effort="high",
+            selection_variants=(
+                ACPModelSelectionVariant(
+                    name="gemini-pro-orchestrator-neon",
+                    model="gemini-pro-orchestrator-neon",
+                    profile="default",
+                    is_default=True,
+                ),
             ),
         ),
         ACPModelOption(
@@ -1697,6 +1733,32 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
             ),
         ),
         ACPModelOption(
+            name="gemini-pro-orchestrator-argon",
+            description="Orchestrator (Argon)",
+            reasoning_efforts=("low", "medium", "high"),
+            default_reasoning_effort="high",
+            selection_variants=(
+                ACPModelSelectionVariant(
+                    name="gemini-pro-orchestrator-argon",
+                    model="gemini-pro-orchestrator-argon",
+                    profile="default",
+                    is_default=True,
+                ),
+            ),
+        ),
+        ACPModelOption(
+            name="gemini-3.8-flash",
+            description="Gemini 3.8 Flash",
+            reasoning_efforts=("low", "medium", "high"),
+            default_reasoning_effort="high",
+            selection_variants=tuple(
+                ACPModelSelectionVariant(
+                    name=f"gemini-3.8-flash/{e}", model="gemini-3.8-flash", effort=e, is_default=(e == "high")
+                )
+                for e in ("low", "medium", "high")
+            ),
+        ),
+        ACPModelOption(
             name="claude-opus-5-5",
             description="Claude Opus 5.5",
             reasoning_efforts=("low", "medium", "high"),
@@ -1704,6 +1766,18 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
             selection_variants=tuple(
                 ACPModelSelectionVariant(
                     name=f"claude-opus-5-5/{e}", model="claude-opus-5-5", effort=e, is_default=(e == "medium")
+                )
+                for e in ("low", "medium", "high")
+            ),
+        ),
+        ACPModelOption(
+            name="claude-sonnet-5-5",
+            description="Claude Sonnet 5.5",
+            reasoning_efforts=("low", "medium", "high"),
+            default_reasoning_effort="medium",
+            selection_variants=tuple(
+                ACPModelSelectionVariant(
+                    name=f"claude-sonnet-5-5/{e}", model="claude-sonnet-5-5", effort=e, is_default=(e == "medium")
                 )
                 for e in ("low", "medium", "high")
             ),
@@ -1718,18 +1792,40 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
         ),
     ]
 
-    # 1. Default cascade picks gemini-pro-orchestrator and Carbon+Hydrogen high
+    # 1. Default cascade picks gemini-pro-orchestrator and Carbon+Hydrogen high, while preserving bare native default
     default_cascade = resolve_model_cascade(catalog)
     assert default_cascade.selected_model == "gemini-pro-orchestrator"
     orch_state = resolve_agy_orchestrator_cascade(catalog, orchestrator_model="gemini-pro-orchestrator")
     assert orch_state.has_role_models is True
+    assert orch_state.planner_model_names == (
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "claude-opus-5-5",
+    )
+    assert orch_state.executor_model_names == (
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+        "claude-sonnet-5-5",
+    )
     assert orch_state.selected_planner_model == "gemini-4-carbon"
     assert orch_state.selected_planner_effort == "high"
     assert orch_state.selected_executor_model == "gemini-4-hydrogen"
     assert orch_state.selected_executor_effort == "high"
     assert orch_state.selection == "gemini-pro-orchestrator/high/high"
 
-    # 2. Custom Planner + Executor model/effort round-trip & fixed-effort role model
+    bare_preserved = resolve_agy_orchestrator_cascade(
+        catalog,
+        orchestrator_model="gemini-pro-orchestrator",
+        current_model="gemini-pro-orchestrator",
+    )
+    assert bare_preserved.selected_planner_model == "gemini-4-carbon"
+    assert bare_preserved.selected_planner_effort == "default"
+    assert bare_preserved.selected_executor_model == "gemini-4-hydrogen"
+    assert bare_preserved.selected_executor_effort == "default"
+    assert bare_preserved.selection == "gemini-pro-orchestrator"
+
+    # 2. Custom allowed Planner (Opus) + Executor (Sonnet / Hydrogen) round-trip & strict allowlist enforcement
     custom_sel = compose_agy_orchestrator_selection(
         "gemini-pro-orchestrator",
         "high",
@@ -1756,24 +1852,65 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
         normalize_agy_model_input("gemini-pro-orchestrator/claude-opus-5-5/high/gemini-4-hydrogen/xhigh")
         == custom_sel
     )
+    assert (
+        normalize_agy_model_input("orchestrator/high/xhigh")
+        == "gemini-pro-orchestrator/high/xhigh"
+    )
 
-    fixed_sel = compose_agy_orchestrator_selection(
+    sonnet_sel = compose_agy_orchestrator_selection(
         "gemini-pro-orchestrator",
-        None,
+        "medium",
         "high",
-        planner_model="gpt-oss-120b-medium",
-        executor_model="gemini-4-hydrogen",
+        planner_model="claude-opus-5-5",
+        executor_model="claude-sonnet-5-5",
     )
-    assert fixed_sel == "gemini-pro-orchestrator/gpt-oss-120b-medium/gemini-4-hydrogen:high"
-    assert requires_agy_cli_orchestrator_session(fixed_sel) is True
-    assert is_valid_agy_catalog_selection(catalog, fixed_sel) is True
-    assert resolve_agy_orchestrator_settings(fixed_sel) == (
+    assert sonnet_sel == "gemini-pro-orchestrator/claude-opus-5-5:medium/claude-sonnet-5-5:high"
+    assert is_valid_agy_catalog_selection(catalog, sonnet_sel) is True
+    assert resolve_agy_orchestrator_settings(sonnet_sel) == (
         "gemini-pro-orchestrator",
-        {"orchestrator": {"planner": "GPT-OSS 120B (Medium)", "executor": "Gemini 4 Hydrogen (High)"}},
+        {"orchestrator": {"planner": "Claude Opus 5.5 (Medium)", "executor": "Claude Sonnet 5.5 (High)"}},
     )
-    assert not is_valid_agy_catalog_selection(
-        catalog, "gemini-pro-orchestrator/gpt-oss-120b-medium:high/gemini-4-hydrogen:high"
+
+    # Disallowed Planner/Executor models fail-closed across selection helpers and Workflow validation
+    disallowed_pairs = [
+        ("gpt-oss-120b-medium", "gemini-4-hydrogen"),
+        ("gemini-3.8-flash", "gemini-4-hydrogen"),
+        ("gemini-4-hydrogen", "gemini-4-hydrogen"),
+        ("gemini-4-carbon", "gemini-4-carbon"),
+        ("gemini-4-carbon", "claude-opus-5-5"),
+        ("gemini-4-carbon", "gpt-oss-120b-medium"),
+    ]
+    for bad_p, bad_e in disallowed_pairs:
+        with pytest.raises(ValueError):
+            compose_agy_orchestrator_selection(
+                "gemini-pro-orchestrator",
+                "high",
+                "high",
+                planner_model=bad_p,
+                executor_model=bad_e,
+            )
+        bad_sel = f"gemini-pro-orchestrator/{bad_p}:high/{bad_e}:high"
+        with pytest.raises(ValueError):
+            parse_agy_model_selection(bad_sel)
+        assert is_valid_agy_catalog_selection(catalog, bad_sel) is False
+
+    wf_cap = ToolCapability(
+        tool_name="agy",
+        display_name="AGY",
+        available=True,
+        supports_model=True,
+        supports_effort=True,
+        models=tuple(opt.name for opt in catalog),
+        efforts_by_model={opt.name: opt.reasoning_efforts for opt in catalog if opt.reasoning_efforts},
+        authoritative_models=True,
     )
+    assert validate_agent_binding_spec("agy", model_name=sonnet_sel, capabilities={"agy": wf_cap})[0] is True
+    ok_bad_wf, _ = validate_agent_binding_spec(
+        "agy",
+        model_name="gemini-pro-orchestrator/gpt-oss-120b-medium:high/gemini-4-hydrogen:high",
+        capabilities={"agy": wf_cap},
+    )
+    assert ok_bad_wf is False
 
     # 3. SyncAGYCLISession preserves custom Planner/Executor models
     cli_sess = SyncAGYCLISession(cwd=str(tmp_path), config=AGYCLIConfig(command="agy"), model_name=custom_sel)
@@ -1782,11 +1919,11 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
         "planner": "Claude Opus 5.5 (High)",
         "executor": "Gemini 4 Hydrogen (XHigh)",
     }
-    assert cli_sess.set_model(fixed_sel) is True
-    assert cli_sess._model_name == fixed_sel
-    assert "GPT-OSS 120B (Medium)" in cli_sess.get_session_info()
+    assert cli_sess.set_model(sonnet_sel) is True
+    assert cli_sess._model_name == sonnet_sel
+    assert "Claude Sonnet 5.5 (High)" in cli_sess.get_session_info()
 
-    # 4. Card builder renders 4 dropdowns & ToolCockpitBuilder stays within Feishu budgets
+    # 4. Card builder unifies Orchestrator into 1 entry, restricts 4x3 dropdowns in 2x2 column_set, omits width
     _t, card_json = SystemBuilder.build_acp_model_cascade_card(
         catalog,
         "agy",
@@ -1798,12 +1935,28 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
         pending_effort="xhigh",
     )
     card_obj = json.loads(card_json)
-    select_names = [
-        el["name"]
-        for el in card_obj["body"]["elements"]
-        if isinstance(el, dict) and el.get("tag") == "select_static"
-    ]
+    selects_list = [node for node in _walk_nodes(card_obj) if node.get("tag") == "select_static"]
+    select_names = [el["name"] for el in selects_list]
     assert select_names == ["model_group", "planner_model", "model_profile", "executor_model", "model_effort"]
+    assert all("width" not in el for el in selects_list)
+    selects_map = {el["name"]: el for el in selects_list}
+    group_opts = selects_map["model_group"]["options"]
+    assert [opt["value"] for opt in group_opts].count("gemini-pro-orchestrator") == 1
+    assert "gemini-pro-orchestrator-neon" not in [opt["value"] for opt in group_opts]
+    assert "gemini-pro-orchestrator-argon" not in [opt["value"] for opt in group_opts]
+    assert next(o["text"]["content"] for o in group_opts if o["value"] == "gemini-pro-orchestrator") == "🪐 Orchestrator（双阶段规划+执行）"
+    assert [opt["value"] for opt in selects_map["planner_model"]["options"]] == [
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "claude-opus-5-5",
+    ]
+    assert [opt["value"] for opt in selects_map["executor_model"]["options"]] == [
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+        "claude-sonnet-5-5",
+    ]
+    assert any(node.get("tag") == "column_set" for node in _walk_nodes(card_obj))
     assert custom_sel in card_json
 
     _t2, settings_json = ToolCockpitBuilder.build_tool_settings_card(
@@ -1817,9 +1970,20 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
     settings_card = json.loads(settings_json)
     assert count_tagged_nodes(settings_card) <= THRESHOLDS["CARD_NODE_BUDGET"]
     assert len(settings_json.encode("utf-8")) <= THRESHOLDS["CARD_BYTE_BUDGET"]
-    assert "planner_model" in settings_json and "executor_model" in settings_json
+    settings_selects = {n["name"]: n for n in _walk_nodes(settings_card) if n.get("tag") == "select_static"}
+    assert [opt["value"] for opt in settings_selects["planner_model"]["options"]] == [
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "claude-opus-5-5",
+    ]
+    assert [opt["value"] for opt in settings_selects["executor_model"]["options"]] == [
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+        "claude-sonnet-5-5",
+    ]
 
-    # 5. SystemHandler cascade, select, /model, /effort, and /settings cockpit callbacks
+    # 5. SystemHandler cascade, 1-click promotion from default, fail-closed validation, /model, /effort, /settings
     project = ProjectContext("proj-1", "Project 1", str(tmp_path))
     project.acp_tool_name = "agy"
     project.acp_model_name = "gemini-pro-orchestrator"
@@ -1861,6 +2025,24 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
     system.reply_text = MagicMock()  # type: ignore[method-assign]
     system.reply_error = MagicMock()  # type: ignore[method-assign]
 
+    # 1-click changing Executor Effort from "default" on /agy card promotes Planner Effort to "high"
+    system.handle_acp_model_cascade_select(
+        "m-card",
+        "chat-1",
+        "proj-1",
+        {
+            "action": action_ids.SELECT_ACP_MODEL_EFFORT,
+            "tool_name": "agy",
+            "model_group": "gemini-pro-orchestrator",
+            "planner_model": "gemini-4-carbon",
+            "model_profile": "default",
+            "executor_model": "gemini-4-hydrogen",
+            "model_effort": "default",
+            "_option": "xhigh",
+        },
+    )
+    assert "gemini-pro-orchestrator/high/xhigh" in system.update_card.call_args.args[1]
+
     # Pick planner model on /agy card -> redraws with claude-opus-5-5
     system.handle_acp_model_cascade_select(
         "m-card",
@@ -1879,6 +2061,24 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
     )
     updated_card = system.update_card.call_args.args[1]
     assert custom_sel in updated_card
+
+    # Reject disallowed role model on confirm
+    system.handle_select_acp_model(
+        "m-card",
+        "chat-1",
+        "proj-1",
+        {
+            "action": action_ids.SELECT_ACP_MODEL,
+            "tool_name": "agy",
+            "model_group": "gemini-pro-orchestrator",
+            "planner_model": "gpt-oss-120b-medium",
+            "model_profile": "high",
+            "executor_model": "gemini-4-hydrogen",
+            "model_effort": "xhigh",
+            "use_default_model": False,
+        },
+    )
+    system.reply_error.assert_called()
 
     # Confirm custom selection
     system.handle_select_acp_model(
@@ -1905,7 +2105,8 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
         "gemini-pro-orchestrator/claude-opus-5-5:medium/gemini-4-hydrogen:high",
     )
 
-    # /settings cockpit changing executor model updates and persists
+    # /settings cockpit changing executor model to claude-sonnet-5-5 updates and persists, while disallowed model fails closed
+    system.reply_error.reset_mock()
     system.handle_tool_cockpit_action(
         "m-settings",
         "chat-1",
@@ -1921,7 +2122,43 @@ def test_agy_orchestrator_planner_executor_model_and_effort_cascade_and_cli(tmp_
             "_option": "gpt-oss-120b-medium",
         },
     )
+    system.reply_error.assert_called_once()
+
+    system.handle_tool_cockpit_action(
+        "m-settings",
+        "chat-1",
+        "proj-1",
+        {
+            "action": action_ids.SETTINGS_SELECT_ORCH_EXECUTOR_MODEL,
+            "tool_name": "agy",
+            "model_group": "gemini-pro-orchestrator",
+            "planner_model": "claude-opus-5-5",
+            "model_profile": "medium",
+            "executor_model": "gemini-4-hydrogen",
+            "model_effort": "high",
+            "_option": "claude-sonnet-5-5",
+        },
+    )
     assert committed[-1] == (
         "agy",
-        "gemini-pro-orchestrator/claude-opus-5-5:medium/gpt-oss-120b-medium",
+        "gemini-pro-orchestrator/claude-opus-5-5:medium/claude-sonnet-5-5:high",
     )
+
+    # /settings 1-click change Executor Effort from bare default promotes Planner Effort to high
+    project.set_acp_configuration("agy", "gemini-pro-orchestrator", chat_id="chat-1")
+    system.handle_tool_cockpit_action(
+        "m-settings-2",
+        "chat-1",
+        "proj-1",
+        {
+            "action": action_ids.SETTINGS_SELECT_MODEL_EFFORT,
+            "tool_name": "agy",
+            "model_group": "gemini-pro-orchestrator",
+            "planner_model": "gemini-4-carbon",
+            "model_profile": "default",
+            "executor_model": "gemini-4-hydrogen",
+            "model_effort": "default",
+            "_option": "xhigh",
+        },
+    )
+    assert committed[-1] == ("agy", "gemini-pro-orchestrator/high/xhigh")

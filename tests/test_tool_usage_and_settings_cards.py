@@ -527,3 +527,42 @@ def test_tool_cockpit_builder_respects_import_boundaries_and_ux_previews_exist()
     assert "刷新用量" in cockpit_html
     assert "已加载 Skills" in native_html
     assert "用量 /usage" in native_html
+
+
+def test_tool_settings_card_agy_unified_orchestrator_preserves_default_and_restricts_roles() -> None:
+    full_catalog = [
+        ACPModelOption(name="gemini-4-neon", reasoning_efforts=("low", "medium", "high", "xhigh"), default_reasoning_effort="high"),
+        ACPModelOption(name="gemini-4-carbon", reasoning_efforts=("low", "medium", "high"), default_reasoning_effort="high"),
+        ACPModelOption(name="gemini-4-argon", reasoning_efforts=("low", "medium", "high"), default_reasoning_effort="high"),
+        ACPModelOption(name="gemini-4-hydrogen", reasoning_efforts=("low", "medium", "high", "xhigh"), default_reasoning_effort="high"),
+        ACPModelOption(name="gemini-pro-orchestrator-neon", description="Orchestrator (Neon)"),
+        ACPModelOption(name="gemini-pro-orchestrator", description="Orchestrator (Carbon)", is_default=True),
+        ACPModelOption(name="gemini-pro-orchestrator-argon", description="Orchestrator (Argon)"),
+        ACPModelOption(name="claude-opus-5-5", reasoning_efforts=("low", "medium", "high")),
+        ACPModelOption(name="claude-sonnet-5-5", reasoning_efforts=("low", "medium", "high")),
+        ACPModelOption(name="gpt-oss-120b-medium"),
+    ]
+    card, _raw = _parse_card(
+        ToolCockpitBuilder.build_tool_settings_card(
+            "agy",
+            models=full_catalog,
+            current_model="gemini-pro-orchestrator",
+            available_tools=["agy", "coco"],
+        )
+    )
+    selects = {n["name"]: n for n in _nodes(card, "select_static")}
+    assert [opt["value"] for opt in selects["model_group"]["options"]].count("gemini-pro-orchestrator") == 1
+    assert "gemini-pro-orchestrator-neon" not in [opt["value"] for opt in selects["model_group"]["options"]]
+    assert selects["model_profile"]["initial_option"] == "default"
+    assert selects["model_effort"]["initial_option"] == "default"
+    assert [opt["value"] for opt in selects["planner_model"]["options"]] == [
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "claude-opus-5-5",
+    ]
+    assert [opt["value"] for opt in selects["executor_model"]["options"]] == [
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+        "claude-sonnet-5-5",
+    ]

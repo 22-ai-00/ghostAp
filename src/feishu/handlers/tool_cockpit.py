@@ -1022,25 +1022,33 @@ class ToolCockpitMixin:
                 SETTINGS_SELECT_ORCH_EXECUTOR_MODEL,
             }:
                 orch_probe = _maybe_orch_cascade(orch_base)
-                if orch_probe is None or selected not in orch_probe.role_model_names:
+                allowed_models = (
+                    (orch_probe.planner_model_names or orch_probe.role_model_names)
+                    if action == SETTINGS_SELECT_ORCH_PLANNER_MODEL
+                    else (orch_probe.executor_model_names or orch_probe.role_model_names)
+                    if orch_probe is not None
+                    else ()
+                )
+                if orch_probe is None or selected not in allowed_models:
                     self.reply_error(
                         message_id,
                         _system_module().UI_TEXT["system_acp_unknown_model"].format(model=selected),
                     )
                     return
                 if action == SETTINGS_SELECT_ORCH_PLANNER_MODEL:
+                    cur_eff_val = str(payload.get("model_effort") or "").strip() or None
                     orch_state = _maybe_orch_cascade(
                         orch_base,
                         p_model=selected,
                         p_eff=None,
                         e_model=executor_model,
-                        e_eff=str(payload.get("model_effort") or "").strip() or None,
+                        e_eff=(None if cur_eff_val == "default" else cur_eff_val),
                     )
                 else:
                     orch_state = _maybe_orch_cascade(
                         orch_base,
                         p_model=planner_model,
-                        p_eff=profile,
+                        p_eff=(None if profile == "default" else profile),
                         e_model=selected,
                         e_eff=None,
                     )
@@ -1069,7 +1077,7 @@ class ToolCockpitMixin:
                         p_model=planner_model,
                         p_eff=selected,
                         e_model=executor_model,
-                        e_eff=effort_val,
+                        e_eff=("default" if selected.lower() == "default" else (None if effort_val == "default" else effort_val)),
                     )
                 else:
                     if orch_probe.executor_efforts and selected.lower() not in orch_probe.executor_efforts:
@@ -1081,7 +1089,7 @@ class ToolCockpitMixin:
                     orch_state = _maybe_orch_cascade(
                         orch_base,
                         p_model=planner_model,
-                        p_eff=profile,
+                        p_eff=("default" if selected.lower() == "default" else (None if profile == "default" else profile)),
                         e_model=executor_model,
                         e_eff=selected,
                     )

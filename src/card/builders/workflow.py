@@ -164,6 +164,15 @@ def _extract_current_base_model(
     ):
         return raw_current
 
+    if tool in {"agy", "agy_b"}:
+        from src.acp.agy_selection import is_agy_orchestrator_model, parse_agy_model_selection
+
+        if is_agy_orchestrator_model(raw_current):
+            try:
+                return parse_agy_model_selection(raw_current).model_id
+            except ValueError:
+                return raw_current.split("/", 1)[0].strip() or None
+
     if cap.models:
         from src.acp.model_selection import CODEX_REASONING_EFFORTS
 
@@ -218,18 +227,9 @@ def _extract_current_base_model(
         base, _effort = split_claude_model_selection(raw_current)
         return base or None
     if tool in {"agy", "agy_b"}:
-        from src.acp.agy_selection import (
-            AGY_REASONING_EFFORTS,
-            is_agy_orchestrator_model,
-            parse_agy_model_selection,
-        )
+        from src.acp.agy_selection import AGY_REASONING_EFFORTS
         from src.acp.model_selection import split_slash_model_effort
 
-        if is_agy_orchestrator_model(raw_current):
-            try:
-                return parse_agy_model_selection(raw_current).model_id
-            except ValueError:
-                return raw_current.split("/", 1)[0].strip() or None
         base, _effort = split_slash_model_effort(
             raw_current,
             allowed_efforts=AGY_REASONING_EFFORTS,
